@@ -54,8 +54,12 @@ typedef uint8_t u8;typedef uint16_t u16,__be16;typedef uint32_t u32;typedef uint
 #define HZ 100
 #define system_wq 0
 #define READ_ONCE(v) (v)
+#define WRITE_ONCE(v,n) ((v)=(n))
 #define time_after(a,b) ((long)((b)-(a))<0)
+#define time_after_eq(a,b) ((long)((a)-(b))>=0)
 struct list_head {struct list_head *next,*prev;};
+struct rb_node {unsigned int indexed;};
+struct rb_root {unsigned int count;};
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define list_for_each_entry(p,h,m) for(struct list_head *c=(h)->next;c!=(h) && ((p)=container_of(c,__typeof__(*(p)),m));c=c->next)
 #define list_for_each_entry_safe(p,n,h,m) for(struct list_head *c=(h)->next,*nc=c->next;c!=(h) && ((p)=container_of(c,__typeof__(*(p)),m),(n)=container_of(nc,__typeof__(*(n)),m),1);c=nc,nc=c->next)
@@ -73,11 +77,12 @@ struct rtl_fe_port {struct net_device *netdev;unsigned int source,destination,ll
 struct work_struct {int unused;};struct delayed_work {struct work_struct work;unsigned int queued;};
 #define to_delayed_work(w) container_of(w,struct delayed_work,work)
 struct rtl_dq_io {int unused;};
-struct rtl_fe {struct list_head flows;struct rtl_fe_port *ports[2];struct net_device *itu_netdev;struct rtl_itu_paths *itu_paths;unsigned char ppp_protocol_ids[2];bool enabled;int lock;};
+struct rtl_fe {struct list_head flows;struct rb_root cookies;struct rtl_fe_port *ports[2];struct net_device *itu_netdev;struct rtl_itu_paths *itu_paths;unsigned char ppp_protocol_ids[2];bool enabled;int lock;};
 struct fe_bridge_packet {struct net *net;struct rtl9617c_bridge_frame input,output;unsigned int bridge,ingress,egress;u16 vid;};
-struct rtl_fe_bridge {struct rtl_fe *fe;struct delayed_work work;int pending_lock;unsigned int read,write;int epoch,flush;bool stopping;struct fe_bridge_packet pending[256];};
+struct rtl_fe_bridge {struct rtl_fe *fe;struct delayed_work work;int pending_lock;unsigned int read,write;int epoch,flush,recheck;unsigned long next_maintenance;bool active;u32 queued,coalesced,overflow,work_runs,maintenance_runs;bool stopping;struct fe_bridge_packet pending[256];};
 static struct net_device *devices[128],*fdb_source,*fdb_destination;
 static unsigned int installed,deleted,refreshed,age=2;
+static bool fail_age_read;
 static unsigned long jiffies=100;
 static int atomic_read(int *v){return *v;}
 static int atomic_xchg(int *v,int n){int old=*v;*v=n;return old;}
@@ -108,7 +113,8 @@ static int br_vlan_get_pvid_rcu(struct net_device *d,u16 *p){*p=d->pvid;return 0
 static void spin_lock_bh(int *v){assert(!*v);*v=1;}
 static void spin_unlock_bh(int *v){assert(*v);*v=0;}
 static void get_net(struct net *n){n->references++;}
-static void put_net(struct net *n){assert(n->references);n->references--;}
+static void (*after_put_net)(void);
+static void put_net(struct net *n){assert(n->references);n->references--;if(after_put_net)after_put_net();}
 static void mod_delayed_work(int q,struct delayed_work *w,unsigned int t){(void)q;(void)t;w->queued++;}
 static void queue_delayed_work(int q,struct delayed_work *w,unsigned int t){assert(q==0&&t==HZ);w->queued++;}
 static struct net_device *__dev_get_by_index(struct net *n,unsigned int i){(void)n;return i<128?devices[i]:NULL;}
@@ -125,8 +131,11 @@ static void rtnl_lock(void){}
 static void rtnl_unlock(void){}
 static void mutex_lock(int *v){assert(!*v);*v=1;}
 static void mutex_unlock(int *v){assert(*v);*v=0;}
+static void rb_erase(struct rb_node *node,struct rb_root *root){assert(node->indexed&&root->count);node->indexed=0;root->count--;}
+struct rtl_fe_flow;
+static void fe_index_flow(struct rtl_fe *fe,struct rtl_fe_flow *flow);
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){(void)fe;return (struct rtl_dq_io){};}
-static int rtl_fe_main_age_read(struct rtl_dq_io *io,unsigned int index,unsigned int *value){(void)io;(void)index;*value=age;return 0;}
+static int rtl_fe_main_age_read(struct rtl_dq_io *io,unsigned int index,unsigned int *value){(void)io;(void)index;if(fail_age_read)return -EIO;*value=age;return 0;}
 static int rtl_fe_main_age(struct rtl_dq_io *io,unsigned int index,unsigned int value){(void)io;(void)index;assert(value==1);return 0;}
 static void br_fdb_refresh_offload(struct net_device *d,const u8 *mac,u16 vid,bool source){(void)d;(void)mac;(void)vid;(void)source;refreshed++;}
 '''
@@ -139,9 +148,22 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  flow->input=port;flow->output=data.output;flow->bridge=true;flow->published=true;flow->installed=true;
  flow->cookie=cookie;flow->ethernet_protocol=data.ethernet_protocol;flow->ingress_session=data.pppoe_session;
  memcpy(flow->ethernet_source,data.source,6);memcpy(flow->destination,data.destination,6);
- list_add_tail(&flow->list,&port->fe->flows);return 0;
+ list_add_tail(&flow->list,&port->fe->flows);fe_index_flow(port->fe,flow);return 0;
 }
-static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *f){(void)fe;f->list.prev->next=f->list.next;f->list.next->prev=f->list.prev;free(f);deleted++;return 0;}
+static void fe_index_flow(struct rtl_fe *fe,struct rtl_fe_flow *flow){assert(!flow->cookie_node.indexed);flow->cookie_node.indexed=1;fe->cookies.count++;}
+static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *f){rb_erase(&f->cookie_node,&fe->cookies);f->list.prev->next=f->list.next;f->list.next->prev=f->list.prev;free(f);deleted++;return 0;}
+static struct rtl_fe_bridge *backlog_bridge;
+static struct fe_bridge_packet backlog_packet;
+static unsigned backlog_injections;
+static void inject_backlog(void){
+ if(!backlog_injections)return;
+ unsigned next=(backlog_bridge->write+1)%FE_BRIDGE_PENDING;
+ assert(next!=backlog_bridge->read);
+ get_net(backlog_packet.net);
+ backlog_bridge->pending[backlog_bridge->write]=backlog_packet;
+ backlog_bridge->write=next;
+ backlog_injections--;
+}
 '''.replace('struct rtl_fe_port {', 'struct rtl_fe_port {')
 common = common.replace('struct rtl_fe_port {struct net_device', 'struct rtl_fe_port {struct rtl_fe *fe;struct net_device')
 test = r'''
@@ -165,16 +187,39 @@ int main(void){
  fe_bridge_forwarded(&bridge,&skb,&output);assert(bridge.read==bridge.write);
  assert(fe_bridge_capture(&bridge,&skb,&input)==NF_ACCEPT && skb.saved.port==1);
  fe_bridge_forwarded(&bridge,&skb,&output);assert(net.references==1 && bridge.write==1);
+ unsigned queued_work=bridge.work.queued;
+ for(unsigned i=0;i<1000;i++)fe_bridge_forwarded(&bridge,&skb,&output);
+ assert(net.references==1 && bridge.write==1 && bridge.coalesced==1000);
+ assert(bridge.work.queued==queued_work && bridge.overflow==0);
  fe_bridge_work(&bridge.work.work);
  assert(!net.references && installed==1 && last.bridge && last.action.bridge);
+ assert(bridge.work_runs==1 && bridge.maintenance_runs==1 && bridge.queued==1);
  assert(last.vlan_count==0 && last.action.vlan_set && last.action.vlan_count==1);
  assert(last.action.vlan[0].vid==100 && last.action.vlan[0].priority==4);
  assert(last.pppoe_session==0x1234 && !last.action.pppoe_pop && !last.egress_pppoe);
  assert(last.key.mask==57 && last.action.destination==32 && last.ppp_protocol_slot==4);
- fe_bridge_work(&bridge.work.work);assert(refreshed==2 && deleted==0);
+ /* Age-read MMIO can fail transiently. The next maintenance must remain armed. */
+ fail_age_read=true;jiffies+=HZ;fe_bridge_work(&bridge.work.work);
+ assert(bridge.active && bridge.work.queued>=3 && deleted==0);
+ fail_age_read=false;
+ jiffies+=HZ;fe_bridge_work(&bridge.work.work);assert(refreshed==2 && deleted==0);
  /* Destination movement removes the old rule before another frame is learned. */
- fdb_destination=&other;fe_bridge_work(&bridge.work.work);assert(deleted==1);
+ fdb_destination=&other;bridge.recheck=1;fe_bridge_work(&bridge.work.work);assert(deleted==1);
  assert(fe.flows.next==&fe.flows);
+ /* Keep adding an invalid flow observation while work consumes its 256-entry
+  * budget. No active flow remains to arm periodic maintenance, so the worker
+  * MUST explicitly reschedule the residual queue. */
+ backlog_bridge=&bridge;backlog_packet=bridge.pending[0];backlog_injections=300;
+ assert(bridge.read==bridge.write);get_net(backlog_packet.net);
+ bridge.pending[bridge.write]=backlog_packet;
+ bridge.write=(bridge.write+1)%FE_BRIDGE_PENDING;
+ after_put_net=inject_backlog;
+ queued_work=bridge.work.queued;
+ fe_bridge_work(&bridge.work.work);
+ assert(bridge.read!=bridge.write && bridge.work.queued>queued_work);
+ fe_bridge_work(&bridge.work.work);
+ after_put_net=NULL;
+ assert(!backlog_injections && bridge.read==bridge.write && !net.references);
  /* VLAN-aware access egress takes its VID from ingress, not the egress PVID. */
  br.filtering=true;lan.pvid=100;vlan.pvid=200;
  skb.extension=false;fe_bridge_wire(&bridge,&skb,&wire);fe_bridge_capture(&bridge,&skb,&input);
@@ -199,15 +244,15 @@ int main(void){
  fe_bridge_work(&bridge.work.work);
  assert(installed==3 && last.ppp_protocol_slot==9);
  /* STP and link changes withdraw the learned forwarding decision. */
- lan.state=0;fe_bridge_work(&bridge.work.work);assert(deleted==3);
+ lan.state=0;bridge.flush=1;fe_bridge_work(&bridge.work.work);assert(deleted==3);
  lan.state=3;pon.carrier=false;
  fe_bridge_forwarded(&bridge,&skb,&output);fe_bridge_work(&bridge.work.work);
  assert(installed==3);
- assert(!net.references);
+ assert(!net.references && fe.cookies.count==0);
  puts("Bridge learner: real wire/bridge hooks, VLAN subinterfaces, PCP/DEI, access VID, PPPoE preservation, FDB ageing/movement, STP and link changes passed");
 }
 '''
-functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_frame','fe_bridge_wire','fe_bridge_capture','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
+functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_frame','fe_bridge_wire','fe_bridge_capture','fe_bridge_same','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
 with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='bridge-learning-') as directory:
     directory=Path(directory)
     (directory/'bridge.c').write_text(common+structs+backend+(drivers/'rtl9617c-fe-vlan.h').read_text()+functions+test)

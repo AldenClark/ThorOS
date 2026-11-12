@@ -38,6 +38,10 @@ struct rtl_qm_rx {
 	struct rtl9617c_ni_endpoint __rcu *pon;
 	bool profile;
 	u64 host_poll_ns, host_polls;
+	u64 voq_packets[RTL_QM_VOQS];
+	u64 poll_budget_hits;
+	bool rx_prefetch;
+	bool pppoe_rx_checksum;
 };
 
 int rtl_qm_rx_alloc(struct device *dev, struct rtl_qm_rx *rx);
@@ -46,6 +50,7 @@ void rtl_qm_rx_stop(struct rtl_qm_rx *rx);
 void rtl_qm_rx_free(struct device *dev, struct rtl_qm_rx *rx);
 int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget);
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf);
+ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf);
 ssize_t rtl_qm_rx_trace(struct rtl_qm_rx *rx, char *buf);
 ssize_t rtl_qm_rx_pool(struct rtl_qm_rx *rx, char *buf);
 ssize_t rtl_qm_deepq_state(struct rtl_qm_rx *rx, char *buf);
