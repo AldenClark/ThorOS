@@ -76,4 +76,13 @@ else
     python3 "$PROJECT/tools/prepare_pon_runtime.py" "$TREE/files" \
         --stock "${TYFZA1_STOCK_INPUTS:-$PROJECT/analysis/private/live-files}"
 fi
-make -j"$JOBS" world
+if make -j"$JOBS" world; then
+    exit 0
+fi
+# A quiet parallel build only reports the failed package. Replay serially
+# with full compiler/patch diagnostics, but never publish after any failure.
+echo 'OpenWrt parallel build failed; collecting serial verbose diagnostics' >&2
+if make -j1 V=sc world; then
+    echo 'Serial replay succeeded, but the original parallel build failed' >&2
+fi
+exit 1
