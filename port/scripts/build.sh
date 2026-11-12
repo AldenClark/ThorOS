@@ -8,8 +8,8 @@ if [ -n "${TYFZA1_PROXY:-}" ]; then
 fi
 export CURL_OPTIONS='--speed-time 60 --speed-limit 1024'
 umask 022
-PORT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-PROJECT=$(CDPATH= cd -- "$PORT/.." && pwd)
+PORT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+PROJECT=$(CDPATH='' cd -- "$PORT/.." && pwd)
 export TYFZA1_PROJECT=$PROJECT
 TREE=${1:?Usage: build.sh /path/to/openwrt-checkout [jobs]}
 TREE=$(realpath "$TREE")
@@ -66,6 +66,9 @@ if grep -qi microsoft /proc/sys/kernel/osrelease; then
     fi
 fi
 make -j"$JOBS" download
+# The telnet installer needs OpenWrt's U-Boot source to build a static
+# fw_printenv. Check that archive before spending hours on the kernel.
+sh "$PROJECT/scripts/resolve_uboot_archive.sh" "$TREE" >/dev/null
 # Catch package-source patch drift before the expensive toolchain/kernel build.
 # The upstream version of netifd can change its hotplug event code even when
 # the OpenWrt checkout itself is pinned and all configuration checks succeed.

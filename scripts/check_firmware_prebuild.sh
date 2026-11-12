@@ -3,7 +3,7 @@
 # Single source of truth for the early firmware/PR regression gate.
 set -eu
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 mkdir -p artifacts logs
 
@@ -20,3 +20,4 @@ python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_dma_tx_fastpath.py
 python3 scripts/test_ni_adaptive_timer.py
 python3 scripts/test_rx_checksum_policy.py
+python3 scripts/test_release_uboot_archive.py

@@ -77,6 +77,7 @@ jobs:
           openssl req -new -x509 -key artifacts/signing/dev.key \
             -out artifacts/signing/dev.crt -subj /CN=TYFZA1-FIT -days 3650
       - name: Build wired-only OpenWrt
+        id: build
         shell: bash
         env:
           TYFZA1_RUNTIME_INPUTS: ${{ github.workspace }}/artifacts/runtime-inputs
@@ -86,14 +87,19 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
       - name: Verify built board variants
+        id: verify_boards
+        continue-on-error: true
         run: |
           kernel=$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)
+          cp "$kernel/.config" artifacts/kernel.config
           manifest=$(find sources/openwrt/bin/targets/rtl9617c/generic -maxdepth 1 -name '*.manifest' -print -quit)
           test -n "$manifest"
           python3 scripts/verify_release_kernel.py --kernel "$kernel" --manifest "$manifest"
           python3 scripts/test_board_variants.py --kernel "$kernel"
           python3 scripts/test_nand_batch.py --kernel "$kernel"
       - name: Verify flowtable concurrency, bridge paths and forwarding
+        id: verify_flowtable
+        continue-on-error: true
         run: |
           kernel=$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)
           python3 scripts/test_flowtable_work_lifetime.py --kernel "$kernel"
@@ -102,16 +108,36 @@ jobs:
           python3 scripts/test_flowtable_software_ageing.py --kernel "$kernel"
           python3 scripts/test_fe_cookie_index.py --kernel "$kernel"
       - name: Verify wired-only UI and package regressions
+        id: verify_ui
+        continue-on-error: true
         run: |
           python3 scripts/test_wired_only.py
           python3 scripts/test_package_manager_output.py
           python3 scripts/test_package_timeout.py
           python3 scripts/test_apk_repository_config.py
       - name: Package firmware and installer
+        id: package
+        continue-on-error: true
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
           git archive --format=tar.gz --prefix=PonWRT-TYFZA1/ HEAD \
             > artifacts/release/PonWRT-TYFZA1-source.tar.gz
+      # Keep testing independent post-build stages after one failure, then
+      # enforce all outcomes before any release may be published.
+      - name: Enforce post-build validation results
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          failed=0
+          for outcome in "${{ steps.verify_boards.outcome }}" \
+                         "${{ steps.verify_flowtable.outcome }}" \
+                         "${{ steps.verify_ui.outcome }}" \
+                         "${{ steps.package.outcome }}"; do
+            if [ "$outcome" != success ]; then failed=1; fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo 'At least one post-build validation stage failed' >&2
+          fi
+          exit "$failed"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
@@ -119,6 +145,7 @@ jobs:
           path: |
             artifacts/release/
             artifacts/build.log
+            artifacts/kernel.config
             logs/
           retention-days: 14
       - name: Publish release
