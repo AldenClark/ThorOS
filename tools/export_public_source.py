@@ -44,8 +44,7 @@ for source in paths:
         continue
     if source.name in ('modules.order', 'Module.symvers'):
         continue
-    if source.parent == root / 'manifests' and source.name not in (
-            'radio-stock-rf-dm.json', 'wireless-study-current.json'):
+    if source.parent == root / 'manifests':
         continue
     data = source.read_text()
     for value, replacement in sorted(substitutions.items(), key=lambda item: -len(item[0])):

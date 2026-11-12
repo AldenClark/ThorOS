@@ -12,8 +12,6 @@ void rtl_fe_free(struct rtl_fe *fe);
 int rtl_fe_add_port(struct rtl_fe *fe, struct net_device *netdev,
                     unsigned int source, unsigned int destination, unsigned int llid);
 void rtl_fe_remove_port(struct rtl_fe *fe, struct net_device *netdev);
-int rtl_fe_add_wifi_port(struct rtl_fe *fe, struct net_device *netdev, unsigned int id);
-int rtl_fe_wifi_peer_route(struct rtl_fe *fe, struct net_device *netdev, const u8 *address, unsigned int destination);
 bool rtl_fe_enabled(struct rtl_fe *fe);
 int rtl_fe_flush_port(struct rtl_fe *fe, struct net_device *netdev);
 int rtl_fe_setup_tc(struct rtl_fe *fe, struct net_device *netdev,

@@ -34,7 +34,6 @@
 #include "rtl9617c-dma.h"
 #include "rtl9617c-qm.h"
 #include "rtl9617c-ni.h"
-#include <linux/rtl9617c-wifi.h>
 #include "rtl9617c-fe.h"
 #include "rtl9617c-mib.h"
 
@@ -86,7 +85,6 @@ struct rtl_xram {
 	struct tyfza1_led phy_led;
 	bool phy_led_registered;
 	bool native_groups_created;
-	bool wifi_started;
 	struct napi_struct napi;
 	struct hrtimer timer;
 	spinlock_t tx_lock;
@@ -692,111 +690,6 @@ netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_transmit);
 
-int rtl9617c_ni_wifi_lookup(struct device *dev, struct sk_buff *skb, unsigned int id)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	unsigned long flags;
-	int ret;
-
-	spin_lock_irqsave(&priv->tx_lock, flags);
-	ret = rtl_dma_tx_wifi(&priv->dma, priv->netdev, skb, id);
-	spin_unlock_irqrestore(&priv->tx_lock, flags);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_lookup);
-
-int rtl9617c_ni_wifi_attach(struct device *dev, struct rtl9617c_ni_wifi_endpoint *endpoint)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	unsigned int id;
-	int ret;
-
-	ASSERT_RTNL();
-	if (!priv->dma_tx || !priv->qm_rx || !priv->fe) return -EOPNOTSUPP;
-	for (id = 1; id <= RTL_WIFI_ID_MAX; id++)
-		if (!rcu_access_pointer(priv->qm.wifi[id])) break;
-	if (id > RTL_WIFI_ID_MAX) return -ENOSPC;
-	ret = rtl_engine_get(priv);
-	if (ret) return ret;
-	ret = rtl_fe_add_wifi_port(priv->fe, endpoint->netdev, id);
-	if (ret) { rtl_engine_put(priv); return ret; }
-	dev_hold(endpoint->netdev);
-	rcu_assign_pointer(priv->qm.wifi[id], endpoint);
-	return id;
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_attach);
-
-int rtl9617c_ni_wifi_id(struct device *dev, struct net_device *netdev)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	unsigned int id;
-	int ret = -ENODEV;
-	rcu_read_lock();
-	for (id = 1; id <= RTL_WIFI_ID_MAX; id++) {
-		struct rtl9617c_ni_wifi_endpoint *endpoint = rcu_dereference(priv->qm.wifi[id]);
-		if (endpoint && endpoint->netdev == netdev) { ret = id; break; }
-	}
-	rcu_read_unlock();
-	return ret;
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_id);
-
-int rtl9617c_ni_wifi_detach(struct device *dev, unsigned int id)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	struct rtl9617c_ni_wifi_endpoint *endpoint = rcu_access_pointer(priv->qm.wifi[id]);
-	u32 status;
-	unsigned long flags;
-	int ret;
-
-	ASSERT_RTNL();
-	/* The caller has removed its ingress hook. Withdraw rules, drain copied
-	 * NI submissions and old EPPs, then release the ID and netdev reference. */
-	/* Keep the flow-block owner across NETDEV_DOWN/UP; UNREGISTER retires it. */
-	ret = rtl_fe_flush_port(priv->fe, endpoint->netdev);
-	if (ret && !priv->removing) return ret;
-	spin_lock_irqsave(&priv->tx_lock, flags);
-	ret = readl_poll_timeout_atomic(priv->dma.registers + 0x100 + priv->dma.vp * 0xa0 + 0x1c,
-		status, (status & 63) == priv->dma.write, 1, 100000);
-	spin_unlock_irqrestore(&priv->tx_lock, flags);
-	/* A busy shared queue retains this identity. Removing the NI supplier
-	 * releases all identities together; none can be reassigned afterward. */
-	if (ret && !priv->removing) return ret;
-	usleep_range(1000, 2000);
-	napi_disable(&priv->napi);
-	local_bh_disable();
-	rtl_qm_rx_poll(&priv->qm, &priv->napi, 1024);
-	/* The manual drain has no NAPI completion to flush held VIF packets. */
-	napi_gro_flush(&priv->napi, false);
-	netif_receive_skb_list(&priv->napi.gro.rx_list);
-	priv->napi.gro.rx_count = 0;
-	local_bh_enable();
-	rcu_assign_pointer(priv->qm.wifi[id], NULL);
-	napi_enable(&priv->napi);
-	/* An IRQ during napi_disable can mask RX without scheduling a poll. */
-	napi_schedule(&priv->napi);
-	synchronize_net();
-	dev_put(endpoint->netdev);
-	rtl_engine_put(priv);
-	return 0;
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_detach);
-
-bool rtl9617c_ni_wifi_enabled(struct device *dev)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	return rtl_fe_enabled(priv->fe);
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_enabled);
-
-int rtl9617c_ni_wifi_peer_route(struct device *dev, struct net_device *netdev,
-	const u8 *address, unsigned int destination)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	return rtl_fe_wifi_peer_route(priv->fe, netdev, address, destination);
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_wifi_peer_route);
-
 int rtl9617c_ni_oam_configure(struct device *dev)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
@@ -1053,14 +946,8 @@ static ssize_t datapath_profile_show(struct device *dev, struct device_attribute
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
 
-	return sysfs_emit(buf, "enabled=%u host_RX_poll_ns=%llu host_RX_polls=%llu "
-		"WiFi_forwarded_packets=%llu WiFi_miss_packets=%llu WiFi_RX_copy_bytes=%llu "
-		"WiFi_RX_copy_ns=%llu WiFi_dispatch_ns=%llu "
-		"WiFi_lookup_packets=%llu WiFi_TX_copy_bytes=%llu WiFi_TX_prepare_ns=%llu\n",
-		priv->qm.profile, priv->qm.host_poll_ns, priv->qm.host_polls,
-		priv->qm.wifi_forwarded, priv->qm.wifi_missed, priv->qm.wifi_copy_bytes,
-		priv->qm.wifi_copy_ns, priv->qm.wifi_dispatch_ns,
-		priv->dma.wifi_packets, priv->dma.wifi_copy_bytes, priv->dma.wifi_prepare_ns);
+	return sysfs_emit(buf, "enabled=%u host_RX_poll_ns=%llu host_RX_polls=%llu\n",
+		priv->qm.profile, priv->qm.host_poll_ns, priv->qm.host_polls);
 }
 
 static ssize_t datapath_profile_store(struct device *dev, struct device_attribute *attr,
@@ -1351,13 +1238,6 @@ static int rtl_probe(struct platform_device *pdev)
 		dev_warn(dev, "NI diagnostic attributes unavailable: %d\n", ret);
 	else
 		priv->native_groups_created = true;
-	if (priv->qm_rx && priv->dma_tx) {
-		ret = rtl_wifi_start(dev);
-		if (ret)
-			dev_warn(dev, "NI Wi-Fi notifier unavailable: %d; LAN ports retained\n", ret);
-		else
-			priv->wifi_started = true;
-	}
 	schedule_delayed_work(&priv->mib_work, HZ);
 	return 0;
 
@@ -1386,7 +1266,6 @@ static void rtl_remove(struct platform_device *pdev)
 		flush_work(&priv->lan4_work);
 	cancel_delayed_work_sync(&priv->mib_work);
 	priv->removing = true;
-	if (priv->wifi_started) rtl_wifi_stop();
 	if (priv->native_groups_created)
 		sysfs_remove_groups(&pdev->dev.kobj, rtl_native_groups);
 	for (port = 0; port < ARRAY_SIZE(priv->ports); port++)

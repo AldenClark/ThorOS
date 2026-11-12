@@ -1,0 +1,150 @@
+diff --git a/modules/luci-mod-network/Makefile b/modules/luci-mod-network/Makefile
+index eee0827..5b3f1a9 100644
+--- a/modules/luci-mod-network/Makefile
++++ b/modules/luci-mod-network/Makefile
+@@ -7,7 +7,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ LUCI_TITLE:=LuCI Network Administration
+-LUCI_DEPENDS:=+luci-base +rpcd-mod-iwinfo +luci-lib-uqr
++LUCI_DEPENDS:=+luci-base +luci-lib-uqr
+ 
+ PKG_LICENSE:=Apache-2.0
+ 
+diff --git a/modules/luci-mod-network/root/usr/share/luci/menu.d/luci-mod-network.json b/modules/luci-mod-network/root/usr/share/luci/menu.d/luci-mod-network.json
+index 911a366..2ba08fe 100644
+--- a/modules/luci-mod-network/root/usr/share/luci/menu.d/luci-mod-network.json
++++ b/modules/luci-mod-network/root/usr/share/luci/menu.d/luci-mod-network.json
+@@ -13,19 +13,6 @@
+ 		}
+ 	},
+ 
+-	"admin/network/wireless": {
+-		"title": "Wireless",
+-		"order": 15,
+-		"action": {
+-			"type": "view",
+-			"path": "network/wireless"
+-		},
+-		"depends": {
+-			"acl": [ "luci-mod-network-config" ],
+-			"uci": { "wireless": { "@wifi-device": true } }
+-		}
+-	},
+-
+ 	"admin/network/remote_addr/*": {
+ 		"action": {
+ 			"type": "call",
+diff --git a/modules/luci-mod-network/root/usr/share/rpcd/acl.d/luci-mod-network.json b/modules/luci-mod-network/root/usr/share/rpcd/acl.d/luci-mod-network.json
+index 3bcec4a..b46bd46 100644
+--- a/modules/luci-mod-network/root/usr/share/rpcd/acl.d/luci-mod-network.json
++++ b/modules/luci-mod-network/root/usr/share/rpcd/acl.d/luci-mod-network.json
+@@ -13,25 +13,21 @@
+ 			},
+ 			"ubus": {
+ 				"file": [ "exec" ],
+-				"iwinfo": [ "assoclist", "countrylist", "freqlist", "txpowerlist" ],
+ 				"luci": [ "getSwconfigFeatures", "getSwconfigPortState" ],
+ 				"network.device": [ "status" ]
+ 			},
+-			"uci": [ "dhcp", "firewall", "luci", "network", "wireless", "system" ]
++			"uci": [ "dhcp", "firewall", "luci", "network", "system" ]
+ 		},
+ 		"write": {
+ 			"cgi-io": [ "exec" ],
+ 			"file": {
+ 				"/sbin/ifup": [ "exec" ],
+-				"/sbin/ifdown": [ "exec" ],
+-				"/sbin/wifi": [ "exec" ]
++				"/sbin/ifdown": [ "exec" ]
+ 			},
+ 			"ubus": {
+-				"file": [ "exec" ],
+-				"hostapd.*": [ "del_client" ],
+-				"iwinfo": [ "scan" ]
++				"file": [ "exec" ]
+ 			},
+-			"uci": [ "dhcp", "firewall", "luci", "network", "wireless" ]
++			"uci": [ "dhcp", "firewall", "luci", "network" ]
+ 		}
+ 	},
+ 
+diff --git a/modules/luci-mod-status/Makefile b/modules/luci-mod-status/Makefile
+index 6b86e84..776b8d2 100644
+--- a/modules/luci-mod-status/Makefile
++++ b/modules/luci-mod-status/Makefile
+@@ -7,10 +7,9 @@
+ include $(TOPDIR)/rules.mk
+ 
+ LUCI_TITLE:=LuCI Status Pages
+-LUCI_DEPENDS:=+luci-base +libiwinfo +rpcd-mod-iwinfo
++LUCI_DEPENDS:=+luci-base
+ 
+ PKG_RELEASE:=4
+-PKG_BUILD_DEPENDS:=iwinfo
+ PKG_LICENSE:=Apache-2.0
+ 
+ include ../../luci.mk
+diff --git a/modules/luci-mod-status/root/usr/share/luci/menu.d/luci-mod-status.json b/modules/luci-mod-status/root/usr/share/luci/menu.d/luci-mod-status.json
+index 23e8bdb..7b8fc80 100644
+--- a/modules/luci-mod-status/root/usr/share/luci/menu.d/luci-mod-status.json
++++ b/modules/luci-mod-status/root/usr/share/luci/menu.d/luci-mod-status.json
+@@ -122,19 +122,6 @@
+ 		}
+ 	},
+ 
+-	"admin/status/channel_analysis": {
+-		"title": "Channel Analysis",
+-		"order": 7,
+-		"action": {
+-			"type": "view",
+-			"path": "status/channel_analysis"
+-		},
+-		"depends": {
+-			"acl": [ "luci-mod-status-channel_analysis" ],
+-			"uci": { "wireless": { "@wifi-device": true } }
+-		}
+-	},
+-
+ 	"admin/status/realtime": {
+ 		"title": "Realtime Graphs",
+ 		"order": 7,
+@@ -165,18 +152,6 @@
+ 		}
+ 	},
+ 
+-	"admin/status/realtime/wireless": {
+-		"title": "Wireless",
+-		"order": 3,
+-		"action": {
+-			"type": "view",
+-			"path": "status/wireless"
+-		},
+-		"depends": {
+-			"uci": { "wireless": { "@wifi-device": true } }
+-		}
+-	},
+-
+ 	"admin/status/realtime/connections": {
+ 		"title": "Connections",
+ 		"order": 4,
+diff --git a/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json b/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json
+index b1d2b8f..d36e96f 100644
+--- a/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json
++++ b/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status.json
+@@ -75,15 +75,6 @@
+ 		}
+ 	},
+ 
+-	"luci-mod-status-channel_analysis": {
+-		"description": "Grant access to wireless channel status",
+-		"read": {
+-			"ubus": {
+-				"iwinfo": [ "info", "freqlist", "scan" ]
+-			}
+-		}
+-	},
+-
+ 	"luci-mod-status-firewall": {
+ 		"description": "Grant access to firewall status",
+ 		"read": {

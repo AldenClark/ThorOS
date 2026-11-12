@@ -53,66 +53,6 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-controls-') as directory:
             before = after
         else:
             assert after == before
-    wifi = patched / 'package/network/config/wifi-scripts/files-ucode'
-    source = (wifi / 'lib/netifd/wireless/mac80211.sh').read_text()
-    functions = source[source.index('function phy_suffix('):source.index('function teardown(')]
-    program = r'''
-let calls = [], failed = [], up = 0, fail_power = false;
-function system(command) { push(calls, command); return fail_power && index(command, 'set txpower') >= 0 ? 1 : 0; }
-function log(message) {}
-function set_default(obj, key, value) { obj[key] ??= value; }
-function find_phy(config, rename) { return 'phy0'; }
-function validate(kind, config) {}
-const fs = { access: function() { return false; } };
-const netifd = {
-    set_data: function(data) {}, set_up: function() { up++; },
-    setup_failed: function(reason) { push(failed, reason); }
-};
-''' + functions + r'''
-for (let test in [
-    { value: 0, expected: 'fixed 000' },
-    { value: 10, expected: 'fixed 1000' },
-    { value: null, expected: 'auto' }
-]) {
-    for (let fail in [false, true]) {
-        calls = []; failed = []; up = 0; fail_power = fail;
-        ARGV[3] = sprintf('%J', {
-            config: { channel: 1, band: '2g', txpower: test.value, rxantenna: 3, txantenna: 3, distance: 0 },
-            data: { rxantenna: 3, txantenna: 3 }, interfaces: {}
-        });
-        let result = setup();
-        assert(index(calls, 'iw phy phy0 set txpower ' + test.expected) >= 0);
-        assert(result == (fail ? 1 : 0));
-        assert(up == (fail ? 0 : 1));
-        assert(sprintf('%J', failed) == sprintf('%J', fail ? ['TXPOWER_FAILED'] : []));
-    }
-}
-'''
-    subprocess.run([str(ucode), '-e', program], check=True)
-
-    source = (wifi / 'usr/share/ucode/iwinfo.uc').read_text()
-    info = source[source.index('export function info('):source.index('export function htmodelist(')]
-    info = info.replace('export function', 'function')
-    program = r'''
-let ifaces = {};
-function format_channel(value) { return 1; }
-function format_frequency(value) { return 2.4; }
-function hwmodelist(iface) { return []; }
-function find_phy(id) { return {}; }
-function assoclist(iface) { return {}; }
-function format_rate(value) { return 'unknown'; }
-function dbm2quality(value) { return 0; }
-''' + info + r'''
-for (let raw in [null, 0, 1000]) {
-    ifaces = { wlan0: { hardware: {}, assoclist: [] } };
-    if (raw != null) ifaces.wlan0.wiphy_tx_power_level = raw;
-    let result = info('wlan0');
-    assert(result[0].txpower === (raw == null ? null : raw / 100));
-}
-'''
-    subprocess.run([str(ucode), '-e', program], check=True)
-    print('Wireless: 0/auto/10 dBm, command failure propagation and unknown/zero readings passed.')
-
     patch_copy(kernel, root / 'port/overlay/target/linux/rtl9617c/patches-6.18/215-cpufreq-retry-same-target.patch', work / 'kernel')
     cpufreq = (work / 'kernel/drivers/cpufreq/cpufreq.c').read_text()
     for name, end in [('__target_index', 'int __cpufreq_driver_target'),
@@ -139,7 +79,6 @@ for (let raw in [null, 0, 1000]) {
         shutil.copyfile(installed / name, path)
     database = (sandbox / 'lib/apk/db/installed').read_text()
     protected = ['luci-mod-status', 'luci-mod-network', 'luci-app-package-manager',
-                 'rpcd-mod-iwinfo', 'libiwinfo20230701', 'wifi-scripts',
                  'luci-base', 'luci-compat', 'luci-lua-runtime', 'luci-lib-base',
                  'luci-lib-ip', 'luci-lib-jsonc', 'luci-lib-nixio', 'ucode',
                  'libucode20230711']

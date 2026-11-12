@@ -23,6 +23,3 @@ python3 tools/verify_pcie_dtb.py "$P/evidence/wireless-study-20261008/evidence/s
 python3 tools/verify_pcie_payload.py "$OUT"
 KERNEL_DIRECTORY=$(python3 port/tools/project_paths.py --kernel-directory "$P/sources/openwrt")
 cp "$(dirname "$KERNEL_DIRECTORY")/vmlinux-initramfs.debug" "$OUT/vmlinux-initramfs.debug"
-cp "$P/artifacts/wifi-runtime-manifest.json" "$OUT/wifi-runtime-manifest.json"
-python3 tools/verify_wifi_payload.py "$OUT" --manifest "$OUT/wifi-runtime-manifest.json" \
-    --kernel-elf "$OUT/vmlinux-initramfs.debug" --require-wifi-management

@@ -1,0 +1,161 @@
+diff --git a/modules/luci-mod-network/htdocs/luci-static/resources/tools/network.js b/modules/luci-mod-network/htdocs/luci-static/resources/tools/network.js
+index 255a62f..593872e 100644
+--- a/modules/luci-mod-network/htdocs/luci-static/resources/tools/network.js
++++ b/modules/luci-mod-network/htdocs/luci-static/resources/tools/network.js
+@@ -489,8 +489,7 @@ return baseclass.extend({
+ 		o.default = (dev ? dev.getName() : '');
+ 		o.ucioption = 'name';
+ 		o.filter = function(section_id, value) {
+-			var dev = network.instantiateDevice(value);
+-			return !deviceSectionExists(section_id, value) && (dev.getType() != 'wifi' || dev.isUp());
++			return !deviceSectionExists(section_id, value);
+ 		};
+ 		o.validate = function(section_id, value) {
+ 			updatePlaceholders(this, section_id);
+@@ -509,10 +508,6 @@ return baseclass.extend({
+ 		o.noaliases = true;
+ 		o.default = (dev ? dev.getName() : '').match(/^.+\.\d+$/) ? dev.getName().replace(/\.\d+$/, '') : '';
+ 		o.ucioption = 'ifname';
+-		o.filter = function(section_id, value) {
+-			var dev = network.instantiateDevice(value);
+-			return (dev.getType() != 'wifi' || dev.isUp());
+-		};
+ 		o.validate = function(section_id, value) {
+ 			updatePlaceholders(this, section_id);
+ 
+@@ -601,23 +596,12 @@ return baseclass.extend({
+ 		o.noaliases = true;
+ 		o.nobridges = true;
+ 		o.ucioption = 'ports';
+-		o.default = L.toArray(dev ? dev.getPorts() : null).filter(function(p) { return p.getType() != 'wifi' }).map(function(p) { return p.getName() });
++		o.default = L.toArray(dev ? dev.getPorts() : null).map(function(p) { return p.getName() });
+ 		o.filter = function(section_id, device_name) {
+ 			var bridge_name = uci.get('network', section_id, 'name'),
+ 				choice_dev = network.instantiateDevice(device_name),
+ 				parent_dev = choice_dev.getParent();
+ 
+-			/* only show wifi networks which are already present in "option ifname" */
+-			if (choice_dev.getType() == 'wifi') {
+-				var ifnames = L.toArray(uci.get('network', section_id, 'ports'));
+-
+-				for (var i = 0; i < ifnames.length; i++)
+-					if (ifnames[i] == device_name)
+-						return true;
+-
+-				return false;
+-			}
+-
+ 			return (!parent_dev || parent_dev.getName() != bridge_name);
+ 		};
+ 		o.description = _('Specifies the wired ports to attach to this bonding.')
+@@ -991,27 +975,16 @@ return baseclass.extend({
+ 		o.noaliases = true;
+ 		o.nobridges = true;
+ 		o.ucioption = 'ports';
+-		o.default = L.toArray(dev ? dev.getPorts() : null).filter(function(p) { return p.getType() != 'wifi' }).map(function(p) { return p.getName() });
++		o.default = L.toArray(dev ? dev.getPorts() : null).map(function(p) { return p.getName() });
+ 		o.filter = function(section_id, device_name) {
+ 			const bridge_name = uci.get('network', section_id, 'name'),
+ 				choice_dev = network.instantiateDevice(device_name),
+ 				parent_dev = choice_dev.getParent();
+ 
+-			/* only show wifi networks which are already present in "option ifname" */
+-			if (choice_dev.getType() == 'wifi') {
+-				const ifnames = L.toArray(uci.get('network', section_id, 'ports'));
+-
+-				for (let ifn of ifnames)
+-					if (ifn == device_name)
+-						return true;
+-
+-				return false;
+-			}
+-
+ 			return (!parent_dev || parent_dev.getName() != bridge_name);
+ 		};
+-		o.description = dev?.getType() == 'bridge' ? _('Specifies the wired ports to attach to this bridge. In order to attach wireless networks, choose the associated interface as network in the wireless settings.'):
+-			_('Specifies the devices to attach to this VRF. In order to attach wireless networks, choose the associated interface as network in the wireless settings.');
++		o.description = dev?.getType() == 'bridge' ? _('Specifies the wired ports to attach to this bridge.') :
++			_('Specifies the devices to attach to this VRF.');
+ 		o.onchange = function(ev, section_id, values) {
+ 			ss.updatePorts(values);
+ 
+@@ -1395,8 +1368,6 @@ return baseclass.extend({
+ 		ss.updatePorts = function(ports) {
+ 			const devices = ports.map(function(port) {
+ 				return network.instantiateDevice(port)
+-			}).filter(function(dev) {
+-				return dev.getType() != 'wifi' || dev.isUp();
+ 			}).sort(function(a, b) {
+ 				return L.naturalCompare(a.getName(), b.getName());
+ 			});
+diff --git a/modules/luci-mod-network/htdocs/luci-static/resources/view/network/interfaces.js b/modules/luci-mod-network/htdocs/luci-static/resources/view/network/interfaces.js
+index 01ff027..efd4f28 100644
+--- a/modules/luci-mod-network/htdocs/luci-static/resources/view/network/interfaces.js
++++ b/modules/luci-mod-network/htdocs/luci-static/resources/view/network/interfaces.js
+@@ -1552,9 +1552,6 @@ return view.extend({
+ 				if (sections.filter(function(s) { return s.name == nd.getName() }).length)
+ 					continue;
+ 
+-				if (nd.getType() == 'wifi' && !nd.isUp())
+-					continue;
+-
+ 				/* Unless http://lists.openwrt.org/pipermail/openwrt-devel/2020-July/030397.html is implemented,
+ 				   we cannot properly redefine bridges as devices, so filter them away for now... */
+ 
+@@ -1723,7 +1720,6 @@ return view.extend({
+ 			case 'vrf':
+ 				return 'vrf';
+ 
+-			case 'wifi':
+ 			case 'alias':
+ 			case 'switch':
+ 			case 'ethernet':
+diff --git a/modules/luci-mod-network/htdocs/luci-static/resources/view/network/switch-vlan.js b/modules/luci-mod-network/htdocs/luci-static/resources/view/network/switch-vlan.js
+index f7003b5..9a10fbe 100644
+--- a/modules/luci-mod-network/htdocs/luci-static/resources/view/network/switch-vlan.js
++++ b/modules/luci-mod-network/htdocs/luci-static/resources/view/network/switch-vlan.js
+@@ -68,7 +68,7 @@ function renderNoBridgeBlocker() {
+ 		E('h2', _('Switch / VLAN Configuration')),
+ 		E('div', { 'class': 'alert-message warning' }, [
+ 			E('h4', _('No managed switch found')),
+-			E('p', _('No bridge eligible for switch-style configuration was found. This view requires a bridge with VLAN filtering enabled (explicitly or implicitly via bridge-vlan sections) whose member ports are all physical ethernet or DSA switch ports. Bridges containing wireless, tunnel, VLAN sub-interfaces or other virtual members are intentionally excluded.')),
++			E('p', _('No bridge eligible for switch-style configuration was found. This view requires a bridge with VLAN filtering enabled (explicitly or implicitly via bridge-vlan sections) whose member ports are all physical ethernet or DSA switch ports. Bridges containing tunnels, VLAN sub-interfaces or other virtual members are intentionally excluded.')),
+ 			E('p', [
+ 				_('You can enable VLAN filtering on a bridge from the '),
+ 				E('a', { 'href': L.url('admin/network/network') }, _('Interfaces → Devices')),
+diff --git a/modules/luci-mod-network/root/usr/share/ucitrack/luci-mod-network-wireless.json b/modules/luci-mod-network/root/usr/share/ucitrack/luci-mod-network-wireless.json
+deleted file mode 100644
+index edbaee7..0000000
+--- a/modules/luci-mod-network/root/usr/share/ucitrack/luci-mod-network-wireless.json
++++ /dev/null
+@@ -1,6 +0,0 @@
+-{
+-	"config": "wireless",
+-	"affects": [
+-		"network"
+-	]
+-}
+diff --git a/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json b/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json
+index b3f2cef..6f998be 100644
+--- a/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json
++++ b/modules/luci-mod-status/root/usr/share/rpcd/acl.d/luci-mod-status-index.json
+@@ -55,19 +55,5 @@
+ 				"luci": [ "getBuiltinEthernetPorts" ]
+ 			}
+ 		}
+-	},
+-
+-	"luci-mod-status-index-wifi": {
+-		"description": "Grant access to wireless status display",
+-		"read": {
+-			"ubus": {
+-				"iwinfo": [ "assoclist" ]
+-			}
+-		},
+-		"write": {
+-			"ubus": {
+-				"hostapd.*": [ "del_client", "wps_start", "wps_cancel", "wps_status" ]
+-			}
+-		}
+ 	}
+ }

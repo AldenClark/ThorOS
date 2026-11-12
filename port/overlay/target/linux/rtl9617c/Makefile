@@ -8,7 +8,6 @@ CPU_TYPE:=cortex-a55
 CPU_CFLAGS_cortex-a55:=-mcpu=cortex-a55
 SUBTARGETS:=generic
 FEATURES:=fpu nand ramdisk squashfs targz usb
-DEPENDS:=+@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT
 KERNEL_PATCHVER:=6.18
 KERNELNAME:=Image
 DEVICE_TYPE:=router

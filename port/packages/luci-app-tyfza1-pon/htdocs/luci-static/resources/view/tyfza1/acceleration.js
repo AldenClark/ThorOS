@@ -8,7 +8,7 @@
 return view.extend({
 	load: function() { return Promise.all([uci.load('firewall'), status.callStatus().catch(function() { return null; })]); },
 	render: function(data) {
-		var m = new form.Map('firewall', '流量卸载', '使用现有 firewall4 设置及 TYFZA1 FE 后端，不改变 WAN、桥接或 Wi-Fi 拓扑。');
+		var m = new form.Map('firewall', '流量卸载', '使用现有 firewall4 设置及 TYFZA1 FE 后端，不改变 WAN 或桥接拓扑。');
 		if (!L.hasViewPermission()) m.readonly = true;
 		var defaults = uci.sections('firewall', 'defaults')[0];
 		if (defaults) {

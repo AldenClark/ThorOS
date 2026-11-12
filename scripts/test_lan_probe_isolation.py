@@ -72,7 +72,7 @@ struct rtl_xram {
  struct device *lan4_parent;struct device_node *lan4_phy;
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
- bool phy_led_registered,qm_rx,native_groups_created,wifi_started;
+ bool phy_led_registered,qm_rx,native_groups_created;
  int tx_lock;void *fe;
 };
 static struct device_node nodes[5];
@@ -142,7 +142,6 @@ services = probe[probe.index('\tret = sysfs_create_groups('):probe.index('\tsche
 code += r'''
 static int service_failure;
 static int sysfs_create_groups(void *d,void *g){return service_failure==1?-EIO:0;}
-static int rtl_wifi_start(struct device *d){return service_failure==2?-EIO:0;}
 static void *rtl_native_groups;
 static void services(struct rtl_xram *priv,struct device *dev){int ret;
 '''+services+r'''
@@ -184,12 +183,11 @@ int main(void){
   }
   if(board_ports==5 && !(expected&BIT(4)))assert(!power && !actions);
   if(stage==9)assert(!priv.phy_led_registered);
-  for(service_failure=0;service_failure<=2;service_failure++){
-   priv.dma_tx=true;priv.native_groups_created=priv.wifi_started=false;
+  for(service_failure=0;service_failure<=1;service_failure++){
+   priv.dma_tx=true;priv.native_groups_created=false;
    services(&priv,&parent);
    assert(active==expected && !removed);
    assert(priv.native_groups_created==(service_failure!=1));
-   assert(priv.wifi_started==(service_failure!=2));
   }
   for(int p=0;p<board_ports;p++)rtl_unregister_lan(&priv,p);
   assert(!active && !fe_ports && !allocated && !priv.registered_ports);
@@ -198,7 +196,7 @@ int main(void){
  printf("%u per-port fault cases, both boards, optional services and cleanup passed\n",cases);
 }
 '''
-code = code.replace('bool phy_led_registered,qm_rx,native_groups_created,wifi_started;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created,wifi_started;')
+code = code.replace('bool phy_led_registered,qm_rx,native_groups_created;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created;')
 # The production code uses the device kobject only as a sysfs API argument.
 code = code.replace('struct device {struct device_node *of_node;};', 'struct device {struct device_node *of_node;int kobj;};')
 if __name__ == '__main__':

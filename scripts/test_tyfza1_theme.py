@@ -100,7 +100,13 @@ else: sys.exit(2)
     assert "-tyfza1-r2'" in header
     assert "base_url       : resource" in header
     assert "-' + pkgs_update_time + '-tyfza1" in header
-    assert "当前功率上限" in (luci / "modules/luci-mod-network/htdocs/luci-static/resources/view/network/wireless.js").read_text()
+    for view in ("modules/luci-mod-network/htdocs/luci-static/resources/view/network/wireless.js",
+                 "modules/luci-mod-status/htdocs/luci-static/resources/view/status/wireless.js",
+                 "modules/luci-mod-status/htdocs/luci-static/resources/view/status/channel_analysis.js",
+                 "modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/60_wifi.js"):
+        assert not (luci / view).exists()
+    assert "rpcd-mod-iwinfo" not in (luci / "modules/luci-mod-network/Makefile").read_text()
+    assert "libiwinfo" not in (luci / "modules/luci-mod-status/Makefile").read_text()
     config = (tree / ".config").read_text()
     assert config.count("CONFIG_PACKAGE_luci-theme-argon=y") == 1
     assert config.count("CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=y") == 1

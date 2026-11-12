@@ -33,6 +33,15 @@ fi
 ln -sfn "$ARGON" "$TREE/package/luci-theme-argon"
 ./scripts/feeds update packages luci
 sh "$P/port/scripts/apply-luci-patches.sh" "$TREE"
+# Keep only wired status/configuration views in the compiled LuCI packages.
+# These paths belong to the pinned LuCI revision in configs/feeds.conf.
+for view in \
+    modules/luci-mod-network/htdocs/luci-static/resources/view/network/wireless.js \
+    modules/luci-mod-status/htdocs/luci-static/resources/view/status/wireless.js \
+    modules/luci-mod-status/htdocs/luci-static/resources/view/status/channel_analysis.js \
+    modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/60_wifi.js; do
+    rm -f "$TREE/feeds/luci/$view"
+done
 printf '%s\n' "$PACKAGES" | xargs ./scripts/feeds install cgi-io luasrcdiet luci
 # Existing build trees retain .config; select the new default there as well.
 sed -i '/^CONFIG_PACKAGE_luci-theme-argon=/d; /^# CONFIG_PACKAGE_luci-theme-argon is not set$/d; /^CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn=/d; /^# CONFIG_PACKAGE_luci-i18n-argon-config-zh-cn is not set$/d' .config

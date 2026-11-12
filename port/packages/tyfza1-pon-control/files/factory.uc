@@ -33,10 +33,6 @@ function save(path, data) {
 		die('Cannot write factory runtime: ' + path);
 }
 
-function hexbytes(text) {
-	return join('', map(split(text, ','), value => chr(int(value, 16))));
-}
-
 function mac(text) {
 	if (!match(text, /^[0-9a-fA-F]{12}$/) || (int(substr(text, 0, 2), 16) & 1) || text == '000000000000')
 		die('Invalid factory MAC');
@@ -49,34 +45,6 @@ function import_optical() {
 	if (calibration == null) die('Cannot read factory BOSA calibration');
 	if (length(calibration) < 1024) die('BOSA calibration needs at least 1024 bytes');
 	save('tmp/tyfza1-factory/rtl9617c/bosa-calibration.bin', calibration);
-}
-
-function import_radio(radio) {
-	unlink(output + '/tmp/tyfza1-factory/tyfza1/' + radio[0] + '/flash-calibration.bin');
-	let data = 'TYFC0003';
-	for (let key in ['HW_RX_GAINGAP_2G_CCK_AB', 'HW_RX_GAINGAP_2G_OFDM_AB',
-		'HW_RX_GAINGAP_5GL_AB', 'HW_RX_GAINGAP_5GM_AB', 'HW_RX_GAINGAP_5GH_AB'])
-		data += chr(int(field(hs, key)));
-	for (let path in ['A', 'B']) data += chr(int(field(hs, 'HW_THERMAL_' + path + '_WLAN' + radio[1])));
-	data += chr(int(field(hs, 'HW_XCAP_WLAN' + radio[1] + '_AX')));
-	for (let band in ['2G_CCK', '2G_BW40_1S', '5G_BW40_1S'])
-		for (let path in ['A', 'B']) data += hexbytes(field(hs, 'HW_' + band + '_TSSI_' + path));
-	// Stock setup_mac_addr: ELAN base +1 for wlan1 (2G), +2 for wlan0 (5G).
-	// Use full-address addition so the last octet carries instead of wrapping.
-	const base = replace(mac(field(hs, 'ELAN_MAC_ADDR')), /:/g, '');
-	const address = mac(sprintf('%012x', int(base, 16) + 2 - radio[1]));
-	data += hexbytes(replace(address, /:/g, ','));
-	for (let kind in ['GAIN', 'CW']) {
-		for (let path in ['A', 'B']) data += hexbytes(field(hs, 'HW_2G_CCK_TSSI_' + kind + '_DIFF_' + path));
-		for (let path in ['A', 'B'])
-			for (let band in ['2G', '5G']) data += hexbytes(field(hs, 'HW_' + band + '_TSSI_' + kind + '_DIFF_' + path));
-	}
-	// The stock flash API has no BW20/80/160 entries: B retains A's last CW byte.
-	const slope = split(field(hs, 'HW_5G_TSSI_CW_DIFF_A'), ',');
-	for (let seed in [0, int(slope[length(slope) - 1], 16)])
-		for (let width = 0; width < 4; width++)
-			for (let i = 0; i < 14; i++) data += chr(width == 1 ? 0 : seed);
-	save('tmp/tyfza1-factory/tyfza1/' + radio[0] + '/flash-calibration.bin', data);
 }
 
 let failed = false;
@@ -154,15 +122,6 @@ try {
 } catch (e) {
 	warn('Factory LAN identity: ' + e.message + '\n');
 	failed = true;
-}
-for (let radio in [ ['rtl8852ce', 0], ['rtl8192xbe', 1] ]) {
-	try {
-		import_radio(radio);
-		print('Loaded factory radio calibration: ' + radio[0] + '\n');
-	} catch (e) {
-		warn('Factory radio ' + radio[0] + ': ' + e.message + '\n');
-		failed = true;
-	}
 }
 try {
 	import_optical();

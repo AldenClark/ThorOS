@@ -48,8 +48,7 @@ can force off/on and restore automatic operation. GPIO and MDIO output errors
 propagate to the sysfs writer and are reported during shutdown.
 
 The shared LED callback now returns an error and retains all three brightness
-values. Kernel and radio modules must be rebuilt together; the changed radio
-callback is included in the focused ARM64 compilation.
+values. The wired-only kernel retains the native LAN/PHY LED interface.
 
 ## External PHY and S3
 
@@ -101,7 +100,7 @@ under `artifacts/boot-selector-fix-20261018/`:
   timeout cleanup are exercised.
 - Real OpenWrt UCI and BusyBox execute board LED defaults and upgrade migration.
 - LED arbitration, automatic PHY mode restoration, and output error reporting pass.
-- Modified LED, MDIO, NI, Realtek PHY, and radio objects compile for ARM64 in an
+- Modified LED, MDIO, NI, and Realtek PHY objects compile for ARM64 in an
   isolated kernel tree. Existing MDIO and boot-contract tests pass.
 
 No full firmware image, flash, reboot, voltage measurement, or 2.5G throughput
