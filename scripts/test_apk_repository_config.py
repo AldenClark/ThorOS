@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Exercise repository selection through the real overlay synchronization script."""
 from pathlib import Path
+import json
 import os
 import shutil
 import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
+upstream = Path(os.environ.get('TYFZA1_UPSTREAM_TREE', root / 'sources/openwrt'))
 script = (root / 'port/scripts/sync-overlay.sh').read_text()
 with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
     work = Path(directory)
     port, tree = work / 'port', work / 'openwrt'
-    for path in ('scripts', 'configs', 'host-patches', 'overlay/target/linux/rtl9617c',
+    for path in ('scripts', 'tools', 'configs', 'host-patches', 'overlay/target/linux/rtl9617c',
                  'packages/luci-app-tyfza1-pon', 'packages/tyfza1-pon-control',
                  'packages/tyfza1-storage'):
         (port / path).mkdir(parents=True, exist_ok=True)
@@ -27,6 +29,8 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
         shutil.copyfile(patch, port / 'host-patches' / patch.name)
     shutil.copyfile(root / 'port/scripts/apply-openwrt-patches.sh',
                     port / 'scripts/apply-openwrt-patches.sh')
+    shutil.copyfile(root / 'port/tools/project_paths.py',
+                    port / 'tools/project_paths.py')
     shutil.copytree(root / 'port/openwrt-patches', port / 'openwrt-patches')
     for patch in (port / 'openwrt-patches').glob('*.patch'):
         for line in patch.read_text().splitlines():
@@ -34,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
                 name = line[6:]
                 destination = tree / name
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                original = subprocess.check_output(['git', '-C', str(root / 'sources/openwrt'),
+                original = subprocess.check_output(['git', '-C', str(upstream),
                                                     'show', 'HEAD:' + name])
                 destination.write_bytes(original)
     subprocess.run(['git', 'init', '-q', str(tree)], check=True)
@@ -42,8 +46,11 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
                     '-c', 'user.email=fixture@example.invalid', 'commit',
                     '--allow-empty', '-qm', 'fixture'], check=True)
     revision = subprocess.check_output(['git', '-C', str(tree), 'rev-parse', 'HEAD'], text=True).strip()
+    lock = json.loads((root / 'port/sources.lock.json').read_text())
+    lock['openwrt']['commit'] = revision
+    (port / 'sources.lock.json').write_text(json.dumps(lock))
     sync = port / 'scripts/sync-overlay.sh'
-    sync.write_text(script.replace('PIN=79bc56cb7483bc716da07c369530b792631904b4', 'PIN=' + revision))
+    sync.write_text(script)
     env = {k: v for k, v in os.environ.items() if k not in
            ('TYFZA1_APK_REPOSITORY', 'GITHUB_REPOSITORY', 'RELEASE_TAG', 'TYFZA1_CONFIG')}
     config = tree / '.config'

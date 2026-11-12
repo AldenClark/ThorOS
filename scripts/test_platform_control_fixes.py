@@ -17,7 +17,8 @@ root = Path(__file__).resolve().parents[1]
 tree = root / 'sources/openwrt'
 ucode = tree / 'staging_dir/hostpkg/bin/ucode'
 apk = tree / 'staging_dir/host/bin/apk'
-kernel = tree / 'build_dir/target-aarch64_cortex-a55_musl/linux-rtl9617c_generic/linux-6.18.55'
+kernel_version = json.loads((root / 'port/sources.lock.json').read_text())['openwrt']['kernel']
+kernel = tree / f'build_dir/target-aarch64_cortex-a55_musl/linux-rtl9617c_generic/linux-{kernel_version}'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--rootfs', type=Path, default=tree / 'build_dir/target-aarch64_cortex-a55_musl/root-rtl9617c')
 args = parser.parse_args()

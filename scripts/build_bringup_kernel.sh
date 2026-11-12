@@ -3,8 +3,9 @@
 # Build the current OpenWrt-patched kernel with the already booted native rootfs.
 set -eu
 P=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-K=$P/artifacts/kernel-source/linux-6.18.55
-B=$P/artifacts/kernel-build-6.18.55
+KERNEL_VERSION=$(python3 "$P/port/tools/project_paths.py" --field kernel)
+K=$P/artifacts/kernel-source/linux-$KERNEL_VERSION
+B=$P/artifacts/kernel-build-$KERNEL_VERSION
 R=$P/artifacts/bringup-rootfs
 G=$P/sources/openwrt/target/linux/generic
 if [ ! -f "$K/.tyfza1-prepared" ]; then
@@ -30,5 +31,5 @@ cp "$P/artifacts/prior-native-20261002/verification/kernel.config" "$B/.config"
 "$K/scripts/config" --file "$B/.config" --enable PINCTRL --enable PINCTRL_RTL9617C
 make -C "$K" O="$B" ARCH=arm64 olddefconfig
 make -C "$K" O="$B" ARCH=arm64 -j2 Image
-sh "$P/port/scripts/check-dtb.sh" "$K" "$P/artifacts/dtb-6.18.55" "$P/analysis/private/live-fit.dtb"
+sh "$P/port/scripts/check-dtb.sh" "$K" "$P/artifacts/dtb-$KERNEL_VERSION" "$P/analysis/private/live-fit.dtb"
 sha256sum "$B/arch/arm64/boot/Image"

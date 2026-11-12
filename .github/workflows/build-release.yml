@@ -96,11 +96,20 @@ jobs:
           python3 scripts/verify_release_kernel.py --kernel "$kernel" --manifest "$manifest"
           python3 scripts/test_board_variants.py --kernel "$kernel"
           python3 scripts/test_nand_batch.py --kernel "$kernel"
+      - name: Verify flowtable concurrency, bridge paths and forwarding
+        run: |
+          kernel=$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)
+          python3 scripts/test_flowtable_work_lifetime.py --kernel "$kernel"
+          python3 scripts/test_flowtable_bridge_move.py --kernel "$kernel"
+          python3 scripts/test_flowtable_bridge_ageing.py --kernel "$kernel"
+          python3 scripts/test_flowtable_software_ageing.py --kernel "$kernel"
+          python3 scripts/test_fe_cookie_index.py --kernel "$kernel"
       - name: Verify wired-only UI and package regressions
         run: |
           python3 scripts/test_wired_only.py
           python3 scripts/test_package_manager_output.py
           python3 scripts/test_package_timeout.py
+          python3 scripts/test_apk_repository_config.py
       - name: Package firmware and installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release

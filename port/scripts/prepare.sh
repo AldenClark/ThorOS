@@ -3,7 +3,8 @@
 set -eu
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 TREE=${1:?Usage: prepare.sh /path/to/new-or-matching/openwrt-checkout}
-PIN=79bc56cb7483bc716da07c369530b792631904b4
+PORT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PIN=$(python3 "$PORT/tools/project_paths.py" --field openwrt-commit)
 PROXY=${TYFZA1_PROXY:-${http_proxy:-}}
 if [ ! -e "$TREE/.git" ]; then
     git init "$TREE"
