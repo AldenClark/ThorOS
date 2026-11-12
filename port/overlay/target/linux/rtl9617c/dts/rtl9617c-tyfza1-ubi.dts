@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include "rtl9617c-tyfza1-pcie.dts"
-#include "rtl9617c-tyfza1-usb.dtsi"
 
 / { model = "Tianyi TYFZA1 (RTL9617C UBI)"; };
 
 // The production image has no WLAN driver. Disable both radio-facing PCIe
-// root ports while retaining pcie_controls, required by SGMII 2.5G and USB PHY.
+// root ports while retaining pcie_controls, required by SGMII 2.5G.
 &pcie0 { status = "disabled"; };
 &pcie1 { status = "disabled"; };
 

@@ -30,7 +30,7 @@ class WiredOnly(unittest.TestCase):
         dts = read("port/overlay/target/linux/rtl9617c/dts/rtl9617c-tyfza1-ubi.dts")
         for controller in ("pcie0", "pcie1"):
             self.assertRegex(dts, rf"&{controller}\s*\{{\s*status\s*=\s*\"disabled\";\s*\}}")
-        # The PHY provider also owns SGMII (2.5G) and USB control registers.
+        # The shared PHY provider remains mandatory for the 2.5G SGMII port.
         self.assertIn("pcie_controls:", read("port/overlay/target/linux/rtl9617c/dts/rtl9617c-tyfza1-pcie.dts"))
         self.assertTrue((TARGET / "dts/rtl9617c-tyfza1-ubi-2p5g.dts").exists())
         self.assertFalse(list((TARGET / "files-6.18/drivers/net/wireless").rglob("*.*")))
@@ -56,12 +56,50 @@ class WiredOnly(unittest.TestCase):
         self.assertIn("kmod-cfg80211|kmod-mac80211", read("port/scripts/build.sh"))
         self.assertNotIn("build_pe_radio_wd", read("port/scripts/build.sh"))
         self.assertNotIn("prepare_wifi_runtime", read("port/scripts/build.sh"))
-        self.assertNotIn("rtl-ax-ap", read("port/overlay/target/linux/rtl9617c/modules.mk"))
+        self.assertFalse((TARGET / "modules.mk").exists())
         self.assertFalse((TARGET / "base-files/etc/board.d/03_wireless").exists())
         self.assertFalse((TARGET / "base-files/etc/uci-defaults/92-tyfza1-wireless-country").exists())
         self.assertNotIn("import_radio", (PACKAGE / "factory.uc").read_text())
         self.assertNotIn("wifi_leds", (PACKAGE / "leds.uc").read_text())
         self.assertNotIn("wifi-scripts", read("port/overlay/target/linux/rtl9617c/base-files/etc/uci-defaults/99-tyfza1-platform-packages"))
+        control = read("port/packages/tyfza1-pon-control/Makefile")
+        self.assertNotIn("rtl8852ce", control)
+        self.assertNotIn("rtl8192xbe", control)
+        self.assertIn("bosa-calibration.bin", control)
+
+    def test_slim_runtime(self):
+        image = read("port/overlay/target/linux/rtl9617c/image/Makefile")
+        config = read("port/configs/tyfza1-boot.config")
+        kernel = read("port/overlay/target/linux/rtl9617c/config-6.18")
+        excluded = read("port/configs/tyfza1-exclusions.config")
+        runtime = read("port/configs/tyfza1-compat.config")
+        pinned = read("port/overlay/target/linux/rtl9617c/base-files/etc/uci-defaults/99-tyfza1-platform-packages")
+        for option in ("luci", "luci-compat", "luci-lua-runtime", "luci-theme-bootstrap",
+                       "ucode-mod-lua", "tcpdump", "kmod-usb-core", "kmod-usb3",
+                       "block-mount", "kmod-sched-cake", "kmod-ovpn-backports",
+                       "iptables-nft", "kmod-nft-compat", "kmod-ipt-offload"):
+            self.assertIn(f"# CONFIG_PACKAGE_{option} is not set", excluded)
+            self.assertNotIn(f"CONFIG_PACKAGE_{option}=y", runtime)
+        for package in ("luci-mod-admin-full", "luci-app-firewall", "luci-app-package-manager",
+                        "uhttpd", "uhttpd-mod-ubus", "rpcd-mod-rrdns"):
+            self.assertIn(f"CONFIG_PACKAGE_{package}=y", config)
+        for package in ("kmod-wireguard", "kmod-tun", "kmod-nft-socket", "kmod-nft-tproxy"):
+            self.assertIn(f"CONFIG_PACKAGE_{package}=y", runtime)
+        self.assertNotIn("kmod-usb", image)
+        self.assertNotIn("block-mount", image)
+        self.assertIn("# CONFIG_USB_SUPPORT is not set", kernel)
+        self.assertIn("CONFIG_PHY_RTL9617C_PCIE=y", kernel)
+        self.assertNotIn("CONFIG_PHY_RTL9617C_USB=y", kernel)
+        self.assertNotIn('rtl9617c-tyfza1-usb.dtsi', read("port/overlay/target/linux/rtl9617c/dts/rtl9617c-tyfza1-ubi.dts"))
+        self.assertFalse((TARGET / "dts/rtl9617c-tyfza1-usb.dtsi").exists())
+        self.assertFalse((TARGET / "files-6.18/drivers/phy/phy-rtl9617c-usb.c").exists())
+        self.assertFalse((TARGET / "modules.mk").exists())
+        self.assertFalse((TARGET / "base-files/etc/config/fstab").exists())
+        pinned_names = re.search(r'split\("([^"]+)", names', pinned).group(1).split()
+        for name in ("luci-compat", "luci-lua-runtime", "ucode-mod-lua", "luci-lib-base"):
+            self.assertNotIn(name, pinned_names)
+        for option in ("IKCONFIG", "IKCONFIG_PROC", "DEVMEM"):
+            self.assertIn(f"# CONFIG_KERNEL_{option} is not set", excluded)
 
     def test_luci_wired_only(self):
         patch = read("port/luci-patches/116-tyfza1-wired-only-ui.patch")

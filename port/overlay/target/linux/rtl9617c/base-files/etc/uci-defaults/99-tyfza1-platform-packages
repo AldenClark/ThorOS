@@ -2,10 +2,23 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Pin patched packages and the image's LuCI/ucode runtime by identity.
 set -eu
+# An upgrade may preserve the old APK world file. Remove only the identity
+# constraints that the previous image itself added for the discarded Lua
+# bridge; leave user-selected package names and other pins untouched.
+if [ -f /etc/apk/world ]; then
+	sed -i \
+		-e '/^luci-compat></d' \
+		-e '/^luci-lua-runtime></d' \
+		-e '/^luci-lib-base></d' \
+		-e '/^luci-lib-ip></d' \
+		-e '/^luci-lib-jsonc></d' \
+		-e '/^luci-lib-nixio></d' \
+		-e '/^ucode-mod-lua></d' /etc/apk/world
+fi
 constraints=$(awk '
 BEGIN {
 	RS = ""; FS = "\n"
-	split("luci-mod-status luci-mod-network luci-app-package-manager luci-base luci-compat luci-lua-runtime luci-lib-base luci-lib-ip luci-lib-jsonc luci-lib-nixio ucode libucode20230711 ucode-mod-lua", names, " ")
+	split("luci-mod-status luci-mod-network luci-app-package-manager luci-base ucode libucode20230711", names, " ")
 	for (i in names) required[names[i]] = 1
 }
 {

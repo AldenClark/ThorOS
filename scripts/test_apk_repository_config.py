@@ -18,8 +18,11 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
     (work / 'VERSION').write_text('0.7.0-alpha\n')
     (port / 'configs/tyfza1-boot.config').write_text('CONFIG_PACKAGE_keep=y\n')
     shutil.copyfile(root / 'port/configs/tyfza1-compat.config', port / 'configs/tyfza1-compat.config')
+    shutil.copyfile(root / 'port/configs/tyfza1-exclusions.config', port / 'configs/tyfza1-exclusions.config')
     required = [line for line in (port / 'configs/tyfza1-compat.config').read_text().splitlines()
                 if line.startswith('CONFIG_PACKAGE_')]
+    excluded = [line for line in (port / 'configs/tyfza1-exclusions.config').read_text().splitlines()
+                if line.startswith('# CONFIG_')]
     for patch in (root / 'port/host-patches').glob('*.patch'):
         shutil.copyfile(patch, port / 'host-patches' / patch.name)
     shutil.copyfile(root / 'port/scripts/apply-openwrt-patches.sh',
@@ -44,7 +47,9 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
     env = {k: v for k, v in os.environ.items() if k not in
            ('TYFZA1_APK_REPOSITORY', 'GITHUB_REPOSITORY', 'RELEASE_TAG', 'TYFZA1_CONFIG')}
     config = tree / '.config'
-    original = 'CONFIG_PACKAGE_keep=y\nCONFIG_VERSION_REPO="https://old.example/build"\n'
+    original = ('CONFIG_PACKAGE_keep=y\nCONFIG_PACKAGE_luci=y\n'
+                'CONFIG_PACKAGE_kmod-usb3=y\nCONFIG_PACKAGE_kmod-sched-cake=y\n'
+                'CONFIG_VERSION_REPO="https://old.example/build"\n')
     config.write_text(original)
 
     # Local builds discard stale release URLs and use official feeds alone.
@@ -60,14 +65,20 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
             assert lines.count('CONFIG_SIGNED_PACKAGES=y') == 1
             assert lines.count('CONFIG_SIGN_EACH_PACKAGE=y') == 1
             assert all(lines.count(setting) == 1 for setting in required)
+            assert all(lines.count(setting) == 1 for setting in excluded)
+            assert 'CONFIG_PACKAGE_luci=y' not in lines
+            assert 'CONFIG_PACKAGE_kmod-usb3=y' not in lines
             assert 'CONFIG_PACKAGE_keep=y' in lines
 
     custom = work / 'custom.config'
-    custom.write_text('CONFIG_PACKAGE_custom=y\nCONFIG_VERSION_REPO="https://stale.example"\n')
+    custom.write_text('CONFIG_PACKAGE_custom=y\nCONFIG_PACKAGE_luci-lua-runtime=y\n'
+                      'CONFIG_VERSION_REPO="https://stale.example"\n')
     subprocess.run(['sh', str(sync), str(tree)], env={**env, 'TYFZA1_CONFIG': str(custom),
                     'TYFZA1_APK_REPOSITORY': 'https://packages.example/build-003'},
                    check=True, capture_output=True)
     assert 'CONFIG_PACKAGE_custom=y' in config.read_text()
+    assert '# CONFIG_PACKAGE_luci-lua-runtime is not set' in config.read_text()
+    assert 'CONFIG_PACKAGE_luci-lua-runtime=y' not in config.read_text()
     assert 'CONFIG_VERSION_REPO="https://downloads.openwrt.org/snapshots"' in config.read_text()
     assert 'https://stale.example' in custom.read_text()
 

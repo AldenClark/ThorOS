@@ -47,7 +47,7 @@ VERSION=$(cat "$PORT/../VERSION")
 sed -i '/^CONFIG_VERSIONOPT=/d; /^# CONFIG_VERSIONOPT is not set$/d; /^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d; /^CONFIG_SIGNED_PACKAGES=/d; /^# CONFIG_SIGNED_PACKAGES is not set$/d; /^CONFIG_SIGN_EACH_PACKAGE=/d; /^# CONFIG_SIGN_EACH_PACKAGE is not set$/d' "$TREE/.config"
 printf 'CONFIG_VERSIONOPT=y\nCONFIG_VERSION_NUMBER="%s"\n' "$VERSION" >> "$TREE/.config"
 printf 'CONFIG_VERSION_REPO="https://downloads.openwrt.org/snapshots"\nCONFIG_SIGNED_PACKAGES=y\nCONFIG_SIGN_EACH_PACKAGE=y\n' >> "$TREE/.config"
-# Keep the common plugin dependencies in existing and custom build configs.
+# Keep essential runtime dependencies in existing and custom build configs.
 while IFS= read -r setting; do
     case "$setting" in
         CONFIG_PACKAGE_*=y)
@@ -57,4 +57,16 @@ while IFS= read -r setting; do
             ;;
     esac
 done < "$PORT/configs/tyfza1-compat.config"
+# Prior builds explicitly selected the now-removed features. De-select them
+# even in a retained .config so a re-build cannot silently keep them.
+while IFS= read -r setting; do
+    case "$setting" in
+        '# CONFIG_'*' is not set')
+            option=${setting#\# }
+            option=${option% is not set}
+            sed -i "/^$option=/d; /^# $option is not set$/d" "$TREE/.config"
+            printf '%s\n' "$setting" >> "$TREE/.config"
+            ;;
+    esac
+done < "$PORT/configs/tyfza1-exclusions.config"
 echo "Applied RTL9617C overlay to $TREE at $PIN"

@@ -35,10 +35,9 @@ The strap mapping comes from its saved OEM U-Boot environment.
 
 `rtl9617c-tyfza1-leds.dtsi` retains the four-GbE board wiring.
 `rtl9617c-tyfza1-2p5g.dtsi` supplies the original 2.5G board's LED GPIOs,
-polarities, and light-switch button. It removes the unwired `LED_USB0` node;
-this board uses `LED_USB1` on GPIO2. USB defaults use the selected board name.
-Preserved configurations referencing the nonexistent USB0 LED are migrated on
-the 2.5G board. Existing custom LAN LED bindings remain intact.
+polarities, and light-switch button. USB and WPS LEDs are not exposed in either
+production device tree. Preserved configurations using a USB trigger are removed
+during upgrade. Existing custom LAN LED bindings remain intact.
 
 The RTL8221B LED0 remains a PHY output. The PHY initializes its original function
 register (MMD31 0xd032=0x00a7); NI registers `LED_8221B_P4_0` with the shared LED
@@ -60,7 +59,7 @@ The bus reset callback then drives GPIO14 high, releases ownership and waits
 its output latch; the later FPGA loader can acquire it as RX input. The
 four-GbE board has no GPIO14 property and the callback does not toggle it.
 S3 power, isolation, mux, and speed sequences remain owned by the shared PHY
-provider, preserving USB/PCIe bits.
+provider, preserving unrelated PCIe/USB register fields even though USB is disabled.
 
 Patch206 now registers a dedicated TYFZA1 RTL8221B Clause45 driver before the
 generic entries. It matches the declared HiSGMII PHY and the original
@@ -91,7 +90,8 @@ Focused validation is recorded under `artifacts/board-variants-20261017/`.
 The OEM boot handoff regression and signed UBI/RAM package checks are recorded
 under `artifacts/boot-selector-fix-20261018/`:
 
-- Both compiled production DTs match every original GPIO LED and button.
+- The original GPIO LED and button mapping was verified before the optional
+  USB/WPS nodes were removed from the lean runtime device trees.
 - Boot selection covers both OEM configurations, older 2.5G loaders without a
   GPIO command, and manual RAM boots using the original environment selector.
 - The production signer verifies both configuration signatures; corrupted

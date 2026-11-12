@@ -7,7 +7,7 @@ BOARDNAME:=Realtek RTL9617C (Taurus)
 CPU_TYPE:=cortex-a55
 CPU_CFLAGS_cortex-a55:=-mcpu=cortex-a55
 SUBTARGETS:=generic
-FEATURES:=fpu nand ramdisk squashfs targz usb
+FEATURES:=fpu nand ramdisk squashfs targz
 KERNEL_PATCHVER:=6.18
 KERNELNAME:=Image
 DEVICE_TYPE:=router

@@ -89,7 +89,7 @@ else: sys.exit(2)
     feed_tool = tree / "scripts/feeds"
     feed_tool.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> feed-calls\n')
     feed_tool.chmod(0o755)
-    (tree / ".config").write_text("CONFIG_PACKAGE_luci=y\nCONFIG_PACKAGE_keep_me=y\n# CONFIG_PACKAGE_luci-theme-argon is not set\n# CONFIG_LUCI_LANG_zh_Hans is not set\n")
+    (tree / ".config").write_text("CONFIG_PACKAGE_luci-mod-admin-full=y\nCONFIG_PACKAGE_keep_me=y\n# CONFIG_PACKAGE_luci-theme-argon is not set\n# CONFIG_LUCI_LANG_zh_Hans is not set\n")
     for _ in range(2):
         subprocess.run(["sh", str(project / "scripts/prepare_luci_feeds.sh"), str(tree)], check=True)
     status_source = (luci / "modules/luci-mod-status/htdocs/luci-static/resources/view/status/include/10_system.js").read_text()

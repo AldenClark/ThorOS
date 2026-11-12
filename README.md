@@ -88,7 +88,7 @@ sysupgrade /tmp/sysupgrade.bin
 两种机型的有线接口 `lan1`–`lan4` 均对应机身 LAN1–LAN4 标号；2.5G 版蓝色口为 `lan1`。PON 业务接口为 `pon0`。
 业务 MAC 在启动时从原厂 `ELAN_MAC_ADDR` 读取，自定义值在网络接口中设置。PON 管理中的 ONU MAC 用于 EPON 注册与 OAM。
 保留配置升级时，已有 `lan1`–`lan4` 配置直接按新的机身编号生效。
-首次迁移旧 `ethN` 配置时按硬件端口对应到当前编号；2.5G 版遗留的 `lan5` 引用修正为蓝色口 `lan1`。已迁移设备上的 USB `ethN` 名称保持不变。
+首次迁移旧 `ethN` 配置时按硬件端口对应到当前编号；2.5G 版遗留的 `lan5` 引用修正为蓝色口 `lan1`。本固件不提供 USB 主机及 USB 网卡支持。
 
 ## 软件源
 
@@ -99,7 +99,7 @@ apk update
 apk add htop nano iperf3
 ```
 
-常用插件所需的内核模块和运行库随固件预装，涵盖 VPN、SQM、代理、多 WAN 和流量统计。具体项目见[预装依赖清单](port/configs/tyfza1-compat.config)，软件包架构和安装验证见[兼容说明](port/APK_COMPATIBILITY.md)。
+基础运行库以及 WireGuard、TUN、原生 nftables TPROXY 所需模块随固件预装。旧版 LuCI Lua、OpenVPN、SQM、旧 iptables、多 WAN 扩展及流量统计模块不再默认包含；相关插件可能需要额外编译匹配当前内核的模块。具体项目见[预装依赖清单](port/configs/tyfza1-compat.config)与[精简排除清单](port/configs/tyfza1-exclusions.config)，软件包架构和安装要求见[兼容说明](port/APK_COMPATIBILITY.md)。
 
 RTL9617C 的 Cortex-A55 可运行官方 `aarch64_cortex-a53` 用户态软件；固件已启用该架构，不限制第三方来源。第三方软件可添加其 APK 软件源，或安装本地 `.apk`，沿用官方 APK 的依赖和签名规则。
 
@@ -130,7 +130,7 @@ sh scripts/package_release.sh sources/openwrt artifacts/release
 
 自定义软件包可先运行 `sh port/scripts/sync-overlay.sh sources/openwrt` 和 `sh scripts/prepare_luci_feeds.sh sources/openwrt`，再进入 `sources/openwrt` 执行 `make menuconfig`。后续构建保留 `.config`，也可通过 `TYFZA1_CONFIG` 指定配置文件。
 
-常用插件的预装依赖配置位于 `port/configs/tyfza1-compat.config`，同步脚本会将其合并入构建配置。
+精简后的预装依赖位于 `port/configs/tyfza1-compat.config`；`port/configs/tyfza1-exclusions.config` 同时清除历史构建配置中残留的已移除选项。
 
 固件保留原厂 UBI 卷编号：内核上限 6 MiB，rootfs 上限约 32.09 MiB。rootfs 按镜像大小取整到 UBI 逻辑擦除块，可写数据卷使用剩余空间；升级时自动调整两者大小。构建脚本自动检查镜像大小。
 
@@ -139,11 +139,13 @@ sh scripts/package_release.sh sources/openwrt artifacts/release
 ## 有线版裁剪范围
 
 - 内核：关闭 cfg80211/mac80211 和 Realtek 无线驱动；移除无线专用 PE 固件、QM/EPP 缓冲池及 FE 无线流表。
-- 硬件：正式 UBI 设备树关闭两路连接无线芯片的 PCIe 控制器；保留 SGMII/2.5G PHY 所需的共享控制器和 USB 功能。
+- 硬件：正式 UBI 设备树关闭两路连接无线芯片的 PCIe 控制器；保留 SGMII/2.5G PHY 所需的共享控制器；移除 USB 控制器设备树、USB PHY 和 USB 驱动。
 - 启动与固件：不导入无线射频校准，不安装无线固件或监管数据库；继续导入 PON/光模块校准和 LAN MAC。
-- LuCI：移除无线设置、无线状态、信道分析、无线 RPC 权限及相关依赖。
+- LuCI：移除无线设置、无线状态、信道分析、无线 RPC 权限及相关依赖；只保留 Argon 主题，不预装旧 Lua 兼容运行时。
+- USB：移除主机、存储、文件系统、USB 指示灯与 LuCI 默认 LED 配置；升级时清理旧 USB LED 触发器。
+- 运行时：保留 WireGuard、TUN 和 nftables TPROXY，移除预装 SQM、OpenVPN、iptables 兼容模块及生产版调试工具。
 
-这仅是针对 TYFZA1 的软件裁剪，设备内原有无线芯片仍在硬件上。请在首次刷机后验证 PON 注册、四个 LAN 端口、2.5G 链路、硬件卸载及 USB；尚未对这一裁剪版本完成实机验收。
+这仅是针对 TYFZA1 的软件裁剪，设备内原有无线芯片和 USB 电路仍在硬件上。请在首次刷机后验证 PON 注册、四个 LAN 端口、2.5G 链路及硬件卸载；尚未对这一裁剪版本完成实机验收。
 
 ## 参与项目
 
