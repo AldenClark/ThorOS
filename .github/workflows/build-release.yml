@@ -1,28 +1,13 @@
 name: Build TYFZA1 firmware
 
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
-    inputs:
-      release_tag:
-        description: Release tag (an existing tag must match the selected commit)
-        required: true
-      config_file:
-        description: Optional repository path to a custom OpenWrt config
-        required: false
-        default: ''
-      replace_release:
-        description: Rebuild and replace assets of an existing release
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: firmware-${{ inputs.release_tag || github.ref_name }}
+  group: tyfza1-firmware-release
   cancel-in-progress: false
 
 jobs:
@@ -31,36 +16,17 @@ jobs:
     timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-      REPLACE_RELEASE: ${{ inputs.replace_release && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Check release source
+      - name: Generate release version
         run: |
-          case "$RELEASE_TAG" in
-            v*) ;;
-            *) echo "::error::Release tag must start with v (for example, v0.8.0-beta)."; exit 1 ;;
-          esac
+          RELEASE_TAG="v$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
           git check-ref-format "refs/tags/$RELEASE_TAG"
-          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
-            tag_commit=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
-            build_commit=$(git rev-parse HEAD)
-            if [ "$tag_commit" != "$build_commit" ]; then
-              echo "::error::Release tag $RELEASE_TAG points to $tag_commit, not build commit $build_commit. Choose a new tag or build the tagged commit."
-              exit 1
-            fi
-          fi
-          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 && [ "$REPLACE_RELEASE" != true ]; then
-            echo "::error::Release $RELEASE_TAG already exists. Enable replace_release to rebuild this release, or choose a new tag."
-            exit 1
-          fi
-      - name: Prepare release notes
-        run: |
-          python3 scripts/test_release_notes.py
-          python3 scripts/release_notes.py "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "Firmware release: $RELEASE_TAG (Asia/Shanghai)" >> "$GITHUB_STEP_SUMMARY"
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -117,7 +83,6 @@ jobs:
         env:
           TYFZA1_RUNTIME_INPUTS: ${{ github.workspace }}/artifacts/runtime-inputs
           TYFZA1_SIGNING_KEYS: ${{ github.workspace }}/artifacts/signing
-          TYFZA1_CONFIG: ${{ inputs.config_file }}
         run: |
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
@@ -146,16 +111,8 @@ jobs:
           retention-days: 14
       - name: Publish release
         run: |
-          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-              --target "$(git rev-parse HEAD)" \
-              --title "$RELEASE_TAG" --draft \
-              --notes-file "$RUNNER_TEMP/release-notes.md"
-          fi
-          gh release upload "$RELEASE_TAG" artifacts/release/sysupgrade.bin \
+          gh release create "$RELEASE_TAG" artifacts/release/sysupgrade.bin \
             artifacts/release/tyfza1-telnet-install.tar.gz artifacts/release/SHA256SUMS \
             artifacts/release/COPYING artifacts/release/PonWRT-TYFZA1-source.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest \
-            --title "$RELEASE_TAG" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "ThorOS $RELEASE_TAG" --generate-notes --latest
