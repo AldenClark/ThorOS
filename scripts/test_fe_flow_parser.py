@@ -456,7 +456,8 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts',prefix='fe-parser-') as 
 (root / 'logs/fe-flow-parser.json').write_text(json.dumps({
     'production_source_sha256':hashlib.sha256(native.encode()).hexdigest(),
     'Linux_NAT_builder_sha256':hashlib.sha256(upstream.encode()).hexdigest(),
-    'Linux_version':'6.18.55','TCP_UDP_both_directions':True,
+    'Linux_version':json.loads((root / 'port/sources.lock.json').read_text())['openwrt']['kernel'],
+    'TCP_UDP_both_directions':True,
     'vectors':1028,'IPv6_128bit_route_vectors':4,'Linux_VLAN_QinQ_vectors':288,'PPPoE_IPv4_IPv6_both_directions':8,'sanitizers':['ASan','UBSan'],
     'hardware_flowtable_acceptance':False,
 },indent=2)+'\n')

@@ -22,6 +22,7 @@ common = next(ast.literal_eval(n.value) for n in existing.body
 common = common.replace("unsigned xmit_type;", "unsigned xmit_type,dir,mtu;")
 common = common.replace("struct flow_offload {", "struct flow_offload_tuple_rhash {struct flow_offload_tuple tuple;};\nstruct flow_offload {")
 common = common.replace("struct {struct flow_offload_tuple tuple;}tuplehash[2]", "struct flow_offload_tuple_rhash tuplehash[2]")
+common = common.replace("unsigned type;unsigned long flags;", "unsigned type,priority;unsigned long flags;")
 
 
 def function(text, name):
@@ -38,6 +39,11 @@ core = (args.kernel / "net/netfilter/nf_flow_table_core.c").read_text()
 fdb = (args.kernel / "net/bridge/br_fdb.c").read_text()
 offload = (args.kernel / "net/netfilter/nf_flow_table_offload.c").read_text()
 ip = (args.kernel / "net/netfilter/nf_flow_table_ip.c").read_text()
+if args.before:
+    # Restore the original forwarding path without changing the companion
+    # offload/FDB helpers needed to build the in-memory fixture.
+    assert ip.count('flow_offload_refresh_bridge(flow, dir, jiffies);') == 2
+    ip = ip.replace('flow_offload_refresh_bridge(flow, dir, jiffies);', '')
 model = r'''
 #define HZ 1
 #define likely(x) (x)
@@ -48,9 +54,14 @@ model = r'''
 static bool nf_flowtable_hw_offload(struct nf_flowtable *t){(void)t;return false;}
 static void nf_flow_offload_add(struct nf_flowtable *t,struct flow_offload *f){(void)t;(void)f;assert(false);}
 struct nf_flowtable_ctx {unsigned offset,hdrsize;};
-struct iphdr {u8 ihl,protocol,ttl;};
+struct iphdr {u8 ihl,protocol,ttl,tos;};
 struct ipv6hdr {u8 nexthdr,hop_limit;};
-struct sk_buff {unsigned len,family;struct iphdr ip;struct ipv6hdr ip6;};
+struct sk_buff {unsigned len,family,priority;struct net_device *dev;struct iphdr ip;struct ipv6hdr ip6;};
+struct netns_ipv4 {bool sysctl_ip_fwd_update_priority;};
+struct net_with_ipv4 {struct netns_ipv4 ipv4;};
+static struct net_with_ipv4 stub_net;
+static struct net_with_ipv4 *dev_net(struct net_device *dev){(void)dev;return &stub_net;}
+static unsigned rt_tos2priority(unsigned tos){return tos;}
 static unsigned reject;
 static bool nf_flow_exceeds_mtu(struct sk_buff *s,unsigned mtu){return s->len>mtu;}
 static void *skb_network_header(struct sk_buff *s){return s->family==4?(void *)&s->ip:(void *)&s->ip6;}

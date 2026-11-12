@@ -112,10 +112,12 @@
  
  	return tuplehash;
  }
-@@ -570,6 +603,7 @@
+@@ -617,8 +650,9 @@
  
  	if (nf_flow_has_expired(flow) ||
  	    nf_ct_is_dying(flow->ct) ||
+ 	    !nf_flow_dst_valid(flow_table, flow, FLOW_OFFLOAD_DIR_ORIGINAL) ||
+ 	    !nf_flow_dst_valid(flow_table, flow, FLOW_OFFLOAD_DIR_REPLY) ||
 +	    nf_flow_bridge_changed(flow) ||
  	    nf_flow_custom_gc(flow_table, flow)) {
  		flow_offload_teardown(flow);

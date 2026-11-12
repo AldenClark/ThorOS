@@ -41,7 +41,7 @@ common = r'''
 #include <stdatomic.h>
 typedef int32_t __s32; typedef uint64_t u64;
 enum {NF_FLOW_CLOSING,NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,
- NF_FLOW_HW_DEAD,NF_FLOW_HW_PENDING,NF_FLOW_HW_BIDIRECTIONAL};
+ NF_FLOW_HW_DEAD,NF_FLOW_PENDING,NF_FLOW_HW_BIDIRECTIONAL};
 enum {FLOW_CLS_REPLACE,FLOW_CLS_DESTROY,FLOW_CLS_STATS};
 #define BIT(n) (1UL<<(n))
 #define GFP_ATOMIC 0
@@ -61,7 +61,7 @@ struct flow_offload_work {unsigned cmd;struct nf_flowtable *flowtable;
  struct flow_offload *flow;struct work_struct work;};
 struct flow_stats {u64 pkts,bytes,lastused;};
 static unsigned now,unlinked,unsafe_unlink,adds,deletes,stats,accounted;
-static bool fail_alloc,bridge_changed,late_pending,late_dying,worker_gc;
+static bool fail_alloc,bridge_changed,late_pending,late_dying,worker_gc,worker_released;
 static struct flow_offload_work *pending,*running;
 static struct nf_flowtable *table;
 static void nf_flow_offload_gc_step(struct nf_flowtable *,struct flow_offload *,void *);
@@ -70,7 +70,7 @@ static bool test_bit(unsigned n,const _Atomic unsigned long *p){
  bool value=!!(atomic_load(p)&BIT(n));
  /* A stale RCU submitter acquires PENDING after GC's first check. */
  if(n==NF_FLOW_HW_DEAD&&value&&late_pending){
-  late_pending=false;atomic_fetch_or((_Atomic unsigned long *)p,BIT(NF_FLOW_HW_PENDING));
+  late_pending=false;atomic_fetch_or((_Atomic unsigned long *)p,BIT(NF_FLOW_PENDING));
  }
  return value;
 }
@@ -79,7 +79,7 @@ static bool test_bit_acquire(unsigned n,const _Atomic unsigned long *p){
 }
 static bool test_and_set_bit(unsigned n,_Atomic unsigned long *p){
  /* DESTROY finished after the caller decided to submit new work. */
- if(n==NF_FLOW_HW_PENDING&&late_dying){
+ if(n==NF_FLOW_PENDING&&late_dying){
   late_dying=false;atomic_fetch_or(p,BIT(NF_FLOW_HW_DYING)|BIT(NF_FLOW_HW_DEAD));
  }
  return !!(atomic_fetch_or(p,BIT(n))&BIT(n));
@@ -87,9 +87,13 @@ static bool test_and_set_bit(unsigned n,_Atomic unsigned long *p){
 static void set_bit(unsigned n,_Atomic unsigned long *p){atomic_fetch_or(p,BIT(n));}
 static void clear_bit(unsigned n,_Atomic unsigned long *p){
  atomic_fetch_and(p,~BIT(n));
- if(n==NF_FLOW_HW_PENDING&&worker_gc&&running){
-  worker_gc=false;nf_flow_offload_gc_step(table,running->flow,NULL);
-  assert(!unlinked); /* DESTROY still has its final DEAD store to perform. */
+ if(n==NF_FLOW_PENDING&&worker_gc&&running){
+  worker_gc=false;worker_released=true;
+  nf_flow_offload_gc_step(table,running->flow,NULL);
+  /* Upstream now sets DEAD inside DESTROY, before publishing work completion.
+   * A GC unlink after that final flow access is safe even while kfree runs.
+   */
+  assert(!unsafe_unlink);
  }
 }
 static void smp_mb__before_atomic(void){atomic_thread_fence(memory_order_seq_cst);}
@@ -101,10 +105,11 @@ static bool nf_flow_has_expired(struct flow_offload *f){return nf_flow_timeout_d
 static bool nf_ct_is_dying(struct nf_conn *ct){return ct->dying;}
 static bool nf_flow_bridge_changed(struct flow_offload *f){(void)f;return bridge_changed;}
 static bool nf_flow_custom_gc(struct nf_flowtable *t,struct flow_offload *f){(void)t;(void)f;return false;}
+static bool nf_flow_dst_valid(struct nf_flowtable *t,struct flow_offload *f,int d){(void)t;(void)f;(void)d;return true;}
 static void flow_offload_teardown(struct flow_offload *f){set_bit(NF_FLOW_TEARDOWN,&f->flags);}
 static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct){(void)ct;}
 static void flow_offload_work_add(struct flow_offload_work *w){(void)w;adds++;}
-static void flow_offload_work_del(struct flow_offload_work *w){(void)w;deletes++;}
+static void flow_offload_work_del(struct flow_offload_work *w){deletes++;set_bit(NF_FLOW_HW_DEAD,&w->flow->flags);}
 static void flow_offload_tuple_stats(struct flow_offload_work *w,unsigned d,struct flow_stats *s){
  (void)w;(void)d;stats++;s->lastused=now;s->pkts=1;s->bytes=100;
 }
@@ -116,7 +121,7 @@ static void flow_offload_queue_work(struct flow_offload_work *w){assert(!pending
 static void flow_offload_del(struct nf_flowtable *t,struct flow_offload *f){
  (void)t;(void)f;unlinked++;
  /* GC's retirement PENDING bit is not itself a queued task. */
- if(pending||running)unsafe_unlink++;
+ if(pending||(running&&!worker_released))unsafe_unlink++;
 }
 '''
 
@@ -125,7 +130,7 @@ static void reset(struct flow_offload *f,unsigned long flags){
  if(pending){kfree(pending);pending=NULL;}
  assert(!running);f->flags=flags;f->timeout=now+3000;f->ct->dying=false;
  unlinked=unsafe_unlink=adds=deletes=stats=accounted=0;
- late_pending=late_dying=fail_alloc=bridge_changed=worker_gc=false;
+ late_pending=late_dying=fail_alloc=bridge_changed=worker_gc=worker_released=false;
 }
 static void complete(void){
  assert(pending);running=pending;pending=NULL;
@@ -143,7 +148,7 @@ int main(void){
  bool closing_uaf=unsafe_unlink!=0;
  reset(&f,BIT(NF_FLOW_HW)|BIT(NF_FLOW_HW_DYING)|BIT(NF_FLOW_HW_DEAD)|BIT(NF_FLOW_TEARDOWN));
  late_pending=true;nf_flow_offload_gc_step(&t,&f,NULL);bool late_uaf=unlinked!=0;
- reset(&f,BIT(NF_FLOW_HW)|BIT(NF_FLOW_HW_DYING)|BIT(NF_FLOW_HW_DEAD)|BIT(NF_FLOW_TEARDOWN)|BIT(NF_FLOW_HW_PENDING));
+ reset(&f,BIT(NF_FLOW_HW)|BIT(NF_FLOW_HW_DYING)|BIT(NF_FLOW_HW_DEAD)|BIT(NF_FLOW_TEARDOWN)|BIT(NF_FLOW_PENDING));
  nf_flow_offload_gc_step(&t,&f,NULL);bool pending_uaf=unlinked!=0;
  reset(&f,BIT(NF_FLOW_HW)|BIT(NF_FLOW_HW_DYING)|BIT(NF_FLOW_HW_DEAD)|BIT(NF_FLOW_TEARDOWN));
  nf_flow_offload_gc_step(&t,&f,NULL);assert(unlinked==1);
@@ -156,15 +161,19 @@ int main(void){
  }
  printf("dead_stats=%u closing_uaf=%u late_pending_uaf=%u pending_uaf=%u retired_admission=%u dying_admission=%u\n",
   dead_stats,closing_uaf,late_uaf,pending_uaf,retired_admission,dying_admission);
+ fflush(stdout);
 #ifdef EXPECT_BEFORE
- assert(dead_stats&&closing_uaf&&late_uaf&&pending_uaf&&retired_admission&&dying_admission);
+ /* 6.18.60 upstream already guards CLOSING and ordinary PENDING, but
+  * unprotected retirement and a late work submit still reproduce.
+  */
+ assert(dead_stats&&late_uaf&&retired_admission&&dying_admission);
+ return 0;
 #else
  assert(!dead_stats&&!closing_uaf&&!late_uaf&&!pending_uaf&&!retired_admission&&!dying_admission);
-#endif
  /* Active ADD/STATS, allocation retries and delayed DESTROY must still progress. */
  for(unsigned i=0;i<2000;i++){
   reset(&f,BIT(NF_FLOW_HW)|BIT(NF_FLOW_HW_BIDIRECTIONAL));
-  fail_alloc=true;nf_flow_offload_add(&t,&f);assert(!pending&&!test_bit(NF_FLOW_HW_PENDING,&f.flags));
+  fail_alloc=true;nf_flow_offload_add(&t,&f);assert(!pending&&!test_bit(NF_FLOW_PENDING,&f.flags));
   fail_alloc=false;nf_flow_offload_add(&t,&f);assert(pending);complete();assert(adds==1);
   now+=400;nf_flow_offload_gc_step(&t,&f,NULL);assert(pending&&pending->cmd==FLOW_CLS_STATS);
   nf_flow_offload_add(&t,&f);assert(pending->cmd==FLOW_CLS_STATS);
@@ -173,7 +182,7 @@ int main(void){
   if(i%4==2)bridge_changed=true;
   if(i%4==3)f.timeout=now;
   nf_flow_offload_gc_step(&t,&f,NULL);assert(!unlinked);
-  complete();assert(stats==2&&accounted==2&&!test_bit(NF_FLOW_HW_PENDING,&f.flags));
+  complete();assert(stats==2&&accounted==2&&!test_bit(NF_FLOW_PENDING,&f.flags));
   /* STATS may refresh an expired timeout; emulate the later idle expiry. */
   if(i%4==3)now=f.timeout;
   fail_alloc=true;nf_flow_offload_gc_step(&t,&f,NULL);
@@ -181,12 +190,12 @@ int main(void){
   fail_alloc=false;nf_flow_offload_gc_step(&t,&f,NULL);
   assert(pending&&pending->cmd==FLOW_CLS_DESTROY);
   nf_flow_offload_gc_step(&t,&f,NULL);assert(!unlinked);
-  worker_gc=true;complete();assert(deletes==1&&!unlinked);
-  nf_flow_offload_gc_step(&t,&f,NULL);assert(unlinked==1&&!unsafe_unlink);
+ worker_gc=true;complete();assert(deletes==1&&unlinked==1&&!unsafe_unlink);
  }
  reset(&f,0);f.timeout=now;nf_flow_offload_gc_step(&t,&f,NULL);
- assert(unlinked==1&&!pending&&!test_bit(NF_FLOW_HW_PENDING,&f.flags));
+ assert(unlinked==1&&!pending&&!test_bit(NF_FLOW_PENDING,&f.flags));
  puts("PASS: 2000 active/teardown cycles, stats/accounting, allocation retry, destroy handoff, software expiry");
+#endif
 }
 '''
 

@@ -21,7 +21,7 @@
 
 ## 关于项目
 
-ThorOS 是基于 PonWRT-TYFZA1 的 TYFZA1 有线固件分支。设备采用 Realtek RTL9617C 四核 Cortex-A55，固件基于 Linux 6.18.55。
+ThorOS 是基于 PonWRT-TYFZA1 的 TYFZA1 有线固件分支。设备采用 Realtek RTL9617C 四核 Cortex-A55，固件基于 Linux 6.18.60。
 
 - **PON 适配**：10G-EPON、XG-PON 线路认证、业务配置和状态管理。
 - **有线网络**：LAN1–LAN4（包括 2.5G 版本）、PON 和有线硬件流量卸载。

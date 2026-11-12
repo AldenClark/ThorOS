@@ -11,7 +11,7 @@ export CURL_OPTIONS='--speed-time 60 --speed-limit 1024'
 sh port/scripts/build.sh "$P/sources/openwrt" 2
 cd "$P"
 BIN=$P/sources/openwrt/bin/targets/rtl9617c/generic
-OUT=${TYFZA1_LAN_OUT:-$P/artifacts/full-lan-luci-6.18.55}
+OUT=${TYFZA1_LAN_OUT:-$P/artifacts/full-lan-luci-$KERNEL_VERSION}
 mkdir -p "$OUT/firmware"
 cp -a "$BIN/." "$OUT/firmware/"
 set -- "$BIN"/*-initramfs-Image

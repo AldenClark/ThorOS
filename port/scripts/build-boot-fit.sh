@@ -9,7 +9,7 @@ KEYDIR=$(realpath "${3:?Specify the validated dev.key/dev.crt directory}")
 KEYDTB=$(realpath "${4:?Specify the actual bootloader public-key DTB}")
 OUT=${5:?Specify a new output directory}
 [ ! -e "$OUT" ] || { echo "Output already exists: $OUT" >&2; exit 1; }
-test "$(git -C "$TREE" rev-parse HEAD)" = 79bc56cb7483bc716da07c369530b792631904b4
+test "$(git -C "$TREE" rev-parse HEAD)" = "$(python3 "$PORT/tools/project_paths.py" --field openwrt-commit)"
 grep -q '^CONFIG_TOOLS_LIBCRYPTO=y' "$TOOLS/uboot-tools.config"
 for tool in mkimage dumpimage fit_check_sign; do
     test -x "$TOOLS/$tool"

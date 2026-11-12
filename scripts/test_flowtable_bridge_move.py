@@ -9,7 +9,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--kernel', type=Path, default=root / 'sources/openwrt/build_dir/target-aarch64_cortex-a55_musl/linux-rtl9617c_generic/linux-6.18.55')
+parser.add_argument('--kernel', type=Path, help='Prepared kernel tree (default: derive from sources.lock.json)')
 parser.add_argument('--before', action='store_true')
 args = parser.parse_args()
 
@@ -28,6 +28,7 @@ def function(source, name):
 
 common = r'''
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -43,9 +44,9 @@ typedef uint8_t u8;typedef uint16_t u16,__u16,__be16;typedef uint32_t u32;
 enum flow_offload_xmit_type {FLOW_OFFLOAD_XMIT_UNSPEC,FLOW_OFFLOAD_XMIT_NEIGH,FLOW_OFFLOAD_XMIT_XFRM,FLOW_OFFLOAD_XMIT_DIRECT};
 enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY};
 enum ip_conntrack_dir {IP_CT_DIR_ORIGINAL,IP_CT_DIR_REPLY};
-enum {DEV_PATH_ETHERNET,DEV_PATH_DSA,DEV_PATH_VLAN,DEV_PATH_PPPOE,DEV_PATH_BRIDGE};
+enum {DEV_PATH_ETHERNET,DEV_PATH_DSA,DEV_PATH_VLAN,DEV_PATH_PPPOE,DEV_PATH_BRIDGE,DEV_PATH_IEEE80211};
 enum {DEV_PATH_BR_VLAN_UNTAG_HW,DEV_PATH_BR_VLAN_TAG,DEV_PATH_BR_VLAN_UNTAG,DEV_PATH_BR_VLAN_KEEP};
-enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_HW_PENDING};
+enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_PENDING};
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define test_bit_acquire(n,p) test_bit(n,p)
@@ -63,6 +64,7 @@ struct dst_entry {struct net_device *dev;};
 struct nf_conn {struct net *net;bool dying,offloaded;};
 struct flow_offload_tuple {
  unsigned dir,xmit_type,l3proto,mtu,iifidx,encap_num,in_vlan_ingress,ifidx,dst_cookie;
+ unsigned bridge_path,bridge_vlan,port_vlans;
  struct {u16 id;__be16 proto;}encap[2];struct dst_entry *dst_cache;
  struct {u32 ifidx,hw_ifidx,bridge_ifidx,bridge_port;u16 bridge_vid;u8 h_source[6],h_dest[6];}out;
 };
@@ -71,7 +73,7 @@ struct flow_offload {struct nf_conn *ct;unsigned type;unsigned long flags;struct
 struct nf_flowtable {struct flow_offload_tuple_rhash *rhashtable;bool hw;};
 struct nft_flowtable {struct nf_flowtable data;};
 struct nf_flow_route {struct {struct dst_entry *dst;struct {u32 ifindex;struct {u16 id;__be16 proto;}encap[2];unsigned num_encaps,ingress_vlans;}in;
- struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u8 h_source[6],h_dest[6];}out;unsigned xmit_type;}tuple[2];};
+ struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u8 h_source[6],h_dest[6];unsigned bridge_path,bridge_vlan,port_vlans;}out;unsigned xmit_type;}tuple[2];};
 struct net_device_path {unsigned type;struct net_device *dev;struct {unsigned vlan_mode;u16 vlan_id,vlan_proto;}bridge;struct {u16 id,proto;u8 h_dest[6];}encap;};
 struct net_device_path_stack {int num_paths;struct net_device_path path[4];};
 static struct net_device_path_stack path_stack;
@@ -87,6 +89,7 @@ static void *rhashtable_lookup(void *table,void *key,int params){(void)key;(void
 static bool nf_ct_is_dying(struct nf_conn *ct){return ct->dying;}
 static bool nf_flow_has_expired(struct flow_offload *f){(void)f;return false;}
 static bool nf_flow_custom_gc(struct nf_flowtable *ft,struct flow_offload *f){(void)ft;(void)f;return false;}
+static bool nf_flow_dst_valid(struct nf_flowtable *ft,struct flow_offload *f,int dir){(void)ft;(void)f;(void)dir;return true;}
 static void nf_flow_table_extend_ct_timeout(struct nf_conn *ct){(void)ct;}
 static void nf_flow_offload_stats(struct nf_flowtable *ft,struct flow_offload *f){(void)ft;(void)f;}
 static void nf_flow_offload_del(struct nf_flowtable *ft,struct flow_offload *f){
@@ -126,6 +129,12 @@ int main(void){
  flow.tuplehash[0].tuple.l3proto=ipv6?NFPROTO_IPV6:NFPROTO_IPV4;
  assert(!flow_offload_fill_route(&flow,&route,0));
  struct flow_offload_tuple *tuple=&flow.tuplehash[0].tuple;
+#ifdef EXPECT_BEFORE
+ (void)ft;
+ assert(tuple->out.bridge_ifidx==0 && tuple->out.bridge_port==0 && tuple->out.bridge_vid==0);
+ puts("Pre-fix bridge path is not captured; an FDB move cannot retire this flow.");
+ return 0;
+#else
  assert(tuple->out.bridge_ifidx==10 && tuple->out.bridge_port==2 && tuple->out.bridge_vid==7 && tuple->out.hw_ifidx==4);
  ft.rhashtable=&flow.tuplehash[0];assert(flow_offload_lookup(&ft,tuple));
  moved=1;
@@ -145,20 +154,24 @@ int main(void){
   if(control==3)tuple->out.bridge_ifidx=0;
   assert(flow_offload_lookup(&ft,tuple) && ct.offloaded);
  }
- }
  puts("Bridge move: IPv4/IPv6 path/VLAN capture -> software miss -> paired hardware removal -> connection released; unrelated flows retained.");
+#endif
+ }
 }
 '''
 with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
     work = Path(directory)
-    kernel = args.kernel
+    kernel = args.kernel or Path(subprocess.check_output([
+        'python3', str(root / 'port/tools/project_paths.py'),
+        '--kernel-directory', str(root / 'sources/openwrt')], text=True).strip())
     if args.before:
         patch = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/216-flowtable-bridge-move.patch'
         for name in re.findall(r'^\+\+\+ b/(.+)$', patch.read_text(), re.M):
             target = work / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
-        subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(patch)], cwd=work, check=True, stdout=subprocess.DEVNULL)
+        # Backported upstream flowtable layout shifts several context hunks.
+        subprocess.run(['patch', '-R', '-p1', '--fuzz=2', '-i', str(patch)], cwd=work, check=True, stdout=subprocess.DEVNULL)
         kernel = work
     core = (kernel / 'net/netfilter/nf_flow_table_core.c').read_text()
     path = (kernel / 'net/netfilter/nf_flow_table_path.c').read_text()
@@ -170,5 +183,8 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
     code += function(core, 'flow_offload_lookup') + function(core, 'nf_flow_offload_gc_step') + cases
     source, binary = work / 'roam.c', work / 'roam'
     source.write_text(code)
-    subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined', str(source), '-o', str(binary)], check=True)
+    command = ['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-parameter', '-fsanitize=address,undefined']
+    if args.before:
+        command.append('-DEXPECT_BEFORE')
+    subprocess.run(command + [str(source), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)
