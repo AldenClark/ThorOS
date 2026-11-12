@@ -24,8 +24,10 @@ cp "$PROJECT/port/overlay/target/linux/rtl9617c/base-files/etc/fw_env.config" "$
 ARCHIVE=$(sh "$PROJECT/scripts/resolve_uboot_archive.sh" "$TREE")
 ARCHIVE_NAME=${ARCHIVE##*/}
 SOURCE=$PROJECT/artifacts/release-envtools/${ARCHIVE_NAME%.tar.bz2}
-mkdir -p "$PROJECT/artifacts/release-envtools"
-tar -xf "$ARCHIVE" -C "$PROJECT/artifacts/release-envtools"
+# Upstream source tarballs do not guarantee that their top-level directory
+# matches the archive basename (U-Boot sometimes includes a "v" prefix).
+mkdir -p "$SOURCE"
+tar -xjf "$ARCHIVE" --strip-components=1 -C "$SOURCE"
 set -- "$TREE"/staging_dir/toolchain-aarch64_cortex-a55_gcc-*_musl/bin/aarch64-openwrt-linux-musl-gcc
 CC=$1
 STRIP=${CC%gcc}strip

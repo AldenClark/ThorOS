@@ -11,9 +11,10 @@ args = parser.parse_args()
 
 config = (args.kernel / '.config').read_text().splitlines()
 selected = set(config)
-# NET_SELFTESTS is a PHYLIB/INET Kconfig dependency (def_tristate PHYLIB),
-# not an independently removable selftest suite on this network appliance.
-removed = ('BLK_DEV_DM', 'MD', 'DM_VERITY', 'IO_URING_ZCRX')
+# NET_SELFTESTS and IO_URING_ZCRX are unprompted Kconfig defaults once their
+# required network dependencies are enabled; neither can be independently
+# deselected by a target config fragment.
+removed = ('BLK_DEV_DM', 'MD', 'DM_VERITY')
 for name in removed:
     if f'CONFIG_{name}=y' in selected or f'CONFIG_{name}=m' in selected:
         parser.error(f'unexpected compiled kernel feature: {name}')

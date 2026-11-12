@@ -94,6 +94,7 @@ jobs:
           cp "$kernel/.config" artifacts/kernel.config
           manifest=$(find sources/openwrt/bin/targets/rtl9617c/generic -maxdepth 1 -name '*.manifest' -print -quit)
           test -n "$manifest"
+          cp "$manifest" artifacts/firmware.manifest
           python3 scripts/verify_release_kernel.py --kernel "$kernel" --manifest "$manifest"
           python3 scripts/test_board_variants.py --kernel "$kernel"
           python3 scripts/test_nand_batch.py --kernel "$kernel"
@@ -146,6 +147,7 @@ jobs:
             artifacts/release/
             artifacts/build.log
             artifacts/kernel.config
+            artifacts/firmware.manifest
             logs/
           retention-days: 14
       - name: Publish release

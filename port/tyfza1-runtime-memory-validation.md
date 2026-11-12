@@ -16,10 +16,13 @@ evidence that a physical range is unused.
    optical LOS and management authentication have no single reliable event
    source. Its default 1-second interval is preserved for diagnostics.
 3. The production UBI FIT boots a direct ubiblock SquashFS root, so the
-   Device Mapper / dm-verity kernel stack is omitted along with io_uring
-   zero-copy RX. `NET_SELFTESTS` remains enabled automatically when PHYLIB and
-   INET are built in (Linux `def_tristate PHYLIB`); it is not a background
-   test daemon or an independently removable kernel option. The experimental
+   Device Mapper / dm-verity kernel stack is omitted. `NET_SELFTESTS` remains
+   enabled automatically when PHYLIB and INET are built in (Linux
+   `def_tristate PHYLIB`); it is not a background test daemon. Likewise,
+   `IO_URING_ZCRX` is an unprompted `def_bool y` when io_uring, page pool,
+   IPv4 and busy-poll support are enabled. Neither option can be disabled
+   independently without changing required networking features or patching
+   upstream Kconfig. The experimental
    `port/tools/make_boot_fit.py` verified-root pipeline still exists, but its
    verity image is **not bootable with the trimmed production kernel**.
 4. The TUN, WireGuard, nftables TPROXY and socket kernel packages remain

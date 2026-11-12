@@ -82,7 +82,7 @@ def verify(tree, stock):
     # Production FIT boots a signed, direct ubiblock SquashFS root. Its boot
     # script never constructs a dm-verity device; experimental verity FITs
     # built by port/tools/make_boot_fit.py are not production images.
-    for symbol in ('BLK_DEV_DM', 'DM_VERITY', 'MD', 'IO_URING_ZCRX'):
+    for symbol in ('BLK_DEV_DM', 'DM_VERITY', 'MD'):
         if any(f'CONFIG_{symbol}={state}' in config for state in ('y', 'm')):
             raise ValueError(f'Unexpected optional kernel feature: {symbol}')
     if 'CONFIG_WATCHDOG_OPEN_TIMEOUT=60' not in config:
