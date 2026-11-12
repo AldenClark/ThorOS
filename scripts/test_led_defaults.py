@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run both boards' LAN/USB LED defaults and preserved-config migration with real UCI."""
+"""Run both boards' wired LED defaults and prune old USB triggers on upgrades."""
 import json
 import os
 from pathlib import Path
@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix='led-defaults-') as directory:
             .replace('/lib/functions/uci-defaults.sh', str(defaults))
             .replace('/lib/functions/system.sh', str(system))
             .replace('/lib/functions.sh', str(functions)))
-    for board, led in [('tianyi,tyfza1', 'LED_USB0'), ('tianyi,tyfza1-2p5g', 'LED_USB1')]:
+    for board in ('tianyi,tyfza1', 'tianyi,tyfza1-2p5g'):
         # Captured OEM PORT_REMAPPING=04,02,01,00 and EPHY0..3 -> eth0.2..5.
         lans = ['lan1', 'lan2', 'lan3', 'lan4'] if board.endswith('-2p5g') else ['lan4', 'lan3', 'lan2', 'lan1']
         system.write_text('board_name() { printf "%s\\n" ' + shlex.quote(board) + '; }\n')
@@ -51,8 +51,7 @@ with tempfile.TemporaryDirectory(prefix='led-defaults-') as directory:
         board_file.write_text(json.dumps({'model': {'id': board}}))
         subprocess.run(shell + [str(work / 'board.sh')], env=dict(env, CFG=str(board_file)), check=True)
         data = json.loads(board_file.read_text())
-        assert data['led']['usb']['sysfs'] == led
-        assert data['led']['usb']['trigger'] == 'tyfza1-usb'
+        assert 'usb' not in data['led']
         for port, dev in enumerate(lans):
             assert data['led'][f'lan{port}']['sysfs'] == f'LED_EPHY{port}'
             assert data['led'][f'lan{port}']['device'] == dev, (board, port, data['led'])
@@ -62,9 +61,7 @@ with tempfile.TemporaryDirectory(prefix='led-defaults-') as directory:
                 "config led 'custom'\n option sysfs 'LED_EPHY0'\n option dev 'lan3'\n")
             subprocess.run(shell + [str(work / 'migrate.sh')], env=env, check=True)
             exported = subprocess.check_output(cli + ['export', 'system'])
-            expected = led if board == 'tianyi,tyfza1-2p5g' else old
-            assert subprocess.check_output(cli + ['get', 'system.usb.sysfs'], text=True).strip() == expected
-            assert subprocess.check_output(cli + ['get', 'system.usb.name'], text=True).strip() == 'My USB'
+            assert subprocess.run(cli + ['get', 'system.usb'], capture_output=True).returncode != 0
             assert subprocess.check_output(cli + ['get', 'system.custom.dev'], text=True).strip() == 'lan3'
             for port in range(1, 4):
                 assert subprocess.check_output(cli + ['get', f'system.led_lan{port}.dev'], text=True).strip() == lans[port]
@@ -75,10 +72,10 @@ with tempfile.TemporaryDirectory(prefix='led-defaults-') as directory:
             f" option sysfs 'LED_EPHY{port}'\n option trigger 'netdev'\n"
             f" option dev '{lans[port]}'\n option mode 'link tx rx'\n"
             for port in range(4)) +
-            f"config led 'led_usb'\n option sysfs '{led}'\n option trigger 'usbport'\n"
+            "config led 'led_usb'\n option sysfs 'LED_USB0'\n option trigger 'usbport'\n"
             " list port 'usb1-port1'\n list port 'usb2-port1'\n")
         subprocess.run(shell + [str(work / 'migrate.sh')], env=env, check=True)
-        assert subprocess.check_output(cli + ['get', 'system.led_usb.trigger'], text=True).strip() == 'tyfza1-usb'
+        assert subprocess.run(cli + ['get', 'system.led_usb'], capture_output=True).returncode != 0
         for port, dev in enumerate(lans):
             assert subprocess.check_output(cli + ['get', f'system.led_lan{port}.dev'], text=True).strip() == dev
         exported = subprocess.check_output(cli + ['export', 'system'])
@@ -93,4 +90,4 @@ with tempfile.TemporaryDirectory(prefix='led-defaults-') as directory:
         exported = subprocess.check_output(cli + ['export', 'system'])
         subprocess.run(shell + [str(work / 'migrate.sh')], env=env, check=True)
         assert subprocess.check_output(cli + ['export', 'system']) == exported
-print('Both boards: LAN/USB defaults, existing bindings, USB migration, custom bindings and repeated boot passed')
+print('Both boards: LAN defaults, old USB triggers removed, custom bindings and repeated boot passed')

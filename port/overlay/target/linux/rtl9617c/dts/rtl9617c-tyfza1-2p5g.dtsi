@@ -5,7 +5,6 @@
 	compatible = "tianyi,tyfza1-2p5g", "tianyi,tyfza1", "realtek,rtl9617c";
 
 	leds {
-		/delete-node/ usb0;
 		internet { gpios = <&gpio0 71 GPIO_ACTIVE_LOW>; };
 		power { gpios = <&gpio0 70 GPIO_ACTIVE_LOW>; };
 		phone { gpios = <&gpio0 139 GPIO_ACTIVE_LOW>; };
@@ -13,8 +12,6 @@
 		lan1 { gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>; };
 		lan2 { gpios = <&gpio0 3 GPIO_ACTIVE_LOW>; };
 		lan3 { gpios = <&gpio0 4 GPIO_ACTIVE_LOW>; };
-		usb1 { gpios = <&gpio0 2 GPIO_ACTIVE_LOW>; };
-		wps { gpios = <&gpio0 140 GPIO_ACTIVE_HIGH>; };
 	};
 
 	led-button {

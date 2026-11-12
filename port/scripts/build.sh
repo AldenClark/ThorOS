@@ -39,6 +39,19 @@ while IFS= read -r setting; do
             ;;
     esac
 done < "$PORT/configs/tyfza1-compat.config"
+# Catch dependencies which would re-introduce an explicitly removed feature.
+while IFS= read -r setting; do
+    case "$setting" in
+        '# CONFIG_'*' is not set')
+            option=${setting#\# }
+            option=${option% is not set}
+            if grep -qx "${option}=y" .config; then
+                echo "Removed TYFZA1 feature selected after defconfig: $option" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done < "$PORT/configs/tyfza1-exclusions.config"
 # A custom build config cannot silently put the radio stack back into the image.
 if grep -Eq '^CONFIG_PACKAGE_(kmod-cfg80211|kmod-mac80211|kmod-rtl-ax-ap|iw|iwinfo|libiwinfo[^=]*|rpcd-mod-iwinfo|hostapd[^=]*|wpad[^=]*|wifi-scripts|wireless-regdb)=y$' .config; then
     echo "Wireless packages selected in a wired-only TYFZA1 build" >&2

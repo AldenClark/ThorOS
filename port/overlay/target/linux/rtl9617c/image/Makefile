@@ -37,9 +37,7 @@ define Device/tianyi_tyfza1
 	-wpad-basic-mbedtls -wpad-mbedtls -hostapd -hostapd-basic-mbedtls \
 	-hostapd-mbedtls -wifi-scripts -iw -iwinfo -wireless-regdb \
 	-kmod-cfg80211 -kmod-mac80211 -kmod-rtl-ax-ap -rpcd-mod-iwinfo \
-	kmod-gpio-button-hotplug kmod-usb3 kmod-usb-storage kmod-usb-storage-uas \
-	kmod-usb-ledtrig-usbport kmod-tyfza1-usb-led block-mount kmod-fs-vfat kmod-fs-exfat \
-	kmod-fs-ntfs3 kmod-fs-ext4 kmod-nls-utf8 kmod-nls-cp437 kmod-nls-iso8859-1
+	kmod-gpio-button-hotplug
   KERNEL := kernel-bin | tyfza1-ubi-fit
   KERNEL_INITRAMFS := kernel-bin
   KERNEL_SUFFIX := -kernel.itb

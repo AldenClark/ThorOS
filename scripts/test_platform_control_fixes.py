@@ -79,25 +79,28 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-controls-') as directory:
         shutil.copyfile(installed / name, path)
     database = (sandbox / 'lib/apk/db/installed').read_text()
     protected = ['luci-mod-status', 'luci-mod-network', 'luci-app-package-manager',
-                 'luci-base', 'luci-compat', 'luci-lua-runtime', 'luci-lib-base',
-                 'luci-lib-ip', 'luci-lib-jsonc', 'luci-lib-nixio', 'ucode',
-                 'libucode20230711']
+                 'luci-base', 'ucode', 'libucode20230711']
     protected += re.findall(r'^P:(ucode-mod-.*)$', database, re.M)
-    assert 'ucode-mod-lua' in protected
+    assert 'ucode-mod-lua' not in protected
     rom = work / 'rom-installed'
     rom.write_text(database)
     script = (root / 'port/overlay/target/linux/rtl9617c/base-files/etc/uci-defaults/99-tyfza1-platform-packages').read_text()
     script = script.replace('/rom/lib/apk/db/installed', str(rom))
+    script = script.replace('/etc/apk/world', str(sandbox / 'etc/apk/world'))
     script = script.replace('apk add', shlex.quote(str(apk)) + ' --root ' + shlex.quote(str(sandbox)) + ' --no-scripts add')
+    with (sandbox / 'etc/apk/world').open('a') as out:
+        out.write('luci-compat><Q1obsolete\nluci-lua-runtime><Q1obsolete\nucode-mod-lua><Q1obsolete\n')
     for _ in range(2):
         subprocess.run(['sh', '-s'], input=script, text=True, check=True, capture_output=True)
+    assert not any(line.startswith(('luci-compat><', 'luci-lua-runtime><', 'ucode-mod-lua><'))
+                   for line in (sandbox / 'etc/apk/world').read_text().splitlines())
     constraints = (sandbox / 'etc/apk/world').read_text().splitlines()
     pins = [line for line in constraints if line.split('><')[0] in protected]
     assert len(pins) == len(protected) and all('><Q1' in pin for pin in pins)
-    missing_rom = work / 'rom-without-lua-bridge'
+    missing_rom = work / 'rom-without-luci-base'
     missing_rom.write_text('\n\n'.join(
         record for record in database.strip().split('\n\n')
-        if '\nP:ucode-mod-lua\n' not in '\n' + record + '\n') + '\n')
+        if '\nP:luci-base\n' not in '\n' + record + '\n') + '\n')
     world_before = (sandbox / 'etc/apk/world').read_text()
     missing = subprocess.run(['sh', '-s'], input=script.replace(str(rom), str(missing_rom)),
                              text=True, capture_output=True)
