@@ -83,9 +83,15 @@ p.write_text(json.dumps(data))
 
     def test_production_kernel_needs_no_device_mapper(self):
         config = (ROOT / 'port/overlay/target/linux/rtl9617c/config-6.18').read_text()
-        for symbol in ('MD', 'BLK_DEV_DM', 'IO_URING_ZCRX', 'NET_SELFTESTS'):
+        for symbol in ('MD', 'BLK_DEV_DM'):
             self.assertIn(f'# CONFIG_{symbol} is not set', config)
             self.assertNotIn(f'CONFIG_{symbol}=y', config)
+        # PHYLIB + INET select NET_SELFTESTS through an unprompted Kconfig
+        # default. A requested "not set" here never survives olddefconfig.
+        self.assertNotIn('# CONFIG_NET_SELFTESTS is not set', config)
+        # IO_URING_ZCRX is likewise def_bool y when IO_URING, PAGE_POOL,
+        # INET and NET_RX_BUSY_POLL are selected.
+        self.assertNotIn('# CONFIG_IO_URING_ZCRX is not set', config)
         fit = (ROOT / 'scripts/make_ubi_fit.py').read_text()
         self.assertIn('root=${tyfza1_block} rootfstype=squashfs', fit)
         self.assertNotIn('dm-mod.create=', fit)
@@ -109,7 +115,10 @@ p.write_text(json.dumps(data))
                       'ppp', 'ppp-mod-pppoe', 'firewall4', 'dnsmasq')
             manifest.write_text(''.join(name + ' 1\n' for name in needed))
             config = root / '.config'
-            config.write_text('# CONFIG_BLK_DEV_DM is not set\n')
+            config.write_text('# CONFIG_BLK_DEV_DM is not set\nCONFIG_PHYLIB=y\n'
+                              'CONFIG_INET=y\nCONFIG_NET_SELFTESTS=y\n'
+                              'CONFIG_IO_URING=y\nCONFIG_PAGE_POOL=y\n'
+                              'CONFIG_NET_RX_BUSY_POLL=y\nCONFIG_IO_URING_ZCRX=y\n')
             command = [sys.executable, str(ROOT / 'scripts/verify_release_kernel.py'),
                        '--kernel', str(root), '--manifest', str(manifest)]
             self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)

@@ -1,7 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 set -eu
-PROJECT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PROJECT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 TREE=${1:?Usage: package_release.sh openwrt-tree output-directory}
 TREE=$(realpath "$TREE")
 OUT=${2:?Usage: package_release.sh openwrt-tree output-directory}
@@ -17,10 +17,17 @@ cp "$PROJECT/scripts/install_ubi_telnet.sh" "$OUT/install.sh"
 cp "$PROJECT/port/overlay/target/linux/rtl9617c/base-files/lib/upgrade/tyfza1-storage.sh" "$OUT/"
 cp "$PROJECT/port/overlay/target/linux/rtl9617c/base-files/etc/fw_env.config" "$OUT/fw_env.config"
 
-VERSION=$(python3 "$PROJECT/port/tools/project_paths.py" --field uboot-version)
-SOURCE=$PROJECT/artifacts/release-envtools/u-boot-$VERSION
-mkdir -p "$PROJECT/artifacts/release-envtools"
-tar -xf "$TREE/dl/u-boot-$VERSION.tar.bz2" -C "$PROJECT/artifacts/release-envtools"
+# Use the U-Boot release already fetched by the pinned OpenWrt checkout.
+# The separately pinned host FIT-tool version need not match OpenWrt's
+# uboot-envtools package; assuming it does makes packaging fail late when
+# upstream changes its package version.
+ARCHIVE=$(sh "$PROJECT/scripts/resolve_uboot_archive.sh" "$TREE")
+ARCHIVE_NAME=${ARCHIVE##*/}
+SOURCE=$PROJECT/artifacts/release-envtools/${ARCHIVE_NAME%.tar.bz2}
+# Upstream source tarballs do not guarantee that their top-level directory
+# matches the archive basename (U-Boot sometimes includes a "v" prefix).
+mkdir -p "$SOURCE"
+tar -xjf "$ARCHIVE" --strip-components=1 -C "$SOURCE"
 set -- "$TREE"/staging_dir/toolchain-aarch64_cortex-a55_gcc-*_musl/bin/aarch64-openwrt-linux-musl-gcc
 CC=$1
 STRIP=${CC%gcc}strip

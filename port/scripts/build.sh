@@ -8,8 +8,8 @@ if [ -n "${TYFZA1_PROXY:-}" ]; then
 fi
 export CURL_OPTIONS='--speed-time 60 --speed-limit 1024'
 umask 022
-PORT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-PROJECT=$(CDPATH= cd -- "$PORT/.." && pwd)
+PORT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+PROJECT=$(CDPATH='' cd -- "$PORT/.." && pwd)
 export TYFZA1_PROJECT=$PROJECT
 TREE=${1:?Usage: build.sh /path/to/openwrt-checkout [jobs]}
 TREE=$(realpath "$TREE")
@@ -66,6 +66,9 @@ if grep -qi microsoft /proc/sys/kernel/osrelease; then
     fi
 fi
 make -j"$JOBS" download
+# The telnet installer needs OpenWrt's U-Boot source to build a static
+# fw_printenv. Check that archive before spending hours on the kernel.
+sh "$PROJECT/scripts/resolve_uboot_archive.sh" "$TREE" >/dev/null
 # Catch package-source patch drift before the expensive toolchain/kernel build.
 # The upstream version of netifd can change its hotplug event code even when
 # the OpenWrt checkout itself is pinned and all configuration checks succeed.
@@ -76,4 +79,13 @@ else
     python3 "$PROJECT/tools/prepare_pon_runtime.py" "$TREE/files" \
         --stock "${TYFZA1_STOCK_INPUTS:-$PROJECT/analysis/private/live-files}"
 fi
-make -j"$JOBS" world
+if make -j"$JOBS" world; then
+    exit 0
+fi
+# A quiet parallel build only reports the failed package. Replay serially
+# with full compiler/patch diagnostics, but never publish after any failure.
+echo 'OpenWrt parallel build failed; collecting serial verbose diagnostics' >&2
+if make -j1 V=sc world; then
+    echo 'Serial replay succeeded, but the original parallel build failed' >&2
+fi
+exit 1
