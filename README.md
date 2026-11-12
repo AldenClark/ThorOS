@@ -81,8 +81,10 @@ sysupgrade /tmp/sysupgrade.bin
 
 | 入口 | 配置内容 |
 | --- | --- |
-| **网络 → PON 管理** | 按线路选择 PON 模式，填写运营商要求的认证参数；MAC、SN 等身份项留空时使用本机原厂值 |
+| **网络 → PON → PON 状态** | 查看光链路、注册认证、OLT 下发的 GEM 业务；折叠查看当前 ONU 身份、BOSA 校准或按需读取高级诊断 |
+| **网络 → PON → PON 设置** | 选择 PON 模式，填写运营商认证参数；MAC、SN 等身份项留空使用原厂值，高级兼容参数默认隐藏 |
 | **网络 → 接口 → WAN** | 设置 DHCP 或 PPPoE、上网 VLAN 和 IPv6；默认业务设备为 `pon0`，VLAN 子设备为 `pon0.VID` |
+| **网络 → 接口 → 设备** | 管理网桥、VLAN 与 IGMP Snooping 等 IPTV 局域网配置 |
 | **网络 → 防火墙** | 配置软件流量卸载和硬件流量卸载 |
 
 两种机型的有线接口 `lan1`–`lan4` 均对应机身 LAN1–LAN4 标号；2.5G 版蓝色口为 `lan1`。PON 业务接口为 `pon0`。
