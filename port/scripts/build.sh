@@ -66,6 +66,10 @@ if grep -qi microsoft /proc/sys/kernel/osrelease; then
     fi
 fi
 make -j"$JOBS" download
+# Catch package-source patch drift before the expensive toolchain/kernel build.
+# The upstream version of netifd can change its hotplug event code even when
+# the OpenWrt checkout itself is pinned and all configuration checks succeed.
+python3 "$PROJECT/scripts/test_fw4_topology_events.py" --source-tree "$TREE" --patches-only
 if [ -n "${TYFZA1_RUNTIME_INPUTS:-}" ]; then
     python3 "$PROJECT/tools/install_runtime_inputs.py" "$TYFZA1_RUNTIME_INPUTS" "$TREE/files"
 else

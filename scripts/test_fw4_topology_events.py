@@ -1,21 +1,33 @@
 #!/usr/bin/env python3
 """Replay late bridge topology changes through netifd and firewall4 hotplug."""
 from pathlib import Path
-import re, subprocess, json, os, tempfile, shutil
+import argparse, re, subprocess, json, os, tempfile, shutil
 root=Path(__file__).resolve().parents[1]
+parser=argparse.ArgumentParser(description='Check pinned netifd/firewall4 patches and hotplug behavior')
+parser.add_argument('--source-tree', type=Path, default=root/'sources/openwrt')
+parser.add_argument('--patches-only', action='store_true', help='Validate patch application before the firmware build')
+args=parser.parse_args()
+tree=args.source_tree.resolve()
 temporary=tempfile.TemporaryDirectory(prefix='fw4-topology-',dir=root/'artifacts')
 out=Path(temporary.name)
 for package in ('netifd','firewall4'):
-    makefile=(root/'sources/openwrt/package/network/config'/package/'Makefile').read_text()
+    makefile=(tree/'package/network/config'/package/'Makefile').read_text()
     date=re.search(r'^PKG_SOURCE_DATE:=(.+)$',makefile,re.M)[1].replace('-','.')
     revision=re.search(r'^PKG_SOURCE_VERSION:=(.+)$',makefile,re.M)[1][:8]
     name=f'{package}-{date}~{revision}'
-    subprocess.run(['tar','--zstd','-xf',str(root/'sources/openwrt/dl'/(name+'.tar.zst')),'-C',str(out)],check=True)
+    subprocess.run(['tar','--zstd','-xf',str(tree/'dl'/(name+'.tar.zst')),'-C',str(out)],check=True)
     for side in ('before','after'):
         (out/side).mkdir(exist_ok=True)
         shutil.copytree(out/name,out/side/package)
+    if package=='firewall4':
+        # Mirror sync-overlay.sh's patch order, including the VLAN-lower fix.
+        subprocess.run(['patch','-p1','--fuzz=0','-i',str(root/'port/host-patches/120-firewall4-netifd-lower-devices.patch')],cwd=out/'after'/package,stdout=subprocess.DEVNULL,check=True)
     patch='120-netifd-interface-topology.patch' if package=='netifd' else '121-firewall4-interface-topology.patch'
     subprocess.run(['patch','-p1','--fuzz=0','-i',str(root/'port/host-patches'/patch)],cwd=out/'after'/package,stdout=subprocess.DEVNULL,check=True)
+if args.patches_only:
+    print('Pinned netifd and firewall4 patches apply without fuzz')
+    temporary.cleanup()
+    raise SystemExit(0)
 original=out/'before/netifd'
 def function(text,name):
  m=re.search(r'(?:static void\s+|void\s+)'+name+r'\([^;]*?\)\s*\{',text);assert m,name
@@ -43,11 +55,12 @@ for side in ('before','after'):
 '''+ '\n'.join(enum(h,n) for n in ('interface_event','interface_state','interface_update_flags'))+enum((original/'device.h').read_text(),'device_event')+'''
 struct device { bool external, sys_present; const char *ifname; };
 struct device_user { struct device *dev; };
-struct interface { struct list_head hotplug_list; enum interface_event hotplug_ev; enum interface_update_flags hotplug_updated,updated; const char *name; struct device_user main_dev,l3_dev; bool renew; enum interface_state state; void *proto; };
+struct interface { struct list_head hotplug_list; enum interface_event hotplug_ev; enum interface_update_flags hotplug_updated,updated; const char *name; struct device_user main_dev,l3_dev; bool renew; enum interface_state state; void *proto; int netns_fd; const char *jail_device; };
 struct uloop_process { bool pending; pid_t pid; };
 static struct uloop_process task;
 static struct interface *current;
 static enum interface_event current_ev;
+static bool stopped;
 static LIST_HEAD(pending);
 static char *hotplug_cmd_path;
 static const char *eventnames[]={ [IFEV_UP]="ifup",[IFEV_UPDATE]="ifupdate",[IFEV_DOWN]="ifdown" };
@@ -62,6 +75,9 @@ static void interface_set_enabled(struct interface *i,bool b){(void)i;(void)b;}
 static void interface_set_main_dev(struct interface *i,void *d){(void)i;(void)d;}
 static void interface_set_link_state(struct interface *i,bool b){(void)i;(void)b;}
 static bool device_link_active(void *d){(void)d;return true;}
+static bool system_link_netns_move(struct device *d,int fd,const char *n){(void)d;(void)fd;(void)n;return true;}
+static void interface_jail_pending_clear(struct interface *i){(void)i;}
+static void netifd_exit_check(void){}
 static void netifd_ubus_interface_event(struct interface *i,bool b){(void)i;(void)b;}
 static void netifd_ubus_interface_notify(struct interface *i,bool b){(void)i;(void)b;}
 static void uloop_process_add(struct uloop_process *p){p->pending=true;}
@@ -108,7 +124,7 @@ int main(int argc,char **argv) {
  (work/'hotplug').write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$ACTION" "$IFUPDATE_TOPOLOGY" "$IFUPDATE_ADDRESSES" >> "$EVENT_LOG"\nexec sh "'+str(work/'hook')+'"\n')
  for f in ('firewall','fw4','logger','hotplug'):(work/f).chmod(0o755)
  for f in ('reloads','events'):(work/f).write_text('')
- subprocess.run(['cc','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-I'+str(root/'sources/openwrt/staging_dir/host/include'),str(work/'events.c'),'-o',str(work/'check')],check=True)
+ subprocess.run(['cc','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-I'+str(tree/'staging_dir/host/include'),str(work/'events.c'),'-o',str(work/'check')],check=True)
  env=dict(os.environ,PATH=str(work)+':'+os.environ['PATH'],RELOAD_LOG=str(work/'reloads'),EVENT_LOG=str(work/'events'))
  subprocess.run([str(work/'check'),str(work/'hotplug')],env=env,check=True)
  events=(work/'events').read_text().splitlines();reloads=len((work/'reloads').read_text().splitlines())
