@@ -31,6 +31,7 @@
 struct rtl_fe_bridge;
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe);
 static void fe_bridge_stop(struct rtl_fe_bridge *bridge);
+static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes);
 
 #define FE_INTERFACES 64
 #define FE_COUNTERS 32
@@ -1370,6 +1371,7 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
   FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned);
  mutex_unlock(&fe->lock);
+ length+=fe_bridge_stats(fe->bridge,buffer+length,PAGE_SIZE-length);
  return length;
 }
 

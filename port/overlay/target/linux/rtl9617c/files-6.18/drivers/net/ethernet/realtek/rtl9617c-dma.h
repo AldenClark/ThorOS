@@ -28,6 +28,11 @@ struct rtl_dma_tx {
 	struct net_device *owners[RTL_DMA_COUNT];
 	unsigned int port;
 	unsigned int vp;
+	u32 completion_checks;
+	u32 invalid_frames;
+	u32 queue_busy;
+	bool wake_pending;
+	unsigned int hardware_read;
 };
 
 /* HP=11, direct LAN, one linear frame, software checksums. */

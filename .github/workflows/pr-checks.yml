@@ -26,5 +26,10 @@ jobs:
           python3 scripts/test_lan_link_mode.py
           python3 scripts/test_fe_lan_lifecycle.py
           python3 scripts/test_itu_pppoe_datapath.py
+          python3 scripts/test_bridge_learning.py
+          python3 scripts/test_qm_cached_epp.py
+          python3 scripts/test_dma_tx_fastpath.py
+          python3 scripts/test_ni_adaptive_timer.py
+          python3 scripts/test_rx_checksum_policy.py
           python3 scripts/test_package_timeout.py
           python3 scripts/test_wired_only.py

@@ -122,7 +122,7 @@ int main(void) {
 }
 '''
 functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_frame',
-    'fe_bridge_wire','fe_bridge_capture','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
+    'fe_bridge_wire','fe_bridge_capture','fe_bridge_same','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
 with tempfile.TemporaryDirectory(prefix='fe-evto-') as temp:
     work = Path(temp)
     (work / 'test.c').write_text(common + structs + backend +

@@ -488,8 +488,10 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			rx->last_size = length_word;
 			offset = address - lower_32_bits(rx->memory_dma);
 			count++;
+			rx->voq_packets[cos]++;
 			if (offset < RTL_QM_RING_BYTES * RTL_QM_VOQS ||
-			    offset >= RTL_QM_MEMORY_BYTES ||
+			    offset > RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES ||
+			    (offset & (RTL_QM_BUFFER_BYTES - 1)) ||
 			    ((command & 0xf) != EQ_ID && (command & 0xf) != EQ_ID + 1)) {
 				dev->stats.rx_errors++;
 				goto consume;
@@ -513,8 +515,9 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				goto consume;
 			}
 			/* Warm only validated, CPU-owned bytes while allocating the skb. */
-			for (unsigned int i = 0; i < length; i += L1_CACHE_BYTES)
-				prefetch(rx->memory + offset + RTL_QM_HEADROOM + header + i);
+			if (READ_ONCE(rx->rx_prefetch))
+				for (unsigned int i = 0; i < length; i += L1_CACHE_BYTES)
+					prefetch(rx->memory + offset + RTL_QM_HEADROOM + header + i);
 			skb = napi_alloc_skb(napi, length);
 			if (!skb) {
 				dev->stats.rx_dropped++;
@@ -522,7 +525,9 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			}
 			memcpy(skb_put(skb, length), rx->memory + offset + RTL_QM_HEADROOM + header, length);
 			if (checksum_enabled &&
-			    get_unaligned_be16(skb->data + 12) == ETH_P_IP &&
+			    (get_unaligned_be16(skb->data + 12) == ETH_P_IP ||
+			     (READ_ONCE(rx->pppoe_rx_checksum) &&
+			      get_unaligned_be16(skb->data + 12) == ETH_P_PPP_SES)) &&
 			    rtl_rx_checksum_valid(command, skb->data, length))
 				skb->ip_summed = CHECKSUM_UNNECESSARY;
 			source = FIELD_GET(GENMASK(14, 9), h1);
@@ -575,11 +580,24 @@ consume:
 	}
 	/* Every EPP is retired before its BID can return to hardware. */
 	rtl_qm_refill_drain(&rx->refill, rx, rtl_qm_try_push, NAPI_POLL_WEIGHT);
+	if (budget && count >= budget)
+		rx->poll_budget_hits++;
 	if (begin) {
 		rx->host_poll_ns += ktime_get_ns() - begin;
 		rx->host_polls++;
 	}
 	return count;
+}
+
+ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
+{
+	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u\n",
+		READ_ONCE(rx->voq_packets[7]), READ_ONCE(rx->voq_packets[6]),
+		READ_ONCE(rx->voq_packets[5]), READ_ONCE(rx->voq_packets[4]),
+		READ_ONCE(rx->voq_packets[3]), READ_ONCE(rx->voq_packets[2]),
+		READ_ONCE(rx->voq_packets[1]), READ_ONCE(rx->voq_packets[0]),
+		READ_ONCE(rx->poll_budget_hits), READ_ONCE(rx->rx_prefetch),
+		READ_ONCE(rx->pppoe_rx_checksum));
 }
 
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)

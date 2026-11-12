@@ -7,7 +7,7 @@ parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--source', type=Path)
 args=parser.parse_args()
 source=(args.source or root/'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-qm.c').read_text()
-tree=ast.parse((root/'scripts/test_ni_rx_credit.py').read_text())
+tree=ast.parse((root/'scripts/fixtures/qm_cached_epp_model.py').read_text())
 common=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='common' for t in n.targets))
 common=common.replace('static bool seen[129];', 'static bool seen[129];static u8 hardware_ring[8192];static unsigned syncs;')
 common=common.replace('void *entry=active->ring_memory+(producer%128)*8;', 'void *entry=hardware_ring+(producer%128)*8;')
@@ -38,9 +38,12 @@ static void received(struct sk_buff*s){u8 expected[64];unsigned skip=kind==0?14:
 a=source.index('static void rtl_qm_rx_retire(');b=source.index('\nssize_t rtl_qm_rx_state(',a)
 cases=r"""
 int main(void){unsigned cases=0;
- for(unsigned start=0;start<128;start++)for(unsigned len=1;len<128;len+=7)for(unsigned budget=1;budget<=64;budget*=2){
+ const unsigned starts[]={0,1,7,63,64,127},lens[]={1,2,8,63,64,65,127},budgets[]={1,8,64};
+ for(unsigned a=0;a<6;a++)for(unsigned b=0;b<7;b++)for(unsigned c=0;c<3;c++){
+  unsigned start=starts[a],len=lens[b],budget=budgets[c];
   struct net_device owner={.running=true},input={.running=true};struct napi_struct napi={.dev=&owner};
-  struct rtl_qm_rx rx={.memory_dma=0x4000000,.ring_dma=0x6000000,.device=&owner};rx.lan[0]=&input;
+  struct rtl_qm_rx rx={.memory_dma=0x4000000,.ring_dma=0x6000000,.device=&owner};
+  rx.lan[0]=&input;rx.rx_prefetch=(cases&1)==0;
   rx.memory=calloc(1,RTL_QM_MEMORY_BYTES);rx.ring_memory=malloc(8192);memset(rx.ring_memory,0xcc,8192);rx.ni=calloc(1,65536);active=&rx;
   producer=consumer=start;rx.read[0]=start*8;delivered=drops=syncs=kind=0;memset(seen,0,sizeof(seen));
   for(unsigned i=0;i<len;i++)enqueue(i);
@@ -48,6 +51,7 @@ int main(void){unsigned cases=0;
   assert(delivered==len&&rx.refill.returned==len&&!drops&&syncs);
   /* Hardware writes the next entry in a line already present in CPU cache. */
   enqueue(128);assert(rtl_qm_rx_poll(&rx,&napi,budget)==1&&seen[128]);
+  assert(rx.voq_packets[0]==len+1);
   free(rx.memory);free(rx.ring_memory);free(rx.ni);cases++;
  }
  printf("Actual cached EPP poll: %u start/length/budget/wrap cases; poisoned cache, DMA publication, partial-line extension and payloads passed\n",cases);

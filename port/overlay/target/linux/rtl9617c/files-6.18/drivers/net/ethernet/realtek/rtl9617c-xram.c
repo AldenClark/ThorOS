@@ -87,6 +87,8 @@ struct rtl_xram {
 	bool native_groups_created;
 	struct napi_struct napi;
 	struct hrtimer timer;
+	u32 idle_poll_ms;
+	u64 timer_fast_ticks, timer_idle_ticks;
 	spinlock_t tx_lock;
 	spinlock_t rx_lock;
 	struct mutex mib_lock;
@@ -391,35 +393,51 @@ static int rtl_poll(struct napi_struct *napi, int budget)
 static enum hrtimer_restart rtl_timer(struct hrtimer *timer)
 {
 	struct rtl_xram *priv = container_of(timer, struct rtl_xram, timer);
+	unsigned int interval = READ_ONCE(priv->idle_poll_ms);
 
-	if (!priv->qm_rx || READ_ONCE(priv->qm.refill.pending))
+	if (!priv->qm_rx || READ_ONCE(priv->qm.refill.pending)) {
 		napi_schedule(&priv->napi);
+		interval = 1;
+	}
 	spin_lock(&priv->tx_lock);
 	if (priv->dma_tx) {
 		struct rtl9617c_ni_endpoint *endpoint;
+		bool wake;
 
 		rtl_dma_tx_complete(&priv->dma, priv->netdev);
-		rcu_read_lock();
-		endpoint = rcu_dereference(priv->qm.pon);
-		if (endpoint && rtl_dma_tx_available(&priv->dma))
-			endpoint->wake(endpoint);
-		rcu_read_unlock();
-		if (rtl_dma_tx_available(&priv->dma)) {
+		wake = priv->dma.wake_pending && rtl_dma_tx_available(&priv->dma);
+		if (wake) {
 			unsigned int port;
 
+			priv->dma.wake_pending = false;
+			rcu_read_lock();
+			endpoint = rcu_dereference(priv->qm.pon);
+			if (endpoint)
+				endpoint->wake(endpoint);
+			rcu_read_unlock();
 			for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
 				if (priv->ports[port] && netif_running(priv->ports[port]) &&
 				    netif_queue_stopped(priv->ports[port]))
 					netif_wake_queue(priv->ports[port]);
 		}
+		/* Software read intentionally trails two prefetched descriptors. Use
+		 * the hardware cursor to detect activity, not tx->read != tx->write. */
+		if (priv->dma.hardware_read != priv->dma.write || priv->dma.wake_pending)
+			interval = 1;
 	} else if (priv->tx_pending && rtl_pointer(priv, TX_READ) == rtl_pointer(priv, TX_WRITE)) {
 		priv->tx_pending = false;
 		priv->netdev->stats.tx_packets++;
 		priv->netdev->stats.tx_bytes += priv->tx_length;
 		netif_wake_queue(priv->netdev);
 	}
+	if (priv->tx_pending)
+		interval = 1;
 	spin_unlock(&priv->tx_lock);
-	hrtimer_forward_now(timer, ms_to_ktime(1));
+	if (interval == 1)
+		priv->timer_fast_ticks++;
+	else
+		priv->timer_idle_ticks++;
+	hrtimer_forward_now(timer, ms_to_ktime(interval));
 	return HRTIMER_RESTART;
 }
 
@@ -965,6 +983,31 @@ static ssize_t datapath_profile_store(struct device *dev, struct device_attribut
 }
 static DEVICE_ATTR_RW(datapath_profile);
 
+static ssize_t idle_poll_ms_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return sysfs_emit(buf, "interval_ms=%u fast_ticks=%llu idle_ticks=%llu\n",
+		READ_ONCE(priv->idle_poll_ms), READ_ONCE(priv->timer_fast_ticks),
+		READ_ONCE(priv->timer_idle_ticks));
+}
+
+static ssize_t idle_poll_ms_store(struct device *dev, struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	unsigned int value;
+	int ret = kstrtouint(buf, 0, &value);
+
+	if (ret)
+		return ret;
+	if (value < 1 || value > 10)
+		return -EINVAL;
+	WRITE_ONCE(priv->idle_poll_ms, value);
+	return count;
+}
+static DEVICE_ATTR_RW(idle_poll_ms);
+
 static ssize_t pipeline_state_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
@@ -985,6 +1028,58 @@ static ssize_t qm_state_show(struct device *dev, struct device_attribute *attr, 
 	return priv->qm_rx ? rtl_qm_rx_state(&priv->qm, buf) : sysfs_emit(buf, "XRAM RX\n");
 }
 static DEVICE_ATTR_RO(qm_state);
+
+static ssize_t qm_voqs_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_qm_rx_voq_state(&priv->qm, buf);
+}
+static DEVICE_ATTR_RO(qm_voqs);
+
+static ssize_t rx_prefetch_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(priv->qm.rx_prefetch));
+}
+
+static ssize_t rx_prefetch_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	bool enabled;
+	int ret = kstrtobool(buf, &enabled);
+
+	if (ret)
+		return ret;
+	WRITE_ONCE(priv->qm.rx_prefetch, enabled);
+	return count;
+}
+static DEVICE_ATTR_RW(rx_prefetch);
+
+static ssize_t pppoe_rx_checksum_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(priv->qm.pppoe_rx_checksum));
+}
+
+static ssize_t pppoe_rx_checksum_store(struct device *dev, struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	bool enabled;
+	int ret = kstrtobool(buf, &enabled);
+
+	if (ret)
+		return ret;
+	/* Keep disabled unless good/bad real hardware captures prove that the
+	 * checksum error flag applies to PPPoE-encapsulated IPv4 as well. */
+	WRITE_ONCE(priv->qm.pppoe_rx_checksum, enabled);
+	return count;
+}
+static DEVICE_ATTR_RW(pppoe_rx_checksum);
 
 static ssize_t qm_trace_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -1106,8 +1201,12 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_xram_state.attr,
 	&dev_attr_dma_state.attr,
 	&dev_attr_datapath_profile.attr,
+	&dev_attr_idle_poll_ms.attr,
 	&dev_attr_pipeline_state.attr,
 	&dev_attr_qm_state.attr,
+	&dev_attr_qm_voqs.attr,
+	&dev_attr_rx_prefetch.attr,
+	&dev_attr_pppoe_rx_checksum.attr,
 	&dev_attr_qm_trace.attr,
 	&dev_attr_qm_pool.attr,
 	&dev_attr_pon_deepq.attr,
@@ -1122,7 +1221,9 @@ static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, 
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(kobj_to_dev(kobj)));
 
 	if (!priv->qm_rx &&
-	    (attr == &dev_attr_qm_pool.attr || attr == &dev_attr_pon_deepq.attr || attr == &dev_attr_qm_trace.attr ||
+	    (attr == &dev_attr_qm_pool.attr || attr == &dev_attr_qm_voqs.attr ||
+	     attr == &dev_attr_rx_prefetch.attr || attr == &dev_attr_pppoe_rx_checksum.attr ||
+	     attr == &dev_attr_pon_deepq.attr || attr == &dev_attr_qm_trace.attr ||
 	     attr == &dev_attr_qm_wait.attr || attr == &dev_attr_qm_es.attr ||
 	     attr == &dev_attr_qm_buffer.attr))
 		return 0;
@@ -1155,6 +1256,7 @@ static int rtl_probe(struct platform_device *pdev)
 	priv = netdev_priv(netdev);
 	priv->lan.shared = priv;
 	priv->netdev = netdev;
+	priv->idle_poll_ms = 4;
 	priv->ni = devm_platform_ioremap_resource(pdev, 0);
 	priv->xram = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(priv->ni) || IS_ERR(priv->xram)) {
@@ -1202,6 +1304,7 @@ static int rtl_probe(struct platform_device *pdev)
 	}
 	priv->qm_rx = of_property_read_bool(dev->of_node, "realtek,qm-rx");
 	if (priv->qm_rx) {
+		priv->qm.rx_prefetch = true;
 		priv->qm.ni = priv->ni;
 		priv->qm.axi_reorder = devm_platform_ioremap_resource(pdev, 3);
 		if (IS_ERR(priv->qm.axi_reorder)) {

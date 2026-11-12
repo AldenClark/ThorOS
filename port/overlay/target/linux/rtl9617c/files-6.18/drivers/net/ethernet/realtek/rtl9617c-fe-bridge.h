@@ -30,11 +30,29 @@ struct rtl_fe_bridge {
  struct nf_hook_ops hooks[2];
  spinlock_t pending_lock;
  unsigned int read, write;
- atomic_t epoch, flush;
+ atomic_t epoch, flush, recheck;
+ unsigned long next_maintenance;
+ bool active;
+ u32 queued, coalesced, overflow, work_runs, maintenance_runs;
  struct list_head wire_ports;
  bool stopping;
  struct fe_bridge_packet pending[FE_BRIDGE_PENDING];
 };
+
+static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes)
+{
+ u32 queued,coalesced,overflow;
+ unsigned int pending;
+
+ spin_lock_bh(&bridge->pending_lock);
+ queued=bridge->queued;coalesced=bridge->coalesced;overflow=bridge->overflow;
+ pending=(bridge->write+FE_BRIDGE_PENDING-bridge->read)%FE_BRIDGE_PENDING;
+ spin_unlock_bh(&bridge->pending_lock);
+ return scnprintf(buffer,bytes,
+  "bridge_pending=%u bridge_queued=%u bridge_coalesced=%u bridge_overflow=%u bridge_work=%u bridge_maintenance=%u\n",
+  pending,queued,coalesced,overflow,READ_ONCE(bridge->work_runs),
+  READ_ONCE(bridge->maintenance_runs));
+}
 
 /* There is one NI/FE complex on RTL9617C. Namespace hooks share that owner. */
 static struct rtl_fe_bridge *fe_bridge_owner;
@@ -162,6 +180,17 @@ static unsigned int fe_bridge_capture(void *private,struct sk_buff *skb,
  return NF_ACCEPT;
 }
 
+/* Only deduplicate entries still waiting in the queue. A new bridge epoch,
+ * VLAN action, GEM or PPPoE session must produce a separate observation. */
+static bool fe_bridge_same(const struct fe_bridge_packet *a,
+                           const struct fe_bridge_packet *b)
+{
+ return a->net==b->net && a->bridge==b->bridge &&
+  a->ingress==b->ingress && a->egress==b->egress && a->vid==b->vid &&
+  !memcmp(&a->input,&b->input,sizeof(a->input)) &&
+  !memcmp(&a->output,&b->output,sizeof(a->output));
+}
+
 static unsigned int fe_bridge_forwarded(void *private,struct sk_buff *skb,
                                        const struct nf_hook_state *state)
 {
@@ -170,6 +199,7 @@ static unsigned int fe_bridge_forwarded(void *private,struct sk_buff *skb,
  struct fe_bridge_packet packet={.net=state->net};
  struct net_device *brdev,*physical;
  unsigned int next;
+ bool schedule=false;
 
  if(!saved || !saved->port || !state->out || saved->epoch!=(u32)atomic_read(&bridge->epoch) ||
     fe_bridge_frame(skb,&packet.output))return NF_ACCEPT;
@@ -189,12 +219,22 @@ static unsigned int fe_bridge_forwarded(void *private,struct sk_buff *skb,
  spin_lock_bh(&bridge->pending_lock);
  next=(bridge->write+1)%FE_BRIDGE_PENDING;
  if(next!=bridge->read) {
-  get_net(packet.net);
-  bridge->pending[bridge->write]=packet;
-  bridge->write=next;
- }
+  unsigned int last=(bridge->write+FE_BRIDGE_PENDING-1)%FE_BRIDGE_PENDING;
+
+  if(bridge->read!=bridge->write && fe_bridge_same(&bridge->pending[last],&packet))
+   bridge->coalesced++;
+  else {
+   schedule=bridge->read==bridge->write;
+   get_net(packet.net);
+   bridge->pending[bridge->write]=packet;
+   bridge->write=next;
+   bridge->queued++;
+  }
+ } else bridge->overflow++;
  spin_unlock_bh(&bridge->pending_lock);
- mod_delayed_work(system_wq,&bridge->work,0);
+ /* An empty-to-nonempty transition also preempts the periodic ageing timer.
+  * Scheduling once per packet makes this workqueue run at line rate. */
+ if(schedule)mod_delayed_work(system_wq,&bridge->work,0);
  return NF_ACCEPT;
 }
 
@@ -307,12 +347,20 @@ static void fe_bridge_work(struct work_struct *work)
  struct rtl_fe_flow *flow,*next;
  struct rtl_dq_io io=fe_io(fe);
  bool flush=atomic_xchg(&bridge->flush,0);
- bool active=false;
+ bool recheck=atomic_xchg(&bridge->recheck,0);
+ bool pending;
+ bool active=READ_ONCE(bridge->active);
+ bool maintenance=flush || recheck || time_after_eq(jiffies,bridge->next_maintenance);
  unsigned int budget=FE_BRIDGE_PENDING;
 
+ bridge->work_runs++;
  rtnl_lock();
  mutex_lock(&fe->lock);
- list_for_each_entry_safe(flow,next,&fe->flows,list) {
+ if(maintenance) {
+  bridge->maintenance_runs++;
+  bridge->next_maintenance=jiffies+HZ;
+  active=false;
+  list_for_each_entry_safe(flow,next,&fe->flows,list) {
   struct net *net;
   unsigned int age;
   unsigned long lifetime;
@@ -326,13 +374,19 @@ static void fe_bridge_work(struct work_struct *work)
    fe_delete(fe,flow);continue;
   }
   lifetime=clock_t_to_jiffies(br_get_ageing_time(__dev_get_by_index(net,flow->bridge_index)));
+  /* A transient hardware age-read failure must not stop future maintenance
+   * of an otherwise live rule. */
+  if(flow->published)active=true;
   if(rtl_fe_main_age_read(&io,flow->hash_index,&age))continue;
   if(age>1) {
    rtl_fe_main_age(&io,flow->hash_index,1);
    flow->lastused=jiffies;
    br_fdb_refresh_offload(__dev_get_by_index(net,flow->bridge_ingress),flow->ethernet_source,flow->bridge_vid,true);
    br_fdb_refresh_offload(__dev_get_by_index(net,flow->bridge_egress),flow->destination,flow->bridge_vid,false);
-  } else if(lifetime && time_after(jiffies,flow->lastused+lifetime))fe_delete(fe,flow);
+  } else if(lifetime && time_after(jiffies,flow->lastused+lifetime)) {
+   fe_delete(fe,flow);continue;
+  }
+  }
  }
  while(budget--) {
   struct fe_bridge_packet packet;
@@ -342,14 +396,21 @@ static void fe_bridge_work(struct work_struct *work)
   }
   packet=bridge->pending[bridge->read];bridge->read=(bridge->read+1)%FE_BRIDGE_PENDING;
   spin_unlock_bh(&bridge->pending_lock);
-  fe_bridge_learn(bridge,&packet);
+  if(!fe_bridge_learn(bridge,&packet))active=true;
   put_net(packet.net);
  }
- list_for_each_entry(flow,&fe->flows,list)
-  if(flow->learned && flow->published){active=true;break;}
+ WRITE_ONCE(bridge->active,active);
  mutex_unlock(&fe->lock);
  rtnl_unlock();
- if(active && !READ_ONCE(bridge->stopping))queue_delayed_work(system_wq,&bridge->work,HZ);
+ spin_lock_bh(&bridge->pending_lock);
+ pending=bridge->read!=bridge->write;
+ spin_unlock_bh(&bridge->pending_lock);
+ if(!READ_ONCE(bridge->stopping)) {
+  /* New packets can arrive faster than one work invocation can learn them.
+   * Leaving a non-empty queue asleep would strand packets indefinitely. */
+  if(pending)mod_delayed_work(system_wq,&bridge->work,0);
+  else if(active)queue_delayed_work(system_wq,&bridge->work,HZ);
+ }
 }
 
 static int fe_bridge_netdev_event(struct notifier_block *notifier,unsigned long event,void *ptr)
@@ -377,6 +438,7 @@ static int fe_bridge_switch_event(struct notifier_block *notifier,unsigned long 
   atomic_inc(&bridge->epoch);
   if(event!=SWITCHDEV_FDB_ADD_TO_DEVICE && event!=SWITCHDEV_FDB_DEL_TO_DEVICE)
    atomic_set(&bridge->flush,1);
+  else atomic_set(&bridge->recheck,1);
   mod_delayed_work(system_wq,&bridge->work,0);
  }
  return NOTIFY_DONE;
@@ -398,6 +460,7 @@ static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe)
 
  if(!bridge)return ERR_PTR(-ENOMEM);
  bridge->fe=fe;
+ bridge->next_maintenance=jiffies;
  INIT_LIST_HEAD(&bridge->wire_ports);
  spin_lock_init(&bridge->pending_lock);
  INIT_DELAYED_WORK(&bridge->work,fe_bridge_work);

@@ -76,6 +76,11 @@ int rtl_dma_tx_start(struct rtl_dma_tx *tx)
 	memset(tx->owners, 0, sizeof(tx->owners));
 	tx->read = 0;
 	tx->write = 0;
+	tx->completion_checks = 0;
+	tx->invalid_frames = 0;
+	tx->queue_busy = 0;
+	tx->wake_pending = false;
+	tx->hardware_read = 0;
 	writel(lower_32_bits(tx->memory_dma) | RTL_DMA_DEPTH, vp + VP_BASE_LOW);
 	writel(2, vp + VP_BASE_HIGH);
 	writel(BIT(31) | BIT(30), vp + VP_BASE_ACCESS);
@@ -126,6 +131,8 @@ void rtl_dma_tx_complete(struct rtl_dma_tx *tx, struct net_device *dev)
 {
 	unsigned int hardware_read = readl(rtl_dma_vp(tx) + VP_READ) & (RTL_DMA_COUNT - 1);
 
+	tx->completion_checks++;
+	tx->hardware_read = hardware_read;
 	/* Taurus prefetches descriptors; the stock completion path retains two. */
 	while (((hardware_read - tx->read) & (RTL_DMA_COUNT - 1)) > 2) {
 		struct net_device *owner = tx->owners[tx->read];
@@ -137,7 +144,7 @@ void rtl_dma_tx_complete(struct rtl_dma_tx *tx, struct net_device *dev)
 		tx->owners[tx->read] = NULL;
 		tx->read = (tx->read + 1) & (RTL_DMA_COUNT - 1);
 	}
-	if (netif_queue_stopped(dev) && rtl_dma_tx_available(tx))
+	if (tx->wake_pending && rtl_dma_tx_available(tx) && netif_queue_stopped(dev))
 		netif_wake_queue(dev);
 }
 
@@ -158,26 +165,50 @@ netdev_tx_t rtl_dma_tx_frame(struct rtl_dma_tx *tx, struct sk_buff *skb,
 	unsigned int offset = RTL_DMA_COUNT * sizeof(*tx->descriptors) +
 			      tx->write * RTL_DMA_BUFFER_SIZE;
 	unsigned int prefix = frame ? frame->prefix_length : 0;
-	unsigned int length = (frame && frame->raw_payload ? skb->len : max(skb->len, 60U)) + prefix;
+	unsigned int payload = frame && frame->raw_payload ? skb->len : max(skb->len, 60U);
+	unsigned int length;
 	u32 high = frame ? frame->header_high : BIT(13);
 	u32 low = frame ? frame->header_low : (16 << 9) | (tx->port << 3) | BIT(29);
+	void *buffer = tx->memory + offset;
 
-	rtl_dma_tx_complete(tx, dev);
+	/* DMA descriptors have a fixed 2 KiB slot, including the 16-byte header.
+	 * Validate before touching any slot or consuming the skb. */
+	if (prefix > RTL_DMA_BUFFER_SIZE - 16 ||
+	    payload > RTL_DMA_BUFFER_SIZE - 16 - prefix ||
+	    (prefix && (!frame || !frame->prefix))) {
+		tx->invalid_frames++;
+		dev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+	length = payload + prefix;
+	/* The hrtimer retires normal bursts; only read MMIO in the TX hot path
+	 * when the ring might actually need reclaimed descriptors. */
+	if (!rtl_dma_tx_available(tx))
+		rtl_dma_tx_complete(tx, dev);
 	if (!rtl_dma_tx_available(tx)) {
+		tx->queue_busy++;
+		tx->wake_pending = true;
 		netif_stop_queue(dev);
 		return NETDEV_TX_BUSY;
 	}
 	/* Native LSO parameters + Header A, with both checksum engines disabled. */
-	memset(tx->memory + offset, 0, length + 16);
-	put_unaligned_le32(0, tx->memory + offset);
-	put_unaligned_le32(length, tx->memory + offset + 4);
-	put_unaligned_le32(high, tx->memory + offset + 8);
+	put_unaligned_le32(0, buffer);
+	put_unaligned_le32(length, buffer + 4);
+	put_unaligned_le32(high, buffer + 8);
 	if (!(low & GENMASK(28, 15)))
 		low |= length << 15;
-	put_unaligned_le32(low, tx->memory + offset + 12);
+	put_unaligned_le32(low, buffer + 12);
 	if (prefix)
-		memcpy(tx->memory + offset + 16, frame->prefix, prefix);
-	skb_copy_bits(skb, 0, tx->memory + offset + 16 + prefix, skb->len);
+		memcpy(buffer + 16, frame->prefix, prefix);
+	if (unlikely(skb_copy_bits(skb, 0, buffer + 16 + prefix, skb->len))) {
+		tx->invalid_frames++;
+		dev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+	if (payload > skb->len)
+		memset(buffer + 16 + prefix + skb->len, 0, payload - skb->len);
 	tx->descriptors[tx->write].address = cpu_to_le32(tx->memory_dma + offset);
 	tx->descriptors[tx->write].control = cpu_to_le32(0x61000002U | ((length + 16) << 8));
 	tx->lengths[tx->write] = skb->len;
@@ -194,9 +225,10 @@ ssize_t rtl_dma_tx_state(struct rtl_dma_tx *tx, char *buf)
 	void __iomem *base = tx->registers;
 	void __iomem *vp = rtl_dma_vp(tx);
 
-	return sysfs_emit(buf, "vp=%u port=%u desc=%pad sw=%u/%u hw=%u/%u ctrl=%08x vpctl=%08x ss=%08x misc=%08x base_hi=%08x axistat=%08x\n",
+	return sysfs_emit(buf, "vp=%u port=%u desc=%pad sw=%u/%u hw=%u/%u ctrl=%08x vpctl=%08x ss=%08x misc=%08x base_hi=%08x axistat=%08x completion_checks=%u invalid=%u busy=%u\n",
 		tx->vp, tx->port, &tx->memory_dma, tx->read, tx->write,
 		readl(vp + VP_READ), readl(vp + VP_WRITE), readl(base + CTRL),
 		readl(vp + VP_ENABLE), readl(base + SS_CTRL), readl(vp + VP_MISC_IRQ),
-		readl(vp + VP_BASE_HIGH), readl(base + 0xd88));
+		readl(vp + VP_BASE_HIGH), readl(base + 0xd88), tx->completion_checks,
+		tx->invalid_frames, tx->queue_busy);
 }

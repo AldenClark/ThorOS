@@ -39,6 +39,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef int netdev_
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
 #define READ_ONCE(x) (x)
+#define unlikely(x) (x)
 #define ETH_HLEN 14
 #define ETH_ALEN 6
 #define VLAN_HLEN 4
@@ -117,7 +118,7 @@ static void napi_gro_receive(struct napi_struct*n,struct sk_buff*s){(void)n;deli
 #define RTL_DMA_COUNT 64
 #define RTL_DMA_BUFFER_SIZE 2048
 struct rtl_dma_descriptor {u32 address,control;};
-struct rtl_dma_tx {void *memory,*registers;u32 memory_dma;struct rtl_dma_descriptor *descriptors;unsigned read,write,vp,port,lengths[64];struct net_device*owners[64];};
+struct rtl_dma_tx {void *memory,*registers;u32 memory_dma;struct rtl_dma_descriptor *descriptors;unsigned read,write,vp,port,lengths[64];struct net_device*owners[64];u32 completion_checks,invalid_frames,queue_busy;bool wake_pending;unsigned hardware_read;};
 static struct rtl_dma_tx dma;
 static void rtl_dma_tx_complete(struct rtl_dma_tx*t,struct net_device*d){(void)t;(void)d;}
 '''

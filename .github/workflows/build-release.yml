@@ -37,12 +37,20 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
       - name: Verify LAN initialization and port counters
         run: |
+          mkdir -p artifacts
           python3 scripts/test_runtime_trim.py
           python3 scripts/test_lan_probe_isolation.py
           python3 scripts/test_lan_async.py
           python3 scripts/test_qspi_poll.py
           python3 scripts/test_lan_pm_mapping.py
           python3 scripts/test_lan_link_mode.py
+          python3 scripts/test_fe_lan_lifecycle.py
+          python3 scripts/test_itu_pppoe_datapath.py
+          python3 scripts/test_bridge_learning.py
+          python3 scripts/test_qm_cached_epp.py
+          python3 scripts/test_dma_tx_fastpath.py
+          python3 scripts/test_ni_adaptive_timer.py
+          python3 scripts/test_rx_checksum_policy.py
       - name: Verify storage migration
         run: |
           python3 scripts/test_ubi_storage.py
