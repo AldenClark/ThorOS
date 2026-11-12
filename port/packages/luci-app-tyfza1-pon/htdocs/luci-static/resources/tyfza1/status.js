@@ -78,25 +78,17 @@ function ponCard(data) {
 		E('div', { class: 'tyf-link-facts' }, rows([
 			['运行协议', modes[serdes.mode] || value(serdes.mode)],
 			['接收光信号', los],
-			['发射告警', optical.tx_fault == null ? '未提供' : flag(optical.tx_fault) ? '发射故障' : '无发射故障']
+			['发射告警', optical.tx_fault == null ? '未提供' : flag(optical.tx_fault) ? '发射故障' : '无发射故障'],
+			['光口发射', optical.tx_disabled == null ? '未提供' : flag(optical.tx_disabled) ? '已关闭' : '已允许']
 		]))
 	]);
 }
 
-function offloadCard(data) {
-	var fe = data.fe || {}, available = flag(fe.available), enabled = flag(fe.enabled);
-	var error = fe.error != null && +fe.error !== 0;
-	return card('硬件转发', badge(error ? '运行异常' : fe.available == null ? '状态未知' : !available ? '不可用' : fe.enabled == null ? '状态未知' : enabled ? '已启用' : '未启用',
-		error ? 'danger' : available && enabled ? 'good' : 'muted'), E('div', {}, [
-		rows([['当前硬件流', value(fe.flows)], ['累计安装 / 释放', value(fe.installs) + ' / ' + value(fe.deletes)]]),
-		error ? E('p', { class: 'tyf-note' }, '错误码：' + fe.error) : null
-	]));
-}
-
 return baseclass.extend({
 	modes: modes, value: value, badge: badge, rows: rows, card: card,
-	omciLive: omciLive, ponState: ponState, ponCard: ponCard, offloadCard: offloadCard,
+	omciLive: omciLive, ponState: ponState, ponCard: ponCard,
 	// Track the CSS content independently of LuCI's version across sysupgrades.
-	style: function() { return E('link', { rel: 'stylesheet', href: L.resource('tyfza1/status.css') + '?v=9f264a673f8f' }); },
-	callStatus: callStatus
+	style: function() { return E('link', { rel: 'stylesheet', href: L.resource('tyfza1/status.css') + '?v=72f4eb21b2c8' }); },
+	callStatus: callStatus,
+	callDiagnostics: rpc.declare({ object: 'luci.tyfza1-pon', method: 'diagnostics', expect: { '': {} }, reject: true })
 });
