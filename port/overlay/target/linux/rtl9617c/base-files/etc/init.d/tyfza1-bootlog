@@ -1,9 +1,0 @@
-#!/bin/sh /etc/rc.common
-# SPDX-License-Identifier: GPL-2.0-only
-START=01
-
-boot() {
-	umask 077
-	mkdir -p /tmp/log
-	dmesg > /tmp/log/tyfza1-boot.log
-}

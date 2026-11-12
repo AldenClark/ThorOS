@@ -48,5 +48,8 @@ start() {
 	if [ -d "$device" ]; then
 		cat "$runtime/lan_mac" > "$device/data_mac" || return $?
 	fi
+	# Successful imports are already in the kernel log. Keep the temporary
+	# transcript only when factory import or device initialization fails.
+	[ "$result" != 0 ] || rm -f /tmp/log/tyfza1-factory.log
 	return "$result"
 }

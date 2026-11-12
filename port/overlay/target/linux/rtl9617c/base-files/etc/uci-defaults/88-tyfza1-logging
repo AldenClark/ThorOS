@@ -1,11 +1,27 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 
-[ -n "$(uci -q get 'system.@system[0].log_file')" ] && exit 0
+# A file-backed logread -f is a second permanent process and consumes tmpfs.
+# Leave user-defined logging intact, but migrate the exact old TYFZA1 defaults
+# on sysupgrade as well as choosing a lean default for fresh installations.
+old_file=$(uci -q get 'system.@system[0].log_file')
+old_buffer=$(uci -q get 'system.@system[0].log_buffer_size')
+old_size=$(uci -q get 'system.@system[0].log_size')
+changed=0
 
-uci batch <<'EOF'
-set system.@system[0].log_buffer_size='256'
-set system.@system[0].log_file='/tmp/log/tyfza1.log'
-set system.@system[0].log_size='2048'
-commit system
-EOF
+if [ -z "$old_buffer" ] || {
+	[ "$old_file" = '/tmp/log/tyfza1.log' ] && [ "$old_buffer" = 256 ];
+}; then
+	uci set 'system.@system[0].log_buffer_size=128' || exit $?
+	changed=1
+fi
+
+if [ "$old_file" = '/tmp/log/tyfza1.log' ]; then
+	uci delete 'system.@system[0].log_file' || exit $?
+	changed=1
+	if [ "$old_size" = 2048 ]; then
+		uci delete 'system.@system[0].log_size' || exit $?
+	fi
+fi
+
+[ "$changed" = 0 ] || uci commit system
