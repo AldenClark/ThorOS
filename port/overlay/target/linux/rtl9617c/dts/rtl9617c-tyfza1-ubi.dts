@@ -4,6 +4,11 @@
 
 / { model = "Tianyi TYFZA1 (RTL9617C UBI)"; };
 
+// The production image has no WLAN driver. Disable both radio-facing PCIe
+// root ports while retaining pcie_controls, required by SGMII 2.5G and USB PHY.
+&pcie0 { status = "disabled"; };
+&pcie1 { status = "disabled"; };
+
 &qspi {
 	flash@0 {
 		/delete-property/ read-only;

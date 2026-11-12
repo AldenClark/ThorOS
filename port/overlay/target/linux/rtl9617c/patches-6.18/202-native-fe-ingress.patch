@@ -1,0 +1,11 @@
+--- a/drivers/net/ethernet/realtek/Kconfig
++++ b/drivers/net/ethernet/realtek/Kconfig
+@@ -16,6 +16,8 @@ config RTL9617C_XRAM_ETH
+ 	tristate "RTL9617C management XRAM Ethernet"
+ 	depends on OF && ARCH_RTL9617C && PHYLIB
+ 	select CRC32
++	select NETFILTER
++	select NETFILTER_INGRESS
+ 	select NET_CLS_ACT
+ 	help
+ 	  Single-port management Ethernet through the Taurus XRAM packet path.

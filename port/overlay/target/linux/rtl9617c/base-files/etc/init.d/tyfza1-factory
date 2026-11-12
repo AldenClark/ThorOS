@@ -1,6 +1,6 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: GPL-2.0-only
-# Populate per-unit firmware before boot's kmodloader probes the radios.
+# Import factory LAN/PON identity and optical calibration during early boot.
 START=09
 
 start() {

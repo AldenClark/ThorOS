@@ -13,12 +13,10 @@
 #include <linux/io.h>
 #include <linux/if_vlan.h>
 #include <linux/iopoll.h>
-#include <linux/ktime.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 
 #include "rtl9617c-dma.h"
-#include "rtl9617c-wifi-format.h"
 
 #define CTRL 0x000
 #define CTRL_ENABLE BIT(0)
@@ -189,43 +187,6 @@ netdev_tx_t rtl_dma_tx_frame(struct rtl_dma_tx *tx, struct sk_buff *skb,
 	writel(next, rtl_dma_vp(tx) + VP_WRITE);
 	dev_consume_skb_any(skb);
 	return NETDEV_TX_OK;
-}
-
-/* On success NI owns a copy and consumes skb; errors leave skb with the
- * caller. This is RX reinjection, so it must not stop the radio's TX queue. */
-int rtl_dma_tx_wifi(struct rtl_dma_tx *tx, struct net_device *dev,
-		    struct sk_buff *skb, unsigned int id)
-{
-	unsigned int offset, length = max(skb->len, 60U);
-	u64 begin = READ_ONCE(tx->profile) ? ktime_get_ns() : 0;
-
-	if (!id || id > RTL_WIFI_ID_MAX || skb->len < ETH_HLEN ||
-	    length > RTL_DMA_BUFFER_SIZE)
-		return -EINVAL;
-	if (skb_is_gso(skb) || skb_vlan_tag_present(skb) ||
-	    skb->ip_summed == CHECKSUM_PARTIAL)
-		return -EOPNOTSUPP;
-	rtl_dma_tx_complete(tx, dev);
-	if (!rtl_dma_tx_available(tx))
-		return -EBUSY;
-	offset = RTL_DMA_COUNT * sizeof(*tx->descriptors) +
-		 tx->write * RTL_DMA_BUFFER_SIZE;
-	if (skb_copy_bits(skb, 0, tx->memory + offset, skb->len))
-		return -EFAULT;
-	memset(tx->memory + offset + skb->len, 0, length - skb->len);
-	tx->descriptors[tx->write].address = cpu_to_le32(tx->memory_dma + offset);
-	tx->descriptors[tx->write].control = cpu_to_le32(rtl_wifi_lookup_control(id, length));
-	/* Unlike ordinary TX there is no LSO prefix or software Header A. */
-	tx->owners[tx->write] = NULL;
-	dma_wmb();
-	tx->write = (tx->write + 1) & (RTL_DMA_COUNT - 1);
-	writel(tx->write, rtl_dma_vp(tx) + VP_WRITE);
-	tx->wifi_packets++;
-	tx->wifi_copy_bytes += skb->len;
-	if (begin)
-		tx->wifi_prepare_ns += ktime_get_ns() - begin;
-	dev_consume_skb_any(skb);
-	return 0;
 }
 
 ssize_t rtl_dma_tx_state(struct rtl_dma_tx *tx, char *buf)

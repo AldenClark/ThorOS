@@ -19,17 +19,9 @@ if [ -z "${TYFZA1_RUNTIME_INPUTS:-}" ]; then
         --stock "${TYFZA1_STOCK_INPUTS:-$PROJECT/analysis/private/live-files}" \
         --check-inputs-only
 fi
-PE_RADIO_CFLAGS=-DPE_UPLINK sh "$PROJECT/scripts/build_pe_radio_wd.sh" "$PROJECT/artifacts/pe-radio-production"
-cp "$PROJECT/artifacts/pe-radio-production/pe-tx-code.h" \
-    "$PORT/overlay/target/linux/rtl9617c/files-6.18/drivers/net/wireless/realtek/rtl_ax_ap/pe-tx-code.h"
 sh "$PORT/scripts/sync-overlay.sh" "$TREE"
 sh "$PROJECT/scripts/prepare_luci_feeds.sh" "$TREE"
 cd "$TREE"
-REGDB_PATCHED=0
-if ! grep -Fq 'regulatory.db.p7s' package/firmware/wireless-regdb/Makefile; then
-    patch -p1 --fuzz=0 < "$PORT/host-patches/110-wireless-regdb-signed.patch"
-    REGDB_PATCHED=1
-fi
 make defconfig
 for package in luci-app-tyfza1-pon luci-theme-argon luci-i18n-argon-config-zh-cn; do
     grep -qx "CONFIG_PACKAGE_$package=y" .config || {
@@ -47,8 +39,10 @@ while IFS= read -r setting; do
             ;;
     esac
 done < "$PORT/configs/tyfza1-compat.config"
-if [ "$REGDB_PATCHED" = 1 ]; then
-    make package/firmware/wireless-regdb/clean
+# A custom build config cannot silently put the radio stack back into the image.
+if grep -Eq '^CONFIG_PACKAGE_(kmod-cfg80211|kmod-mac80211|kmod-rtl-ax-ap|iw|iwinfo|libiwinfo[^=]*|rpcd-mod-iwinfo|hostapd[^=]*|wpad[^=]*|wifi-scripts|wireless-regdb)=y$' .config; then
+    echo "Wireless packages selected in a wired-only TYFZA1 build" >&2
+    exit 1
 fi
 # On this WSL host, TCP fakeroot fails at the first file operation. Use the
 # existing upstream SysV backend, not root builds or altered package ownership.
@@ -64,6 +58,5 @@ if [ -n "${TYFZA1_RUNTIME_INPUTS:-}" ]; then
 else
     python3 "$PROJECT/tools/prepare_pon_runtime.py" "$TREE/files" \
         --stock "${TYFZA1_STOCK_INPUTS:-$PROJECT/analysis/private/live-files}"
-    python3 "$PROJECT/tools/prepare_wifi_runtime.py" "$TREE/files" --openwrt-tree "$TREE"
 fi
 make -j"$JOBS" world

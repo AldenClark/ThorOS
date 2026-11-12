@@ -126,10 +126,6 @@ for i in range(160):
                   inner_vid=(4095-i*4095//159) if count==2 else 0,
                   inner_tpid_enc=1+(i%2) if count==2 else 0)
     cases.append(tagged)
-for id in range(1, 61):
-    wireless = dict(cases[0], lspid=18, orig_lspid=18,
-                    mdata=0x123456789abc0000 | id)
-    cases.append(wireless)
 with tempfile.TemporaryDirectory(prefix="fe-key-", dir=root / "artifacts") as temporary:
     temporary = Path(temporary)
     source = temporary / "key.c"
@@ -175,7 +171,7 @@ with tempfile.TemporaryDirectory(prefix="fe-key-", dir=root / "artifacts") as te
 
 record = {"stock_module_sha256": hashlib.sha256(stock.read_bytes()).hexdigest(),
           "native_header_sha256": hashlib.sha256(header.read_bytes()).hexdigest(),
-          "vectors": len(cases), "VLAN_QinQ_vectors":160,"wifi_metadata_vectors":60,
+          "vectors": len(cases), "VLAN_QinQ_vectors":160,
           "key_bytes": key_size, "mask_bytes": mask_size,
           "actual_stock_masked_key_and_CRC16_CRC32_match": True,
           "protocols": ["IPv4 TCP", "IPv4 UDP"], "LLIDs": 32, "profiles": 4,

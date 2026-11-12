@@ -5,12 +5,12 @@
       "ubus": {
         "luci.tyfza1-pon": ["status"],
         "system": ["board"],
-        "luci-rpc": ["getBoardJSON", "getHostHints", "getNetworkDevices", "getWirelessDevices"],
+        "luci-rpc": ["getBoardJSON", "getHostHints", "getNetworkDevices"],
         "network": ["get_proto_handlers"],
         "network.device": ["status"],
         "network.interface": ["dump"]
       },
-      "uci": ["pon", "firewall", "network", "wireless", "luci"]
+      "uci": ["pon", "firewall", "network", "luci"]
     },
     "write": {
       "uci": ["pon", "firewall", "network"]

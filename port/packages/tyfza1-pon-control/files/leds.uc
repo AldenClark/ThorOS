@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Stock TYFZA1 PON LED spec 2, using native PON and management-session state.
 'use strict';
-import { readfile, writefile, glob } from 'fs';
+import { readfile, writefile } from 'fs';
 
 const pon = '/sys/bus/platform/devices/4f5500000.pon/';
 let patterns = {};
-let wifi_bound = {};
 
 function fields(text) {
 	let result = {};
@@ -51,29 +50,6 @@ function live(status, now) {
 		now >= updated && now - updated < 5000;
 }
 
-function wifi_leds() {
-	for (let path in glob('/sys/class/net/*/phy80211/device/device')) {
-		let id = readfile(path);
-		let name = id != null && trim(id) == '0xc852' ? 'LED_WLAN_5G' :
-			id != null && trim(id) == '0x0192' ? 'LED_WLAN_2G' : null;
-		let iface = split(path, '/')[4];
-		let net = '/sys/class/net/' + iface + '/';
-		let type = readfile(net + 'type');
-		if (name == null || type == null || trim(type) != '1') continue;
-		let index = readfile(net + 'ifindex');
-		if (index == null || wifi_bound[name] == index) continue;
-		let led = '/sys/class/leds/' + name + '/';
-		// A netdev can appear while its PCI probe is still registering the LED.
-		if (readfile(led + 'max_brightness') == null) continue;
-		put(led + 'trigger', 'netdev');
-		put(led + 'device_name', iface);
-		put(led + 'link', 1);
-		put(led + 'rx', 1);
-		put(led + 'tx', 1);
-		wifi_bound[name] = index;
-	}
-}
-
 // A null entry retains the previous pattern, as the stock event handler does.
 const itu_patterns = { O1: 0, O2: 250, O23: 250, O4: 250, O5: 250, O7: 0 };
 const gpon_states = ['O1', 'O2', 'O3', 'O4', 'O5', 'O6', 'O7'];
@@ -82,7 +58,6 @@ let line_key, auth_key, context_key, current = 0;
 pattern('LED_PON', 0);
 
 while (true) {
-	wifi_leds();
 	let now = +split(required('/proc/uptime'), ' ')[0] * 1000;
 	let link = fields(required(pon + 'led_state'));
 	let mode = link.mode, session = link.session;

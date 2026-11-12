@@ -5,6 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '..');
+const luci = process.env.TYFZA1_LUCI_FEED || path.join(root, 'sources/openwrt/feeds/luci');
 const resources = path.join(root, 'port/packages/luci-app-tyfza1-pon/htdocs/luci-static/resources');
 const baseclass = { extend: object => object };
 let rpcResults = {};
@@ -34,8 +35,8 @@ function E(tag, attrs, children) {
 function load(file, context) {
 	return new Function(...Object.keys(context), fs.readFileSync(file, 'utf8'))(...Object.values(context));
 }
-const uci = load(path.join(root, 'sources/openwrt/feeds/luci/modules/luci-base/htdocs/luci-static/resources/uci.js'), { baseclass, rpc, L });
-const validation = load(path.join(root, 'sources/openwrt/feeds/luci/modules/luci-base/htdocs/luci-static/resources/validation.js'), {
+const uci = load(path.join(luci, 'modules/luci-base/htdocs/luci-static/resources/uci.js'), { baseclass, rpc, L });
+const validation = load(path.join(luci, 'modules/luci-base/htdocs/luci-static/resources/validation.js'), {
 	baseclass, _: text => ({ format: () => text })
 });
 const status = load(path.join(resources, 'tyfza1/status.js'), { baseclass, rpc, L, E });
@@ -62,8 +63,7 @@ function config(device = 'pon0', protocol = 'dhcp') {
 		network: { wan: { '.type': 'interface', device, proto: protocol },
 			wan6: { '.type': 'interface', device: '@wan', proto: 'dhcpv6' },
 			lan: { '.type': 'interface', device: 'br-lan', proto: 'static' } },
-		firewall: { defaults: { '.name': 'defaults', '.type': 'defaults', flow_offloading_hw: '1' } },
-		wireless: { radio0: { '.type': 'wifi-device', disabled: '0' } }
+		firewall: { defaults: { '.name': 'defaults', '.type': 'defaults', flow_offloading_hw: '1' } }
 	}, creates: {}, changes: {}, deletes: {}, reorder: {} };
 }
 async function render(data = {}) { return view.render([null, data, null, null]); }
@@ -166,7 +166,6 @@ async function main() {
 	assert.equal(options._acceleration.cfgvalue().attrs.href, '/admin/onu/acceleration');
 	assert.equal(uci.state.changes.firewall, undefined);
 	assert.equal(options.llid_count.rmempty, false);
-	assert.equal(uci.state.changes.wireless, undefined);
 	assert.equal(uci.state.changes.network, undefined);
 	assert.equal(uci.state.changes.pon, undefined);
 	await polling();
@@ -206,7 +205,7 @@ async function main() {
 			view: baseclass, form, uci, status, ui, L, E, widgets: { DeviceSelect: 'device' }
 		});
 		config();
-		const snapshot = { pon: online, board: {}, networks: [], wifi: [] };
+		const snapshot = { pon: online, board: {}, networks: [] };
 		const args = { overview: snapshot, hardware: snapshot, acceleration: [null, online], diagnostics: online,
 			internet: [null, snapshot], iptv: [null, online] };
 		const rendered = await module.render(args[filename]);
@@ -260,16 +259,12 @@ async function main() {
 		'network.interface.dump': [{ interface: 'wan', proto: 'pppoe', up: true, l3_device: 'pppoe-wan', 'ipv4-address': [{address: '192.0.2.1', mask: 32}],
 			'ipv6-address': [{address: '2001:db8::1', mask: 64}],
 			'ipv6-prefix-assignment': [{'local-address': {address: '2001:db8::1', mask: 64}}, {'local-address': {address: '2001:db8:1::1', mask: 64}}] }],
-		'luci-rpc.getWirelessDevices': { radio0: { up: true, interfaces: [{ ifname: 'wlan0', iwinfo: { ssid: 'Fixture', frequency: 5180, bitrate: 1201000 } }] } }
 	};
 	let snapshot = await ui.snapshot();
 	assert.equal(snapshot.networks[0].ipv4[0], '192.0.2.1/32');
 	assert.deepEqual(snapshot.networks[0].ipv6, ['2001:db8::1/64', '2001:db8:1::1/64']);
-	assert.equal(snapshot.wifi[0].frequency, '5.180'); assert.equal(snapshot.wifi[0].bitrate, 1201);
 	rpcResults['network.interface.dump'] = new Error('unavailable');
-	snapshot = await ui.snapshot(); assert.equal(snapshot.networkError, true); assert.equal(snapshot.wifiError, false);
-	rpcResults['luci-rpc.getWirelessDevices'] = new Error('unavailable');
-	snapshot = await ui.snapshot(); assert.equal(snapshot.wifiError, true);
+	snapshot = await ui.snapshot(); assert.equal(snapshot.networkError, true);
 	const acl = JSON.parse(fs.readFileSync(path.join(resources, '../../../root/usr/share/rpcd/acl.d/luci-app-tyfza1-pon.json')));
 	assert.deepEqual(acl['luci-app-tyfza1-pon'].write.uci, ['pon', 'firewall', 'network']);
 	assert.equal(acl['luci-app-tyfza1-pon'].write.ubus, undefined);

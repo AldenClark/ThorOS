@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='netdev-rename-', dir=root / 'artifacts'
  option type 'bridge'
  list ports 'eth0'
  list ports 'eth2.100'
- list ports 'phy0-ap0'
+ list ports 'mytun0'
 config bridge-vlan 'tags'
  option device 'br-lan'
  list ports 'eth1:t'
@@ -73,11 +73,6 @@ config led 'internet'
  list device 'custom0'
  list network 'eth0'
 """,
-        'wireless': """config wifi-iface 'ap'
- option ifname 'phy0-ap0'
- option ssid 'eth0 pon-data0'
- option key 'leave eth4 alone'
-""",
         'sqm': """config queue 'wan'
  option interface 'pon-data0.41'
 """,
@@ -100,7 +95,7 @@ config led 'internet'
 
     subprocess.run(runtime + [str(script)], check=True)
     expected = {
-        'network.bridge.ports': 'lan4 lan2.100 phy0-ap0',
+        'network.bridge.ports': 'lan4 lan2.100 mytun0',
         'network.tags.ports': 'lan3:t lan1:u*',
         'network.tagged.name': 'pon0.100.200',
         'network.tagged.ifname': 'pon0.100',
@@ -122,8 +117,6 @@ config led 'internet'
         'system.@system[0].tyfza1_netdev_names': '2',
         'firewall.wan.device': 'pon0.41 !eth3.100 custom0',
         'firewall.wan.network': 'eth0',
-        'wireless.ap.ssid': 'eth0 pon-data0',
-        'wireless.ap.key': 'leave eth4 alone',
         'sqm.wan.interface': 'pon0.41',
         'pon.pon.loid': 'eth0 pon-data0',
     }

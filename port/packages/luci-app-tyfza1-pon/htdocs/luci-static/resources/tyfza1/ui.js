@@ -6,7 +6,6 @@
 
 var board = rpc.declare({ object: 'system', method: 'board', expect: { '': {} }, reject: true });
 var interfaces = rpc.declare({ object: 'network.interface', method: 'dump', expect: { 'interface': [] }, reject: true });
-var radios = rpc.declare({ object: 'luci-rpc', method: 'getWirelessDevices', expect: { '': {} }, reject: true });
 
 function note(text) { return E('p', { class: 'tyf-note' }, [text]); }
 function link(label, path) { return E('a', { class: 'cbi-button tyf-link', href: L.url.apply(L, path.split('/')) }, [label]); }
@@ -91,19 +90,8 @@ function ports(data) {
 }
 function snapshot() {
 	return Promise.all([status.callStatus().catch(function() { return null; }), board().catch(function() { return {}; }),
-		interfaces().catch(function() { return null; }), radios().catch(function() { return null; })]).then(function(data) {
-		var wifi = [];
-		Object.keys(data[3] || {}).forEach(function(name) {
-			var radio = data[3][name];
-			(radio.interfaces || []).forEach(function(iface) {
-				var info = iface.iwinfo || {};
-				wifi.push({ name: iface.ifname || iface.section || name, ssid: info.ssid || (iface.config || {}).ssid,
-					up: radio.up && !radio.disabled && !!iface.ifname, channel: info.channel,
-					frequency: info.frequency > 0 ? (info.frequency / 1000).toFixed(3) : null,
-					bitrate: info.bitrate > 0 ? info.bitrate / 1000 : null });
-			});
-		});
-		return { pon: data[0], board: data[1], wifi: wifi, networkError: data[2] == null, wifiError: data[3] == null,
+		interfaces().catch(function() { return null; })]).then(function(data) {
+		return { pon: data[0], board: data[1], networkError: data[2] == null,
 			networks: (data[2] || []).map(function(net) {
 				function addresses(key) { return (net[key] || []).map(function(addr) { return addr.address + '/' + addr.mask; }); }
 				var ipv6 = addresses('ipv6-address');

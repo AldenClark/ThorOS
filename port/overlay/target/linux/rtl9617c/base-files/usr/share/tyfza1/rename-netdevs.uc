@@ -45,7 +45,6 @@ const references = {
 	network: ['name', 'device', 'ifname', 'ports', 'bridge', 'master', 'parent', 'tunlink'],
 	firewall: ['device', 'src_device', 'dest_device'],
 	system: ['dev'],
-	wireless: ['ifname'],
 	sqm: ['interface'],
 	qos: ['interface'],
 	vnstat: ['interface'],

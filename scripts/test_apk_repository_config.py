@@ -15,7 +15,6 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
                  'packages/luci-app-tyfza1-pon', 'packages/tyfza1-pon-control',
                  'packages/tyfza1-storage'):
         (port / path).mkdir(parents=True, exist_ok=True)
-    (tree / 'package/network/services/hostapd/patches').mkdir(parents=True)
     (work / 'VERSION').write_text('0.7.0-alpha\n')
     (port / 'configs/tyfza1-boot.config').write_text('CONFIG_PACKAGE_keep=y\n')
     shutil.copyfile(root / 'port/configs/tyfza1-compat.config', port / 'configs/tyfza1-compat.config')

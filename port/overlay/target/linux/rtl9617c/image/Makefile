@@ -32,8 +32,11 @@ define Device/tianyi_tyfza1
   DEVICE_DTS := rtl9617c-tyfza1 rtl9617c-tyfza1-nand-readonly rtl9617c-tyfza1-stock-ubi-readonly rtl9617c-tyfza1-mdio rtl9617c-tyfza1-xram-lan rtl9617c-tyfza1-dma-tx rtl9617c-tyfza1-ni rtl9617c-tyfza1-pon-status rtl9617c-tyfza1-pcie rtl9617c-tyfza1-pcie-2p5g rtl9617c-tyfza1-ubi rtl9617c-tyfza1-ubi-2p5g
   DEVICE_DTS_DIR := ../dts
   IMAGE_METADATA := "tyfza1_storage": "factory-v1"
-  DEVICE_PACKAGES := kmod-rtl-ax-ap tyfza1-pon-control tyfza1-storage luci-app-tyfza1-pon \
-	ubi-utils nand-utils uboot-envtools iw wpad-mbedtls wifi-scripts wireless-regdb \
+  DEVICE_PACKAGES := tyfza1-pon-control tyfza1-storage luci-app-tyfza1-pon \
+	ubi-utils nand-utils uboot-envtools \
+	-wpad-basic-mbedtls -wpad-mbedtls -hostapd -hostapd-basic-mbedtls \
+	-hostapd-mbedtls -wifi-scripts -iw -iwinfo -wireless-regdb \
+	-kmod-cfg80211 -kmod-mac80211 -kmod-rtl-ax-ap -rpcd-mod-iwinfo \
 	kmod-gpio-button-hotplug kmod-usb3 kmod-usb-storage kmod-usb-storage-uas \
 	kmod-usb-ledtrig-usbport kmod-tyfza1-usb-led block-mount kmod-fs-vfat kmod-fs-exfat \
 	kmod-fs-ntfs3 kmod-fs-ext4 kmod-nls-utf8 kmod-nls-cp437 kmod-nls-iso8859-1

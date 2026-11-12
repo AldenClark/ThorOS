@@ -37,7 +37,6 @@ common = r'''
 #include <linux/ppp_defs.h>
 #include <linux/if_ether.h>
 #include "rtl9617c-fe-pipeline.h"
-#include "rtl9617c-wifi-format.h"
 #define BIT(n) (1U<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define FE_LAN_PORTS 5
@@ -54,8 +53,7 @@ struct rtl_fe {
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled;int error;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][7],map_saved[2][4];
- unsigned int wifi_ippb_saved,wifi_ippb,wifi_mask_saved[8],wifi_mask[8];
- unsigned int bridge_mask_saved[6][8],bridge_mask[6][8];
+ unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
  unsigned int reg[0x10000/4],mask[8],cls[1040][7],map[256];
  struct rtl_fe_cam_protocol protocol_cam[3];unsigned char ppp_protocol_ids[2];
  unsigned int cam[9][64][5];
@@ -79,8 +77,8 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
   assert(f->reg[0x3948/4]&1U);
   assert((f->reg[0x3c80/4]&255)==255);
   assert((f->reg[0x3940/4]&0xffff)==0xd0d0); /* Failed checks bypass the hit action. */
-  assert(!(f->mask[6]&BIT(25)) && !(f->wifi_mask[6]&BIT(25)));
-  for(unsigned int i=0;i<6;i++)assert(!(f->bridge_mask[i][6]&BIT(25)));
+  assert(!(f->mask[6]&BIT(25)));
+  for(unsigned int i=0;i<3;i++)assert(!(f->bridge_mask[i][6]&BIT(25)));
   assert(f->reg[0x351c/4]&BIT(12)); /* PE pads shortened Ethernet frames. */
   assert((f->reg[0x3508/4]&0x1f00)==0x1f00); /* TX MIB deltas require wrap mode. */
   assert((f->reg[0x30cc/4]&0xfff)==0xf21); /* TTL exceptions retain the original packet. */
@@ -92,10 +90,7 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
 }
 static int fe_access(void *ctx,unsigned int reg,unsigned int value){
  struct rtl_fe *f=ctx;unsigned int index=value&255,i;
- if(reg==0x11dc){
-  assert(index==RTL_WIFI_SOURCE);
-  if(value&BIT(30))f->wifi_ippb=f->reg[0x11e0/4];else f->reg[0x11e0/4]=f->wifi_ippb;
- } else if(reg==0x3200){
+ if(reg==0x3200){
   unsigned int bank=(value>>16)&15;index=value&63;assert(bank==2||bank==8);
   for(i=0;i<5;i++)if(value&BIT(30))f->cam[bank][index][i]=f->reg[(0x3214-i*4)/4];
   else f->reg[(0x3214-i*4)/4]=f->cam[bank][index][i];
@@ -104,7 +99,8 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
   if((value&BIT(30)) && f->fail_mask_writes){f->fail_mask_writes--;return -ETIMEDOUT;}
   unsigned int bank=(value>>6)&1;
   unsigned int slot=value&63;
-  unsigned int *selected=slot==63?f->mask:slot==62?f->wifi_mask:f->bridge_mask[61-slot];
+  assert(slot==63 || slot==61 || slot==59 || slot==57);
+  unsigned int *selected=slot==63?f->mask:f->bridge_mask[(61-slot)/2];
   for(i=0;i<4;i++)if(value&BIT(30))selected[bank*4+i]=f->reg[(0x3920-i*4)/4];
   else f->reg[(0x3920-i*4)/4]=selected[bank*4+i];
  } else if(reg==0x33b0){
@@ -131,13 +127,13 @@ if lan_defines:
     common = common.replace('#define FE_LAN_PORTS 5\n#define FE_LAN_RX_CTRL(p) (0xa5f8+0x90*(p))', lan_defines.group())
 test = r'''
 int main(void){
- struct rtl_fe f={.dma=0x03800000,.wifi_ippb=0xa5000004};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1040][7],old_map[256],old_demux,old_wifi_mask[8];
- unsigned int old_bridge_mask[6][8];
+ struct rtl_fe f={.dma=0x03800000};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1040][7],old_map[256],old_demux;
+ unsigned int old_bridge_mask[3][8];
  for(unsigned int i=0;i<0x10000/4;i++)f.reg[i]=0x80000000U+i;
  f.reg[0x30a4/4]=0x0001b000U;
  for(unsigned int i=0;i<5;i++)f.reg[(0xa5f8+i*0x90)/4]=lan[i]=0x18100400U|(i<<24);
- for(unsigned int i=0;i<8;i++){f.mask[i]=old_mask[i]=0x55000000+i;f.wifi_mask[i]=old_wifi_mask[i]=0xaa550000+i;}
- for(unsigned int s=0;s<6;s++)for(unsigned int i=0;i<8;i++)
+ for(unsigned int i=0;i<8;i++)f.mask[i]=old_mask[i]=0x55000000+i;
+ for(unsigned int s=0;s<3;s++)for(unsigned int i=0;i<8;i++)
   f.bridge_mask[s][i]=old_bridge_mask[s][i]=0x5a000000+s*8+i;
  for(unsigned int s=0;s<1040;s++)for(unsigned int i=0;i<7;i++)f.cls[s][i]=old_cls[s][i]=0x11000000+s*7+i;
  for(unsigned int i=0;i<256;i++)f.map[i]=old_map[i]=0x100+i;
@@ -149,13 +145,10 @@ int main(void){
    assert(((f.cls[row][4]>>26)&7)==7);
    assert(((f.cls[row][4]>>30)|(f.cls[row][5]<<2))%1024==16);
   }
-  assert(f.wifi_ippb==0xa5000012);
-  assert(fe_read(&f,0x3700)==8 && fe_read(&f,0x3704)==63 && fe_read(&f,0x3708)==318);
-  assert(fe_read(&f,0x370c)==(61|2U<<8) && fe_read(&f,0x3710)==(60|3U<<8));
-  assert(fe_read(&f,0x371c)==(57|6U<<8) && fe_read(&f,0x3720)==(56|7U<<8));
+  assert(fe_read(&f,0x3700)==4 && fe_read(&f,0x3704)==63 && fe_read(&f,0x3708)==(61|1U<<8));
+  assert(fe_read(&f,0x370c)==(59|2U<<8) && fe_read(&f,0x3710)==(57|3U<<8));
   assert(f.ppp_protocol_ids[0]==1 && f.ppp_protocol_ids[1]==2);
   assert(f.cam[2][0][0]==0x18864 && f.cam[8][0][0]==0x10021 && f.cam[8][1][0]==0x10057);
-  for(unsigned int b=0;b<256;b++)assert(((f.wifi_mask[b/32]>>(b%32))&1)==((b>=135 && b<143)?0:((f.mask[b/32]>>(b%32))&1)));
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==((lan[i]&~(63U<<16))|(25U<<16)));
   assert(!(f.cls[1028][6]&BIT(16)) && (f.cls[1024][6]&BIT(16)) && ((f.cls[1024][6]>>17)&63)==7);
   assert(((fe_read(&f,0x3418)>>10)&15)==1 && ((fe_read(&f,0x3424)>>10)&15)==0);
@@ -167,11 +160,9 @@ int main(void){
   unsigned int writes=f.admission_writes;assert(!rtl_fe_enable(&f) && f.admission_writes==writes);
   assert(!rtl_fe_disable(&f) && !f.enabled && !f.prepared);
   assert(fe_read(&f,0x30a4)==0x0001b000U);
-  assert(f.wifi_ippb==0xa5000004);
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==lan[i]);
   for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
   assert(!memcmp(f.mask,old_mask,sizeof(old_mask)) && !memcmp(f.cls,old_cls,sizeof(old_cls)));
-  assert(!memcmp(f.wifi_mask,old_wifi_mask,sizeof(old_wifi_mask)));
   assert(!memcmp(f.bridge_mask,old_bridge_mask,sizeof(old_bridge_mask)));
   assert(!memcmp(f.map,old_map,sizeof(old_map)));
   assert(!rtl_fe_disable(&f));

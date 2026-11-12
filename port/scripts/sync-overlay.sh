@@ -19,9 +19,6 @@ mkdir -p "$TREE/package/tyfza1-pon-control"
 rsync -a --delete "$PORT/packages/tyfza1-pon-control/" "$TREE/package/tyfza1-pon-control/"
 mkdir -p "$TREE/package/tyfza1-storage"
 rsync -a --delete "$PORT/packages/tyfza1-storage/" "$TREE/package/tyfza1-storage/"
-# hostapd patches apply to its unpacked source, not the OpenWrt tree root.
-cp "$PORT/host-patches/471-hostapd-acs-no-survey.patch" \
-    "$TREE/package/network/services/hostapd/patches/471-hostapd-acs-no-survey.patch"
 mkdir -p "$TREE/package/network/config/firewall4/patches"
 cp "$PORT/host-patches/120-firewall4-netifd-lower-devices.patch" \
     "$TREE/package/network/config/firewall4/patches/120-firewall4-netifd-lower-devices.patch"
@@ -30,18 +27,6 @@ cp "$PORT/host-patches/121-firewall4-interface-topology.patch" \
 mkdir -p "$TREE/package/network/config/netifd/patches"
 cp "$PORT/host-patches/120-netifd-interface-topology.patch" \
     "$TREE/package/network/config/netifd/patches/120-netifd-interface-topology.patch"
-mkdir -p "$TREE/package/network/utils/iwinfo/patches"
-cp "$PORT/host-patches/130-iwinfo-txpower-unknown.patch" \
-    "$TREE/package/network/utils/iwinfo/patches/130-iwinfo-txpower-unknown.patch"
-cp "$PORT/host-patches/131-iwinfo-ap-scan.patch" \
-    "$TREE/package/network/utils/iwinfo/patches/131-iwinfo-ap-scan.patch"
-cp "$PORT/host-patches/132-iwinfo-scan-timeout.patch" \
-    "$TREE/package/network/utils/iwinfo/patches/132-iwinfo-scan-timeout.patch"
-mkdir -p "$TREE/package/system/rpcd/patches"
-cp "$PORT/host-patches/132-rpcd-scan-pause.patch" \
-    "$TREE/package/system/rpcd/patches/132-rpcd-scan-pause.patch"
-cp "$PORT/host-patches/133-rpcd-async-scan.patch" \
-    "$TREE/package/system/rpcd/patches/133-rpcd-async-scan.patch"
 if [ -d "$TREE/feeds/luci/modules/luci-mod-status" ]; then
     sh "$PORT/scripts/apply-luci-patches.sh" "$TREE"
 fi
@@ -50,6 +35,13 @@ if [ -n "${TYFZA1_CONFIG:-}" ]; then
 elif [ ! -s "$TREE/.config" ]; then
     cp "$PORT/configs/tyfza1-boot.config" "$TREE/.config"
 fi
+# Avoid stale wireless assets when rebuilding in an existing OpenWrt checkout.
+if [ -d "$TREE/files/lib/firmware/realtek/tyfza1" ]; then
+    rm -r "$TREE/files/lib/firmware/realtek/tyfza1"
+fi
+rm -f "$TREE/files/lib/firmware/regulatory.db" \
+    "$TREE/files/lib/firmware/regulatory.db.p7s" \
+    "$TREE/files/etc/config/wireless"
 VERSION=$(cat "$PORT/../VERSION")
 # Keep package choices, but always identify firmware by the project version.
 sed -i '/^CONFIG_VERSIONOPT=/d; /^# CONFIG_VERSIONOPT is not set$/d; /^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d; /^CONFIG_SIGNED_PACKAGES=/d; /^# CONFIG_SIGNED_PACKAGES is not set$/d; /^CONFIG_SIGN_EACH_PACKAGE=/d; /^# CONFIG_SIGN_EACH_PACKAGE is not set$/d' "$TREE/.config"

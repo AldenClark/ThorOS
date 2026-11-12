@@ -23,10 +23,8 @@
 #include <linux/workqueue.h>
 #include <net/flow_offload.h>
 #include <net/pkt_cls.h>
-#include <net/cfg80211.h>
 #include "rtl9617c-fe.h"
 #include "rtl9617c-fe-pipeline.h"
-#include "rtl9617c-wifi-format.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
@@ -44,14 +42,8 @@ struct rtl_fe_port {
  struct list_head list;
  struct rtl_fe *fe;
  struct net_device *netdev;
- unsigned int source, destination, llid, wifi_id, bindings;
+ unsigned int source, destination, llid, bindings;
  bool retired;
-};
-struct rtl_fe_wifi_peer {
- struct list_head list;
- struct rtl_fe_port *port;
- u8 address[ETH_ALEN];
- unsigned int destination;
 };
 struct rtl_fe_mac {
  unsigned int users, saved[5];
@@ -112,7 +104,7 @@ struct rtl_fe {
  void __iomem *registers;
  struct mutex lock;
  struct delayed_work cleanup_work;
- struct list_head ports, flows, blocks, wifi_peers, retries;
+ struct list_head ports, flows, blocks, retries;
  struct rb_root cookies;
  void *memory;
  dma_addr_t dma;
@@ -120,12 +112,10 @@ struct rtl_fe {
  int error;
  u64 installs, deletes, misses;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
- unsigned int wifi_mask_saved[8];
- unsigned int bridge_mask_saved[6][8];
+ unsigned int bridge_mask_saved[3][8];
  struct rtl_fe_cam_protocol protocol_cam[3];
  unsigned char ppp_protocol_ids[2];
  unsigned int lan_saved[FE_LAN_PORTS];
- unsigned int wifi_ippb_saved;
  unsigned int classifier_saved[2][7], map_saved[2][4];
  struct rtl_fe_mac source_macs[FE_SOURCE_MACS];
  struct rtl_fe_interface interfaces[FE_INTERFACES];
@@ -190,24 +180,6 @@ static void fe_index_flow(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  rb_link_node(&flow->cookie_node,parent,link);
  rb_insert_color(&flow->cookie_node,&fe->cookies);
 }
-static bool fe_wifi_client(struct rtl_fe_port *port)
-{
- return port->netdev->ieee80211_ptr &&
-  port->netdev->ieee80211_ptr->iftype==NL80211_IFTYPE_STATION;
-}
-static struct rtl_fe_wifi_peer *fe_wifi_peer(struct rtl_fe *fe,struct rtl_fe_port *port,const u8 *address)
-{
- struct rtl_fe_wifi_peer *peer;
- list_for_each_entry(peer,&fe->wifi_peers,list)
-  if(peer->port==port && (fe_wifi_client(port) || ether_addr_equal(peer->address,address)))return peer;
- return NULL;
-}
-static void fe_wifi_forget_port(struct rtl_fe *fe,struct rtl_fe_port *port)
-{
- struct rtl_fe_wifi_peer *peer,*next;
- list_for_each_entry_safe(peer,next,&fe->wifi_peers,list)
-  if(peer->port==port){list_del(&peer->list);kfree(peer);}
-}
 static void fe_collect_ports(struct rtl_fe *fe)
 {
  struct rtl_fe_port *port,*next;
@@ -232,15 +204,10 @@ static int fe_prepare(struct rtl_fe *fe)
 
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe->saved[i]=fe_read(fe,fe_registers[i]);
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
- ret=fe_access(fe,0x11dc,BIT(31)|RTL_WIFI_SOURCE);
- if(ret)return ret;
- fe->wifi_ippb_saved=fe_read(fe,0x11e0);
  ret=rtl_fe_mask_read(&io,63,fe->mask_saved);
  if(ret)return ret;
- ret=rtl_fe_mask_read(&io,62,fe->wifi_mask_saved);
- if(ret)return ret;
- for(i=0;i<6;i++) {
-  ret=rtl_fe_mask_read(&io,61-i,fe->bridge_mask_saved[i]);
+ for(i=0;i<3;i++) {
+  ret=rtl_fe_mask_read(&io,61-2*i,fe->bridge_mask_saved[i]);
   if(ret)return ret;
  }
  /* Default type0 FIB index is 1024 | (profile << 2), not a packed row. */
@@ -258,11 +225,6 @@ static int fe_prepare(struct rtl_fe *fe)
  fe_write(fe,0x3218,fe_read(fe,0x3218)|BIT(16));
  /* Keep GEM rewriting disabled until its classifier/default chain is ready. */
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
- /* The inherited IPPB maps source18 to port4. Preserve the Wi-Fi descriptor's
-  * logical source before STG0; per-interface identity remains in metadata. */
- fe_write(fe,0x11e0,(fe->wifi_ippb_saved&~63U)|RTL_WIFI_SOURCE);
- ret=fe_access(fe,0x11dc,BIT(31)|BIT(30)|RTL_WIFI_SOURCE);
- if(ret)return ret;
  rtl_fe_dma_tables(&io,lower_32_bits(fe->dma),(upper_32_bits(fe->dma)&255)|2);
  ret=fe_access(fe,0x393c,1);
  if(ret)return ret;
@@ -279,29 +241,17 @@ static int fe_prepare(struct rtl_fe *fe)
  mask[2]&=~(BIT(25)|BIT(27)); /* PPPoE session/type bits89/91 */
  ret=rtl_fe_mask_write(&io,63,mask);
  if(ret)return ret;
- rtl_fe_wifi_mask(mask);
- ret=rtl_fe_mask_write(&io,62,mask);
- if(ret)return ret;
  rtl_fe_bridge_mask(mask);
  ret=rtl_fe_mask_write(&io,61,mask);
- if(ret)return ret;
- rtl_fe_wifi_mask(mask);
- ret=rtl_fe_mask_write(&io,60,mask);
  if(ret)return ret;
  rtl_fe_bridge_mask(mask);
  rtl_fe_bits_set(mask,92,2,0); /* Exact learned inner DEI/PCP. */
  rtl_fe_bits_set(mask,96,2,0); /* Exact learned outer DEI/PCP. */
  ret=rtl_fe_mask_write(&io,59,mask);
  if(ret)return ret;
- rtl_fe_wifi_mask(mask);
- ret=rtl_fe_mask_write(&io,58,mask);
- if(ret)return ret;
  rtl_fe_bits_set(mask,135,8,255); /* Wired PPPoE data retains no VIF selector. */
  rtl_fe_bits_set(mask,88,1,0); /* Match the CAM protocol encoding; LCP misses. */
  ret=rtl_fe_mask_write(&io,57,mask);
- if(ret)return ret;
- rtl_fe_wifi_mask(mask);
- ret=rtl_fe_mask_write(&io,56,mask);
  if(ret)return ret;
  fe_write(fe,0x3500,0x11); /* Session version/type1, code0. */
  fe_write(fe,0x3504,PPP_IP|PPP_IPV6<<16);
@@ -335,15 +285,11 @@ static int fe_prepare(struct rtl_fe *fe)
  fe_write(fe,0x2304+13*12,0xff|(6<<16));
  for(i=0;i<5;i++)fe_write(fe,0x394c+i*4,0);
  fe_write(fe,0x3724,RTL_FE_ACTION_GROUPS|(3U<<25));
- fe_write(fe,0x3704,63); /* Stock FC five-tuple priority0. */
- fe_write(fe,0x3708,62|BIT(8)); /* Wi-Fi identity tuple, priority1. */
- fe_write(fe,0x370c,61|(2U<<8)); /* Transparent Ethernet, priority2. */
- fe_write(fe,0x3710,60|(3U<<8)); /* Per-VIF transparent Ethernet, priority3. */
- fe_write(fe,0x3714,59|(4U<<8));
- fe_write(fe,0x3718,58|(5U<<8));
- fe_write(fe,0x371c,57|(6U<<8));
- fe_write(fe,0x3720,56|(7U<<8));
- fe_write(fe,0x3700,8);
+ fe_write(fe,0x3704,63); /* IP/IPv6 five-tuple. */
+ fe_write(fe,0x3708,61|BIT(8)); /* Transparent Ethernet. */
+ fe_write(fe,0x370c,59|(2U<<8)); /* Learned bridge with explicit VLAN tags. */
+ fe_write(fe,0x3710,57|(3U<<8)); /* Wired PPPoE data. */
+ fe_write(fe,0x3700,4);
  fe_write(fe,0x3860,0x020d0000);
  fe_write(fe,0x3278,0x88a88100);
  fe_write(fe,0x327c,0x92009100);
@@ -370,9 +316,6 @@ static int fe_restore(struct rtl_fe *fe)
 
  if(!fe->prepared)return 0;
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
- fe_write(fe,0x11e0,fe->wifi_ippb_saved);
- ret=fe_access(fe,0x11dc,BIT(31)|BIT(30)|RTL_WIFI_SOURCE);
- if(ret)return ret;
  fe_write(fe,0x38c4,0);
  ret=fe_access(fe,0x393c,1);
  if(ret)return ret;
@@ -391,10 +334,8 @@ static int fe_restore(struct rtl_fe *fe)
  }
  ret=rtl_fe_mask_write(&io,63,fe->mask_saved);
  if(ret)return ret;
- ret=rtl_fe_mask_write(&io,62,fe->wifi_mask_saved);
- if(ret)return ret;
- for(i=0;i<6;i++) {
-  ret=rtl_fe_mask_write(&io,61-i,fe->bridge_mask_saved[i]);
+ for(i=0;i<3;i++) {
+  ret=rtl_fe_mask_write(&io,61-2*i,fe->bridge_mask_saved[i]);
   if(ret)return ret;
  }
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe_write(fe,fe_registers[i],fe->saved[i]);
@@ -657,7 +598,7 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
  data->bridge=true;data->input=port;
  data->ethernet_protocol=ntohs(basic.key->n_proto);
  data->key=(struct rtl_fe_ipv4_key){.ingress=port->source,.llid=port->llid,
-  .mask=port->wifi_id?60:61};
+  .mask=61};
  ether_addr_copy(data->source,ethernet.key->src);
  ether_addr_copy(data->destination,ethernet.key->dst);
  if(data->ethernet_protocol==ETH_P_PPP_SES) {
@@ -781,7 +722,7 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  data->input=port;
  data->key=(struct rtl_fe_ipv4_key){
   .source_port=ntohs(ports.key->src),.destination_port=ntohs(ports.key->dst),
-  .protocol=basic.key->ip_proto,.ingress=port->source,.llid=port->llid,.mask=port->wifi_id?62:63};
+  .protocol=basic.key->ip_proto,.ingress=port->source,.llid=port->llid,.mask=63};
  if(data->ipv6) {
   if(!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV6_ADDRS))return -EOPNOTSUPP;
   flow_rule_match_ipv6_addrs(rule,&addresses6);
@@ -865,7 +806,7 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   * Linux perform a partial-stack edit; a new tag is fully specified. */
  if(vlan_changed)
   for(i=0;i<output_vlan_count;i++)if(!vlan_known[i])return -EOPNOTSUPP;
- data->action=(struct rtl_fe_ipv4_action){.destination=data->output->destination,.check_mask=port->wifi_id?62:63,
+ data->action=(struct rtl_fe_ipv4_action){.destination=data->output->destination,.check_mask=63,
   .deep_queue=data->output->destination>=32,.translate=source_changed||destination_changed,
   .translate_destination=destination_changed,.address=ntohl(destination_changed?new_destination:new_source),
   .port=ntohs(destination_changed?new_dport:new_sport)};
@@ -981,7 +922,6 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  rtl_fe_key_set(words,RTL_FE_KEY_ORIG_LSPID,0);
  rtl_fe_key_set(words,RTL_FE_KEY_CTRL_SET_ID,0);
  rtl_fe_key_set(words,RTL_FE_KEY_TABLE_ID,0);
- rtl_fe_key_set(words,RTL_FE_KEY_MDATA_BYTE,port->wifi_id);
  rtl_fe_key_crc(words,&crc32,&crc16);
  start=rtl_fe_hash_bucket(crc16);
  for(index=start;index<start+32;index++)if(!test_bit(index,fe->hashes))break;
@@ -1029,13 +969,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  }
  data.action.mac_da_index=flow->destination_index;
  data.action.egress_interface=flow->counter;
- { struct rtl_fe_wifi_peer *peer=fe_wifi_peer(fe,data.output,data.destination);
-   if(peer)data.action.destination=peer->destination; }
  rtl_fe_ipv4_action(action,&data.action);
- if(data.input->wifi_id || data.output->wifi_id) {
-  rtl_fe_action_set(action,RTL_FE_MDATA_BYTE_VLD,1);
-  rtl_fe_action_set(action,RTL_FE_MDATA_BYTE,data.output->wifi_id);
- }
  rtl_fe_action_set(action,RTL_FE_L3_IF_COUNTER_EN,flow->counted);
  ((__le32 *)fe->memory)[index]=cpu_to_le32(crc32);
  memcpy(fe->memory+RTL_FE_ACTION_OFFSET+index*RTL_FE_ACTION_BYTES,action,sizeof(action));
@@ -1241,7 +1175,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  mutex_init(&fe->lock);
  INIT_DELAYED_WORK(&fe->cleanup_work,fe_cleanup_work);
  INIT_LIST_HEAD(&fe->ports);INIT_LIST_HEAD(&fe->flows);INIT_LIST_HEAD(&fe->blocks);
- INIT_LIST_HEAD(&fe->wifi_peers);INIT_LIST_HEAD(&fe->retries);
+ INIT_LIST_HEAD(&fe->retries);
  fe->cookies=RB_ROOT;
  fe->memory=dma_alloc_coherent(device,RTL_FE_MEMORY_BYTES,&fe->dma,GFP_KERNEL);
  if(!fe->memory){kfree(fe);return ERR_PTR(-ENOMEM);}
@@ -1284,68 +1218,9 @@ int rtl_fe_add_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int sou
  mutex_unlock(&fe->lock);
  return 0;
 }
-int rtl_fe_add_wifi_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int id)
-{
- struct rtl_fe_port *port;
- int ret;
-
- mutex_lock(&fe->lock);
- port=fe_port(fe,netdev);
- /* Wi-Fi DMA puts its interface ID in both POL_ID and metadata low8. */
- if(port){port->wifi_id=id;port->llid=id;}
- mutex_unlock(&fe->lock);
- if(port)return 0;
- ret=rtl_fe_add_port(fe,netdev,RTL_WIFI_SOURCE,16,id);
- if(ret)return ret;
- mutex_lock(&fe->lock);
- fe_port(fe,netdev)->wifi_id=id;
- mutex_unlock(&fe->lock);
- return 0;
-}
-
 bool rtl_fe_enabled(struct rtl_fe *fe)
 {
  return fe && READ_ONCE(fe->enabled);
-}
-
-int rtl_fe_wifi_peer_route(struct rtl_fe *fe,struct net_device *netdev,const u8 *address,unsigned int destination)
-{
- struct rtl_fe_port *port;
- struct rtl_fe_wifi_peer *peer;
- struct rtl_fe_flow *flow;
- struct rtl_dq_io io=fe_io(fe);
- int ret=0;
-
- mutex_lock(&fe->lock);
- port=fe_port(fe,netdev);
- if(!port || !port->wifi_id){ret=-ENODEV;goto unlock;}
- peer=fe_wifi_peer(fe,port,address);
- if(destination && !peer) {
-  peer=kzalloc(sizeof(*peer),GFP_KERNEL);
-  if(!peer){ret=-ENOMEM;goto unlock;}
-  peer->port=port;ether_addr_copy(peer->address,address);
-  list_add_tail(&peer->list,&fe->wifi_peers);
- }
- if(destination)peer->destination=destination;
- list_for_each_entry(flow,&fe->flows,list) {
-  u32 *action;
-  if(!flow->installed || flow->deleting || flow->output!=port ||
-     (!fe_wifi_client(port) && !ether_addr_equal(flow->destination,address)))continue;
-  /* Withdraw both lookup locations before changing an in-flight flow's output. */
-  ret=rtl_fe_main_age(&io,flow->hash_index,0);
-  if(ret)goto unlock;
-  ret=rtl_fe_cache_command(&io,flow->hash_index,flow->crc16,1);
-  if(ret)goto unlock;
-  action=fe->memory+RTL_FE_ACTION_OFFSET+flow->hash_index*RTL_FE_ACTION_BYTES;
-  rtl_fe_action_set(action,RTL_FE_MCGID,destination?destination:port->destination);
-  dma_wmb();
-  ret=rtl_fe_main_age(&io,flow->hash_index,1);
-  if(ret)goto unlock;
- }
- if(!destination && peer){list_del(&peer->list);kfree(peer);}
-unlock:
- mutex_unlock(&fe->lock);
- return ret;
 }
 
 void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
@@ -1357,7 +1232,6 @@ void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
  mutex_lock(&fe->lock);
  port=fe_port(fe,netdev);
  if(port) {
-  fe_wifi_forget_port(fe,port);
   port->retired=true;
   list_for_each_entry_safe(flow,next,&fe->flows,list)
    if(flow->input==port || flow->output==port) {
@@ -1377,7 +1251,6 @@ int rtl_fe_flush_port(struct rtl_fe *fe,struct net_device *netdev)
  if(!fe)return 0;
  mutex_lock(&fe->lock);
  port=fe_port(fe,netdev);
- fe_wifi_forget_port(fe,port);
  list_for_each_entry_safe(flow,next,&fe->flows,list)
   if(flow->input==port || flow->output==port) {
    ret=fe_delete(fe,flow);
@@ -1475,7 +1348,6 @@ void rtl_fe_free(struct rtl_fe *fe)
  rtl_fe_disable(fe);
  cancel_delayed_work_sync(&fe->cleanup_work);
  list_for_each_entry_safe(flow,flow_next,&fe->flows,list){list_del(&flow->list);kfree(flow);}
- list_for_each_entry(port,&fe->ports,list)fe_wifi_forget_port(fe,port);
  list_for_each_entry_safe(port,next,&fe->ports,list){list_del(&port->list);kfree(port);}
  dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
  kvfree(fe->itu_paths);

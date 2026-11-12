@@ -69,7 +69,7 @@ struct ethhdr {u8 h_dest[6],h_source[6];__be16 h_proto;} __attribute__((packed))
 struct vlan_hdr {__be16 h_vlan_TCI,h_vlan_encapsulated_proto;};
 struct nf_hook_state {struct net *net;struct net_device *in,*out;};
 struct rtl_fe;
-struct rtl_fe_port {struct net_device *netdev;unsigned int source,destination,llid,wifi_id;bool retired;};
+struct rtl_fe_port {struct net_device *netdev;unsigned int source,destination,llid;bool retired;};
 struct work_struct {int unused;};struct delayed_work {struct work_struct work;unsigned int queued;};
 #define to_delayed_work(w) container_of(w,struct delayed_work,work)
 struct rtl_dq_io {int unused;};

@@ -456,13 +456,6 @@ static inline void rtl_fe_ipv6_mask(unsigned int words[RTL_FE_MASK_WORDS])
  rtl_fe_bits_set(words,67,9,128); /* full128-bit source */
 }
 
-/* Wi-Fi interfaces share a source port; metadata low8 carries their ID.
- * The caller selects this mask only after registering the Wi-Fi RX path. */
-static inline void rtl_fe_wifi_mask(unsigned int words[RTL_FE_MASK_WORDS])
-{
- rtl_fe_bits_set(words,135,8,0);
-}
-
 /* Original generate_hash_mask/generate_hash_key use full SA/DA and VID.
  * L3/L4 fields stay masked; the packet editor leaves their bytes untouched. */
 static inline void rtl_fe_bridge_mask(unsigned int words[RTL_FE_MASK_WORDS])
