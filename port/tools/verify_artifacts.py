@@ -76,10 +76,15 @@ def verify(tree, stock):
                    'MTD_SPI_NAND', 'MTD_UBI', 'MTD_UBI_BLOCK', 'SQUASHFS',
                    'RTL9617C_WATCHDOG', 'RTL9617C_PER_IRQ', 'MDIO_RTL9617C',
                    'WATCHDOG_HANDLE_BOOT_ENABLED', 'ARM64_ERRATUM_1024718',
-                   'ARM64_ERRATUM_1530923', 'BLK_DEV_DM', 'DM_INIT', 'DM_VERITY',
-                   'CRYPTO_SHA256'):
+                   'ARM64_ERRATUM_1530923', 'CRYPTO_SHA256'):
         if f'CONFIG_{symbol}=y' not in config:
             raise ValueError(f'Missing built-in kernel support: {symbol}')
+    # Production FIT boots a signed, direct ubiblock SquashFS root. Its boot
+    # script never constructs a dm-verity device; experimental verity FITs
+    # built by port/tools/make_boot_fit.py are not production images.
+    for symbol in ('BLK_DEV_DM', 'DM_VERITY', 'MD', 'NET_SELFTESTS', 'IO_URING_ZCRX'):
+        if any(f'CONFIG_{symbol}={state}' in config for state in ('y', 'm')):
+            raise ValueError(f'Unexpected optional kernel feature: {symbol}')
     if 'CONFIG_WATCHDOG_OPEN_TIMEOUT=60' not in config:
         raise ValueError('Trial-slot watchdog handoff must not feed forever before procd opens it')
     return {'scope': 'offline artifact inspection only', 'openwrt_commit': commit,

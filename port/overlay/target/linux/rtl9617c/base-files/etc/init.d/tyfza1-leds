@@ -8,6 +8,9 @@ start_service() {
 	config_load system
 	config_get mode led_control mode 2
 	printf '%s\n' "$mode" > /sys/devices/platform/leds/mode || return $?
+	# Disabled LEDs need no userspace LED poller. Keep the 1 Hz monitor
+	# while LEDs are enabled: LOS has no reliable userspace event source.
+	[ "$mode" != 0 ] || return 0
 	procd_open_instance
 	procd_set_param command /usr/bin/ucode /usr/share/tyfza1/leds.uc
 	procd_set_param stdout 1
@@ -20,10 +23,9 @@ service_triggers() {
 }
 
 reload_service() {
-	local mode
-	config_load system
-	config_get mode led_control mode 2
-	printf '%s\n' "$mode" > /sys/devices/platform/leds/mode
+	# A procd service replacement also removes the old poller on mode=0 and
+	# creates it again on mode=1/2; writing mode alone leaves a stale instance.
+	start
 }
 
 stop_service() {
