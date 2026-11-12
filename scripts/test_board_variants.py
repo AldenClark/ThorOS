@@ -56,13 +56,21 @@ with tempfile.TemporaryDirectory(prefix='board-variants-') as directory:
             assert start % 0x10000 == size % 0x10000 == 0 and size
             reserved_pages.update(range(start >> 16, (start + size) >> 16))
         assert reserved_pages == shadow_pages, 'RAM reservations must match all PE ATU windows exactly'
-        for label, expected in original['leds'].items():
-            matching = [p for n, p in native.items() if n.startswith('/leds/') and
-                        p.get('label') == label.encode() + b'\0']
-            assert len(matching) == 1, (board, label)
-            assert cells(matching[0]['gpios'])[1:] == expected, (board, label)
-        assert {names(p['label'])[0] for n, p in native.items()
-                if n.startswith('/leds/')} == set(original['leds'])
+        # Wired-only DT deliberately omits stock USB and WPS indicator
+        # consumers. Every retained LED must still match the OEM GPIO and
+        # polarity, and unexpected/duplicate LED labels remain forbidden.
+        omitted_indicators = {'LED_USB0', 'LED_USB1', 'LED_WPS_G'}
+        expected_leds = {label: pins for label, pins in original['leds'].items()
+                         if label not in omitted_indicators}
+        compiled_leds = {}
+        for node, properties in native.items():
+            if not node.startswith('/leds/'):
+                continue
+            assert 'label' in properties and 'gpios' in properties, (board, node)
+            label = names(properties['label'])[0]
+            assert label not in compiled_leds, (board, label)
+            compiled_leds[label] = cells(properties['gpios'])[1:]
+        assert compiled_leds == expected_leds, (board, compiled_leds, expected_leds)
         assert cells(native['/led-button/lights-toggle']['gpios'])[1:] == original['lights_toggle']
         ni = native['/soc/ethernet@4f4300000']
         mdio = next(p for n, p in native.items() if p.get('compatible') == b'realtek,rtl9617c-mdio\0')
