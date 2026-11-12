@@ -48,7 +48,7 @@ Subject: [PATCH] Notify policy consumers when an up interface changes bridge mem
  {
  	const char *device = NULL;
 +	enum interface_update_flags updated;
- 	if (list_empty(&pending))
+ 	if (stopped || list_empty(&pending))
  		return;
  
  	current = list_first_entry(&pending, struct interface, hotplug_list);
