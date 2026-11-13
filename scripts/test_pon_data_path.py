@@ -50,11 +50,12 @@ struct net_device {struct rtl_oam_port port;bool running,carrier,stopped,registe
 struct rtl9617c_ni_endpoint {struct net_device *netdev;};
 struct rtl9617c_ni_frame {u32 header_high,header_low;const u8 *prefix;unsigned int prefix_length;};
 struct rtl9617c_pon {
-    struct net_device *oam_devices[32],*data_devices[32];
+    struct net_device *oam_devices[32],*data_devices[32],*omci_device;
     struct rtl9617c_ni_endpoint oam_endpoint;
     unsigned int llid_count,last_oam_llid,last_oam_source,registered;
     enum rtl_pon_mode mode;
     bool traffic_enabled,mpcp_enabled,pdc_configured,puc_configured;
+    unsigned int epon_holdover_active;
     void *mac,*ni_dev;
 };
 #define netdev_priv(dev) (&(dev)->port)
@@ -80,6 +81,7 @@ static struct net_device *rtl_oam_allocate(struct rtl9617c_pon *pon,unsigned int
 static int register_netdevice(struct net_device *dev) {assert(rtnl&&!dev->registered);dev->registered=true;return 0;}
 static void unregister_netdevice(struct net_device *dev) {assert(rtnl&&dev->registered);dev->registered=false;}
 static void free_netdev(struct net_device *dev) {assert(!dev->registered);live--;free(dev);}
+static void rtl_oam_free(struct net_device *dev) {free_netdev(dev);}
 static u32 readl(const void *address) {u32 value;memcpy(&value,address,4);return value;}
 static int netif_running(struct net_device *dev) {return dev->running;}
 static int netif_carrier_ok(struct net_device *dev) {return dev->carrier;}
@@ -88,6 +90,14 @@ static void netif_wake_queue(struct net_device *dev) {dev->stopped=false;woken++
 static void netif_carrier_on(struct net_device *dev) {dev->carrier=true;}
 static void netif_carrier_off(struct net_device *dev) {dev->carrier=false;}
 static void dev_kfree_skb_any(struct sk_buff *skb) {free(skb->allocation);free(skb);retired++;}
+static netdev_tx_t rtl_pon_itu_data_transmit(struct rtl9617c_pon *pon,struct sk_buff *skb,struct net_device *dev)
+{(void)pon;(void)skb;(void)dev;assert(0);return NETDEV_TX_OK;}
+static unsigned int rtl_omci_receive_offset(const u8 *bytes,unsigned int length)
+{(void)bytes;(void)length;assert(0);return 0;}
+static void rtl_pon_omci_receive(struct rtl9617c_pon *pon,struct napi_struct *napi,struct sk_buff *skb,unsigned int source)
+{(void)pon;(void)napi;(void)skb;(void)source;assert(0);}
+static void rtl_pon_itu_data_receive(struct rtl9617c_pon *pon,struct napi_struct *napi,struct sk_buff *skb,unsigned int source)
+{(void)pon;(void)napi;(void)skb;(void)source;assert(0);}
 static unsigned int eth_type_trans(struct sk_buff *skb,struct net_device *dev) {(void)dev;return skb->data[12]*256+skb->data[13];}
 static void skb_pull(struct sk_buff *skb,unsigned int length) {assert(skb->len>=length);skb->len-=length;skb->data+=length;}
 static void napi_gro_receive(struct napi_struct *napi,struct sk_buff *skb) {

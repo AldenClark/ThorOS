@@ -22,7 +22,7 @@ def production_source(relative):
 source = production_source(relative)
 # Keep the real slot-selection statements and full-bucket return, rather than
 # duplicating the new algorithm in a host model. No new production API needed.
-selection = re.search(r' start=rtl_fe_hash_bucket\(crc16\);.*?(?=\n flow=kzalloc\()', source, re.S)
+selection = re.search(r' for\(index=start\+.*?(?=\n flow=kzalloc\()', source, re.S)
 if not selection:
     raise RuntimeError('production fe_install slot-selection boundary not found')
 diag_source = production_source('tools/live-pon-diag/live_fe_memory.c')
@@ -43,7 +43,7 @@ struct rtl_fe {unsigned long hashes[RTL_FE_HASH_ENTRIES/(sizeof(unsigned long)*8
 static int test_bit(unsigned int bit,const unsigned long *map){return !!(map[bit/BITS_PER_LONG]&(1UL<<(bit%BITS_PER_LONG)));}
 static void occupy(struct rtl_fe *fe,unsigned int bit){fe->hashes[bit/BITS_PER_LONG]|=1UL<<(bit%BITS_PER_LONG);}
 static int allocate(struct rtl_fe *fe,unsigned short crc16){
- unsigned int start,index;
+ unsigned int start=rtl_fe_hash_bucket(crc16),index;
 '''
 # SDK: jameywine/ca-network-drivers commit
 # 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0,

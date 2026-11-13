@@ -10,7 +10,8 @@ use crate::wire::Writer;
 pub const BASELINE_LEN: usize = 44;
 pub const BASELINE_WITH_MIC_LEN: usize = 48;
 pub const EXTENDED_HEADER_LEN: usize = 10;
-pub const EXTENDED_MAX_PDU_LEN: usize = 1980;
+// G.988's 1980-byte extended message limit includes the 4-byte MIC.
+pub const EXTENDED_MAX_PDU_LEN: usize = 1980 - 4;
 pub const DEVICE_ID_BASELINE: u8 = 0x0a;
 pub const DEVICE_ID_EXTENDED: u8 = 0x0b;
 pub const BASELINE_VALUE_CAPACITY: usize = 29;
@@ -468,5 +469,18 @@ mod tests {
             &bytes[10..],
             &[RESULT_SUCCESS, 0x80, 0x00, 0, 0, 0, 0, 0xaa, 0xbb]
         );
+    }
+
+    #[test]
+    fn extended_wire_budget_includes_mic() {
+        assert_eq!(EXTENDED_MAX_PDU_LEN + 4, 1980);
+        assert_eq!(EXTENDED_GET_NEXT_VALUE_CAPACITY, 1963);
+        let mut frame = vec![0u8; EXTENDED_MAX_PDU_LEN];
+        frame[3] = DEVICE_ID_EXTENDED;
+        frame[8..10].copy_from_slice(&((EXTENDED_MAX_PDU_LEN - 10) as u16).to_be_bytes());
+        assert!(Request::parse(&frame).is_ok());
+        frame[8..10].copy_from_slice(&((EXTENDED_MAX_PDU_LEN - 9) as u16).to_be_bytes());
+        frame.push(0);
+        assert!(Request::parse(&frame).is_err());
     }
 }

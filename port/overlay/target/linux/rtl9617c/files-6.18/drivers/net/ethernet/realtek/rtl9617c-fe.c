@@ -83,6 +83,7 @@ struct rtl_fe_flow {
  u16 bridge_ppp_protocol;
  unsigned int destination_saved[4];
  u16 crc16;
+ u32 crc32;
  unsigned char ethernet_bytes;
  bool destination_created;
  bool mtu_owned;
@@ -366,11 +367,13 @@ static int fe_source_get(struct rtl_fe *fe,const u8 *address,unsigned int *index
  if(ret)return ret;
  for(unsigned int byte=0;byte<ETH_ALEN;byte++)rtl_fe_bits_set(words,(5-byte)*8,8,address[byte]);
  words[1]|=BIT(16);
- ret=rtl_fe_source_mac_write(&io,i,words);
- if(ret)return ret;
+ /* A timed-out write may have reached the CAM. Give rollback ownership of
+  * the saved row before issuing it, so a failed restore stays on retries. */
  ether_addr_copy(fe->source_macs[i].address,address);
  fe->source_macs[i].users=1;
  *index=i;
+ ret=rtl_fe_source_mac_write(&io,i,words);
+ if(ret)return ret;
  return 0;
 }
 static int fe_source_put(struct rtl_fe *fe,unsigned int index)
@@ -957,6 +960,10 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  rtl_fe_key_set(words,RTL_FE_KEY_TABLE_ID,0);
  rtl_fe_key_crc(words,&crc32,&crc16);
  start=rtl_fe_hash_bucket(crc16);
+ /* The main hash table stores only CRC32; two entries with the same CRC32
+  * in one bucket cannot be distinguished by the hardware. */
+ list_for_each_entry(flow,&fe->flows,list)
+  if(flow->hash_index/32==start/32 && flow->crc32==crc32)return -EEXIST;
  /* RTL9617C cache-age0 erratum: invalidating CRC16[12:0]=0/slot0
   * can select an empty cache row instead of this flow. Keep slot0 free.
   * SDK aal_hash.c (__hash_tbl_entry_add), ca-network-drivers commit
@@ -967,7 +974,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  flow=kzalloc(sizeof(*flow),GFP_KERNEL);
  if(!flow)return -ENOMEM;
  flow->cookie=cookie;
- flow->hash_index=index;flow->crc16=crc16;
+ flow->hash_index=index;flow->crc16=crc16;flow->crc32=crc32;
  INIT_LIST_HEAD(&flow->retry);
  flow->input=data.input;flow->output=data.output;flow->lastused=jiffies;
  flow->ethernet_bytes=data.ethernet_bytes;
@@ -987,9 +994,10 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  list_add_tail(&flow->list,&fe->flows);
  fe_index_flow(fe,flow);
  if(!data.bridge) {
+  flow->source_mac=FE_SOURCE_MACS;
   ret=fe_source_get(fe,data.source,&flow->source_mac);
+  flow->source_owned=flow->source_mac!=FE_SOURCE_MACS;
   if(ret)goto rollback;
-  flow->source_owned=true;
   ret=fe_destination_get(fe,flow,data.destination);
   if(ret)goto rollback;
   ret=fe_interface_get(fe,flow);

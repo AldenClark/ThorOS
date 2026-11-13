@@ -8,8 +8,10 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 fixture = (root / 'scripts/test_bridge_learning.py').read_text().split('functions =')[0]
 exec(compile(fixture, str(root / 'scripts/test_bridge_learning.py'), 'exec'))
+# This scenario never injects backlog packets; avoid a dead C helper under -Werror.
+backend = backend.split('static struct rtl_fe_bridge *backlog_bridge;')[0]
 
-wire = (root / 'artifacts/goal-evto/veip-ani.bin').read_bytes()
+wire = (root / 'scripts/fixtures/veip-ani.bin').read_bytes()
 count, profiles = struct.unpack_from('<HH', wire, 2)
 lines = [f'static struct rtl_itu_paths *config(void) {{ struct rtl_itu_paths *p=calloc(1,sizeof(*p)+{profiles}*sizeof(p->profile[0]));',
          f'assert(p); p->count={count}; p->profile_count={profiles}; p->generation=77;']
@@ -74,7 +76,7 @@ int main(void) {
  skb.saved.pon_generation=76;
  fe_bridge_forwarded(&bridge,&skb,&output);fe_bridge_work(&bridge.work.work);
  assert(installed==2); /* Queued old configuration must not seed a new cache. */
- lan.state=0;fe_bridge_work(&bridge.work.work);
+ lan.state=0;jiffies+=HZ;fe_bridge_work(&bridge.work.work);
  assert(deleted==2 && !net.references);free(fe.itu_paths);
  /* Accepted intermediate OMCI graphs must not install ambiguous FE rules. */
  struct rtl_itu_paths pending={.count=2,.path={
@@ -125,10 +127,14 @@ functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_
     'fe_bridge_wire','fe_bridge_capture','fe_bridge_same','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
 with tempfile.TemporaryDirectory(prefix='fe-evto-') as temp:
     work = Path(temp)
+    # The host model defines u8/u16/u32/u64 itself; the copied bridge header
+    # only needs this include name to resolve on macOS and Linux alike.
+    (work / 'linux').mkdir()
+    (work / 'linux/types.h').write_text('#pragma once\n')
     (work / 'test.c').write_text(common + structs + backend +
         (drivers / 'rtl9617c-fe-vlan.h').read_text() + '\n'.join(lines) + functions + test)
     subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
-        '-fsanitize=address,undefined', '-I' + str(drivers),
+        '-fsanitize=address,undefined', '-I' + str(work), '-I' + str(drivers),
         '-I' + str(root / 'port/overlay/target/linux/rtl9617c/files-6.18/include'),
         str(work / 'test.c'), '-o', str(work / 'test')], check=True)
     subprocess.run([str(work / 'test')], check=True)

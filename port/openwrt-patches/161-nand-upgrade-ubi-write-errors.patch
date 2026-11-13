@@ -1,0 +1,20 @@
+--- a/package/base-files/files/lib/upgrade/nand.sh
++++ b/package/base-files/files/lib/upgrade/nand.sh
+@@ -354,7 +354,7 @@
+ 		local ubidev="$( nand_find_ubi "${CI_ROOT_UBIPART:-$CI_UBIPART}" )"
+ 		local root_ubivol="$( nand_find_volume $ubidev "$CI_ROOTPART" )"
+ 		$cmd < "$tar_file" | tar xOf - "$board_dir/root" | \
+-			ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" -
++			ubiupdatevol /dev/$root_ubivol -s "$rootfs_length" - || return 1
+ 	fi
+ 	if [ "$kernel_length" ]; then
+ 		if [ "$kernel_mtd" ]; then
+@@ -370,7 +370,7 @@
+ 			local ubidev="$( nand_find_ubi "${CI_KERN_UBIPART:-$CI_UBIPART}" )"
+ 			local kern_ubivol="$( nand_find_volume $ubidev "$CI_KERNPART" )"
+ 			$cmd < "$tar_file" | tar xOf - "$board_dir/kernel" | \
+-				ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" -
++				ubiupdatevol /dev/$kern_ubivol -s "$kernel_length" - || return 1
+ 		fi
+ 	fi
+ 
