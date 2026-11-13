@@ -71,10 +71,10 @@ configure_link() {
 		printf '1\n' > "$device/mac" || return $?
 		pon_stage=puc
 		printf '1\n' > "$device/puc" || return $?
-		pon_stage=pdc
-		printf '1\n' > "$device/pdc" || return $?
 		pon_stage=omci_interface
 		ip link set pon-omci up || return $?
+		pon_stage=pdc
+		printf '1\n' > "$device/pdc" || return $?
 		pon_stage=data_interface
 		ip link set pon0 up || return $?
 		pon_stage=activation

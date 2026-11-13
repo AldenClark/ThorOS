@@ -37,7 +37,7 @@ int rtl_pon_stop_locked(struct rtl9617c_pon *pon)
 			ret = stopped;
 	} else {
 		gpiod_set_value_cansleep(pon->tx_disable, 1);
-		ret = pon->fe_enabled ? rtl_pon_fe_configure_locked(pon, false) : 0;
+		ret = (pon->fe_enabled || pon->fe_cpu_path) ? rtl_pon_fe_stop_locked(pon) : 0;
 		if (pon->mode == RTL_PON_GPON)
 			rtl_pon_gpon_stop_locked(pon);
 		else
@@ -85,7 +85,7 @@ int rtl_pon_mpcp_stop(struct rtl9617c_pon *pon)
 	if (rtl_pon_mode_is_epon(pon->mode)) {
 		int stopped;
 
-		ret = pon->fe_enabled ? rtl_pon_fe_configure_locked(pon, false) : 0;
+		ret = (pon->fe_enabled || pon->fe_cpu_path) ? rtl_pon_fe_stop_locked(pon) : 0;
 		stopped = rtl_pon_mpcp_stop_locked(pon);
 		if (!ret)
 			ret = stopped;

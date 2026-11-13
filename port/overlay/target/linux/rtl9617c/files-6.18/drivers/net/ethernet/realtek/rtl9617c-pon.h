@@ -143,6 +143,7 @@ struct rtl9617c_pon {
 	int mpcp_irq;
 	struct rtl_mpcp_backoff backoff;
 	bool fe_enabled;
+	bool fe_cpu_path;
 	u64 ploam_rx, ploam_tx, ploam_mic_errors;
 	u8 gpon_serial[8], gpon_password[10];
 	bool gpon_identity_configured;
@@ -247,6 +248,7 @@ int rtl_pon_pdc_configure(struct rtl9617c_pon *pon);
 int rtl_pon_pdc_refresh(struct rtl9617c_pon *pon);
 ssize_t rtl_pon_pdc_state(struct rtl9617c_pon *pon, char *buf);
 int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable);
+int rtl_pon_fe_stop_locked(struct rtl9617c_pon *pon);
 int rtl_pon_puc_configure(struct rtl9617c_pon *pon);
 ssize_t rtl_pon_puc_state(struct rtl9617c_pon *pon, char *buf);
 int rtl_pon_oam_init(struct rtl9617c_pon *pon);

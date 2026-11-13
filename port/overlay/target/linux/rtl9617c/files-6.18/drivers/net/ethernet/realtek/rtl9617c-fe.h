@@ -17,6 +17,7 @@ int rtl_fe_flush_port(struct rtl_fe *fe, struct net_device *netdev);
 int rtl_fe_setup_tc(struct rtl_fe *fe, struct net_device *netdev,
                     enum tc_setup_type type, void *data);
 int rtl_fe_enable(struct rtl_fe *fe);
+int rtl_fe_cpu_path(struct rtl_fe *fe);
 int rtl_fe_disable(struct rtl_fe *fe);
 ssize_t rtl_fe_state(struct rtl_fe *fe, char *buffer);
 #endif

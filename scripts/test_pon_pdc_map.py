@@ -29,12 +29,14 @@ model = r'''
 #include <string.h>
 #include <errno.h>
 #include "rtl9617c-pon-data.h"
+#include "rtl9617c-pon-mode.h"
 typedef uint32_t u32;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
 #define dev_info(...) ((void)0)
 struct mutex {bool held;};
-struct rtl9617c_pon {void *mac,*dev;struct mutex lock,control_lock;bool mac_prepared,pdc_configured;int pdc_error;unsigned char pdc_source[64];};
+struct rtl9617c_pon {void *mac,*dev,*ni_dev;int mode;bool fe_enabled,fe_cpu_path;struct mutex lock,control_lock;bool mac_prepared,pdc_configured;int pdc_error;unsigned char pdc_source[64];};
+static int rtl9617c_ni_fe_cpu_path(void *dev) {(void)dev;assert(0);return -EIO;}
 static u32 registers[0xc000/4],maps[256][2];static unsigned int accesses,fail_access;
 static void mutex_lock(struct mutex *lock) {assert(!lock->held);lock->held=true;}
 static void mutex_unlock(struct mutex *lock) {assert(lock->held);lock->held=false;}
@@ -86,7 +88,7 @@ int main(void) {
 }
 '''
 constants = '\n'.join(re.findall(r'^#define .*$', source, re.M))
-code = model + constants + '\n' + ''.join(function(name) for name in ('rtl_pdc_access', 'rtl_pon_pdc_refresh', 'rtl_pon_pdc_configure_locked')) + tests
+code = model + constants + '\n' + ''.join(function(name) for name in ('rtl_pdc_access', 'rtl_pon_pdc_refresh', 'rtl_pdc_itu_configure', 'rtl_pon_pdc_configure_locked')) + tests
 with tempfile.TemporaryDirectory(prefix='pdc-map-test-', dir=root / 'artifacts') as directory:
     directory = Path(directory)
     cfile = directory / 'pdc.c'

@@ -38,7 +38,7 @@ struct rtl9617c_pon {
  unsigned char *mac;
  unsigned int mode, itu_alloc_valid;
  unsigned int itu_alloc_ids[32], itu_gpon_gems[128];
- bool fe_enabled, xgpon_restore_pending;
+ bool fe_enabled,fe_cpu_path, xgpon_restore_pending;
  struct rtl_xgtc_puc_saved xgpon_puc_saved;
  unsigned int xgpon_restore_tcont[32];
 };
