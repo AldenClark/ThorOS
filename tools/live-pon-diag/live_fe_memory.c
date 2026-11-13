@@ -127,7 +127,7 @@ static int cache_dma_check(const struct rtl_dq_io *io)
  for(slot=0;slot<RTL_FE_CACHE_ENTRIES;slot++) {
   ret=rtl_fe_cache_read(io,slot,0,metadata);
   if(ret)return ret;
-  if(metadata[0]!=crc32 || (metadata[1]&0x1fff)!=crc16)continue;
+  if(metadata[0]!=crc32 || (metadata[1]&0x1fff)!=(crc16&0x1fff))continue;
   ret=rtl_fe_cache_read(io,slot,1,actual);
   if(ret)return ret;
   if(memcmp(actual,expected,28)) {
