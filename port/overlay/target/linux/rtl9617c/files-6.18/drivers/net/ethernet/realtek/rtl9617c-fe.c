@@ -849,12 +849,17 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  if(flow->published) {
   ret=rtl_fe_main_age(&io,flow->hash_index,0);
   if(ret)goto retry;
+ }
+ /* G3_hash 3.3.2 requires clearing the DDR key before invalidating cache.
+  * SDK aal_hash_delete, ca-network-drivers commit
+  * 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0, lines3302..3305. */
+ ((__le32 *)fe->memory)[flow->hash_index]=0;
+ dma_wmb();
+ if(flow->published) {
   ret=rtl_fe_cache_command(&io,flow->hash_index,flow->crc16,1);
   if(ret)goto retry;
   flow->published=false;
  }
- ((__le32 *)fe->memory)[flow->hash_index]=0;
- dma_wmb();
  if(flow->destination_owned) {
   ret=fe_destination_put(fe,flow);
   if(ret)goto retry;

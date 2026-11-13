@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise production flow teardown with shared MACs and a failed CAM restore."""
+import argparse
 import hashlib
 import json
 from pathlib import Path
@@ -9,7 +10,11 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
-native = (drivers / 'rtl9617c-fe.c').read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--revision', help='Run the same teardown oracle against an older production commit')
+args = parser.parse_args()
+relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
+native = subprocess.check_output(['git', 'show', args.revision + ':' + relative], cwd=root, text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
 def function(name):
     start = re.search(r'^.*\b' + name + r'\([^;]*?\)\s*\{',native,re.M).start()
     end = native.index('{',start)+1
@@ -33,7 +38,8 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 typedef uint32_t __le32;typedef uint64_t u64;
 #define ETH_ALEN 6
 #define BIT(n) (1U<<(n))
-#define dma_wmb() ((void)0)
+static unsigned int dma_barriers;
+#define dma_wmb() (++dma_barriers)
 #define kfree(p) free(p)
 struct list_head {struct list_head *next,*prev;};
 static void init_list(struct list_head *h){h->next=h->prev=h;}
@@ -70,7 +76,8 @@ struct rtl_fe {
  u64 deletes;
  unsigned int registers[0x4000/4],ages[RTL_FE_HASH_ENTRIES/32][4],cam[5];
  unsigned int deletes_FDB,restores_CAM,restores_IF,cache_invalidates;
- bool fail_CAM,fail_age,fail_cache;
+ bool fail_CAM,fail_age,fail_age_write,fail_cache;
+ unsigned int oracle_hash_index,age_withdraw_barriers;
  struct delayed_work cleanup_work;
  int lock;
 };
@@ -84,13 +91,22 @@ static void fe_write(void *context,unsigned int reg,unsigned int value){((struct
 static int fe_access(void *context,unsigned int reg,unsigned int value){
  struct rtl_fe *fe=context;
  if(reg==0x3928){
-  if(fe->fail_age){fe->fail_age=false;return -ETIMEDOUT;}
+  if(fe->fail_age || (fe->fail_age_write && (value&BIT(30)))){
+   fe->fail_age=fe->fail_age_write=false;return -ETIMEDOUT;
+  }
+  if(value&BIT(30))fe->age_withdraw_barriers=dma_barriers;
   unsigned int row=value&(RTL_FE_HASH_ENTRIES/32-1);
   for(unsigned int i=0;i<4;i++) {
    if(value&BIT(30))fe->ages[row][i]=fe_read(fe,0x3938-i*4);
    else fe_write(fe,0x3938-i*4,fe->ages[row][i]);
   }
  } else if(reg==0x38b0){
+  /* Independent hardware-spec oracle: G3_hash 3.3.2 Hash Entry Removal,
+   * quoted by same-chip SDK aal_hash_delete at 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0:
+   * first clear Main Hash's32-bit DDR field, then invalidate the cache.
+   * A completed DMA write barrier must publish the clear before this command. */
+  assert(!((u32 *)fe->memory)[fe->oracle_hash_index]);
+  assert(dma_barriers>fe->age_withdraw_barriers);
   if(fe->fail_cache){fe->fail_cache=false;return -ETIMEDOUT;}
   fe->cache_invalidates++;
  }
@@ -129,19 +145,26 @@ int main(void){
  set_bit(a->counter,fe.counters);set_bit(b->counter,fe.counters);
  ((u32 *)fe.memory)[1280]=0x12345678;((u32 *)fe.memory)[65344]=0x87654321;
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
+ fe.oracle_hash_index=a->hash_index;
  assert(!fe_delete(&fe,a));
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  assert(fe.source_macs[0].users==1 && !fe.deletes_FDB && !fe.restores_CAM);
  assert(!test_bit(1280,fe.hashes) && test_bit(65344,fe.hashes));
  /* FDB migration may meet a failed age/cache withdrawal. Keep every
   * live hardware owner until the existing cleanup can finish withdrawal. */
- fe.fail_age=true;
+ fe.oracle_hash_index=b->hash_index;fe.fail_age=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->deleting);
  assert(b->source_owned && b->destination_owned && b->interface_owned);
  assert(test_bit(65344,fe.hashes) && test_bit(30,fe.counters));
+ assert(((u32 *)fe.memory)[65344]==0x87654321); /* Failed withdrawal preserves the DDR key. */
+ fe.fail_age_write=true;
+ assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
+ assert(((u32 *)fe.memory)[65344]==0x87654321 && !fe.deletes_FDB);
  fe.fail_cache=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
  assert(!fe.deletes_FDB && fe.source_macs[0].users==1);
+ assert(!((u32 *)fe.memory)[65344] && b->interface_owned && b->mtu_owned);
+ assert(fe.interfaces[30].users==1 && fe.mtus[0].users==1);
  fe.fail_CAM=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
@@ -150,7 +173,7 @@ int main(void){
  assert(test_bit(65344,fe.hashes) && test_bit(30,fe.counters));
  assert(!((u32 *)fe.memory)[65344]);
  port->bindings=1;
- assert(b->deleting && fe.cleanup_work.queued==3);
+ assert(b->deleting && fe.cleanup_work.queued==4);
  assert(fe.retries.next==&b->retry && b->retry.next==&fe.retries);
  fe_cleanup_work(&fe.cleanup_work.work);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
@@ -161,8 +184,19 @@ int main(void){
  for(unsigned int i=0;i<5;i++)assert(fe.cam[i]==0x51000000+i);
  assert(fe.flows.next==&fe.flows && !test_bit(65344,fe.hashes) && !test_bit(30,fe.counters));
  assert(list_empty(&fe.retries) && fe.cookies.erases==2);
+ /* A partial unpublished installation still clears its DDR slot, without
+  * issuing invalidation or counting an installation as a normal delete. */
+ struct rtl_fe_flow *c=calloc(1,sizeof(*c));assert(c);
+ c->hash_index=1413;init_list(&c->retry);list_add_tail(&c->list,&fe.flows);
+ set_bit(c->hash_index,fe.hashes);((u32 *)fe.memory)[c->hash_index]=0xaabbccdd;
+ unsigned int before_invalidations=fe.cache_invalidates,before_barriers=dma_barriers;
+ assert(!fe_delete(&fe,c));
+ assert(!((u32 *)fe.memory)[1413] && !test_bit(1413,fe.hashes));
+ assert(fe.cache_invalidates==before_invalidations && dma_barriers>before_barriers);
+ assert(fe.deletes==2 && fe.cookies.erases==3 && list_empty(&fe.flows));
  free(fe.memory);
  assert(!fe.mtus[0].users && fe_read(&fe,0x3520)==0x23451234);
+ puts("G3 removal order: DDR key zero and DMA barrier precede invalidation; age/cache failures retain ownership; unpublished rollback clears without invalidation");
  puts("Native FE teardown:shared FDB/source MAC,last-owner restore,failed CAM retry and DMA/hash/counter ownership passed");
 }
 '''
@@ -177,6 +211,10 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as w
     subprocess.run([str(binary)],check=True)
 (root/'logs/fe-flow-release.json').write_text(json.dumps({
     'production_source_sha256':hashlib.sha256(native.encode()).hexdigest(),
+    'DDR_key_clear_and_barrier_before_cache_invalidation':True,
+    'failed_age_read_and_write_preserve_DDR_key':True,
+    'failed_cache_invalidation_retains_resource_owners':True,
+    'unpublished_rollback_clears_without_cache_command':True,
     'shared_MAC_last_owner_release':True,'retired_port_retained_until_failed_flow_cleanup_retries_finish':True,'CAM_restore_failure_retried_without_double_release':True,
     'hash_and_counter_slots_retained_until_release_completed':True,
     'sanitizers':['ASan','UBSan'],'hardware_fault_injection':False,
