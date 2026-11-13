@@ -601,10 +601,13 @@ impl Mib {
             return Response::new(request, RESULT_PARAMETER_ERROR);
         }
 
-        let sequence = u16::from_be_bytes([request.content[0], request.content[1]]) as usize;
+        let Some(bytes) = request.content.get(..2) else {
+            return Response::new(request, RESULT_PARAMETER_ERROR);
+        };
+        let sequence = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
         let capacity = request.get_next_value_capacity();
         let start = sequence * capacity;
-        if start >= snapshot.bytes.len() && !snapshot.bytes.is_empty() {
+        if start >= snapshot.bytes.len() && (sequence != 0 || !snapshot.bytes.is_empty()) {
             return Response::new(request, RESULT_PARAMETER_ERROR);
         }
         let end = (start + capacity).min(snapshot.bytes.len());
@@ -1860,6 +1863,7 @@ fn collect_multicast_acl_vlan_id(row: &[u8], output: &mut BTreeSet<u16>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol;
 
     impl Default for IdentityConfig {
         fn default() -> Self {
@@ -1896,6 +1900,32 @@ mod tests {
             enhanced_security: true,
             psk: Some([1; 16]),
         }
+    }
+
+    #[test]
+    fn get_next_rejects_short_sequence_and_empty_table_overrun() {
+        let mut mib = empty_mib();
+        mib.table_snapshot = Some(TableSnapshot {
+            class_id: 287, entity_id: 0, attribute_mask: 0x8000, bytes: Vec::new(),
+        });
+        let mut short = [0u8; 12];
+        short[2] = ACTION_GET_NEXT;
+        short[3] = protocol::DEVICE_ID_EXTENDED;
+        short[4..6].copy_from_slice(&287u16.to_be_bytes());
+        short[8..10].copy_from_slice(&2u16.to_be_bytes());
+        short[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+        let short = Request::parse(&short).unwrap();
+        assert_eq!(mib.handle_get_next(&short).result(), Some(RESULT_PARAMETER_ERROR));
+
+        let mut baseline = [0u8; 44];
+        baseline[2] = ACTION_GET_NEXT;
+        baseline[3] = protocol::DEVICE_ID_BASELINE;
+        baseline[4..6].copy_from_slice(&287u16.to_be_bytes());
+        baseline[8..10].copy_from_slice(&0x8000u16.to_be_bytes());
+        baseline[10..12].copy_from_slice(&1u16.to_be_bytes());
+        let baseline = Request::parse(&baseline).unwrap();
+        assert_eq!(mib.handle_get_next(&baseline).result(), Some(RESULT_PARAMETER_ERROR));
+        assert_eq!(mib.handle_get_next(&Request { content: &[0, 0], ..baseline }).result(), Some(RESULT_SUCCESS));
     }
 
     #[test]

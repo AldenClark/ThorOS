@@ -104,7 +104,7 @@ with tempfile.TemporaryDirectory(prefix='omci-compatibility-') as directory:
 const assert=require('assert'),fs=require('fs');
 const options={};
 const section={tab(){},taboption(tab,type,name){
- const o={tab,values:[],dependencies:[],value(v){this.values.push(v);},depends(k,v){this.dependencies.push(v);}};
+ const o={tab,values:[],dependencies:[],value(v){this.values.push(v);},depends(condition){this.dependencies.push(condition);}};
  options[name]=o;return o;
 }};
 const form={Flag:1,ListValue:2,Value:3,DummyValue:4,NamedSection:5,
@@ -118,9 +118,9 @@ view.render([null,null]).then(()=>{
  assert.deepEqual(options.omcc_version.values,['0xb0','0x86']);
  for(const [name,def] of [['omcc_version','0xb0'],['disable_enhanced_security','0']]){
   assert.equal(options[name].default,def);
-  assert.equal(options[name].tab,'advanced');
+  assert.equal(options[name].tab,'identity');
   assert.equal(options[name].rmempty,false);assert.equal(options[name].retain,true);
-  assert.deepEqual(options[name].dependencies,['gpon','xgpon','xgspon']);
+  assert.deepEqual(options[name].dependencies,['gpon','xgpon','xgspon'].map(mode=>({mode,_advanced:'1'})));
  }
  console.log('LuCI compatibility: defaults, allowed versions and ITU-only independent options passed');
 });

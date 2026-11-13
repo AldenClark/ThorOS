@@ -3,7 +3,8 @@
 #define RTL9617C_PON_OMCI_FORMAT_H
 
 #define RTL_OMCI_PREFIX_BYTES 16
-#define RTL_OMCI_MAX_BODY 1980
+/* G.988's 1980-byte extended message limit includes the 4-byte MIC. */
+#define RTL_OMCI_MAX_BODY (1980 - 4)
 
 /* Original ca_generate_msk -> ca_generate_sk, with Class332 MSK replacement. */
 static inline int rtl_omci_session_key(void *context,

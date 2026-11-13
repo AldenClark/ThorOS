@@ -110,8 +110,12 @@ int rtl_pon_pdc_configure(struct rtl9617c_pon *pon)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	ret = pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
-		rtl_pon_pdc_configure_locked(pon);
+	mutex_lock(&pon->lock);
+	ret = pon->itu_paths_ready || pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
+		0;
+	mutex_unlock(&pon->lock);
+	if (!ret)
+		ret = rtl_pon_pdc_configure_locked(pon);
 	mutex_unlock(&pon->control_lock);
 	return ret;
 }
@@ -121,8 +125,12 @@ int rtl_pon_puc_configure(struct rtl9617c_pon *pon)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	ret = pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
-		rtl_pon_puc_configure_locked(pon);
+	mutex_lock(&pon->lock);
+	ret = pon->itu_paths_ready || pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
+		0;
+	mutex_unlock(&pon->lock);
+	if (!ret)
+		ret = rtl_pon_puc_configure_locked(pon);
 	mutex_unlock(&pon->control_lock);
 	return ret;
 }
