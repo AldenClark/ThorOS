@@ -925,7 +925,12 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  rtl_fe_key_set(words,RTL_FE_KEY_TABLE_ID,0);
  rtl_fe_key_crc(words,&crc32,&crc16);
  start=rtl_fe_hash_bucket(crc16);
- for(index=start;index<start+32;index++)if(!test_bit(index,fe->hashes))break;
+ /* RTL9617C cache-age0 erratum: invalidating CRC16[12:0]=0/slot0
+  * can select an empty cache row instead of this flow. Keep slot0 free.
+  * SDK aal_hash.c (__hash_tbl_entry_add), ca-network-drivers commit
+  * 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0, lines3777..3783. */
+ for(index=start+(!(crc16&0x1fff));index<start+32;index++)
+  if(!test_bit(index,fe->hashes))break;
  if(index==start+32)return -ENOSPC;
  flow=kzalloc(sizeof(*flow),GFP_KERNEL);
  if(!flow)return -ENOMEM;
