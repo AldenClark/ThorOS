@@ -1,0 +1,49 @@
+name: Diagnostic-only macOS Netwatch build
+
+on:
+  push:
+    branches:
+      - codex/tyfza1-netwatch-macos-build
+    paths:
+      - 'tools/tyfza1-netwatch/**'
+      - '.github/workflows/netwatch-macos-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-apple-silicon:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - name: Unit tests
+        run: cargo test --locked --manifest-path tools/tyfza1-netwatch/Cargo.toml
+      - name: Release build
+        run: cargo build --locked --release --manifest-path tools/tyfza1-netwatch/Cargo.toml --target aarch64-apple-darwin
+      - name: macOS CLI and one-minute report smoke test
+        run: |
+          binary=tools/tyfza1-netwatch/target/aarch64-apple-darwin/release/tyfza1-netwatch
+          "$binary" --help | grep -q 'read-only router SSH'
+          "$binary" --no-ssh --duration-min 1 --out "$RUNNER_TEMP/netwatch-smoke"
+          test -s "$RUNNER_TEMP/netwatch-smoke/summary.md"
+          test -s "$RUNNER_TEMP/netwatch-smoke/probes.csv"
+          test "$(wc -l < "$RUNNER_TEMP/netwatch-smoke/probes.csv")" -gt 2
+      - name: Bundle M-series macOS binary
+        run: |
+          mkdir -p dist
+          cp tools/tyfza1-netwatch/target/aarch64-apple-darwin/release/tyfza1-netwatch dist/
+          cp tools/tyfza1-netwatch/README.md tools/tyfza1-netwatch/sites.txt dist/
+          file dist/tyfza1-netwatch
+          shasum -a 256 dist/tyfza1-netwatch
+          tar -czf tyfza1-netwatch-aarch64-apple-darwin.tar.gz -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tyfza1-netwatch-aarch64-apple-darwin
+          path: tyfza1-netwatch-aarch64-apple-darwin.tar.gz
+          retention-days: 14
+

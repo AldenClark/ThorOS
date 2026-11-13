@@ -1,0 +1,12 @@
+[package]
+name = "tyfza1-netwatch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Read-only macOS/WAN and RTL9617C router correlation monitor"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
