@@ -97,7 +97,7 @@ bash scripts/check_flowtable_contracts.sh artifacts/kernel-objects/linux-6.18.60
 
 本地受 ptrace 限制使用 `ASAN_OPTIONS=detect_leaks=0`；ASan/UBSan 仍启用，不声称完成 LSan。SDK 仅对未改动 vendor `reverse_n()` 的 signed-shift UBSan 项局部豁免；不能由此声称整个 SDK 无 UB。
 
-真实 ARM64 编译结果以对应提交 CI 的 `kernel-objects` job 和 `rtl9617c-kernel-object-evidence` 为准。检查 60 个 leaf objects 的实际 AArch64 ELF、最终配置与 SHA256；**不等于最终 vmlinux 链接、完整固件构建、开机或吞吐验收**。
+真实 ARM64 编译已经在首次远端 CI 的 [编译记录](https://github.com/AldenClark/ThorOS/actions/runs/43456507721) 中通过：60 个 leaf objects 的实际 AArch64 ELF、最终配置与 SHA256 均检查成功。该轮后续 host contracts 发现独立干净 job 缺少日志目录；测试入口已补目录初始化并重新验证。后续提交的最终状态以 PR checks 和 `rtl9617c-kernel-object-evidence` 为准。**对象编译不等于最终 vmlinux 链接、完整固件构建、开机或吞吐验收**。
 
 ## 不能继续沿用的推断
 

@@ -9,6 +9,9 @@ if (( $# != 1 )); then
 fi
 kernel=$(CDPATH='' cd -- "$1" && pwd -P)
 cd "$project"
+# This gate runs in an independent clean CI job, not after prebuild. Several
+# production-function oracles write evidence into these project directories.
+mkdir -p artifacts logs
 for test in fe_flow_parser fe_cookie_index fe_pppoe_cleanup \
             flowtable_bridge_move flowtable_bridge_ageing flowtable_software_ageing \
             flowtable_work_lifetime flowtable_bridge_policy flowtable_partial_offload; do
