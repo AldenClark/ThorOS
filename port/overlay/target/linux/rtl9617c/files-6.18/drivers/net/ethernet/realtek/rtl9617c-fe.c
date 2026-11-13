@@ -109,7 +109,7 @@ struct rtl_fe {
  struct rb_root cookies;
  void *memory;
  dma_addr_t dma;
- bool enabled, prepared;
+ bool enabled, prepared, cpu_path, lan_redirected;
  int error;
  u64 installs, deletes, misses;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
@@ -340,7 +340,6 @@ static int fe_restore(struct rtl_fe *fe)
   if(ret)return ret;
  }
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe_write(fe,fe_registers[i],fe->saved[i]);
- for(i=0;i<FE_LAN_PORTS;i++)fe_write(fe,FE_LAN_RX_CTRL(i),fe->lan_saved[i]);
  fe_read(fe,0x383c);
  fe->prepared=false;
  return 0;
@@ -849,12 +848,17 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  if(flow->published) {
   ret=rtl_fe_main_age(&io,flow->hash_index,0);
   if(ret)goto retry;
+ }
+ /* G3_hash 3.3.2 requires clearing the DDR key before invalidating cache.
+  * SDK aal_hash_delete, ca-network-drivers commit
+  * 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0, lines3302..3305. */
+ ((__le32 *)fe->memory)[flow->hash_index]=0;
+ dma_wmb();
+ if(flow->published) {
   ret=rtl_fe_cache_command(&io,flow->hash_index,flow->crc16,1);
   if(ret)goto retry;
   flow->published=false;
  }
- ((__le32 *)fe->memory)[flow->hash_index]=0;
- dma_wmb();
  if(flow->destination_owned) {
   ret=fe_destination_put(fe,flow);
   if(ret)goto retry;
@@ -1289,15 +1293,24 @@ unlock:
  kvfree(copy);
  return ret;
 }
+static void fe_lan_restore_locked(struct rtl_fe *fe)
+{
+ unsigned int i;
+
+ if(!fe->lan_redirected)return;
+ for(i=0;i<FE_LAN_PORTS;i++)fe_write(fe,FE_LAN_RX_CTRL(i),fe->lan_saved[i]);
+ fe->lan_redirected=false;
+}
+
 static int fe_disable_locked(struct rtl_fe *fe)
 {
  struct rtl_fe_flow *flow,*next;
- unsigned int i;
  int ret=0;
 
  fe->enabled=false;
+ fe->cpu_path=false;
  if(fe->prepared) {
-  for(i=0;i<FE_LAN_PORTS;i++)fe_write(fe,FE_LAN_RX_CTRL(i),fe->lan_saved[i]);
+  fe_lan_restore_locked(fe);
   usleep_range(1000,2000);
   list_for_each_entry_safe(flow,next,&fe->flows,list) {
    ret=fe_delete(fe,flow);
@@ -1317,16 +1330,58 @@ int rtl_fe_enable(struct rtl_fe *fe)
  mutex_lock(&fe->lock);
  if(fe->enabled){ret=0;goto unlock;}
  /* An unfinished rollback still owns the original register snapshot. */
- if(fe->prepared) {
+ if(fe->prepared && !fe->cpu_path) {
   ret=fe_disable_locked(fe);
   if(ret)goto unlock;
  }
- ret=fe_prepare(fe);
- if(ret){fe_restore(fe);goto unlock;}
+ if(!fe->prepared) {
+  ret=fe_prepare(fe);
+  if(ret){fe_restore(fe);goto unlock;}
+ }
  /* The DMA tables, miss actions and port maps exist before admitting LAN. */
+ /* CPU-only preparation can precede the first NI engine start. Own LAN
+  * only at admission, so a later disable restores its active CPU mapping. */
+ for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
+ fe->lan_redirected=true;
  for(i=0;i<FE_LAN_PORTS;i++)
   fe_write(fe,FE_LAN_RX_CTRL(i),(fe_read(fe,FE_LAN_RX_CTRL(i))&~(63U<<16))|(25U<<16));
  fe->enabled=true;
+ fe->cpu_path=false;
+ ret=0;
+unlock:
+ fe->error=ret;
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+/* ITU CPU delivery still traverses the packet editor. A raw PDC bypass
+ * does not apply the keep_orig_pkt miss action and can rebuild LCP as
+ * PPP IPv4. Keep the classifier/miss tables, but admit no hardware flows. */
+int rtl_fe_cpu_path(struct rtl_fe *fe)
+{
+ struct rtl_fe_flow *flow,*next;
+ int ret=0;
+
+ if(!fe)return -EOPNOTSUPP;
+ mutex_lock(&fe->lock);
+ if(fe->cpu_path)goto unlock;
+ if(fe->prepared && !fe->enabled) {
+  ret=fe_disable_locked(fe);
+  if(ret)goto unlock;
+ }
+ if(!fe->prepared) {
+  ret=fe_prepare(fe);
+  if(ret){fe_restore(fe);goto unlock;}
+ }
+ /* The lock also gates route callbacks and queued bridge learning. */
+ fe->enabled=false;
+ fe_lan_restore_locked(fe);
+ usleep_range(1000,2000);
+ list_for_each_entry_safe(flow,next,&fe->flows,list) {
+  ret=fe_delete(fe,flow);
+  if(ret)goto unlock;
+ }
+ fe_collect_ports(fe);
+ fe->cpu_path=true;
 unlock:
  fe->error=ret;
  mutex_unlock(&fe->lock);
@@ -1372,9 +1427,9 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   counted+=flow->counted;
   bridged+=flow->bridge;learned+=flow->learned;
  }
- length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u\n",
+ length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u cpu_path=%u\n",
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
-  FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned);
+  FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned,fe->cpu_path);
  mutex_unlock(&fe->lock);
  length+=fe_bridge_stats(fe->bridge,buffer+length,PAGE_SIZE-length);
  return length;

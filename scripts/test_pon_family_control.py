@@ -43,7 +43,7 @@ struct device_attribute {int unused;};
 struct rtl9617c_pon {
  int lock, control_lock, effects, cleanup_error;
  enum rtl_pon_mode mode;
- bool mpcp_enabled, fe_enabled, tx_disabled;
+ bool mpcp_enabled, fe_enabled,fe_cpu_path, tx_disabled;
  unsigned int llid_count;
  unsigned char gpon_serial[8], xgpon_serial[8];
  unsigned int gpon_enabled, gpon_omcc_ready, gpon_omcc_onu_id, gpon_omcc_gem, gpon_ds_fec, gpon_recover;
@@ -74,8 +74,8 @@ static int rtl_pon_epon_traffic_locked(struct rtl9617c_pon *pon, bool enable)
 {pon->tx_disabled=!enable; pon->fe_enabled=enable; return effect(pon);}
 static int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 {pon->fe_enabled=false; return effect(pon);}
-static int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon, bool enable)
-{assert(pon->control_lock && !enable); return pon->cleanup_error;}
+static int rtl_pon_fe_stop_locked(struct rtl9617c_pon *pon)
+{assert(pon->control_lock); return pon->cleanup_error;}
 static int rtl_pon_mpcp_configure(struct rtl9617c_pon *pon)
 {(void)pon; return -EOPNOTSUPP;}
 static int rtl_pon_gpon_activation_locked(struct rtl9617c_pon *pon, bool enable)

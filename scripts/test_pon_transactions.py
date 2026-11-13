@@ -64,7 +64,7 @@ struct delayed_work {bool pending;};
 struct rtl9617c_pon {
     struct mutex lock,control_lock;enum rtl_pon_mode mode;
     void *mac,*control,*epon_control,*gpon_control,*serdes_init,*optical_control,*top_irq,*dev;
-    bool mpcp_enabled,mpcp_configured,mac_prepared,traffic_enabled,serdes_configured,gearbox_ready,rx_synced,puc_configured,pdc_configured,fe_enabled,xgpon_pending_valid;
+    bool mpcp_enabled,mpcp_configured,mac_prepared,traffic_enabled,serdes_configured,gearbox_ready,rx_synced,puc_configured,pdc_configured,fe_enabled,fe_cpu_path,xgpon_pending_valid;
     u32 registered,waiting,serdes_status;int sync_result,serdes_error,mpcp_irq,cleanup_error,policy_error;
     uint64_t epon_epoch,epon_llid_epoch[32];
     u32 epon_crypto_llids,epon_sync_failures;
@@ -82,10 +82,10 @@ static int rtl_pon_epon_crypto_forget(struct rtl9617c_pon *pon,u32 mask)
 {pon->epon_crypto_llids &= ~mask;return 0;}
 int rtl_pon_stop_locked(struct rtl9617c_pon *pon);
 static int rtl_pon_itu_paths_invalidate(struct rtl9617c_pon *pon,enum rtl_pon_mode mode){(void)mode;assert(pon->lock.held);return pon->policy_error;}
-static int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable) {
+static int rtl_pon_fe_stop_locked(struct rtl9617c_pon *pon) {
     lockdep_assert_held(&pon->control_lock);
     if(pon->cleanup_error)return pon->cleanup_error;
-    pon->fe_enabled=enable;return 0;
+    pon->fe_enabled=pon->fe_cpu_path=false;return 0;
 }
 static void gpiod_set_value_cansleep(int *gpio,int value) {*gpio=value;}
 static void rtl_pon_gpon_stop_locked(struct rtl9617c_pon *pon) {(void)pon;}
@@ -133,7 +133,7 @@ static int rtl_pon_burst_polarity(struct rtl9617c_pon *pon,unsigned int page) {(
 static void rtl_pon_gearbox_release(struct rtl9617c_pon *pon) {pon->gearbox_ready=true;}
 static int rtl_pon_epon_traffic_locked(struct rtl9617c_pon *pon,bool enable) {
     assert(!enable);pon->traffic_enabled=false;
-    int ret=pon->fe_enabled?rtl_pon_fe_configure_locked(pon,false):0;
+    int ret=(pon->fe_enabled||pon->fe_cpu_path)?rtl_pon_fe_stop_locked(pon):0;
     /* Cut exactly after stop, while another thread tries public MPCP start. */
     pthread_mutex_lock(&gate);window=true;pthread_cond_broadcast(&changed);
     while(!attempted) pthread_cond_wait(&changed,&gate);

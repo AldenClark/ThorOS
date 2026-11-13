@@ -60,6 +60,8 @@ static int rtl_pdc_itu_configure(struct rtl9617c_pon *pon)
 
 		if (index < 8)
 			word |= BIT(31) | 6;
+		else
+			word = (24 << 3) | (7 << 9);
 		writel(word, pon->mac + PDC_DATA0);
 		writel(pol_id << 4, pon->mac + PDC_DATA1);
 		ret = rtl_pdc_access(pon, index, true);
@@ -85,6 +87,14 @@ int rtl_pon_pdc_configure_locked(struct rtl9617c_pon *pon)
 	}
 	pon->pdc_configured = false;
 	if (!rtl_pon_mode_is_epon(pon->mode)) {
+		/* Prepare the original-packet CPU miss before admitting ITU data.
+		 * OMCI retains its dedicated CPU16 header container. */
+		if (!pon->fe_enabled) {
+			ret = rtl9617c_ni_fe_cpu_path(pon->ni_dev);
+			if (ret)
+				goto unlock;
+			pon->fe_cpu_path = true;
+		}
 		ret = rtl_pdc_itu_configure(pon);
 		pon->pdc_configured = !ret;
 		goto unlock;
@@ -119,7 +129,7 @@ unlock:
 	return ret;
 }
 
-int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable)
+static int rtl_pon_fe_set_locked(struct rtl9617c_pon *pon,bool enable,bool cpu_path)
 {
  unsigned int entry,bank;
  int ret=0;
@@ -135,6 +145,12 @@ int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable)
   ret=rtl9617c_ni_fe_enable(pon->ni_dev);
   if(ret)goto unlock;
   pon->fe_enabled=true;
+  pon->fe_cpu_path=false;
+ } else if(cpu_path) {
+  ret=rtl9617c_ni_fe_cpu_path(pon->ni_dev);
+  if(ret)goto unlock;
+  pon->fe_enabled=false;
+  pon->fe_cpu_path=true;
  }
  /* OAM/control maps retain CPU16 and their original header container. */
  if(pon->pdc_configured && rtl_pon_mode_is_epon(pon->mode))
@@ -152,14 +168,15 @@ int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable)
    ret=rtl_pdc_access(pon,entry,false);
    if(ret)goto unlock;
    data=readl(pon->mac+PDC_DATA0);
-   writel((data&~((63U<<3)|BIT(15)))|((enable?24:16)<<3)|
-    (enable?0:BIT(15)),pon->mac+PDC_DATA0);
+   writel((data&~((63U<<3)|BIT(15)))|(((enable||cpu_path)?24:16)<<3)|
+    ((enable||cpu_path)?0:BIT(15)),pon->mac+PDC_DATA0);
    ret=rtl_pdc_access(pon,entry,true);
    if(ret)goto unlock;
   }
- if(!enable) {
+ if(!enable && !cpu_path) {
   ret=rtl9617c_ni_fe_disable(pon->ni_dev);
   if(ret)goto unlock;
+  pon->fe_cpu_path=false;
  }
  pon->fe_enabled=enable;
 unlock:
@@ -167,9 +184,19 @@ unlock:
  return ret;
 }
 
+int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon,bool enable)
+{
+ return rtl_pon_fe_set_locked(pon,enable,!enable && !rtl_pon_mode_is_epon(pon->mode));
+}
+
+int rtl_pon_fe_stop_locked(struct rtl9617c_pon *pon)
+{
+ return rtl_pon_fe_set_locked(pon,false,false);
+}
+
 ssize_t rtl_pon_pdc_state(struct rtl9617c_pon *pon, char *buf)
 {
-	static const unsigned int sample[] = {0, 31, 63, 64, 127, 192, 255};
+	static const unsigned int sample[] = {0, 8, 9, 10, 31, 63, 64, 127, 192, 255};
 	ssize_t length;
 	unsigned int i;
 	int ret;

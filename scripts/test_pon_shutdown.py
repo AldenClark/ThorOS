@@ -31,7 +31,7 @@ enum {RTL_PON_EPON_1G, RTL_PON_EPON_D10G, RTL_PON_EPON_BI10G, RTL_PON_GPON, RTL_
 struct rtl9617c_pon {
  int lock, control_lock, mode, cleanup_error, cleanup_calls, carrier_updates;
  int epon_tx_action, epon_tx_error;
- bool fe_enabled, traffic_enabled, pdc_configured, puc_configured;
+ bool fe_enabled,fe_cpu_path, traffic_enabled, pdc_configured, puc_configured;
  void *mac; int *tx_disable;
  void *dev, *top_irq, *optical_irq;
  int mpcp_irq, gpon_stops, xgpon_stops, mpcp_stops, work_stops, errors, removed;
@@ -46,11 +46,11 @@ static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
 static bool rtl_pon_mode_is_epon(int mode) { return mode < RTL_PON_GPON; }
 static void gpiod_set_value_cansleep(int *gpio, int value) { *gpio = value; }
 static int gpiod_get_value_cansleep(int *gpio) { return *gpio; }
-static int rtl_pon_fe_configure_locked(struct rtl9617c_pon *pon, bool enable)
+static int rtl_pon_fe_stop_locked(struct rtl9617c_pon *pon)
 {
- assert(pon->control_lock && !pon->lock && !enable);
+ assert(pon->control_lock && !pon->lock);
  pon->cleanup_calls++;
- if (!pon->cleanup_error) pon->fe_enabled = false;
+ if (!pon->cleanup_error) pon->fe_enabled = pon->fe_cpu_path = false;
  return pon->cleanup_error;
 }
 static void rtl_pon_update(void *address, unsigned int mask, unsigned int value)
