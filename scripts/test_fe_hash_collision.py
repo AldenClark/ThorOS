@@ -31,17 +31,19 @@ typedef unsigned char u8;typedef unsigned short u16;typedef unsigned long long u
 #define kzalloc(n,f) calloc(1,n)
 #define dma_wmb() ((void)0)
 #define cpu_to_le32(v) (v)
+#define le32_to_cpu(v) (v)
 struct list_head {struct list_head *next,*prev;};struct rb_node {int unused;};
 static void INIT_LIST_HEAD(struct list_head *l){l->next=l->prev=l;}
 static void list_add_tail(struct list_head *n,struct list_head *h){n->prev=h->prev;n->next=h;h->prev->next=n;h->prev=n;}
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
-#define list_for_each_entry(p,h,m) for(struct list_head *cursor=(h)->next;cursor!=(h) && ((p)=container_of(cursor,__typeof__(*(p)),m));cursor=cursor->next)
+static unsigned long traversed;
+#define list_for_each_entry(p,h,m) for(struct list_head *cursor=(h)->next;cursor!=(h) && (++traversed,((p)=container_of(cursor,__typeof__(*(p)),m)));cursor=cursor->next)
 struct net_device {bool up;};
 struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;bool retired;};
 '''
 fixture+=flow+rule+r'''
-struct rtl_fe {bool enabled;int error;unsigned long installs;void *memory;struct list_head flows;unsigned long hashes[65536/64];};
+struct rtl_fe {bool enabled;int error;unsigned long installs;void *memory;struct list_head flows,retries;unsigned long hashes[65536/64];};
 static int netif_running(struct net_device *d){return d->up;}
 static int netif_carrier_ok(struct net_device *d){return d->up;}
 static struct rtl_fe_flow *fe_flow(struct rtl_fe *f,unsigned long c){(void)f;(void)c;return NULL;}
@@ -64,7 +66,7 @@ static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;ass
 '''
 fixture+=symbol('fe_install')+r'''
 int main(void){
- struct rtl_fe f={.enabled=true};INIT_LIST_HEAD(&f.flows);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
+ struct rtl_fe f={.enabled=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
  struct net_device n={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q=p;
  struct rtl_fe_rule a={.input=&p,.output=&q,.pppoe_input=true,.pppoe_session=1234,
   .key={.source=0x0a000001,.destination=0xc6336401,.source_port=10000,.destination_port=443,.protocol=6,.ingress=7,.llid=1,.mask=63},
@@ -73,8 +75,17 @@ int main(void){
  assert(!fe_install(&p,a,1));int ret=fe_install(&p,b,2);
  const unsigned int *ddr=f.memory;
  assert(ddr[16416]==0x07b0aa2b);
- assert(ret==-EEXIST && !ddr[16417]);
- free(container_of(f.flows.next,struct rtl_fe_flow,list));
+ assert(ret==-EOPNOTSUPP && !ddr[16417]);
+ assert(!traversed); /* The ordinary insertion path must not scan all flows. */
+ /* Once deletion has cleared the DDR key, a timed-out cache invalidation
+  * may still retain it in hardware. Its retry owner must block reuse. */
+ struct rtl_fe_flow *first=container_of(f.flows.next,struct rtl_fe_flow,list);
+ ((unsigned int *)f.memory)[16416]=0;
+ list_add_tail(&first->retry,&f.retries);
+ assert(fe_install(&p,b,2)==-EOPNOTSUPP && !ddr[16417]);
+ assert(f.retries.next==&first->retry && first->published);
+ assert(traversed==1); /* Only the single unresolved cache owner was checked. */
+ free(first);
  free(f.memory);
  return 0;
 }
@@ -84,4 +95,4 @@ with tempfile.TemporaryDirectory(dir=here,prefix='main-publish-') as d:
  subprocess.run(['cc','-std=c11','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),str(p/'repro.c'),'-o',str(p/'repro')],check=True)
  r=subprocess.run([str(p/'repro')],capture_output=True,text=True)
  assert r.returncode==0, r.stdout+r.stderr
- print('PASS: same-bucket duplicate CRC32 is rejected before DDR publication')
+ print('PASS: same-bucket CRC32 collision and pending cache invalidation block DDR publication')

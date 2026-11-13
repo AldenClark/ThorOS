@@ -9,7 +9,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('library', type=Path, help='Host release/libtyfza1_omci.a')
+parser.add_argument('library', nargs='?', type=Path,
+                    help='Host release/libtyfza1_omci.a (omit for UI-only prebuild check)')
 args = parser.parse_args()
 source = root / 'port/packages/tyfza1-pon-control/src'
 daemon = (source / 'pon-omcid.c').read_text()
@@ -89,15 +90,16 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='omci-compatibility-') as directory:
     work = Path(directory)
-    (work / 'active_serial_number').write_text('5445535401020304\n')
-    code = fixture[:fixture.index('static void get_version')] + '#define PON_SYSFS ' + json.dumps(str(work) + '/') + '\n'
-    code += function('identity_field') + '\n' + function('load_identity') + '\n'
-    code += fixture[fixture.index('static void get_version'):]
-    (work / 'test.c').write_text(code)
-    subprocess.run(['cc', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
-                    '-fsanitize=address,undefined', '-I' + str(source), str(work / 'test.c'),
-                    str(args.library.resolve()), '-lpthread', '-lm', '-ldl', '-o', str(work / 'test')], check=True)
-    subprocess.run([str(work / 'test')], check=True)
+    if args.library is not None:
+        (work / 'active_serial_number').write_text('5445535401020304\n')
+        code = fixture[:fixture.index('static void get_version')] + '#define PON_SYSFS ' + json.dumps(str(work) + '/') + '\n'
+        code += function('identity_field') + '\n' + function('load_identity') + '\n'
+        code += fixture[fixture.index('static void get_version'):]
+        (work / 'test.c').write_text(code)
+        subprocess.run(['cc', '-O1', '-g', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+                        '-fsanitize=address,undefined', '-I' + str(source), str(work / 'test.c'),
+                        str(args.library.resolve()), '-lpthread', '-lm', '-ldl', '-o', str(work / 'test')], check=True)
+        subprocess.run([str(work / 'test')], check=True)
 
     ui = root / 'port/packages/luci-app-tyfza1-pon/htdocs/luci-static/resources/view/network/tyfza1-pon.js'
     (work / 'test.js').write_text(r'''

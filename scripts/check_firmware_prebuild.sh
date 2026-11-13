@@ -17,13 +17,16 @@ python3 scripts/test_fe_lan_lifecycle.py
 python3 scripts/test_fe_cache_slot_zero.py
 python3 scripts/test_fe_hash_collision.py
 python3 scripts/test_fe_source_cam_timeout.py
+python3 scripts/test_nand_upgrade_write_errors.py
 python3 scripts/test_fe_cache_snapshot.py
 python3 scripts/test_itu_cpu_path.py
 python3 scripts/test_pon_fe_stop.py
 python3 scripts/test_pon_reconfigure_guard.py
 python3 scripts/test_pon_data_path.py
+python3 scripts/test_omci_compatibility.py
 python3 scripts/test_itu_pppoe_datapath.py
 python3 scripts/test_bridge_learning.py
+python3 scripts/test_fe_evto.py
 python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_dma_tx_fastpath.py
 python3 scripts/test_ni_adaptive_timer.py

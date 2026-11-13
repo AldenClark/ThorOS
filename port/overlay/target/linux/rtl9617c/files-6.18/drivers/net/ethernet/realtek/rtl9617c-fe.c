@@ -960,10 +960,16 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  rtl_fe_key_set(words,RTL_FE_KEY_TABLE_ID,0);
  rtl_fe_key_crc(words,&crc32,&crc16);
  start=rtl_fe_hash_bucket(crc16);
- /* The main hash table stores only CRC32; two entries with the same CRC32
-  * in one bucket cannot be distinguished by the hardware. */
- list_for_each_entry(flow,&fe->flows,list)
-  if(flow->hash_index/32==start/32 && flow->crc32==crc32)return -EEXIST;
+ /* Hardware compares only CRC32 within the 32-slot bucket. Inspect the
+  * occupied DDR keys instead of walking every flow on each installation.
+  * The retry list also covers an uncertain cache invalidation: deletion
+  * clears DDR first, but a failed cache command can leave the old key live. */
+ for(index=start;index<start+32;index++)
+  if(test_bit(index,fe->hashes) &&
+     le32_to_cpu(((__le32 *)fe->memory)[index])==crc32)return -EOPNOTSUPP;
+ list_for_each_entry(flow,&fe->retries,retry)
+  if(flow->published && flow->hash_index/32==start/32 &&
+     flow->crc32==crc32)return -EOPNOTSUPP;
  /* RTL9617C cache-age0 erratum: invalidating CRC16[12:0]=0/slot0
   * can select an empty cache row instead of this flow. Keep slot0 free.
   * SDK aal_hash.c (__hash_tbl_entry_add), ca-network-drivers commit
