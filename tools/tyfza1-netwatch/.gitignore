@@ -1,0 +1,6 @@
+/target/
+/results/
+*.log
+*.csv
+*.tar.gz
+

@@ -1,0 +1,9 @@
+# One HTTPS URL per line; HTTP 403/405 still counts as a reachable server.
+https://www.baidu.com/
+https://www.qq.com/
+https://www.163.com/
+https://www.jd.com/
+https://www.bilibili.com/
+https://www.aliyun.com/
+https://www.sina.com.cn/
+
