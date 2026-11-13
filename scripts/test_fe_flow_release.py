@@ -37,9 +37,11 @@ common = r'''
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 typedef uint32_t __le32;typedef uint64_t u64;
 #define ETH_ALEN 6
+#define FE_INTERFACES 32
 #define BIT(n) (1U<<(n))
 static unsigned int dma_barriers;
 #define dma_wmb() (++dma_barriers)
+#define readl_poll_timeout(address,status,condition,delay,timeout) ((void)(status=0),0)
 #define kfree(p) free(p)
 struct list_head {struct list_head *next,*prev;};
 static void init_list(struct list_head *h){h->next=h->prev=h;}
@@ -60,7 +62,7 @@ struct rtl_fe;
 struct net_device {};
 struct rtl_fe_port {struct list_head list;struct rtl_fe *fe;struct net_device *netdev;unsigned int source,destination,llid,bindings;bool retired;};
 struct rtl_fe_mac {unsigned int users,saved[5];u8 address[6];};
-struct rtl_fe_interface {unsigned int users,saved,source_mac,pppoe;bool counted;};
+struct rtl_fe_interface {unsigned int users,saved,source_mac,pppoe;bool counted,ready;};
 struct rtl_fe_mtu {unsigned int users,size,saved;};
 struct work_struct {int unused;};
 struct delayed_work {struct work_struct work;unsigned int queued;};
@@ -70,13 +72,13 @@ struct rtl_fe {
  struct rb_root cookies;
  void *memory;
  struct rtl_fe_mac source_macs[15];
- struct rtl_fe_interface interfaces[64];
+ struct rtl_fe_interface interfaces[32];
  struct rtl_fe_mtu mtus[16];
  unsigned long hashes[RTL_FE_HASH_ENTRIES/64],counters[1];
  u64 deletes;
  unsigned int registers[0x4000/4],ages[RTL_FE_HASH_ENTRIES/32][4],cam[5];
  unsigned int deletes_FDB,restores_CAM,restores_IF,cache_invalidates;
- bool fail_CAM,fail_age,fail_age_write,fail_cache;
+ bool fail_CAM,fail_IF,fail_age,fail_age_write,fail_cache;
  unsigned int oracle_hash_index,age_withdraw_barriers;
  struct delayed_work cleanup_work;
  int lock;
@@ -115,7 +117,7 @@ static int fe_access(void *context,unsigned int reg,unsigned int value){
   if(fe->fail_CAM){fe->fail_CAM=false;return -ETIMEDOUT;}
   fe->restores_CAM++;
   for(unsigned int i=0;i<5;i++)fe->cam[i]=fe_read(fe,0x3214-i*4);
- } else if(reg==0x3000)fe->restores_IF++;
+ } else if(reg==0x3000){if(fe->fail_IF){fe->fail_IF=false;return -ETIMEDOUT;}fe->restores_IF++;}
  else assert(0);
  return 0;
 }
@@ -138,8 +140,8 @@ int main(void){
  assert(!fe_mtu_get(&fe,a,1492) && !fe_mtu_get(&fe,b,1492));
  assert(a->mtu_index==b->mtu_index && fe.mtus[0].users==2);
  assert(fe_read(&fe,0x3520)==0x234505d4);
- fe.interfaces[31]=(struct rtl_fe_interface){.users=1,.counted=true};
- fe.interfaces[30]=(struct rtl_fe_interface){.users=1,.counted=true};
+ fe.interfaces[31]=(struct rtl_fe_interface){.users=1,.counted=true,.ready=true};
+ fe.interfaces[30]=(struct rtl_fe_interface){.users=1,.counted=true,.ready=true};
  list_add_tail(&a->list,&fe.flows);list_add_tail(&b->list,&fe.flows);
  set_bit(a->hash_index,fe.hashes);set_bit(b->hash_index,fe.hashes);
  set_bit(a->counter,fe.counters);set_bit(b->counter,fe.counters);
@@ -165,15 +167,21 @@ int main(void){
  assert(!fe.deletes_FDB && fe.source_macs[0].users==1);
  assert(!((u32 *)fe.memory)[65344] && b->interface_owned && b->mtu_owned);
  assert(fe.interfaces[30].users==1 && fe.mtus[0].users==1);
+ /* A failed EIF restore still names the source CAM: retain its reference
+  * and the physical row reservation until restoration can be retried. */
+ fe.fail_IF=true;
+ assert(fe_delete(&fe,b)==-ETIMEDOUT && b->source_owned && b->interface_owned);
+ assert(fe.source_macs[0].users==1 && !fe.restores_CAM && fe.interfaces[30].users==1);
+ assert(test_bit(30,fe.counters) && !fe.interfaces[30].ready);
  fe.fail_CAM=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  assert(fe.deletes_FDB==1 && fe.source_macs[0].users==1);
- assert(!b->published && !b->destination_owned && b->source_owned && b->interface_owned);
- assert(test_bit(65344,fe.hashes) && test_bit(30,fe.counters));
+ assert(!b->published && !b->destination_owned && b->source_owned && !b->interface_owned);
+ assert(test_bit(65344,fe.hashes) && !test_bit(30,fe.counters));
  assert(!((u32 *)fe.memory)[65344]);
  port->bindings=1;
- assert(b->deleting && fe.cleanup_work.queued==4);
+ assert(b->deleting && fe.cleanup_work.queued==5);
  assert(fe.retries.next==&b->retry && b->retry.next==&fe.retries);
  fe_cleanup_work(&fe.cleanup_work.work);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
@@ -201,6 +209,8 @@ int main(void){
 }
 '''
 parts = [common,re.search(r'struct rtl_fe_flow \{.*?\n\};',native,re.S)[0]]
+if 'static int fe_interface_transfer(' in native:
+    parts += [function('fe_interface_transfer')]
 parts += [function(n) for n in ('fe_collect_ports','fe_source_put','fe_interface_put','fe_mtu_get','fe_mtu_put','fe_destination_put','fe_delete','fe_cleanup_work')]
 parts.append(test)
 with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as work:
@@ -214,6 +224,7 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as w
     'DDR_key_clear_and_barrier_before_cache_invalidation':True,
     'failed_age_read_and_write_preserve_DDR_key':True,
     'failed_cache_invalidation_retains_resource_owners':True,
+    'failed_EIF_restore_retains_source_CAM_owner':True,
     'unpublished_rollback_clears_without_cache_command':True,
     'shared_MAC_last_owner_release':True,'retired_port_retained_until_failed_flow_cleanup_retries_finish':True,'CAM_restore_failure_retried_without_double_release':True,
     'hash_and_counter_slots_retained_until_release_completed':True,
