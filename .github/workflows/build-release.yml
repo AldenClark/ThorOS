@@ -1,13 +1,13 @@
-name: Build TYFZA1 candidate firmware
+name: Build TYFZA1 firmware
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: tyfza1-firmware-candidate
+  group: tyfza1-firmware-release
   cancel-in-progress: false
 
 jobs:
@@ -21,10 +21,12 @@ jobs:
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
-      - name: Identify candidate source
+      - name: Generate release version
         run: |
-          echo "Candidate source: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-          echo "Build artifacts only; no Release, tag or firmware installation." >> "$GITHUB_STEP_SUMMARY"
+          RELEASE_TAG="v$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "Firmware release: $RELEASE_TAG (Asia/Shanghai)" >> "$GITHUB_STEP_SUMMARY"
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -119,7 +121,7 @@ jobs:
           git archive --format=tar.gz --prefix=PonWRT-TYFZA1/ HEAD \
             > artifacts/release/PonWRT-TYFZA1-source.tar.gz
       # Keep testing independent post-build stages after one failure, then
-      # enforce all outcomes before the candidate build can pass.
+      # enforce all outcomes before any release may be published.
       - name: Enforce post-build validation results
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
@@ -137,7 +139,7 @@ jobs:
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
-          name: firmware-candidate-and-build-log
+          name: firmware-and-build-log
           path: |
             artifacts/release/
             artifacts/build.log
@@ -145,3 +147,10 @@ jobs:
             artifacts/firmware.manifest
             logs/
           retention-days: 14
+      - name: Publish release
+        run: |
+          gh release create "$RELEASE_TAG" artifacts/release/sysupgrade.bin \
+            artifacts/release/tyfza1-telnet-install.tar.gz artifacts/release/SHA256SUMS \
+            artifacts/release/COPYING artifacts/release/PonWRT-TYFZA1-source.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "ThorOS $RELEASE_TAG" --generate-notes --latest
