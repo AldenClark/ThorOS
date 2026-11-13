@@ -17,7 +17,7 @@ relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
 source = subprocess.check_output(['git', 'show', args.revision + ':' + relative], text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
 
 def function(name):
-    start = re.search(r'^(?:static )?int ' + name + r'\(', source, re.M).start()
+    start = re.search(r'^(?:static )?(?:int|void) ' + name + r'\(', source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -44,20 +44,21 @@ common = r'''
 #define lower_32_bits(v) ((unsigned int)(v))
 #define upper_32_bits(v) ((unsigned int)((uint64_t)(v)>>32))
 struct mutex {int unused;};
-struct list_head {int unused;};
-struct rtl_fe_flow {int unused;};
-#define list_for_each_entry_safe(p,n,h,m) for(p=NULL,n=NULL;p;p=n)
+struct rtl_fe_flow {struct rtl_fe_flow *next;};
+struct list_head {struct rtl_fe_flow *first;};
+#define list_for_each_entry_safe(p,n,h,m) for(p=(h)->first,n=p?p->next:NULL;p;p=n,n=p?p->next:NULL)
 static void mutex_lock(struct mutex *m){(void)m;}
 static void mutex_unlock(struct mutex *m){(void)m;}
 struct rtl_fe {
  struct mutex lock;struct list_head flows;
- uint64_t dma;bool prepared,enabled;int error;
+ uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
  unsigned int reg[0x10000/4],mask[8],cls[1040][7],map[256];
  struct rtl_fe_cam_protocol protocol_cam[3];unsigned char ppp_protocol_ids[2];
  unsigned int cam[9][64][5];
- unsigned int admission_writes,cache_ready,fail_mask,fail_mask_writes;
+ unsigned int admission_writes,cache_ready,fail_mask,fail_mask_writes,deletes,fail_delete;
+ unsigned int expected_lan[5];
 };
 static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;assert(reg<0x10000);return f->reg[reg/4];}
 static void fe_write(void *ctx,unsigned int reg,unsigned int value){
@@ -112,14 +113,18 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
   if(value&BIT(30))f->map[index]=f->reg[0x1658/4];else f->reg[0x1658/4]=f->map[index];
  } else {
   assert(reg==0x393c && value==1);
-  /* A table clear must never occur while any LAN still admits FE traffic. */
-  for(i=0;i<5;i++)assert(fe_read(f,0xa5f8+i*0x90)==f->lan_saved[i]);
+  /* The independent NI owner supplies the current reset/native values. */
+  for(i=0;i<5;i++)assert(fe_read(f,0xa5f8+i*0x90)==f->expected_lan[i]);
  }
  return 0;
 }
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,fe_read,fe_write,fe_access};}
 static void fe_collect_ports(struct rtl_fe *f){(void)f;}
-static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){(void)f;(void)p;assert(0);return 0;}
+static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){
+ assert(!f->enabled && f->flows.first==p);
+ if(f->fail_delete){f->fail_delete--;return -ETIMEDOUT;}
+ f->flows.first=p->next;f->deletes++;return 0;
+}
 static void usleep_range(unsigned int a,unsigned int b){assert(a==1000 && b==2000);}
 '''
 lan_defines = re.search(r'^#define FE_LAN_PORTS[^\n]*\n#define FE_LAN_RX_CTRL[^\n]*', source, re.M)
@@ -131,7 +136,7 @@ int main(void){
  unsigned int old_bridge_mask[3][8];
  for(unsigned int i=0;i<0x10000/4;i++)f.reg[i]=0x80000000U+i;
  f.reg[0x30a4/4]=0x0001b000U;
- for(unsigned int i=0;i<5;i++)f.reg[(0xa5f8+i*0x90)/4]=lan[i]=0x18100400U|(i<<24);
+ for(unsigned int i=0;i<5;i++)f.reg[(0xa5f8+i*0x90)/4]=f.expected_lan[i]=lan[i]=0x18100400U|(i<<24);
  for(unsigned int i=0;i<8;i++)f.mask[i]=old_mask[i]=0x55000000+i;
  for(unsigned int s=0;s<3;s++)for(unsigned int i=0;i<8;i++)
   f.bridge_mask[s][i]=old_bridge_mask[s][i]=0x5a000000+s*8+i;
@@ -194,14 +199,79 @@ int main(void){
  assert(!rtl_fe_enable(&f));
  assert(!rtl_fe_disable(&f));
  for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
+ /* CPU trap mode is a legitimate prepared state, not failed rollback. */
+ assert(!rtl_fe_cpu_path(&f) && f.prepared && !f.enabled && f.cpu_path);
+ unsigned int snapshot[64];memcpy(snapshot,f.saved,sizeof(snapshot));
+ unsigned int cpu_regs[64];
+ for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)cpu_regs[i]=fe_read(&f,fe_registers[i]);
+ unsigned int before=f.admission_writes;
+ assert(!rtl_fe_cpu_path(&f) && f.cpu_path && f.prepared);
+ assert(f.admission_writes==before && !memcmp(snapshot,f.saved,sizeof(snapshot)));
+ for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==lan[i]);
+ for(unsigned int cycle=0;cycle<3;cycle++){
+  assert(!rtl_fe_enable(&f) && f.enabled && f.prepared && !f.cpu_path);
+  assert(!memcmp(snapshot,f.saved,sizeof(snapshot)));
+  struct rtl_fe_flow second={},first={.next=&second};f.flows.first=&first;
+  unsigned int deleted=f.deletes;
+  assert(!rtl_fe_cpu_path(&f) && !f.enabled && f.prepared && f.cpu_path);
+  assert(!f.flows.first && f.deletes==deleted+2);
+  assert(!memcmp(snapshot,f.saved,sizeof(snapshot)));
+  for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==cpu_regs[i]);
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==lan[i]);
+ }
+ /* Failed cleanup cannot silently turn a partial state into valid CPU mode. */
+ assert(!rtl_fe_enable(&f));
+ struct rtl_fe_flow stuck={};f.flows.first=&stuck;f.fail_delete=1;
+ assert(rtl_fe_cpu_path(&f)==-ETIMEDOUT && !f.enabled && f.prepared && !f.cpu_path);
+ assert(f.flows.first==&stuck && !memcmp(snapshot,f.saved,sizeof(snapshot)));
+ assert(!rtl_fe_cpu_path(&f) && f.cpu_path && !f.flows.first);
+ assert(!rtl_fe_disable(&f) && !f.enabled && !f.prepared && !f.cpu_path);
+ for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
+ /* A cold CPU-only request must prepare without ever admitting LAN. */
+ before=f.admission_writes;f.fail_mask=1;
+ assert(rtl_fe_cpu_path(&f)==-ETIMEDOUT && !f.enabled && !f.prepared && !f.cpu_path);
+ assert(!rtl_fe_cpu_path(&f) && f.cpu_path && f.prepared && f.admission_writes==before);
+ assert(!rtl_fe_disable(&f) && !f.prepared && !f.cpu_path);
+ /* FE CPU preparation can precede NI engine startup on a cold boot.
+  * LAN RX is then reset, and the engine later establishes native CPU16.
+  * The trap-only owner must never restore its earlier reset snapshot. */
+ for(unsigned int admit=0;admit<2;admit++){
+  unsigned int reset[5],native[5];
+  for(unsigned int i=0;i<5;i++){
+   reset[i]=0x08000400U|(i<<24);
+   f.expected_lan[i]=reset[i];
+   fe_write(&f,FE_LAN_RX_CTRL(i),reset[i]);
+  }
+  assert(!rtl_fe_cpu_path(&f) && f.cpu_path && f.prepared);
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==reset[i]);
+  for(unsigned int i=0;i<5;i++){
+   native[i]=(reset[i]&~(BIT(28)|(63U<<16)|BIT(31)))|BIT(28)|(16U<<16);
+   f.expected_lan[i]=native[i];
+   fe_write(&f,FE_LAN_RX_CTRL(i),native[i]);
+  }
+  assert(!rtl_fe_cpu_path(&f));
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
+  if(admit){
+   assert(!rtl_fe_enable(&f) && f.enabled);
+   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==((native[i]&~(63U<<16))|(25U<<16)));
+   assert(!rtl_fe_cpu_path(&f) && !f.enabled && f.cpu_path);
+   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
+  }
+  assert(!rtl_fe_disable(&f) && !f.prepared);
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
+ }
+ puts("Cold CPU prepare: trap-only never owns LAN; later admission restores the engine's current CPU16 registers");
+ puts("CPU-only FE: first prepare, idempotence, on/off snapshots, cleanup failure and final full restore passed");
  puts("Five-LAN FE:ordered admission,physical source preservation,direct L2TM output,three exact restore cycles and failed preparation passed");
  puts("FE rollback: failed prepare/disable preserves original snapshots across re-enable and repeated rollback failure");
 }
 '''
 functions = ['fe_prepare', 'fe_restore']
+if re.search(r'^static void fe_lan_restore_locked\(', source, re.M):
+    functions.append('fe_lan_restore_locked')
 if re.search(r'^static int fe_disable_locked\(', source, re.M):
     functions.append('fe_disable_locked')
-functions += ['rtl_fe_enable', 'rtl_fe_disable']
+functions += ['rtl_fe_enable', 'rtl_fe_cpu_path', 'rtl_fe_disable']
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycle-') as work:
     path = Path(work) / 'test.c'
     binary = Path(work) / 'test'
@@ -213,6 +283,9 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'production_source_sha256': hashlib.sha256(source.encode()).hexdigest(),
     'LAN_ports': [0, 1, 2, 3, 4], 'exact_enable_disable_cycles': 3,
     'failed_prepare_admits_no_LAN': True,
+    'CPU_only_prepares_without_LAN_admission_and_preserves_snapshot': True,
+    'CPU_only_cleanup_failure_requires_retry': True,
+    'cold_CPU_prepare_does_not_own_LAN_and_admission_snapshots_current_engine_state': True,
     'GEM_gate_opens_after_CLS_defaults_LPB_cache_and_closes_before_restore': True,
     'PON_stream_identity_enabled_before_admission_and_restored': True,
     'both_CLS_defaults_supply_CPU16': True, 'physical_LSPID_preserved': True,

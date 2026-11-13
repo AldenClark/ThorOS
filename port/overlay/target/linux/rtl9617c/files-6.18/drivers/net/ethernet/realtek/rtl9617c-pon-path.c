@@ -150,8 +150,8 @@ static int path_program(struct rtl9617c_pon *pon, const struct rtl_itu_paths *pa
 			if (ret) return ret;
 		}
 		/* Original GEM add uses its internal index as disabled-policer metadata. */
-		writel(((pon->fe_enabled ? 24 : 16) << 3) | (7 << 9) |
-			(pon->fe_enabled ? 0 : BIT(15)), pon->mac + 0x9028);
+		writel((((pon->fe_enabled || pon->fe_cpu_path) ? 24 : 16) << 3) | (7 << 9) |
+			((pon->fe_enabled || pon->fe_cpu_path) ? 0 : BIT(15)), pon->mac + 0x9028);
 		writel(index << 4, pon->mac + 0x9024);
 		ret = path_access(pon, 0x9020, 0xc0000000U | index);
 		if (ret) return ret;

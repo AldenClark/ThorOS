@@ -207,6 +207,14 @@ int rtl9617c_ni_fe_enable(struct device *dev)
  return rtl_fe_enable(priv->fe);
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_fe_enable);
+int rtl9617c_ni_fe_cpu_path(struct device *dev)
+{
+ struct rtl_xram *priv=netdev_priv(dev_get_drvdata(dev));
+ /* Snapshot shared scheduler state only after the first NI/QM start. */
+ if(!READ_ONCE(priv->engine_users))return -EAGAIN;
+ return rtl_fe_cpu_path(priv->fe);
+}
+EXPORT_SYMBOL_GPL(rtl9617c_ni_fe_cpu_path);
 int rtl9617c_ni_fe_disable(struct device *dev)
 {
  struct rtl_xram *priv=netdev_priv(dev_get_drvdata(dev));
