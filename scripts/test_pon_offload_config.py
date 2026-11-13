@@ -49,4 +49,15 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='pon-offload-') as 
     subprocess.run(cli+['set','firewall.@defaults[0].flow_offloading_hw=1'],check=True)
     subprocess.run(cli+['set','firewall.@defaults[0].flow_offloading=0'],check=True)
     subprocess.run(['sh',str(action)],env=env,check=True);assert fe.read_text()=='0\n'
-print('Actual UCI offload defaults/action:fresh software-only,explicit HW enable/disable preserved,software/hardware flags agree;firewall policy preserved')
+    # An existing software-only choice may predate a separate HW option.
+    # Installing new defaults must not re-enable explicitly disabled SW.
+    for software in ('0','1'):
+        subprocess.run(cli+['delete','firewall.@defaults[0].flow_offloading_hw'],check=True)
+        subprocess.run(cli+['set','firewall.@defaults[0].flow_offloading='+software],check=True)
+        subprocess.run(cli+['commit','firewall'],check=True)
+        fe.write_text('available=1 enabled=0\n')
+        subprocess.run(['sh',str(script)],env=env,check=True)
+        assert get('firewall.@defaults[0].flow_offloading')==software
+        assert get('firewall.@defaults[0].flow_offloading_hw')=='0'
+        subprocess.run(['sh',str(action)],env=env,check=True);assert fe.read_text()=='0\n'
+print('Actual UCI offload defaults/action:fresh software-only,explicit SW/HW enable/disable preserved,software/hardware flags agree;firewall policy preserved')
