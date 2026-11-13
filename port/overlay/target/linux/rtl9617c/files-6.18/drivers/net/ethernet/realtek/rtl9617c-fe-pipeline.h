@@ -74,6 +74,49 @@ static inline void rtl_fe_classify_hash(unsigned int words[7],unsigned int profi
  rtl_fe_bits_set(words,209,6,source); /* lspid */
 }
 
+/* Pre-programmed CPU gate profile. The vendor bypass_l3fe recipe uses
+ * keep_orig_pkt plus T2_CTRL_BYPASS=15, not a raw PDC/NI redirect: the latter
+ * still reaches the packet editor and may reconstruct a PPP control frame.
+ * Native RX uses CPU0 without the vendor deep-Q bit. Preserve original LSPID
+ * so a PON packet remains source7 and LAN packets keep their physical port.
+ * Caller must also own/program the adjacent standard-FIB format row to mode0
+ * and exclude competing classifier keys/default result groups before use.
+ */
+static inline void rtl_fe_classify_cpu_original(unsigned int words[7])
+{
+ unsigned int i;
+
+ for(i=0;i<7;i++)words[i]=0;
+ rtl_fe_bits_set(words,154,1,1); /* dpid_vld */
+ rtl_fe_bits_set(words,155,1,1); /* dpid_pri */
+ rtl_fe_bits_set(words,156,1,1); /* permit */
+ rtl_fe_bits_set(words,158,10,16); /* CPU0 */
+ rtl_fe_bits_set(words,182,1,1); /* keep_orig_pkt_vld */
+ rtl_fe_bits_set(words,183,1,1); /* keep_orig_pkt */
+ rtl_fe_bits_set(words,203,1,1); /* t2_ctrl_vld */
+ rtl_fe_bits_set(words,204,4,15); /* T2_CTRL_BYPASS */
+}
+
+/* Each of the two CLS profiles owns 128 key rows, all in this one window.
+ * No mutation: a foreign full/short/flow key makes default-only ownership
+ * unsafe. Check all four valid flags, including the second half of long keys.
+ * 0 = both profiles empty, -EBUSY = foreign key/window, other errors propagate.
+ */
+static inline int rtl_fe_classifier_keys_empty(const struct rtl_dq_io *io)
+{
+ unsigned int i;
+ int ret;
+
+ for(i=0;i<256;i++) {
+  ret=rtl_fe_window_idle(io,0x3380);
+  if(ret)return ret;
+  ret=io->indirect(io->context,0x3380,0x80000000U|i);
+  if(ret)return ret;
+  if(io->read(io->context,0x3384)&(15U<<27))return -EBUSY;
+ }
+ return 0;
+}
+
 /* LPB profile used by the internal LAN-to-L3 connector. No VLAN/packet
  * rewriting occurs here; classifier and flow actions decide forwarding. */
 static inline void rtl_fe_ingress_lpb(unsigned int words[3],unsigned int source,unsigned int destination)
@@ -132,27 +175,80 @@ static inline int rtl_fe_tx_counter_read(const struct rtl_dq_io *io,
  for(i=0;i<7;i++)words[i]=io->read(io->context,0x35e4-i*4);
  return 0;
 }
-/* L2 FDB key stores a48-bit MAC beginning at bit51; the return value's
- * high13 bits are the same destination-MAC index used by the Hash action. */
+/* L3 uses an FDB address as a DA-rewrite reference, not as an L2 lookup.
+ * The RTL8277C FC driver's path action calls this a 4096+32-entry FDB index;
+ * VID/PCP rewriting is a separate action. Keep these references outside the
+ * Linux bridge's learning namespace, otherwise a routed flow pins a bridge
+ * row's output port and its last release restores stale bridge state.
+ *
+ * VID4095 is exclusively internal: every packet-side L2 lookup must exclude
+ * it (including PVID/classifier/EVTO remaps). Linux configuration validation
+ * alone is not sufficient. The L2 owner must exclude the WHOLE VID domain
+ * from learning notifications, ageing reconciliation and per-bridge flushes,
+ * and use the same lock as L3 for the shared FDB command window. Global IVL
+ * mode must not change while rows are referenced. See the evidence document;
+ * a host format test is not a physical forwarding/ASIC-errata validation.
+ */
+#define RTL_FE_FDB_PIN_VID 4095U
+#define RTL_FE_FDB_PIN_SCIND 1U
+#define RTL_FE_FDB_PIN_DOT1P 0U
+#define RTL_FE_FDB_PIN_PORT 16U
+
+static inline int rtl_fe_fdb_is_pin_domain(const unsigned int words[4])
+{
+ /* Protect unexpected SC/PCP/type values too: they may be an uncertain write. */
+ return ((words[1]>>7)&4095U)==RTL_FE_FDB_PIN_VID;
+}
+
+static inline int rtl_fe_fdb_is_pin(const unsigned int words[4])
+{
+ unsigned int type_mask=63U|(1U<<7)|(1U<<8)|(1U<<9)|(1U<<10)|
+  (1U<<19)|(1U<<20)|(1U<<21);
+ unsigned int type=RTL_FE_FDB_PIN_PORT|(1U<<9)|(1U<<19)|(1U<<20)|(1U<<21);
+
+ return rtl_fe_fdb_is_pin_domain(words) &&
+  ((words[1]>>6)&1U)==RTL_FE_FDB_PIN_SCIND &&
+  ((words[1]>>3)&7U)==RTL_FE_FDB_PIN_DOT1P &&
+  (words[0]&type_mask)==type;
+}
+
+/* FDB MAC begins at bit51; CMD_RETURN bits4..16 supply the DA index. */
 static inline void rtl_fe_fdb_key(unsigned int words[4],const unsigned char mac[6])
 {
  unsigned int i;
  for(i=0;i<4;i++)words[i]=0;
  for(i=0;i<6;i++)rtl_fe_bits_set(words,51+(5-i)*8,8,mac[i]);
- words[0]=(1U<<9)|(255U<<11)|(1U<<19)|(1U<<20)|(1U<<21); /* Static UC; both permissions enabled. */
+ rtl_fe_bits_set(words,39,12,RTL_FE_FDB_PIN_VID);
+ rtl_fe_bits_set(words,38,1,RTL_FE_FDB_PIN_SCIND);
+ rtl_fe_bits_set(words,35,3,RTL_FE_FDB_PIN_DOT1P);
+ /* CPU is a defensive destination only, never the domain-isolation guard. */
+ words[0]=RTL_FE_FDB_PIN_PORT|(1U<<9)|(255U<<11)|(1U<<19)|(1U<<20)|(1U<<21);
 }
 static inline int rtl_fe_fdb_command(const struct rtl_dq_io *io,unsigned int command,unsigned int words[4],unsigned int *result)
 {
  unsigned int i,control;
  int ret=rtl_fe_window_idle(io,0x1ca0);
  if(ret)return ret;
+ /* The MAC-limit window leases the same cpu_opt_mode in indirect mode.
+  * A late limit command remains active after its owner drops the mutex;
+  * neither the mode nor FDB DATA may be changed until both windows idle. */
+ ret=rtl_fe_window_idle(io,0x1cb4);
+ if(ret)return ret;
  control=io->read(io->context,0x1c00);
  io->write(io->context,0x1c00,control|0x80000000U);
  for(i=0;i<4;i++)io->write(io->context,0x1cb0-i*4,words[i]);
  io->write(io->context,0x1c2c,0);
  ret=io->indirect(io->context,0x1ca0,0x80000000U|command);
- io->write(io->context,0x1c00,control);
  if(ret)return ret;
+ /* A timeout is not cancellation: switching cpu_opt_mode while the FDB
+  * command is still running changes the interpretation of its shared window.
+  * The fabric owner retains the original mode across a failed transaction;
+  * this stateless helper must not guess it during a later retry. */
+ ret=rtl_fe_window_idle(io,0x1ca0);
+ if(ret)return ret;
+ ret=rtl_fe_window_idle(io,0x1cb4);
+ if(ret)return ret;
+ io->write(io->context,0x1c00,control);
  *result=io->read(io->context,0x1c2c);
  for(i=0;i<4;i++)words[i]=io->read(io->context,0x1cb0-i*4);
  return 0;

@@ -545,7 +545,11 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	if (priv->qm_rx) {
 		ret = rtl_qm_rx_start(&priv->qm, priv->port);
 		if (ret) {
-			rtl_dma_tx_stop(&priv->dma);
+			/* A failure may follow partial queue/credit programming. Close
+			 * admission explicitly before unwinding the TX engine. */
+			rtl_qm_rx_stop(&priv->qm);
+			if (priv->dma_tx)
+				rtl_dma_tx_stop(&priv->dma);
 			return ret;
 		}
 		for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
@@ -761,8 +765,16 @@ static int rtl_setup_tc(struct net_device *netdev,enum tc_setup_type type,void *
  struct rtl_xram *priv=rtl_shared(netdev);
  return rtl_fe_setup_tc(priv->fe,netdev,type,data);
 }
+
+static int rtl_get_port_parent_id(struct net_device *netdev,
+				  struct netdev_phys_item_id *ppid)
+{
+	return rtl_fe_get_port_parent_id(rtl_shared(netdev)->fe, ppid);
+}
+
 static const struct net_device_ops rtl_netdev_ops = {
  .ndo_setup_tc = rtl_setup_tc,
+	.ndo_get_port_parent_id = rtl_get_port_parent_id,
 	.ndo_open = rtl_open,
 	.ndo_stop = rtl_stop,
 	.ndo_start_xmit = rtl_xmit,
@@ -862,6 +874,8 @@ static int rtl_register_lan(struct rtl_xram *priv, struct device *parent,
 	dev->netdev_ops = &rtl_netdev_ops;
 	dev->ethtool_ops = &rtl_ethtool_ops;
 	dev->max_mtu = ETH_DATA_LEN;
+	/* One shared FDB/NI engine cannot isolate independently moved ports. */
+	dev->features |= NETIF_F_NETNS_LOCAL;
 	ether_addr_copy(mac, priv->netdev->dev_addr);
 	mac[5] += port - priv->port;
 	eth_hw_addr_set(dev, mac);
@@ -1199,7 +1213,7 @@ static ssize_t qm_buffer_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_RW(qm_buffer);
 
-/* Direct ingress to CPU0 isolates NI/QM from the classification pipeline. */
+/* Diagnostic only: the epoch-checked FE/switch owner selects CPU/L2/L3 RX. */
 static ssize_t rx_bypass_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
@@ -1207,7 +1221,17 @@ static ssize_t rx_bypass_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%08x\n", readl(priv->ni + 0xa5f8 + PORT_STRIDE * priv->port));
 }
 
-static ssize_t rx_bypass_store(struct device *dev, struct device_attribute *attr,
+static DEVICE_ATTR_RO(rx_bypass);
+
+static ssize_t l2_switch_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return sysfs_emit(buf, "%u\n", rtl_fe_switch_get(priv->fe));
+}
+
+static ssize_t l2_switch_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
@@ -1216,12 +1240,14 @@ static ssize_t rx_bypass_store(struct device *dev, struct device_attribute *attr
 
 	if (ret)
 		return ret;
-	rtl_update(priv, 0xa5f8 + PORT_STRIDE * priv->port,
-		   BIT(28) | GENMASK(21, 16) | BIT(31),
-		   enabled ? BIT(28) | (16 << 16) : 0);
+	/* Request the policy compiler; never open raw L2 ingress from sysfs.
+	 * A true request may still safely fall back for unsupported topology. */
+	ret = rtl_fe_switch_set(priv->fe, enabled);
+	if (ret)
+		return ret;
 	return count;
 }
-static DEVICE_ATTR_RW(rx_bypass);
+static DEVICE_ATTR_RW(l2_switch);
 
 static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_xram_state.attr,
@@ -1240,12 +1266,15 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_qm_es.attr,
 	&dev_attr_qm_buffer.attr,
 	&dev_attr_rx_bypass.attr,
+	&dev_attr_l2_switch.attr,
 	NULL,
 };
 static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, int index)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(kobj_to_dev(kobj)));
 
+	if (attr == &dev_attr_l2_switch.attr && !priv->fe)
+		return 0;
 	if (!priv->qm_rx &&
 	    (attr == &dev_attr_qm_pool.attr || attr == &dev_attr_qm_voqs.attr ||
 	     attr == &dev_attr_rx_prefetch.attr || attr == &dev_attr_pppoe_rx_checksum.attr ||
@@ -1359,6 +1388,7 @@ static int rtl_probe(struct platform_device *pdev)
 	if(priv->qm_rx) {
 		priv->fe=rtl_fe_allocate(dev,priv->ni);
 		if(IS_ERR(priv->fe)){ret=PTR_ERR(priv->fe);priv->fe=NULL;goto free_dma;}
+		priv->qm.fe = priv->fe;
 	}
 	platform_set_drvdata(pdev, netdev);
 	rtl_register_lans(priv, dev);

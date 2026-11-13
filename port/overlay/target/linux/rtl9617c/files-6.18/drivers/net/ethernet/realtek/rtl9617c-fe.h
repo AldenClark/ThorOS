@@ -21,5 +21,10 @@ int rtl_fe_cpu_path(struct rtl_fe *fe);
 int rtl_fe_disable(struct rtl_fe *fe);
 int rtl_fe_engine_suspend(struct rtl_fe *fe);
 int rtl_fe_engine_resume(struct rtl_fe *fe);
+int rtl_fe_get_port_parent_id(struct rtl_fe *fe, struct netdev_phys_item_id *ppid);
+int rtl_fe_switch_set(struct rtl_fe *fe, bool requested);
+bool rtl_fe_switch_get(struct rtl_fe *fe);
+void rtl_fe_switch_rx(struct rtl_fe *fe, struct sk_buff *skb,
+                     unsigned int source, u32 header0, u32 header1);
 ssize_t rtl_fe_state(struct rtl_fe *fe, char *buffer);
 #endif

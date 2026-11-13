@@ -35,7 +35,12 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     build_info = base / 'thoros-build-info'
     state = ('available=1 enabled=1 flows=3 installs=9 counted_flows=1 activity_flows=2\n'
              'admission_requests=12 parse_rejected=3 install_failed=1 reject_pon=3\n'
-             'install_unavailable=0 install_collision=1 install_no_space=0 install_io=0\n')
+             'install_unavailable=0 install_collision=1 install_no_space=0 install_io=0\n'
+             'l2_supported=1 l2_requested=1 l2_active=0 l2_reason=13 l2_hw_reason=0 '
+             'l2_hw_reason_name=ok l2_error=-17 '
+             'l2_ports=0 l2_route_ports=0x1f l2_domain_owned=0 l2_flow_allowed=1 '
+             'l2_static=0 l2_learned=0 l2_rebuilds=7 l2_polls=0 l2_scan_errors=0 '
+             'l2_bum_hardware=0 l2_vlan_hardware=0 l2_local_target=25\n')
     flow_header = ('hash input output pol_id dpid ingress_sid egress_sid age protocol '
                    'source destination counter bytes packets drop_bytes drop_packets egress_word\n')
     flow_body = ('42 lan1 pon0 8 33 0 999 2 6 192.0.2.12:51000 198.51.100.7:443 1 1000 10 0 0 00\n'
@@ -45,6 +50,8 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     write(pon / 'identity', 'PRIVATE_PON_IDENTITY\n')
     write(ni / 'fe', 'WRONG_NI_FE_PATH\n')
     for name, value in {
+        'l2_switch': '1\n',
+        'rx_bypass': '18100400\n',
         'dma_state': 'busy=4 invalid=0 completion_checks=22\n',
         'qm_voqs': 'voq7=20 budget_hits=4 cpu_packets=20 cpu_bytes=12345 ring_errors=0\n',
         'qm_state': 'no_buffer=0 fe_drop=0 l3te_tail_drop=0\n',
@@ -132,6 +139,11 @@ exit 0
     assert '[snapshot_before]' in output and '[snapshot_after]' in output
     assert output.count('admission_requests=12 parse_rejected=3') == 2
     assert output.count('install_unavailable=0 install_collision=1') == 2
+    assert output.count('l2_supported=1 l2_requested=1 l2_active=0') == 2
+    assert output.count('l2_route_ports=0x1f l2_domain_owned=0 l2_flow_allowed=1') == 2
+    assert output.count('[l2_switch]\n1') == 2 and output.count('[rx_bypass]\n18100400') == 2
+    assert output.count('l2_hw_reason_name=ok') == 2
+    assert 'requested_is_not_active' in output
     assert 'ni_sysfs=' + str(ni) in output
     assert 'cpu_bytes=12345' in output and '[softnet]' in output
     assert 'devices = { lan1, pon0 };' in output and 'DISTRIB_REVISION' in output
@@ -144,6 +156,21 @@ exit 0
     assert trace.count('sleep 1\n') == 1
     assert 'timeout -s KILL 3 sh ' not in trace
     assert all(path.read_bytes() == value for path, value in original_files.items())
+
+    # New native state must work without any PON device and take precedence
+    # when both interfaces exist. Old firmware still uses PON/fe above.
+    ni_state = state.replace('l2_rebuilds=7', 'l2_rebuilds=19')
+    write(ni / 'l2_state', ni_state)
+    output, trace, _ = run('1')
+    assert output.count('state_source=' + str(ni / 'l2_state')) == 2
+    assert output.count('l2_rebuilds=19') == 2 and 'l2_rebuilds=7' not in output
+    assert str(pon / 'fe') not in trace
+    (pon / 'fe').unlink()
+    output, trace, _ = run('1')
+    assert output.count('l2_rebuilds=19') == 2 and output.count('admission_requests=12') == 2
+    assert '42 lan1 pon0 2 6 1 1000 10 0 0' in output
+    write(pon / 'fe', state)
+    (ni / 'l2_state').unlink()
 
     output, _, _ = run('1', '--details')
     assert '192.0.2.12:51000' in output and 'warning=details_includes_' in output
@@ -233,5 +260,5 @@ exit 0
     output, trace, _ = run('--help')
     assert 'Usage:' in output and not trace
 
-print('Datapath observer: PON/NI separation, private-by-default counters, missing debugfs/tools, '
+print('Datapath observer: native NI state without PON, legacy PON fallback, private-by-default counters, missing debugfs/tools, '
       'bounded flow-table admission, explicit failures, two snapshots and legacy wrapper passed')

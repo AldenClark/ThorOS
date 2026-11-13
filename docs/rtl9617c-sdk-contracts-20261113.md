@@ -32,7 +32,8 @@ SDK-NE 是包含厂商署名实现的公开 GPL 源码镜像；SDK-REG 是同系
 | `linux-5.10.x/include/soc/cortina/rtl8277c_registers.h` | `ce5940a274a14c91e5bf3cf96e4583d2d1d086ae601eb716566dfc70d87633e0` |
 
 这六个内容摘要由下面的 oracle 校验；仅提交号或文件名相同不足以绕过校验。
-`aal_fdb.c`、`aal_pdc.c` 等人工交叉阅读资料以 SDK-NE 锁定提交为准，不冒充额外自动输入。
+新增 L2 oracle 另逐文件校验 `aal_fdb.c`、`aal_l2_classification.c` 及 FDB、port、arb、QOS、VLAN、CLS/LPB headers；完整摘要在测试的 `SDK_FILES` 清单。
+`aal_pdc.c` 等人工交叉阅读资料以 SDK-NE 锁定提交为准，不冒充额外自动输入。
 
 ## 2. 独立 oracle：验证了什么
 
@@ -42,8 +43,9 @@ SDK-NE 是包含厂商署名实现的公开 GPL 源码镜像；SDK-REG 是同系
 | `scripts/test_fe_register_contract.py` | 从 SDK-REG 提取真实地址宏和 union，解码生产 FE helper 产生的寄存器内容 | PASS |
 | `scripts/test_qm_sdk_registers.py` | 真实 SDK-REG union、16 个地址宏及 SDK `aal_l3qm_get_buffer_size_index()`，解码生产 QM/DQ 初始化 | PASS |
 | `scripts/test_pon_sdk_registers.py` | 真实 SDK-REG union 解码生产 PDC/PVT/VSTBL/CIR/PIR 写入 | PASS |
+| `scripts/test_l2_sdk_contract.py` | 真实 register unions、SDK FDB MAC encoder、PONCLE encoder、MAC-limit 实际操作函数及 CLS/LPB 类型 | PASS |
 
-这四项均已在本轮执行，使用 hosted C、ASan/UBSan；运行过程不读写设备寄存器。
+这些外部 oracle 均已执行，使用 hosted C、ASan/UBSan；运行过程不读写设备寄存器。
 FE source oracle 覆盖 67 个 action 字段 × 32 单 bit、512 个随机 action、33 个 key 字段 × 32 单 bit。
 它另覆盖 1,024 个 IPv4/IPv6 TCP/UDP VLAN/QinQ/PPPoE key 和 256 个 L2 key，比较 masked key 与 CRC16/CRC32。
 FE register oracle 覆盖 12 个 ACCESS busy 契约、8,192 组 invalidate 编码及 48 个 FDB MAC 单 bit。
@@ -89,14 +91,14 @@ native 增加 staging 前 idle guard，未完成时不覆盖 DATA，恢复责任
 
 | FE 相对偏移 | SDK-REG 字段 | busy bit |
 |---|---|---|
-| `0x1654/0x1ca0/0x3000/0x3200/0x33b0/0x35c8` | PDPID / FDB / EIF / CAM / CLS / TX MIB `access` | 31 |
+| `0x1654/0x1ca0/0x1cb4/0x3000/0x3200/0x3380/0x33b0/0x35c8` | PDPID / FDB / MAC-limit / EIF / CAM / CLS key/FIB / TX MIB `access` | 31 |
 | `0x38b0/0x38e0/0x393c` | cache request / SWO / memory init status | 0 |
 | `0x38e4/0x3910/0x3928` | cache read / mask / age access status | 31 |
 
 `test_fe_window_idle.py` 验证 busy、timeout 后重试、保持 CAM ownership 和 idle 后恢复；它是故障模型，不是 silicon 测时。
 FDB ACCESS 完成与 CMD_RETURN 成功是两层结果：SDK `aal_fdb.c:1207–1215` 接受 APPEND 4/5，10 为 full，其他不是成功。
 `test_fe_destination_status.py` 另测试这些状态和不确定操作的 rollback ownership。
-SWO 诊断 timeout 后恢复 tuple、FDB timeout 后恢复 `cpu_opt_mode` 的硬件采样时点仍缺手册确认。
+MAC-limit 与 FDB 共用 `cpu_opt_mode`：任一窗口 BUSY 时不切模式，timeout 保留 owner，等两者 idle 后显式恢复。
 
 ### 3.4 AXI workaround
 
@@ -147,6 +149,32 @@ CIR/PIR 字段见 SDK-REG 102873–102906、103027–103060 行；测试核对 n
 本轮没有从这些原始值推断确定的限速 Mbps，也未证明任何固定 400 Mbps shaping ceiling。
 OMCI/OLT grant、GPON/XG-PON framing、GEM 方向、EVTO 语义和实际排队公平性不能由这一 register oracle 代替验收。
 
+### 6.1 原生 L2 与原包 CPU gate：新增契约
+
+- L2 oracle 已比较 128 个字段、15 个 indirect windows、16,384 个 FDB 向量、448 个 PONCLE key 与 128 条 SDK MAC-limit 成功写序列；计数随新增字段测试更新。
+- FDB 是 4,096 主表 + 32 overflow；`aal_fdb.c:149–159` 的 L3 Hash 容量不能套用到 L2 FDB。
+- L2 key 为 MAC/VID/SC/可选 PCP，没有独立 Linux bridge/FID 字段；不能靠 port mask 解决同 VID、同 MAC 的多 bridge key 冲突。
+- `aal_fdb.c:4950–4952,5113–5115,5166–5168` 在 SVL 软件 key 中明确清 VID/SC；不以 ILPB 的默认 SC/PVID 推断 tagged key 隔离。
+- `aal_port.c:2722–2728` 初始化全部 64 个 IPPB physical→logical 映射；仅检查 ILPB、遗漏 IPPB alias 无法证明非 LAN 不参与学习。
+- DFT flood type 与 PONCLE packet type 不是同一枚举；前者 BC/UUC/UL2MC/UL3MC = 0/1/2/3，来自 `aal_arb.h:52–58`。
+- MC vector 的 64 bits 选择 MCFIB recipes，不是 64-bit 端口掩码；MCFIB COS command 是 active-low：0=改写、1=保留。
+- `aal_fdb.c:862–1010` 的 MAC-limit 窗口在 RAW mode0 运行，address bit6 选择 limit、低6 bits 是端口，DATA low13 是 limit。
+- `aal_fdb.c:3704` 明确 limit0 用于软件学习，不是无限制；native 的 limit helper 不暴露全 FDB flush 或 live counter init。
+- 外部 oracle 只对齐 SDK 成功路径；SDK timeout 后立即恢复模式的做法没有被照搬，native 等所有共享窗口 idle 后才恢复。
+- `aal_fdb.c:4434–4435` 的 `sm_static_entry_fwd=1` 只证明静态 SA move 时允许报文转发，不能证明 static FDB destination 会自动迁移。
+- 后置 PONCLE 的 CPU redirect 没有 learn-disable 字段；控制报文必须由已验证的前置特殊包分类/SPB 禁学，不能把“CPU trap”当作“没有硬件学习”。
+- CLS 仅两个 profiles，各 128 key rows；SDK `aal_l3_cls.h:27–31` 与 `aal_l3_cls.c:3209–3213` 给出范围。
+- CLS KEY window `0x3380` / DATA10 `0x3384` 的有效位为 `[30:27]`；所有 foreign 有效 key 均阻止 default-only gate ownership。
+- `aal_l3_cls.c:4899–4918` 证明每个 default result 是连续两行；第二行 DATA6 `[25:23]` 存 `fib_format_sel`，只写第一行不完整。
+- default 地址按 `1024 | (profile<<2) | ((result&1)<<1) | ((result&2)<<3)`；两个 profiles、四 result types、两行共 16 行，不能当连续 1024–1039 使用。
+- `ca_aal_proc.c:2894–2922` 的 bypass recipe 同时设置 `keep_orig_pkt=1`、`t2_ctrl=15` 和 CPU destination；不等同 raw PDC bypass。
+- LPB `t1_ctrl` 位于 mid-word `[13:10]`；LAN/PON 对应 `0x3418/0x3424`，可直接选择预置原包 CPU profile，不能在原子 gate 内写间接 FIB。
+- L3 parsing-error / over-VLAN / DDoS 控制也能覆盖 T1/T2；只有 default FIB 正确，不能排除这些 foreign override。
+- PDC 控制寄存器没有已证实的 all-data 原包 CPU force；关闭 map、改 raw bypass 或仅关闭 LAN RX 都不是完整 PON→L3 gate。
+- FDB 扫描只作有界 reconciliation，不是硬件 atomic snapshot；失败/部分扫描不证明未见条目已删除，private L3 DA-index 域不得被清除。
+- 当前 BUM 走 CPU-only trap，没有设置“已硬件转发”标志；这不应表述为广播/多播/未知单播已经全硬件交换。
+- 上述源码契约不替代实际 SVL/IPPB/aging clock 基础配置检查、policy 变化中的流量截断抓包、MAC move、PPPoE/LCP 与 line-rate 验收。
+
 ## 7. 重现命令
 
 在 ThorOS 根目录执行；外部目录必须对应以上锁定内容，路径自行替换，不需要接设备。
@@ -160,6 +188,8 @@ python3 scripts/test_fe_sdk_contract.py --sdk "$THOROS_SDK_NE"
 python3 scripts/test_fe_register_contract.py --registers "$THOROS_SDK_REG"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$THOROS_SDK_REG" --sdk-qm "$THOROS_SDK_AAL/aal_l3qm.c"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$THOROS_SDK_REG"
+python3 scripts/test_l2_sdk_contract.py --sdk "$THOROS_SDK_NE" --registers "$THOROS_SDK_REG"
+python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_fe_window_idle.py
 ```
 

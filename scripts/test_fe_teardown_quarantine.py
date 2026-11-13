@@ -24,6 +24,7 @@ fixture = r'''
 #include <stdio.h>
 #include <errno.h>
 #define RTL_FE_MEMORY_BYTES 4096
+#define BIT(n) (1U << (n))
 enum rtl_fe_mode {RTL_FE_MODE_OFF,RTL_FE_MODE_CPU,RTL_FE_MODE_HARDWARE};
 struct list_head {struct list_head *next,*prev;};
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
@@ -39,19 +40,32 @@ struct rtl_fe {
  struct list_head ports,blocks,flows;
  bool shutting_down,engine_ready;
  enum rtl_fe_mode desired_mode;
- int lock,error,fail_disable;
+ int lock,error,fail_disable,fail_switch_stop;
+ unsigned int fdb_cmd_mode_saved,fdb_control,fdb_access,limit_access;
  void *memory,*itu_paths,*device,*bridge,*debug;
  uintptr_t dma;
  unsigned int cleanup_work;
 };
 static struct rtl_fe *current;
-static unsigned int frees,dma_frees,path_frees,warnings,cancelled,debug_removed;
+static unsigned int frees,dma_frees,path_frees,warnings,cancelled,debug_removed,mode_writes,last_mode;
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
-static void fe_bridge_stop(void *bridge){assert(!bridge);}
+static int fe_bridge_stop(void *bridge){assert(!bridge && current->shutting_down);return current->fail_switch_stop;}
 static void debugfs_remove_recursive(void *debug){(void)debug;assert(current->shutting_down);debug_removed++;}
 static void cancel_delayed_work_sync(unsigned int *work){(void)work;assert(current->shutting_down);cancelled++;}
 static int fe_disable_locked(struct rtl_fe *fe){assert(fe->lock && fe->shutting_down && !fe->engine_ready);return fe->fail_disable;}
+struct rtl_dq_io {struct rtl_fe *context;};
+static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}
+static int rtl_fe_window_idle(const struct rtl_dq_io *io,unsigned int reg){
+ assert((reg==0x1ca0 || reg==0x1cb4) && io->context->lock);
+ return (reg==0x1ca0?io->context->fdb_access:io->context->limit_access)&BIT(31)?-EBUSY:0;
+}
+static unsigned int fe_read(struct rtl_fe *fe,unsigned int reg){assert(reg==0x1c00);return fe->fdb_control;}
+static void fe_write(struct rtl_fe *fe,unsigned int reg,unsigned int value){
+ assert(reg==0x1c00 && fe->lock && !((fe->fdb_access|fe->limit_access)&BIT(31)));
+ assert((value&~BIT(31))==(fe->fdb_control&~BIT(31)));
+ fe->fdb_control=value;last_mode=value;mode_writes++;
+}
 static void dev_err(void *device,const char *format,int error,unsigned int bound){
  (void)device;(void)format;(void)error;(void)bound;assert(current->shutting_down);warnings++;
 }
@@ -65,7 +79,8 @@ static struct rtl_fe *make_owner(void){
  init_list(&fe->ports);init_list(&fe->flows);init_list(&fe->blocks);
  fe->memory=malloc(RTL_FE_MEMORY_BYTES);fe->itu_paths=malloc(16);
  assert(fe->memory && fe->itu_paths);fe->engine_ready=true;fe->desired_mode=RTL_FE_MODE_HARDWARE;
- current=fe;frees=dma_frees=path_frees=warnings=cancelled=debug_removed=0;return fe;
+ fe->fdb_control=0xa5123456;
+ current=fe;frees=dma_frees=path_frees=warnings=cancelled=debug_removed=mode_writes=0;return fe;
 }
 '''
 tests = r'''
@@ -75,23 +90,30 @@ int main(void){
  struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
  rtl_fe_free(fe);
  assert(dma_frees==1 && path_frees==1 && frees==2 && !warnings && cancelled==1 && debug_removed==1);
+ assert(mode_writes==1 && last_mode==0x25123456);
+ fe=make_owner();fe->fdb_cmd_mode_saved=BIT(31);fe->fdb_control=0x12345678;
+ rtl_fe_free(fe);assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
- for(unsigned int fault=0;fault<4;fault++){
+ for(unsigned int fault=0;fault<7;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
   struct rtl_fe_flow flow={};struct list_head block;
   if(fault==0)fe->fail_disable=-ETIMEDOUT;
   if(fault==1)port->bindings=1; /* release can run after driver-list unbind */
   if(fault==2)list_add_tail(&block,&fe->blocks);
   if(fault==3)list_add_tail(&flow.list,&fe->flows);
+  if(fault==4)fe->fail_switch_stop=-ETIMEDOUT;
+  if(fault==5)fe->fdb_access=BIT(31); /* An in-flight FDB command still owns CMD mode. */
+  if(fault==6)fe->limit_access=BIT(31); /* A late MAC-limit command shares that mode lease. */
   rtl_fe_free(fe);
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
   assert(!dma_frees && !path_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
-  assert(fe->error==fe->fail_disable);
+  assert(!mode_writes && fe->fdb_control==0xa5123456);
+  assert(fe->error==(fault>=5?-EBUSY:fault==4?-ETIMEDOUT:fe->fail_disable));
   /* Test-only deallocation of deliberately quarantined model objects. Real
    * hardware owners stay allocated until a reboot/drain can be proved. */
   free(port);free(fe->memory);free(fe->itu_paths);free(fe);
  }
- puts("FE teardown: success frees owners; timeout, callback references, driver blocks or residual flows quarantine DMA and private state");
+ puts("FE teardown: success restores only FDB CMD-mode bit; timeout, callback references, residual flows, L2-stop failure or busy FDB/MAC-limit quarantine DMA/private owners");
 }
 '''
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-quarantine-') as directory:

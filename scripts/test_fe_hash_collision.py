@@ -28,7 +28,9 @@ typedef unsigned char u8;typedef unsigned short u16;typedef unsigned long long u
 #define jiffies 1UL
 #define VLAN_CFI_MASK 0x1000
 #define VLAN_PRIO_SHIFT 13
-#define kzalloc(n,f) calloc(1,n)
+static unsigned int allocations,mmio;
+static void *test_alloc(size_t bytes){allocations++;return calloc(1,bytes);}
+#define kzalloc(n,f) test_alloc(n)
 #define dma_wmb() ((void)0)
 #define cpu_to_le32(v) (v)
 #define le32_to_cpu(v) (v)
@@ -43,7 +45,8 @@ struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;bool retired;};
 '''
 fixture+=flow+rule+r'''
-struct rtl_fe {bool enabled;int error;unsigned long installs;void *memory;struct list_head flows,retries;unsigned long hashes[65536/64];};
+struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized;int error;unsigned long installs;void *memory;struct list_head flows,retries;unsigned long hashes[65536/64];};
+static bool fe_switch_flow_allowed(struct rtl_fe *f){return f->fabric_authorized;}
 static int netif_running(struct net_device *d){return d->up;}
 static int netif_carrier_ok(struct net_device *d){return d->up;}
 static struct rtl_fe_flow *fe_flow(struct rtl_fe *f,unsigned long c){(void)f;(void)c;return NULL;}
@@ -52,9 +55,9 @@ static void __set_bit(unsigned int n,unsigned long *b){b[n/64]|=1UL<<(n%64);}
 static void fe_index_flow(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;}
 static void put_unaligned_be32(unsigned int v,u8 *p){p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}
 static void ether_addr_copy(u8 *p,const u8 *q){memcpy(p,q,6);}
-static unsigned int rd(void *p,unsigned int r){(void)p;(void)r;return 0;}
-static void wr(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;}
-static int access_ok(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;return 0;}
+static unsigned int rd(void *p,unsigned int r){(void)p;(void)r;mmio++;return 0;}
+static void wr(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;mmio++;}
+static int access_ok(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;mmio++;return 0;}
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,wr,access_ok};}
 /* Successful unrelated owners are test doubles. The allocator, CRC, DDR
  * publication, action conversion and age publication below are production. */
@@ -66,12 +69,26 @@ static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;ass
 '''
 fixture+=symbol('fe_install')+r'''
 int main(void){
- struct rtl_fe f={.enabled=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
+ struct rtl_fe f={.enabled=true,.fabric_authorized=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
  struct net_device n={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q=p;
  struct rtl_fe_rule a={.input=&p,.output=&q,.pppoe_input=true,.pppoe_session=1234,
   .key={.source=0x0a000001,.destination=0xc6336401,.source_port=10000,.destination_port=443,.protocol=6,.ingress=7,.llid=1,.mask=63},
   .action={.translate=1,.translate_destination=1,.address=0x0a000064,.destination=3,.check_mask=63}};
  struct rtl_fe_rule b=a;b.key.source=0x0ab82e30;b.key.destination=0xc63364cf;b.key.source_port=8894;b.action.address=0x0a0000c8;
+ /* A failed engine quiesce can leave enabled=true while ready=false.
+  * Neither this state nor shutdown may publish or even touch MMIO/owners.
+  * A policy gate must also block PON-originated callbacks (ingress=7),
+  * although their PDC still points at the L3 engine and enabled stays true. */
+ assert(fe_install(&p,a,1)==-EAGAIN);
+ f.engine_ready=true;f.fabric_authorized=false;
+ assert(fe_install(&p,a,1)==-EAGAIN);
+ f.fabric_authorized=true;f.shutting_down=true;
+ assert(fe_install(&p,a,1)==-ENODEV);
+ f.shutting_down=false;p.retired=true;
+ assert(fe_install(&p,a,1)==-ENODEV);p.retired=false;
+ assert(!allocations && !mmio && !f.installs && f.flows.next==&f.flows);
+ for(unsigned int i=0;i<sizeof(f.hashes)/sizeof(f.hashes[0]);i++)assert(!f.hashes[i]);
+ for(unsigned int i=0;i<RTL_FE_MEMORY_BYTES/sizeof(unsigned int);i++)assert(!((unsigned int *)f.memory)[i]);
  assert(!fe_install(&p,a,1));int ret=fe_install(&p,b,2);
  const unsigned int *ddr=f.memory;
  assert(ddr[16416]==0x07b0aa2b);
@@ -95,4 +112,4 @@ with tempfile.TemporaryDirectory(dir=here,prefix='main-publish-') as d:
  subprocess.run(['cc','-std=c11','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),str(p/'repro.c'),'-o',str(p/'repro')],check=True)
  r=subprocess.run([str(p/'repro')],capture_output=True,text=True)
  assert r.returncode==0, r.stdout+r.stderr
- print('PASS: same-bucket CRC32 collision and pending cache invalidation block DDR publication')
+ print('PASS: offline/policy-gated/shutdown admission has zero allocation/MMIO/DDR writes; same-bucket CRC32 collision and pending cache invalidation block publication')

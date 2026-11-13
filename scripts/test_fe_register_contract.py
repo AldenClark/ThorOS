@@ -127,10 +127,23 @@ int main(void)
   L2FE_L2E_FDB_DATA3_t d={.wrd=words[3]};
   assert((((uint64_t)d.bf.mac_addr<<45)|((uint64_t)c.bf.mac_addr<<13)|b.bf.mac_addr)==address);
   assert(a.bf.is_static && a.bf.sa_permit && a.bf.da_permit && !a.bf.mc_flag);
-  assert(a.bf.aging_sts==255 && !b.bf.key_vid && !b.bf.key_dot1p && !b.bf.key_scind);
+  assert(a.bf.aging_sts==255 && b.bf.key_vid==4095 && !b.bf.key_dot1p && b.bf.key_scind==1);
+  /* Generated DATA0 exposes the multicast overlay. The UC low six bits are
+   * logical PID (aal-77c/include/aal_fdb.h::aal_fdb_data0_t). */
+  assert((words[0]&63U)==16 && (words[0]&(1U<<9)));
+  assert(!(words[0]&((1U<<7)|(1U<<8)))); /* no static move / temporary row */
+  assert(rtl_fe_fdb_is_pin_domain(words) && rtl_fe_fdb_is_pin(words));
+  for(unsigned int vid=0;vid<4096;vid++)for(unsigned int sc=0;sc<2;sc++) {
+   b.bf.key_vid=vid;b.bf.key_scind=sc;
+   for(unsigned int pcp=0;pcp<8;pcp++) {
+    b.bf.key_dot1p=pcp;words[1]=b.wrd;
+    assert(rtl_fe_fdb_is_pin_domain(words)==(vid==4095));
+    assert(rtl_fe_fdb_is_pin(words)==(vid==4095 && sc==1 && pcp==0));
+   }
+  }
  }
  puts("Pinned RTL8277C silicon registers: 12 ACCESS busy contracts, DDR/cache sizing, "
-  "AXI RMW, 8192 invalidate encodings, EIF/MIB capacity, cache identity and 48 FDB MAC bits PASS (model only)");
+  "AXI RMW, 8192 invalidate encodings, EIF/MIB capacity, cache identity, 48 FDB MAC bits and reserved DA domain PASS (model only)");
  return 0;
 }
 '''

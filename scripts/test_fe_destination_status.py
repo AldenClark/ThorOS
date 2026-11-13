@@ -36,6 +36,7 @@ fixture = r'''
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include "rtl9617c-fe-pipeline.h"
 typedef unsigned char u8;
 #define ETH_ALEN 6
 #define BIT(n) (1U<<(n))
@@ -44,15 +45,16 @@ struct list_head {struct list_head *next,*prev;};
 struct rtl_fe_flow {struct list_head list;bool destination_owned,destination_ready,destination_created,deleting;unsigned int destination_index,destination_saved[4];u8 destination[6];};
 static const size_t flow_link_offset=offsetof(struct rtl_fe_flow,list);
 struct rtl_fe {struct list_head flows;};
-struct rtl_dq_io {struct rtl_fe *context;};
-static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}
+static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){.context=fe};}
 static void ether_addr_copy(u8 *a,const u8 *b){memcpy(a,b,6);}
 static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
-static void rtl_fe_fdb_key(unsigned int words[4],const u8 mac[6]){memset(words,0,16);memcpy(words,mac,6);}
 static unsigned int statuses[3],calls,commands[3],fail_call;
-static int rtl_fe_fdb_command(const struct rtl_dq_io *io,unsigned int command,unsigned int words[4],unsigned int *result){
+static unsigned int foreign_call,foreign_bit;
+#define rtl_fe_fdb_command mock_fdb_command
+static int mock_fdb_command(const struct rtl_dq_io *io,unsigned int command,unsigned int words[4],unsigned int *result){
  (void)io;unsigned int i=calls<3?calls:2;commands[i]=command;*result=statuses[i];
- if(!calls && (*result&15)==5){words[0]=0x12345678;words[1]=0xabcdef01;}
+ if(!calls && (*result&15)==5)words[0]=(words[0]&~(255U<<11))|(37U<<11)|BIT(6);
+ if(calls+1==foreign_call)words[foreign_bit/32]^=1U<<(foreign_bit%32);
  calls++;return calls==fail_call?-ETIMEDOUT:0;
 }
 '''
@@ -60,6 +62,8 @@ test = r'''
 int main(void){
  struct rtl_fe fe={0};fe.flows.next=fe.flows.prev=&fe.flows;
  const u8 mac[6]={2,0,0,0,0,1};int failures=0,ret;struct rtl_fe_flow flow;
+ unsigned int original[4];rtl_fe_fdb_key(original,mac);
+ original[0]=(original[0]&~(255U<<11))|(37U<<11)|BIT(6);
  /* SDK: 0x5 HIT, 0xf MISS, 0xa append-full, 0xb MAC-limit. A successful
   * MMIO command is not the same as successfully installing/restoring a row. */
  for(unsigned int status=0;status<16;status++)if(status!=5 && status!=15){
@@ -78,7 +82,7 @@ int main(void){
    fprintf(stderr,"FAIL append status=%x exists=%u: ret=%d calls=%u owned=%u ready=%u created=%u\n",
     status,exists,ret,calls,flow.destination_owned,flow.destination_ready,flow.destination_created);failures++;
   }
-  if(exists && (flow.destination_saved[0]!=0x12345678 || flow.destination_saved[1]!=0xabcdef01)){
+  if(exists && memcmp(flow.destination_saved,original,sizeof(original))){
    fprintf(stderr,"FAIL append status=%x lost original FDB snapshot\n",status);failures++;
   }
  }
@@ -107,6 +111,34 @@ int main(void){
   }
  }
  fail_call=0;
+ /* A key hit is not permission to turn a foreign/malformed row into a
+  * private pin. Reject before APPEND and before taking rollback ownership. */
+ const unsigned int foreign_bits[]={0,4,7,8,9,10,19,20,21,35,38,39,50};
+ for(unsigned int i=0;i<sizeof(foreign_bits)/sizeof(foreign_bits[0]);i++) {
+  memset(&flow,0,sizeof(flow));statuses[0]=statuses[1]=statuses[2]=5;
+  calls=0;foreign_call=1;foreign_bit=foreign_bits[i];
+  ret=fe_destination_get(&fe,&flow,mac);
+  if(ret!=-EADDRINUSE || calls!=1 || flow.destination_owned || flow.destination_ready){
+   fprintf(stderr,"FAIL foreign preexisting FDB bit=%u was adopted\n",foreign_bit);failures++;
+  }
+  memset(&flow,0,sizeof(flow));statuses[0]=15;calls=0;foreign_call=3;
+  ret=fe_destination_get(&fe,&flow,mac);
+  if(ret!=-EIO || calls!=3 || !flow.destination_owned || flow.destination_ready){
+   fprintf(stderr,"FAIL malformed post-APPEND bit=%u lost quarantine ownership\n",foreign_bit);failures++;
+  }
+ }
+ foreign_call=0;
+ const unsigned int indices[]={0,4095,4096,4127,4128,8191};
+ for(unsigned int i=0;i<sizeof(indices)/sizeof(indices[0]);i++) {
+  memset(&flow,0,sizeof(flow));statuses[0]=15;statuses[1]=5;
+  statuses[2]=(indices[i]<<4)|5;calls=0;
+  ret=fe_destination_get(&fe,&flow,mac);
+  bool valid=indices[i]<4128;
+  if((ret==0)!=valid || !flow.destination_owned || flow.destination_ready!=valid ||
+     (valid && flow.destination_index!=indices[i])){
+   fprintf(stderr,"FAIL FDB physical index=%u ready/ownership mismatch\n",indices[i]);failures++;
+  }
+ }
  /* No new user may share an uncertain writer or a deleting destination. */
  struct rtl_fe_flow other={.destination_owned=true};memcpy(other.destination,mac,6);
  fe.flows.next=fe.flows.prev=&other.list;other.list.next=other.list.prev=&fe.flows;
@@ -115,7 +147,7 @@ int main(void){
   memset(&flow,0,sizeof(flow));calls=0;ret=fe_destination_get(&fe,&flow,mac);
   if(ret!=-EBUSY || calls || flow.destination_owned){fprintf(stderr,"FAIL uncertain FDB shared\n");failures++;}
  }
- if(!failures)puts("FDB semantic statuses: LOOKUP, APPEND hit/over-limit/full, DELETE miss, rollback ownership and sharing guards passed");
+ if(!failures)puts("FDB semantic statuses: LOOKUP, APPEND hit/over-limit/full, DELETE miss, private-row types, 4128 physical rows, rollback ownership and sharing guards passed");
  return failures?1:0;
 }
 '''
@@ -125,5 +157,6 @@ with tempfile.TemporaryDirectory(prefix='fe-destination-status-') as directory:
     cfile.write_text(fixture + function('fe_destination_get') + function('fe_destination_put') + test)
     subprocess.run(['cc', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                    '-I', str((root / relative).parent),
                     str(cfile), '-o', str(binary)], check=True)
     subprocess.run([str(binary)], check=True)

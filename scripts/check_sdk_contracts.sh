@@ -14,7 +14,12 @@ fetch() {
     curl --fail --location --silent --show-error --retry 3 \
         --connect-timeout 15 --max-time 180 "$1" --output "$2"
 }
-for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_l3qm.c; do
+for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_l3qm.c \
+            include/aal_fdb.h aal_fdb.c include/aal_mcast.h include/aal_port.h \
+            aal_l2_classification.c include/aal_l2_classification.h include/aal_arb.h \
+            include/aal_l2_qos.h include/aal_l2_vlan.h \
+            include/aal_l3_cls.h include/aal_l3fe.h \
+            include/aal_l2_specpkt.h aal_l2_specpkt.c; do
     fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/$file" \
         "$work/sdk/$sdk_path/$file"
 done
@@ -23,6 +28,8 @@ fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/
 cd "$project"
 python3 scripts/test_fe_sdk_contract.py --sdk "$work/sdk"
 python3 scripts/test_fe_register_contract.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_l2_sdk_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_l2_hardware_recipe.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h" \
     --sdk-qm "$work/sdk/$sdk_path/aal_l3qm.c"

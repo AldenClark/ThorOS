@@ -18,10 +18,11 @@ fixture = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-l2-table.h"
 
 struct model {
  unsigned int registers[0x4000/4],writes,commands;
- bool leave_busy;
+ bool leave_busy,false_success,limit_busy_after_fdb;
 };
 static unsigned int read_reg(void *context,unsigned int reg) {
  struct model *m=context;
@@ -39,7 +40,9 @@ static int command(void *context,unsigned int reg,unsigned int value) {
  assert(!(m->registers[reg/4]&busy));
  m->commands++;
  m->registers[reg/4]=m->leave_busy?value:0;
- return m->leave_busy?-ETIMEDOUT:0;
+ if(reg==0x1ca0 && m->limit_busy_after_fdb)
+  m->registers[0x1cb4/4]=RTL_L2_ACCESS_BUSY;
+ return m->leave_busy && !m->false_success?-ETIMEDOUT:0;
 }
 static void stuck(struct model *m,unsigned int reg) {
  memset(m,0,sizeof(*m));
@@ -66,6 +69,12 @@ int main(void) {
  stuck(&m,0x1ca0);
  assert(rtl_fe_fdb_command(&io,0x85,fdb,&result)==-EBUSY);
  assert(result==0x12345678);untouched(&m);
+ stuck(&m,0x1cb4);
+ m.registers[0x1c00/4]=RTL_L2_FDB_LEARN_DISABLE;
+ m.registers[0x1cb0/4]=0x76543210;
+ assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EBUSY);
+ assert(result==0x12345678 && m.registers[0x1c00/4]==RTL_L2_FDB_LEARN_DISABLE);
+ assert(m.registers[0x1cb0/4]==0x76543210);untouched(&m);
  stuck(&m,0x38b0);
  assert(rtl_fe_cache_command(&io,17,0x1234,1)==-EBUSY);untouched(&m);
  stuck(&m,0x38e0);
@@ -85,13 +94,71 @@ int main(void) {
  assert(!rtl_fe_cam_protocol_put(&io,&binding) && !binding.created);
  assert(m.commands==commands+1);
 
+ /* cpu_opt_mode is part of the outstanding FDB transaction, not merely a
+  * wrapper convenience. A timeout must not switch it back to indirect mode.
+  * The fabric lifecycle owner, not a later stateless command, restores the
+  * original mode once every operation has drained. */
+ for(unsigned int initial_mode=0;initial_mode<2;initial_mode++) {
+  memset(&m,0,sizeof(m));m.leave_busy=true;
+  unsigned int control=0x12345U|(initial_mode<<31);
+  m.registers[0x1c00/4]=control;result=0x12345678;
+  assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-ETIMEDOUT);
+  assert(m.registers[0x1c00/4]==(control|0x80000000U) && result==0x12345678);
+  writes=m.writes;commands=m.commands;
+  for(unsigned int i=0;i<4;i++)staged[i]=m.registers[(0x1cb0-i*4)/4];
+  assert(rtl_fe_fdb_command(&io,0x85,fdb,&result)==-EBUSY);
+  assert(m.writes==writes && m.commands==commands);
+  for(unsigned int i=0;i<4;i++)assert(staged[i]==m.registers[(0x1cb0-i*4)/4]);
+  m.registers[0x1ca0/4]=0;m.leave_busy=false;
+  assert(!rtl_fe_fdb_command(&io,0x85,fdb,&result));
+  assert(m.registers[0x1c00/4]==(control|0x80000000U));
+  /* Only an external owner holding the original snapshot may restore it. */
+  write_reg(&m,0x1c00,control);
+  assert(m.registers[0x1c00/4]==control);
+ }
+ memset(&m,0,sizeof(m));m.leave_busy=true;m.false_success=true;
+ assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EBUSY);
+ assert(m.registers[0x1c00/4]&0x80000000U);
+
+ /* The production MAC-limit helper really leases mode0 and can return
+  * before that transaction completes. The subsequent L3 cleanup must not
+  * flip mode1 or touch any DATA/return register during this late command. */
+ memset(&m,0,sizeof(m));m.leave_busy=true;
+ unsigned int limit_control=RTL_L2_FDB_CMD_MODE|RTL_L2_FDB_LEARN_DISABLE|0x12345;
+ m.registers[0x1c00/4]=limit_control;
+ assert(rtl_l2_port_limit_write(&io,3,123)==-ETIMEDOUT);
+ assert(m.registers[0x1c00/4]==(limit_control&~RTL_L2_FDB_CMD_MODE));
+ assert(m.registers[0x1cb4/4]&RTL_L2_ACCESS_BUSY);
+ writes=m.writes;commands=m.commands;result=0x12345678;
+ unsigned int registers_before[sizeof(m.registers)/sizeof(m.registers[0])];
+ memcpy(registers_before,m.registers,sizeof(registers_before));
+ assert(rtl_fe_fdb_command(&io,0x85,fdb,&result)==-EBUSY);
+ assert(result==0x12345678 && m.writes==writes && m.commands==commands);
+ assert(!memcmp(registers_before,m.registers,sizeof(registers_before)));
+ assert(rtl_l2_fdb_command_mode(&io)==-EBUSY);
+ assert(m.writes==writes && m.commands==commands);
+ m.registers[0x1cb4/4]=0;m.leave_busy=false;
+ assert(!rtl_l2_fdb_command_mode(&io));
+ assert(!rtl_fe_fdb_command(&io,0x85,fdb,&result));
+ assert(m.registers[0x1c00/4]==limit_control);
+
+ /* Even a reported-success FDB command is not permission to restore mode
+  * when the shared limit window is busy. No writes occur after the check. */
+ memset(&m,0,sizeof(m));m.limit_busy_after_fdb=true;
+ result=0x12345678;
+ unsigned int fdb_before[4];memcpy(fdb_before,fdb,sizeof(fdb_before));
+ assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EBUSY);
+ assert(m.writes==6 && m.commands==1);
+ assert(m.registers[0x1c00/4]&RTL_L2_FDB_CMD_MODE);
+ assert(result==0x12345678 && !memcmp(fdb,fdb_before,sizeof(fdb_before)));
+
  memset(&m,0,sizeof(m));
  assert(!rtl_fe_mask_write(&io,63,words) && m.commands==2);
  assert(!rtl_fe_classifier_write(&io,1024,words) && m.commands==3);
  assert(!rtl_fe_source_mac_write(&io,3,words) && m.commands==4);
  assert(!rtl_fe_fdb_command(&io,0x85,fdb,&result) && m.commands==5);
  assert(!rtl_fe_cache_command(&io,17,0x1234,1) && m.commands==6);
- puts("FE indirect windows: busy/timeout never overwrites DATA; CAM restore retains ownership; idle recovery and bit0/bit31 checks passed");
+ puts("FE indirect windows: busy/timeout never overwrites DATA or FDB/limit shared mode; real limit-timeout lease and post-completion exclusion; CAM ownership, idle recovery, bit0/bit31 checks passed");
 }
 '''
 

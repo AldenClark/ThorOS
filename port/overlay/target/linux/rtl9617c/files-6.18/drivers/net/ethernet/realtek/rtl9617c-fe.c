@@ -21,6 +21,7 @@
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/tc_act/tc_csum.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -35,8 +36,13 @@
 
 struct rtl_fe_bridge;
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe);
-static void fe_bridge_stop(struct rtl_fe_bridge *bridge);
+static int fe_bridge_stop(struct rtl_fe_bridge *bridge);
 static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes);
+static int fe_switch_quiesce_locked(struct rtl_fe *fe);
+static void fe_switch_reconcile_locked(struct rtl_fe *fe);
+static int fe_switch_request_locked(struct rtl_fe *fe, bool requested);
+static bool fe_switch_requested(struct rtl_fe *fe);
+static bool fe_switch_flow_allowed(struct rtl_fe *fe);
 
 #define FE_INTERFACES 32
 #define FE_COUNTERS 32
@@ -117,6 +123,8 @@ struct rtl_fe {
  struct dentry *debug;
  void __iomem *registers;
  struct mutex lock;
+ /* Atomic policy publication cannot wait for the sleeping table owner. */
+ spinlock_t route_lock;
  struct delayed_work cleanup_work;
  struct list_head ports, flows, blocks, retries;
  struct rb_root cookies;
@@ -125,7 +133,9 @@ struct rtl_fe {
  bool enabled, prepared, cpu_path, lan_redirected;
  /* NI stop/start must not confuse requested policy with live ASIC state. */
  bool engine_ready, shutting_down;
+ bool route_gate_ready, route_admitted;
  enum rtl_fe_mode desired_mode;
+ unsigned int fdb_cmd_mode_saved;
  unsigned int cache_target;
  int error;
  u64 installs, deletes, misses;
@@ -135,7 +145,7 @@ struct rtl_fe {
  struct rtl_fe_cam_protocol protocol_cam[3];
  unsigned char ppp_protocol_ids[2];
  unsigned int lan_saved[FE_LAN_PORTS];
- unsigned int classifier_saved[2][7], map_saved[2][4];
+ unsigned int classifier_saved[2][4][2][7], map_saved[2][4];
  struct rtl_fe_mac source_macs[FE_SOURCE_MACS];
  struct rtl_fe_interface interfaces[FE_INTERFACES];
  struct rtl_fe_mtu mtus[16];
@@ -171,6 +181,68 @@ static int fe_access(void *context,unsigned int address,unsigned int value)
 static struct rtl_dq_io fe_io(struct rtl_fe *fe)
 {
  return (struct rtl_dq_io){fe,fe_read,fe_write,fe_access};
+}
+
+/* LPB1 (LAN connector) and LPB2 (PON connector) select one of two owned
+ * classifier profiles. Profile1 has the SDK keep-original CPU action for
+ * EVERY default result type; profile0 alone may enter the routing hash.
+ * The real TCAM is verified empty before either profile is claimed. This
+ * direct selector, unlike a raw PDC bypass, preserves PPPoE control packets
+ * and stops old WAN->LAN hash hits as well as new LAN admission.
+ *
+ * Lock order: core policy guard -> route_lock. Never take the core guard or
+ * fe->lock while holding route_lock. No indirect command or delay here.
+ */
+static bool fe_route_select_locked(struct rtl_fe *fe, unsigned int profile)
+{
+ unsigned int i, address, value;
+ bool selected=true;
+
+ for(i=0;i<2;i++) {
+  address=0x3418+i*12;
+  value=fe_read(fe,address);
+  fe_write(fe,address,(value&~(15U<<10))|(profile<<10));
+ }
+ for(i=0;i<2;i++)
+  if(((fe_read(fe,0x3418+i*12)>>10)&15)!=profile)selected=false;
+ return selected;
+}
+
+static void fe_route_gate(struct rtl_fe *fe)
+{
+ unsigned long flags;
+
+ spin_lock_irqsave(&fe->route_lock,flags);
+ if(fe->route_gate_ready)fe_route_select_locked(fe,1);
+ WRITE_ONCE(fe->route_admitted,false);
+ spin_unlock_irqrestore(&fe->route_lock,flags);
+}
+
+/* Called only by the generation-checked fabric owner, never by prepare. */
+static bool fe_route_arm(struct rtl_fe *fe)
+{
+ unsigned long flags;
+ bool admitted=false, safe=true;
+
+ spin_lock_irqsave(&fe->route_lock,flags);
+ if(!fe->enabled) {
+  if(fe->route_gate_ready)safe=fe_route_select_locked(fe,1);
+ } else if(fe->prepared && fe->route_gate_ready &&
+           fe->engine_ready && !fe->shutting_down) {
+  admitted=fe_route_select_locked(fe,0);
+  if(!admitted)fe_route_select_locked(fe,1);
+  safe=admitted;
+ } else safe=false;
+ WRITE_ONCE(fe->route_admitted,admitted);
+ spin_unlock_irqrestore(&fe->route_lock,flags);
+ return safe;
+}
+
+static unsigned int fe_classifier_default_index(unsigned int profile,
+                                               unsigned int result,
+                                               unsigned int row)
+{
+ return (1024U|(profile<<2)|((result&1U)<<1)|((result&2U)<<3))+row;
 }
 static struct rtl_fe_port *fe_port(struct rtl_fe *fe,struct net_device *netdev)
 {
@@ -224,9 +296,14 @@ static void fe_collect_ports(struct rtl_fe *fe)
 static int fe_prepare(struct rtl_fe *fe)
 {
  struct rtl_dq_io io=fe_io(fe);
- unsigned int mask[8],cls[7],lpb[3],i,side;
+ unsigned int mask[8],cls[7],zero[7]={0},lpb[3],i,side,type,row;
+ unsigned long flags;
  int ret;
 
+ /* Neither a foreign valid TCAM key nor its result action may defeat the
+  * CPU default used by our atomic gate. Do not clear somebody else's ACL. */
+ ret=rtl_fe_classifier_keys_empty(&io);
+ if(ret)return ret;
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe->saved[i]=fe_read(fe,fe_registers[i]);
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
  ret=rtl_fe_mask_read(&io,63,fe->mask_saved);
@@ -235,10 +312,15 @@ static int fe_prepare(struct rtl_fe *fe)
   ret=rtl_fe_mask_read(&io,61-2*i,fe->bridge_mask_saved[i]);
   if(ret)return ret;
  }
- /* Default type0 FIB index is 1024 | (profile << 2), not a packed row. */
+ /* SDK defaults are standard TWO-row FIBs, with four result types per
+  * profile. The second row contains fib_format_sel: stale data there can
+  * reinterpret an otherwise correct first row. Save every owned row. */
  for(i=0;i<2;i++) {
-  ret=rtl_fe_classifier_read(&io,1024+4*i,fe->classifier_saved[i]);
-  if(ret)return ret;
+  for(type=0;type<4;type++)for(row=0;row<2;row++) {
+   ret=rtl_fe_classifier_read(&io,fe_classifier_default_index(i,type,row),
+                              fe->classifier_saved[i][type][row]);
+   if(ret)return ret;
+  }
   for(side=0;side<4;side++) {
    ret=fe_access(fe,0x1654,BIT(31)|(24+i)|(side<<6));
    if(ret)return ret;
@@ -289,16 +371,24 @@ static int fe_prepare(struct rtl_fe *fe)
  /* Linux must generate TTL/Hop-Limit errors from the original ingress
   * packet; override an accelerated WAN action's deep-Q flag as well. */
  fe_write(fe,0x30cc,(fe_read(fe,0x30cc)&~0xfffU)|0xf21);
+ /* Use the SAME action in all result groups; they are not assumed to be
+  * mutually exclusive packet classes. Normal profile0 keeps actual LSPID
+  * (LAN0..4 / PON7); profile1 skips T2 and sends the original frame to CPU. */
  for(i=0;i<2;i++) {
-  rtl_fe_classify_hash(cls,0,i?7:0);
-  /* LAN0..4 share a connector, but CPU misses and flow keys must retain
-   * the real ingress port. PON keeps its logical source7. */
-  if(!i)rtl_fe_bits_set(cls,208,1,0);
-  ret=rtl_fe_classifier_write(&io,1024+4*(i?0:1),cls);
-  if(ret)return ret;
+  if(i)rtl_fe_classify_cpu_original(cls);
+  else {rtl_fe_classify_hash(cls,0,0);rtl_fe_bits_set(cls,208,1,0);}
+  for(type=0;type<4;type++) {
+   ret=rtl_fe_classifier_write(&io,fe_classifier_default_index(i,type,1),zero);
+   if(!ret)ret=rtl_fe_classifier_write(&io,fe_classifier_default_index(i,type,0),cls);
+   if(ret)return ret;
+  }
+ }
+ for(i=0;i<2;i++) {
   rtl_fe_ingress_lpb(lpb,i?7:0,16);
-  rtl_fe_bits_set(lpb,42,4,i?0:1); /* Native WAN0/LAN1 selectors. */
+  rtl_fe_bits_set(lpb,42,4,1); /* CPU gate until generation-checked arm. */
+  spin_lock_irqsave(&fe->route_lock,flags);
   for(side=0;side<3;side++)fe_write(fe,0x3414+i*12+side*4,lpb[side]);
+  spin_unlock_irqrestore(&fe->route_lock,flags);
   for(side=0;side<4;side++) {
    ret=rtl_fe_window_idle(&io,0x1654);
    if(ret)return ret;
@@ -307,6 +397,11 @@ static int fe_prepare(struct rtl_fe *fe)
    if(ret)return ret;
   }
  }
+ spin_lock_irqsave(&fe->route_lock,flags);
+ fe->route_gate_ready=true;
+ fe_route_select_locked(fe,1);
+ fe->route_admitted=false;
+ spin_unlock_irqrestore(&fe->route_lock,flags);
  fe_write(fe,0x3400,(fe_read(fe,0x3400)&~(BIT(0)|BIT(10)))|BIT(3)|BIT(2)|BIT(19));
  fe_write(fe,0x3404,7|(25<<8)|(1<<14)|(24<<16)|(2<<22)|(3<<24));
  fe_write(fe,0x2300,fe_read(fe,0x2300)|BIT(12)|BIT(13));
@@ -340,14 +435,24 @@ static int fe_prepare(struct rtl_fe *fe)
 static int fe_restore(struct rtl_fe *fe)
 {
  struct rtl_dq_io io=fe_io(fe);
- unsigned int i,side;
+ unsigned int i,side,type,row;
+ unsigned long flags;
  int ret;
 
  if(!fe->prepared)return 0;
+ fe_route_gate(fe);
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
  fe_write(fe,0x38c4,0);
  ret=fe_access(fe,0x393c,1);
  if(ret)return ret;
+ /* All driver route owners have already been deleted and the cache is
+  * now invalidated. Retire the atomic selector before restoring its FIBs;
+  * it must not select a partially restored/foreign classifier profile.
+  * LAN admission remains CPU-only throughout this ownership handoff. */
+ spin_lock_irqsave(&fe->route_lock,flags);
+ fe->route_gate_ready=false;
+ fe->route_admitted=false;
+ spin_unlock_irqrestore(&fe->route_lock,flags);
  for(i=0;i<3;i++) {
   ret=rtl_fe_cam_protocol_put(&io,&fe->protocol_cam[i]);
   if(ret)return ret;
@@ -360,8 +465,11 @@ static int fe_restore(struct rtl_fe *fe)
    ret=fe_access(fe,0x1654,BIT(31)|BIT(30)|(24+i)|(side<<6));
    if(ret)return ret;
   }
-  ret=rtl_fe_classifier_write(&io,1024+4*i,fe->classifier_saved[i]);
-  if(ret)return ret;
+  for(type=0;type<4;type++)for(row=0;row<2;row++) {
+   ret=rtl_fe_classifier_write(&io,fe_classifier_default_index(i,type,row),
+                               fe->classifier_saved[i][type][row]);
+   if(ret)return ret;
+  }
  }
  ret=rtl_fe_mask_write(&io,63,fe->mask_saved);
  if(ret)return ret;
@@ -550,6 +658,9 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  /* The SDK CMD_RETURN status is distinct from ACCESS completion. Only
   * HIT and MISS establish whether an original row exists. */
  if((result&15)!=5 && (result&15)!=15)return -EIO;
+ /* The private VID/SC key is not permission to overwrite a foreign or
+  * indeterminate row. A real L2 forwarding entry must never be pinned here. */
+ if((result&15)==5 && !rtl_fe_fdb_is_pin(words))return -EADDRINUSE;
  flow->destination_created=(result&15)==15;
  if(!flow->destination_created)memcpy(flow->destination_saved,words,sizeof(words));
  /* APPEND updates an existing key in place. Pin its MAC/permissions until
@@ -569,7 +680,8 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  rtl_fe_fdb_key(words,address);
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
- if((result&15)!=5)return -EIO;
+ if((result&15)!=5 || !rtl_fe_fdb_is_pin(words) ||
+    ((result>>4)&0x1fff)>=4128)return -EIO;
  flow->destination_index=(result>>4)&0x1fff;
  flow->destination_ready=true;
  return 0;
@@ -1052,6 +1164,24 @@ static void fe_cleanup_work(struct work_struct *work)
 unlock:
  mutex_unlock(&fe->lock);
 }
+
+/* A synchronous L2 policy gate also invalidates old route actions before
+ * LAN is readmitted. The Linux flowtable can still provide its software
+ * path; a cached hardware action from an older bridge generation is not
+ * authority to bypass the new topology, VLAN, STP or filtering decision. */
+static int __maybe_unused fe_switch_flush_routes_locked(struct rtl_fe *fe)
+{
+ struct rtl_fe_flow *flow,*next;
+ int ret;
+
+ list_for_each_entry_safe(flow,next,&fe->flows,list) {
+  ret=fe_delete(fe,flow);
+  if(ret){fe->error=ret;return ret;}
+ }
+ fe_collect_ports(fe);
+ return 0;
+}
+
 static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned long cookie)
 {
  struct rtl_fe *fe=port->fe;
@@ -1061,8 +1191,9 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  u16 crc16;
  int ret;
 
- if(port->retired)return -ENODEV;
- if(!fe->enabled || !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
+ if(port->retired || fe->shutting_down)return -ENODEV;
+ if(!fe->engine_ready || !fe->enabled || !fe_switch_flow_allowed(fe) ||
+    !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
  if(fe_flow(fe,cookie))return -EEXIST;
  if(data.bridge)rtl_fe_bridge_key(words,data.source,data.destination,data.ethernet_protocol,
@@ -1499,7 +1630,11 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  fe=kzalloc(sizeof(*fe),GFP_KERNEL);
  if(!fe)return ERR_PTR(-ENOMEM);
  fe->device=device;fe->registers=registers;
+ /* The shared fabric owns the command-mode bit across timeouts. A timed-out
+  * FDB operation must not have its mode changed while ACCESS is busy. */
+ fe->fdb_cmd_mode_saved=fe_read(fe,0x1c00)&BIT(31);
  mutex_init(&fe->lock);
+ spin_lock_init(&fe->route_lock);
  INIT_DELAYED_WORK(&fe->cleanup_work,fe_cleanup_work);
  INIT_LIST_HEAD(&fe->ports);INIT_LIST_HEAD(&fe->flows);INIT_LIST_HEAD(&fe->blocks);
  INIT_LIST_HEAD(&fe->retries);
@@ -1546,12 +1681,52 @@ int rtl_fe_add_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int sou
  list_add_tail(&port->list,&fe->ports);
  netdev->hw_features|=NETIF_F_HW_TC;
  netdev->features|=NETIF_F_HW_TC;
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return 0;
 }
 bool rtl_fe_enabled(struct rtl_fe *fe)
 {
- return fe && !READ_ONCE(fe->shutting_down) && READ_ONCE(fe->enabled);
+ return fe && !READ_ONCE(fe->shutting_down) && READ_ONCE(fe->engine_ready) && READ_ONCE(fe->enabled);
+}
+
+/* A stable physical switch ID shared by all of its LAN netdevs. Use the
+ * MMIO resource address, not a kernel pointer or a possibly duplicate MAC. */
+int rtl_fe_get_port_parent_id(struct rtl_fe *fe, struct netdev_phys_item_id *ppid)
+{
+ struct resource *resource;
+
+ if(!fe || READ_ONCE(fe->shutting_down))return -EOPNOTSUPP;
+ resource=platform_get_resource(to_platform_device(fe->device),IORESOURCE_MEM,0);
+ if(!resource)return -ENODEV;
+ ppid->id_len=sizeof(u64);
+ put_unaligned_be64(resource->start,ppid->id);
+ return 0;
+}
+
+/* This is a request to the policy compiler, not a raw bypass-register knob.
+ * Success does not claim native L2 is active: status reports the admission
+ * result and any unsupported policy or hardware precondition separately. */
+int rtl_fe_switch_set(struct rtl_fe *fe, bool requested)
+{
+ int ret;
+
+ if(!fe)return -EOPNOTSUPP;
+ mutex_lock(&fe->lock);
+ ret=fe->shutting_down?-ENODEV:fe_switch_request_locked(fe,requested);
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+
+bool rtl_fe_switch_get(struct rtl_fe *fe)
+{
+ bool requested;
+
+ if(!fe)return false;
+ mutex_lock(&fe->lock);
+ requested=!fe->shutting_down && fe_switch_requested(fe);
+ mutex_unlock(&fe->lock);
+ return requested;
 }
 
 void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
@@ -1561,6 +1736,10 @@ void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
 
  if(!fe)return;
  mutex_lock(&fe->lock);
+ if(!fe->shutting_down) {
+  int ret=fe_switch_quiesce_locked(fe);
+  if(ret)fe->error=ret;
+ }
  port=fe_port(fe,netdev);
  if(port) {
   port->retired=true;
@@ -1571,6 +1750,7 @@ void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
    }
   fe_collect_ports(fe);
  }
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
 }
 int rtl_fe_flush_port(struct rtl_fe *fe,struct net_device *netdev)
@@ -1582,12 +1762,15 @@ int rtl_fe_flush_port(struct rtl_fe *fe,struct net_device *netdev)
  if(!fe)return 0;
  mutex_lock(&fe->lock);
  if(fe->shutting_down){mutex_unlock(&fe->lock);return -ENODEV;}
+ ret=fe_switch_quiesce_locked(fe);
+ if(ret){fe->error=ret;mutex_unlock(&fe->lock);return ret;}
  port=fe_port(fe,netdev);
  list_for_each_entry_safe(flow,next,&fe->flows,list)
   if(flow->input==port || flow->output==port) {
    ret=fe_delete(fe,flow);
    if(ret){fe->error=ret;break;}
   }
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1621,14 +1804,22 @@ static void fe_lan_restore_locked(struct rtl_fe *fe)
  unsigned int i;
 
  if(!fe->lan_redirected)return;
- for(i=0;i<FE_LAN_PORTS;i++)fe_write(fe,FE_LAN_RX_CTRL(i),fe->lan_saved[i]);
+ /* A saved RX selector is never authority to reopen native L2 or L3 after
+  * a policy gate. Only the generation-checked switch guard may do that. */
+ for(i=0;i<FE_LAN_PORTS;i++)
+  fe_write(fe,FE_LAN_RX_CTRL(i),
+   (fe->lan_saved[i]&~(63U<<16))|BIT(28)|(16U<<16));
  fe->lan_redirected=false;
 }
 
 static int fe_disable_locked(struct rtl_fe *fe)
 {
  struct rtl_fe_flow *flow,*next;
- int ret=0;
+ int ret=fe_switch_quiesce_locked(fe);
+
+ /* L2 owns snapshots of some shared tables. Never overwrite those owners
+  * while its previous withdrawal still has an indeterminate command. */
+ if(ret)return ret;
 
  fe->enabled=false;
  fe->cpu_path=false;
@@ -1650,6 +1841,8 @@ static int fe_enable_locked(struct rtl_fe *fe)
  int ret;
 
  if(fe->enabled)return 0;
+ ret=fe_switch_quiesce_locked(fe);
+ if(ret)return ret;
  /* An unfinished rollback still owns the original register snapshot. */
  if(fe->prepared && !fe->cpu_path) {
   ret=fe_disable_locked(fe);
@@ -1664,8 +1857,9 @@ static int fe_enable_locked(struct rtl_fe *fe)
   * baseline only when admitting LAN, including after an engine restart. */
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
  fe->lan_redirected=true;
- for(i=0;i<FE_LAN_PORTS;i++)
-  fe_write(fe,FE_LAN_RX_CTRL(i),(fe_read(fe,FE_LAN_RX_CTRL(i))&~(63U<<16))|(25U<<16));
+ /* Reconcile queues the single fabric owner. It admits route25/native L2
+  * under the policy gate lock, never racing a newly published firewall or
+  * bridge change with an unconditional RX selector write from this path. */
  fe->enabled=true;
  fe->cpu_path=false;
  return 0;
@@ -1679,6 +1873,8 @@ static int fe_cpu_path_locked(struct rtl_fe *fe)
  int ret=0;
 
  if(fe->cpu_path)return 0;
+ ret=fe_switch_quiesce_locked(fe);
+ if(ret)return ret;
  if(fe->prepared && !fe->enabled) {
   ret=fe_disable_locked(fe);
   if(ret)return ret;
@@ -1713,6 +1909,7 @@ int rtl_fe_enable(struct rtl_fe *fe)
   if(!ret)fe->desired_mode=RTL_FE_MODE_HARDWARE;
  }
  fe->error=ret;
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1730,6 +1927,7 @@ int rtl_fe_cpu_path(struct rtl_fe *fe)
   if(!ret)fe->desired_mode=RTL_FE_MODE_CPU;
  }
  fe->error=ret;
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1743,6 +1941,7 @@ int rtl_fe_disable(struct rtl_fe *fe)
  ret=fe->shutting_down?-ENODEV:fe_disable_locked(fe);
  if(!ret)fe->desired_mode=RTL_FE_MODE_OFF;
  fe->error=ret;
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1785,6 +1984,7 @@ int rtl_fe_engine_resume(struct rtl_fe *fe)
 unlock:
  if(ret)fe->engine_ready=false;
  fe->error=ret;
+ fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1794,7 +1994,7 @@ void rtl_fe_free(struct rtl_fe *fe)
  struct rtl_fe_port *port,*next;
  struct rtl_fe_flow *flow,*flow_next;
  bool bound=false;
- int ret;
+ int ret, switch_ret;
 
  if(!fe)return;
  mutex_lock(&fe->lock);
@@ -1802,13 +2002,24 @@ void rtl_fe_free(struct rtl_fe *fe)
  fe->engine_ready=false;
  fe->desired_mode=RTL_FE_MODE_OFF;
  mutex_unlock(&fe->lock);
- fe_bridge_stop(fe->bridge);
+ switch_ret=fe_bridge_stop(fe->bridge);
+ if(!switch_ret)fe->bridge=NULL;
  debugfs_remove_recursive(fe->debug);
  cancel_delayed_work_sync(&fe->cleanup_work);
  mutex_lock(&fe->lock);
  ret=fe_disable_locked(fe);
- fe->error=ret;
+ if(!ret)ret=switch_ret;
  list_for_each_entry(port,&fe->ports,list)if(port->bindings)bound=true;
+ if(!ret && !bound && list_empty(&fe->blocks) && list_empty(&fe->flows)) {
+  struct rtl_dq_io io=fe_io(fe);
+  ret=rtl_fe_window_idle(&io,0x1ca0);
+  if(!ret)ret=rtl_fe_window_idle(&io,0x1cb4);
+  if(!ret) {
+   fe_write(fe,0x1c00,(fe_read(fe,0x1c00)&~BIT(31))|fe->fdb_cmd_mode_saved);
+   fe_read(fe,0x1c00);
+  }
+ }
+ fe->error=ret;
  /* Failure can leave Hash/Cache DMA using this memory. A removed callback
   * can also still own its private port until its release runs. Without a
   * proven hardware drain and zero callback references, leaking a quarantined
@@ -1831,6 +2042,7 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  ssize_t length;
  struct rtl_fe_flow *flow;
  unsigned int flows=0,counted=0,bridged=0,learned=0;
+ unsigned int lan_cpu=0,lan_route=0,lan_l2=0,i;
 
  if(!fe)return sysfs_emit(buffer,"available=0\n");
  mutex_lock(&fe->lock);
@@ -1839,12 +2051,27 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   counted+=flow->counted;
   bridged+=flow->bridge;learned+=flow->learned;
  }
+ if(fe->engine_ready && !fe->shutting_down)for(i=0;i<FE_LAN_PORTS;i++) {
+  unsigned int control=fe_read(fe,FE_LAN_RX_CTRL(i));
+  if(!(control&BIT(28)))lan_l2|=BIT(i);
+  else if(((control>>16)&63)==16)lan_cpu|=BIT(i);
+  else if(((control>>16)&63)==25)lan_route|=BIT(i);
+ }
  length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u cpu_path=%u\n",
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
   FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned,fe->cpu_path);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "engine_ready=%u requested_mode=%u shutting_down=%u\n",
   fe->engine_ready,fe->desired_mode,fe->shutting_down);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "route_gate_ready=%u route_admitted=%u\n",
+  READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted));
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
+  RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "lan_admission_valid=%u lan_cpu_mask=%u lan_route_mask=%u lan_native_l2_mask=%u\n",
+  fe->engine_ready && !fe->shutting_down,lan_cpu,lan_route,lan_l2);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "admission_requests=%llu parse_rejected=%llu install_failed=%llu reject_unspecified=%llu reject_keys=%llu reject_meta=%llu reject_control=%llu reject_protocol=%llu reject_vlan=%llu reject_action=%llu reject_nat=%llu reject_port=%llu reject_pon=%llu\n",
   fe->observe.replace_requests,fe->observe.parse_rejected,fe->observe.install_failed,
@@ -1863,4 +2090,4 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  return length;
 }
 
-#include "rtl9617c-fe-bridge.h"
+#include "rtl9617c-fe-switch.h"

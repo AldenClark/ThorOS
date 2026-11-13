@@ -199,8 +199,8 @@ kmake=(make -C "$kernel" O="$out" ARCH=arm64 CROSS_COMPILE="$cross")
 "${kmake[@]}" olddefconfig
 for symbol in ARM64 ARCH_RTL9617C RTL9617C_XRAM_ETH RTL9617C_PON RTL9617C_BOSA \
               NF_FLOW_TABLE NF_FLOW_TABLE_INET NFT_FLOW_OFFLOAD BRIDGE BRIDGE_VLAN_FILTERING \
-              BRIDGE_IGMP_SNOOPING NET_SWITCHDEV VLAN_8021Q NETFILTER_INGRESS \
-              SKB_EXTENSIONS NET_CLS_ACT PPP PPPOE; do
+              BRIDGE_IGMP_SNOOPING NET_SWITCHDEV RTL9617C_SWITCH_GUARD VLAN_8021Q NETFILTER_INGRESS \
+              SKB_EXTENSIONS NET_CLS_ACT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE; do
     grep -qx "CONFIG_${symbol}=y" "$out/.config" || {
         printf 'Required compile-check feature not enabled after olddefconfig: %s\n' "$symbol" >&2
         exit 1
@@ -235,6 +235,8 @@ targets=(
     net/netfilter/nf_flow_table_xdp.o
     net/netfilter/nf_flow_table_inet.o
     net/netfilter/nft_flow_offload.o
+    net/netfilter/core.o
+    net/sched/sch_api.o
     net/bridge/br.o
     net/bridge/br_device.o
     net/bridge/br_fdb.o
@@ -260,6 +262,8 @@ targets=(
     net/bridge/br_vlan_options.o
     net/bridge/br_mst.o
     net/bridge/br_switchdev.o
+    net/switchdev/switchdev.o
+    net/core/rtl9617c-switch.o
     net/core/skbuff.o
     net/core/flow_offload.o
     net/core/dev.o
@@ -273,6 +277,22 @@ targets=(
     drivers/net/ppp/pppoe.o
 )
 printf '%s\n' "${targets[@]}" > "$work/compile-targets.txt"
+# Compile each changed policy-hook caller too, not just the new gate callee.
+# This coverage assertion complements compilation; it is not a policy test.
+python3 - "$target/patches-$kernel_series/220-l2-switchdev-policy-gate.patch" "${targets[@]}" <<'PY'
+from pathlib import Path
+import sys
+targets = set(sys.argv[2:])
+callers = {
+    line.removeprefix('+++ b/').removesuffix('.c') + '.o'
+    for line in Path(sys.argv[1]).read_text().splitlines()
+    if line.startswith('+++ b/') and line.endswith('.c')
+}
+missing = sorted(callers - targets)
+if missing:
+    raise SystemExit('Missing real object coverage for L2 policy callers: ' + ', '.join(missing))
+print(f'Native L2 gate coverage: all {len(callers)} changed C translation units are real compile targets')
+PY
 "${kmake[@]}" -j"$jobs" "${targets[@]}"
 for object in "${targets[@]}"; do
     [[ -s "$out/$object" ]] || { echo "Missing compiled object: $object" >&2; exit 1; }

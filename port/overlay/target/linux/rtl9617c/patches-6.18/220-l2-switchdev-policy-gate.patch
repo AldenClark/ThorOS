@@ -1,0 +1,884 @@
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -11,6 +11,7 @@
+ #include <linux/list.h>
+ #include <linux/sysctl.h>
+ #include <linux/uidgid.h>
++#include <linux/rtl9617c-switch.h>
+ 
+ #include <net/flow.h>
+ #include <net/netns/core.h>
+@@ -192,6 +193,9 @@
+ #if IS_ENABLED(CONFIG_SMC)
+ 	struct netns_smc	smc;
+ #endif
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	struct rtl9617c_switch_net rtl9617c_switch;
++#endif
+ #ifdef CONFIG_DEBUG_NET_SMALL_RTNL
+ 	/* Move to a better place when the config guard is removed. */
+ 	struct mutex		rtnl_mutex;
+diff --git a/include/net/sch_generic.h b/include/net/sch_generic.h
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@ -95,6 +95,7 @@
+ #define TCQ_F_INVISIBLE		0x80 /* invisible by default in dump */
+ #define TCQ_F_NOLOCK		0x100 /* qdisc does not require locking */
+ #define TCQ_F_OFFLOADED		0x200 /* qdisc is offloaded to HW */
++#define TCQ_F_SW_POLICY		(1 << 17) /* explicit software queue policy */
+ 	u32			limit;
+ 	const struct Qdisc_ops	*ops;
+ 	struct qdisc_size_table	__rcu *stab;
+diff --git a/include/net/tcx.h b/include/net/tcx.h
+--- a/include/net/tcx.h
++++ b/include/net/tcx.h
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/bpf.h>
+ #include <linux/bpf_mprog.h>
++#include <linux/rtl9617c-switch.h>
+ 
+ #include <net/sch_generic.h>
+ 
+@@ -57,7 +58,12 @@
+ tcx_entry_update(struct net_device *dev, struct bpf_mprog_entry *entry,
+ 		 bool ingress)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++	bool old = ingress ? !!rcu_access_pointer(dev->tcx_ingress) :
++			     !!rcu_access_pointer(dev->tcx_egress);
++
+ 	ASSERT_RTNL();
++	rtl9617c_switch_tcx_change(dev, old, !!entry);
+ 	if (ingress)
+ 		rcu_assign_pointer(dev->tcx_ingress, entry);
+ 	else
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -26,6 +26,13 @@
+ 
+ if NET
+ 
++config RTL9617C_SWITCH_GUARD
++	bool
++	help
++	  Synchronous policy-publication admission gate used by the native
++	  RTL9617C switch driver.  Selected by that driver even when modular,
++	  because bridge, netfilter and TC core publication sites are built in.
++
+ config ETHERNET_PACKET_MANGLE
+ 	bool
+ 	help
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -396,6 +396,8 @@
+ 	if (cur == on)
+ 		return;
+ 
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	if (on)
+ 		set_bit(opt, &br->options);
+ 	else
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -415,6 +415,8 @@
+ static void fdb_delete(struct net_bridge *br, struct net_bridge_fdb_entry *f,
+ 		       bool swdev_notify)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(swdev_notify ? br->dev : NULL);
++
+ 	trace_fdb_delete(br, f);
+ 
+ 	if (test_bit(BR_FDB_STATIC, &f->flags))
+@@ -439,6 +441,8 @@
+ 			     const struct net_bridge_port *p,
+ 			     struct net_bridge_fdb_entry *f)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	const unsigned char *addr = f->key.addr.addr;
+ 	struct net_bridge_vlan_group *vg;
+ 	const struct net_bridge_vlan *v;
+@@ -1084,6 +1088,8 @@
+ int br_fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+ 		     const unsigned char *addr, u16 vid)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	int ret;
+ 
+ 	spin_lock_bh(&br->hash_lock);
+@@ -1118,6 +1124,7 @@
+ 		} else {
+ 			unsigned long now = jiffies;
+ 			bool fdb_modified = false;
++			struct net *policy = NULL;
+ 
+ 			if (now != READ_ONCE(fdb->updated)) {
+ 				WRITE_ONCE(fdb->updated, now);
+@@ -1127,19 +1134,24 @@
+ 			/* fastpath: update of existing entry */
+ 			if (unlikely(source != READ_ONCE(fdb->dst) &&
+ 				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
+-				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
+-				WRITE_ONCE(fdb->dst, source);
+-				fdb_modified = true;
+-				/* Take over HW learned entry */
+-				if (unlikely(test_bit(BR_FDB_ADDED_BY_EXT_LEARN,
+-						      &fdb->flags)))
+-					clear_bit(BR_FDB_ADDED_BY_EXT_LEARN,
+-						  &fdb->flags);
+-				/* Clear locked flag when roaming to an
+-				 * unlocked port.
++				/* Only a real MAC move takes hash_lock.  Hardware
++				 * feedback takes hash_lock then the guard lock too,
++				 * making its epoch check + publication atomic with
++				 * this move, without locking timestamp refreshes.
+ 				 */
+-				if (unlikely(test_bit(BR_FDB_LOCKED, &fdb->flags)))
++				spin_lock(&br->hash_lock);
++				if (!hlist_unhashed(&fdb->fdb_node) &&
++				    source != READ_ONCE(fdb->dst) &&
++				    !test_bit(BR_FDB_LOCAL, &fdb->flags) &&
++				    !test_bit(BR_FDB_STICKY, &fdb->flags)) {
++					policy = rtl9617c_switch_policy_begin(br->dev);
++					br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
++					WRITE_ONCE(fdb->dst, source);
++					fdb_modified = true;
++					clear_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+ 					clear_bit(BR_FDB_LOCKED, &fdb->flags);
++				}
++				spin_unlock(&br->hash_lock);
+ 			}
+ 
+ 			if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
+@@ -1152,6 +1164,8 @@
+ 				trace_br_fdb_update(br, source, addr, vid, flags);
+ 				fdb_notify(br, fdb, RTM_NEWNEIGH, true);
+ 			}
++			if (policy)
++				rtl9617c_switch_policy_end(policy);
+ 		}
+ 	} else {
+ 		spin_lock(&br->hash_lock);
+@@ -1278,6 +1292,8 @@
+ 			 const u8 *addr, struct ndmsg *ndm, u16 flags, u16 vid,
+ 			 struct nlattr *nfea_tb[])
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	bool is_sticky = !!(ndm->ndm_flags & NTF_STICKY);
+ 	bool refresh = !nfea_tb[NFEA_DONT_REFRESH];
+ 	struct net_bridge_fdb_entry *fdb;
+@@ -1376,6 +1392,8 @@
+ 			u16 nlh_flags, u16 vid, struct nlattr *nfea_tb[],
+ 			bool *notified, struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	int err = 0;
+ 
+ 	if (ndm->ndm_flags & NTF_USE) {
+@@ -1637,6 +1655,8 @@
+ 			      const unsigned char *addr, u16 vid, bool locked,
+ 			      bool swdev_notify)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(swdev_notify ? br->dev : NULL);
++
+ 	struct net_bridge_fdb_entry *fdb;
+ 	bool modified = false;
+ 	int err = 0;
+@@ -1734,6 +1754,101 @@
+ 	return err;
+ }
+ 
++struct br_rtl9617c_learn_ctx {
++	struct net_bridge_port *port;
++	struct net_bridge_fdb_entry *fdb;
++	const unsigned char *addr;
++	bool changed;
++};
++
++/* Both hash_lock and the policy gate lock are held.  No notifications here:
++ * they could recurse into a policy gate or an unrelated driver's callback.
++ */
++static int br_rtl9617c_fdb_learn_publish(void *context)
++{
++	struct br_rtl9617c_learn_ctx *ctx = context;
++	struct net_bridge *br = ctx->port->br;
++	struct net_bridge_fdb_entry *fdb;
++
++	fdb = br_fdb_find(br, ctx->addr, 0);
++	if (fdb && (test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
++		    test_bit(BR_FDB_STATIC, &fdb->flags) ||
++		    test_bit(BR_FDB_LOCAL, &fdb->flags) ||
++		    test_bit(BR_FDB_STICKY, &fdb->flags) ||
++		    test_bit(BR_FDB_LOCKED, &fdb->flags)))
++		return -EEXIST;
++	if (!fdb) {
++		fdb = fdb_create(br, ctx->port, ctx->addr, 0,
++				 BIT(BR_FDB_ADDED_BY_EXT_LEARN) | BIT(BR_FDB_OFFLOADED));
++		if (!fdb)
++			return -ENOMEM;
++		ctx->changed = true;
++	} else {
++		ctx->changed = READ_ONCE(fdb->dst) != ctx->port ||
++			!test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++		WRITE_ONCE(fdb->dst, ctx->port);
++		set_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++		set_bit(BR_FDB_OFFLOADED, &fdb->flags);
++		WRITE_ONCE(fdb->updated, jiffies);
++		WRITE_ONCE(fdb->used, jiffies);
++	}
++	ctx->fdb = fdb;
++	return 0;
++}
++
++int br_rtl9617c_fdb_learn(const struct net_device *dev,
++			 const unsigned char *addr,
++			 struct rtl9617c_switch_guard *guard, u64 generation)
++{
++	struct br_rtl9617c_learn_ctx ctx = { .addr = addr };
++	int ret;
++
++	ASSERT_RTNL();
++	ctx.port = br_port_get_rtnl(dev);
++	if (!ctx.port)
++		return -ENODEV;
++	spin_lock_bh(&ctx.port->br->hash_lock);
++	ret = rtl9617c_switch_guard_publish(guard, generation,
++					    br_rtl9617c_fdb_learn_publish, &ctx);
++	if (!ret && ctx.changed)
++		fdb_notify(ctx.port->br, ctx.fdb, RTM_NEWNEIGH, false);
++	spin_unlock_bh(&ctx.port->br->hash_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_learn);
++
++/* A scan/unoffload snapshot may predate a userspace replacement of a learned
++ * row.  The generic DEL_TO_BRIDGE operation checks only EXT_LEARNED and would
++ * delete the replacement too.  Revalidate ownership while holding hash_lock.
++ */
++bool br_rtl9617c_fdb_forget(const struct net_device *dev,
++			    const unsigned char *addr)
++{
++	struct net_bridge_fdb_entry *fdb;
++	struct net_bridge_port *p;
++	bool removed = false;
++
++	ASSERT_RTNL();
++	p = br_port_get_rtnl(dev);
++	if (!p)
++		return false;
++	spin_lock_bh(&p->br->hash_lock);
++	fdb = br_fdb_find(p->br, addr, 0);
++	if (fdb && READ_ONCE(fdb->dst) == p &&
++	    test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) &&
++	    !test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) &&
++	    !test_bit(BR_FDB_STATIC, &fdb->flags) &&
++	    !test_bit(BR_FDB_STICKY, &fdb->flags) &&
++	    !test_bit(BR_FDB_LOCKED, &fdb->flags) &&
++	    !test_bit(BR_FDB_LOCAL, &fdb->flags)) {
++		fdb_delete(p->br, fdb, false);
++		removed = true;
++	}
++	spin_unlock_bh(&p->br->hash_lock);
++	return removed;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_forget);
++
+ void br_fdb_offloaded_set(struct net_bridge *br, struct net_bridge_port *p,
+ 			  const unsigned char *addr, u16 vid, bool offloaded)
+ {
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -332,6 +332,8 @@
+  */
+ static void del_nbp(struct net_bridge_port *p)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(p->dev);
++
+ 	struct net_bridge *br = p->br;
+ 	struct net_device *dev = p->dev;
+ 
+@@ -571,6 +573,8 @@
+ int br_add_if(struct net_bridge *br, struct net_device *dev,
+ 	      struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct net_bridge_port *p;
+ 	int err = 0;
+ 	unsigned br_hr, dev_hr;
+@@ -730,6 +734,8 @@
+ /* called with RTNL */
+ int br_del_if(struct net_bridge *br, struct net_device *dev)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct net_bridge_port *p;
+ 	bool changed_addr;
+ 
+diff --git a/net/bridge/br_mst.c b/net/bridge/br_mst.c
+--- a/net/bridge/br_mst.c
++++ b/net/bridge/br_mst.c
+@@ -95,6 +95,8 @@
+ int br_mst_set_state(struct net_bridge_port *p, u16 msti, u8 state,
+ 		     struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(p->dev);
++
+ 	struct switchdev_attr attr = {
+ 		.id = SWITCHDEV_ATTR_ID_PORT_MST_STATE,
+ 		.orig_dev = p->dev,
+@@ -207,6 +209,8 @@
+ int br_mst_set_enabled(struct net_bridge *br, bool on,
+ 		       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct switchdev_attr attr = {
+ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_MST,
+ 		.orig_dev = br->dev,
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -946,6 +946,8 @@
+ static int br_setport(struct net_bridge_port *p, struct nlattr *tb[],
+ 		      struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(p->dev);
++
+ 	unsigned long old_flags, changed_mask;
+ 	bool br_vlan_tunnel_old;
+ 	int err;
+@@ -1095,6 +1097,8 @@
+ int br_setlink(struct net_device *dev, struct nlmsghdr *nlh, u16 flags,
+ 	       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct net_bridge *br = (struct net_bridge *)netdev_priv(dev);
+ 	struct nlattr *tb[IFLA_BRPORT_MAX + 1];
+ 	struct net_bridge_port *p;
+@@ -1151,6 +1155,8 @@
+ /* Delete port information */
+ int br_dellink(struct net_device *dev, struct nlmsghdr *nlh, u16 flags)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct net_bridge *br = (struct net_bridge *)netdev_priv(dev);
+ 	struct net_bridge_port *p;
+ 	struct nlattr *afspec;
+@@ -1277,6 +1283,8 @@
+ 			 struct nlattr *data[],
+ 			 struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brdev);
++
+ 	struct net_bridge *br = netdev_priv(brdev);
+ 	int err;
+ 
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -19,6 +19,7 @@
+ #include <linux/if_vlan.h>
+ #include <linux/rhashtable.h>
+ #include <linux/refcount.h>
++#include <linux/rtl9617c-switch.h>
+ 
+ #define BR_HASH_BITS 8
+ #define BR_HASH_SIZE (1 << BR_HASH_BITS)
+@@ -1897,6 +1898,9 @@
+ 
+ static inline void br_vlan_set_state(struct net_bridge_vlan *v, u8 state)
+ {
++	CLASS(rtl9617c_switch_policy, policy)
++		(br_vlan_is_master(v) ? v->br->dev : v->port->dev);
++
+ 	WRITE_ONCE(v->state, state);
+ 	br_multicast_update_vlan_mcast_ctx(v, state);
+ }
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -28,6 +28,8 @@
+ 
+ void br_set_state(struct net_bridge_port *p, unsigned int state)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(p->dev);
++
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = p->dev,
+ 		.id = SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+@@ -629,6 +631,8 @@
+  */
+ int br_set_ageing_time(struct net_bridge *br, clock_t ageing_time)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	unsigned long t = clock_t_to_jiffies(ageing_time);
+ 	int err;
+ 
+@@ -662,6 +666,9 @@
+ /* called under bridge lock */
+ void __br_set_topology_change(struct net_bridge *br, unsigned char val)
+ {
++	CLASS(rtl9617c_switch_policy, policy)
++		(br->topology_change != val ? br->dev : NULL);
++
+ 	unsigned long t;
+ 	int err;
+ 
+diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -199,6 +199,8 @@
+ int br_stp_set_enabled(struct net_bridge *br, unsigned long val,
+ 		       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	ASSERT_RTNL();
+ 
+ 	if (br_mrp_enabled(br)) {
+@@ -221,6 +223,8 @@
+ /* called under bridge lock */
+ void br_stp_change_bridge_id(struct net_bridge *br, const unsigned char *addr)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	/* should be aligned on 2 bytes for ether_addr_equal() */
+ 	unsigned short oldaddr_aligned[ETH_ALEN >> 1];
+ 	unsigned char *oldaddr = (unsigned char *)oldaddr_aligned;
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -11,6 +11,73 @@
+ 
+ static struct static_key_false br_switchdev_tx_fwd_offload;
+ 
++/* Native UC switching does not implement these optional bridge policies.
++ * Snooping itself is intentionally allowed: every multicast/BUM/control
++ * frame is trapped, not copied after hardware replication, to the CPU.
++ */
++bool br_rtl9617c_l2_eligible(const struct net_device *master)
++{
++	const struct net_bridge_fdb_entry *fdb;
++	const struct net_bridge *br;
++	bool eligible = true;
++
++	ASSERT_RTNL();
++	if (!netif_is_bridge_master(master) || master->promiscuity)
++		return false;
++	br = netdev_priv(master);
++	if (br_opt_get(br, BROPT_MRP_ENABLED) ||
++	    br_opt_get(br, BROPT_CFM_ENABLED) ||
++	    br_opt_get(br, BROPT_MST_ENABLED) ||
++	    br_opt_get(br, BROPT_NEIGH_SUPPRESS_ENABLED) ||
++	    br_opt_get(br, BROPT_NO_LL_LEARN) ||
++	    br_opt_get(br, BROPT_VLAN_STATS_ENABLED) ||
++	    READ_ONCE(br->fdb_max_learned))
++		return false;
++
++	/* switchdev FDB replay does not carry the STATIC/STICKY lifetime bits.
++	 * Do not pin a user-managed dynamic row or turn a movable non-sticky
++	 * STATIC row into a sticky hardware row.  Only local and explicitly
++	 * sticky static entries have the required hardware lifetime semantics.
++	 * Ordinary HW-learned feedback is not policy.
++	 */
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(fdb, &br->fdb_list, fdb_node) {
++		if (!test_bit(BR_FDB_LOCAL, &fdb->flags) &&
++		    ((test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) &&
++		      !test_bit(BR_FDB_STATIC, &fdb->flags)) ||
++		     (test_bit(BR_FDB_STATIC, &fdb->flags) &&
++		      !test_bit(BR_FDB_STICKY, &fdb->flags)))) {
++			eligible = false;
++			break;
++		}
++	}
++	rcu_read_unlock();
++	return eligible;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_l2_eligible);
++
++bool br_rtl9617c_l2_port_eligible(const struct net_device *dev)
++{
++	const unsigned long allowed = BR_LEARNING | BR_LEARNING_SYNC | BR_FLOOD |
++		BR_MCAST_FLOOD | BR_BCAST_FLOOD | BR_PROMISC | BR_BPDU_GUARD |
++		BR_ROOT_BLOCK | BR_ADMIN_COST | BR_MULTICAST_FAST_LEAVE | BR_BPDU_FILTER;
++	const struct net_bridge_port *p;
++
++	ASSERT_RTNL();
++	p = br_port_get_rtnl(dev);
++	/* Non-default per-egress MTU programming is not implemented here;
++	 * smaller Linux port MTUs must retain is_skb_forwardable() in software.
++	 */
++	if (!p || READ_ONCE(dev->mtu) != ETH_DATA_LEN || (p->flags & ~allowed) ||
++	    rcu_access_pointer(p->backup_port) || p->backup_nhid)
++		return false;
++	/* The bridge's own promiscuity reference is not a userspace capture.
++	 * A second reference (e.g. tcpdump) must see traffic through the CPU.
++	 */
++	return dev->promiscuity <= !!(p->flags & BR_PROMISC);
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_l2_port_eligible);
++
+ static bool nbp_switchdev_can_offload_tx_fwd(const struct net_bridge_port *p,
+ 					     const struct sk_buff *skb)
+ {
+diff --git a/net/bridge/br_sysfs_br.c b/net/bridge/br_sysfs_br.c
+--- a/net/bridge/br_sysfs_br.c
++++ b/net/bridge/br_sysfs_br.c
+@@ -33,6 +33,8 @@
+ 				 int (*set)(struct net_bridge *br, unsigned long val,
+ 					    struct netlink_ext_ack *extack))
+ {
++	CLASS(rtl9617c_switch_policy, policy)(to_bridge(d)->dev);
++
+ 	struct net_bridge *br = to_bridge(d);
+ 	struct netlink_ext_ack extack = {0};
+ 	unsigned long val;
+@@ -306,6 +308,8 @@
+ 				struct device_attribute *attr,
+ 				const char *buf, size_t len)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(to_bridge(d)->dev);
++
+ 	struct net_bridge *br = to_bridge(d);
+ 	u8 new_addr[6];
+ 
+diff --git a/net/bridge/br_sysfs_if.c b/net/bridge/br_sysfs_if.c
+--- a/net/bridge/br_sysfs_if.c
++++ b/net/bridge/br_sysfs_if.c
+@@ -334,6 +334,8 @@
+ 			    struct attribute *attr,
+ 			    const char *buf, size_t count)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(kobj_to_brport(kobj)->dev);
++
+ 	struct brport_attribute *brport_attr = to_brport_attr(attr);
+ 	struct net_bridge_port *p = kobj_to_brport(kobj);
+ 	ssize_t ret = -EINVAL;
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -97,6 +97,8 @@
+ 
+ static void __vlan_flags_commit(struct net_bridge_vlan *v, u16 flags)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br_vlan_is_master(v) ? v->br->dev : v->port->dev);
++
+ 	__vlan_flags_update(v, flags, true);
+ }
+ 
+@@ -258,6 +260,8 @@
+ static int __vlan_add(struct net_bridge_vlan *v, u16 flags,
+ 		      struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br_vlan_is_master(v) ? v->br->dev : v->port->dev);
++
+ 	struct net_bridge_vlan *masterv = NULL;
+ 	struct net_bridge_port *p = NULL;
+ 	struct net_bridge_vlan_group *vg;
+@@ -384,6 +388,8 @@
+ 
+ static int __vlan_del(struct net_bridge_vlan *v)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br_vlan_is_master(v) ? v->br->dev : v->port->dev);
++
+ 	struct net_bridge_vlan *masterv = v;
+ 	struct net_bridge_vlan_group *vg;
+ 	struct net_bridge_port *p = NULL;
+@@ -838,6 +844,8 @@
+ 
+ void br_vlan_flush(struct net_bridge *br)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct net_bridge_vlan_group *vg;
+ 
+ 	ASSERT_RTNL();
+@@ -889,6 +897,8 @@
+ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
+ 			  struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = br->dev,
+ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING,
+@@ -940,6 +950,8 @@
+ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto,
+ 			struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = br->dev,
+ 		.id = SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL,
+@@ -1199,6 +1211,8 @@
+ int br_vlan_set_default_pvid(struct net_bridge *br, unsigned long val,
+ 			     struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	u16 pvid = val;
+ 	int err = 0;
+ 
+@@ -1369,6 +1383,8 @@
+ 
+ void nbp_vlan_flush(struct net_bridge_port *port)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(port->dev);
++
+ 	struct net_bridge_vlan_group *vg;
+ 
+ 	ASSERT_RTNL();
+diff --git a/net/bridge/br_vlan_options.c b/net/bridge/br_vlan_options.c
+--- a/net/bridge/br_vlan_options.c
++++ b/net/bridge/br_vlan_options.c
+@@ -267,6 +267,8 @@
+ 			    struct nlattr **tb,
+ 			    struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	struct net_bridge_vlan *v, *curr_start = NULL, *curr_end = NULL;
+ 	struct net_bridge_vlan_group *vg;
+ 	int vid, err = 0;
+@@ -647,6 +649,8 @@
+ 				       int cmd,
+ 				       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct net_bridge_vlan *v, *curr_start = NULL, *curr_end = NULL;
+ 	struct nlattr *tb[BRIDGE_VLANDB_GOPTS_MAX + 1];
+ 	struct net_bridge_vlan_group *vg;
+diff --git a/net/core/Makefile b/net/core/Makefile
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -8,6 +8,7 @@
+ 	 flow_dissector.o
+ 
+ obj-$(CONFIG_SYSCTL) += sysctl_net_core.o
++obj-$(CONFIG_RTL9617C_SWITCH_GUARD) += rtl9617c-switch.o
+ 
+ obj-y		     += dev.o dev_api.o dev_addr_lists.o dst.o netevent.o \
+ 			neighbour.o rtnetlink.o utils.o link_watch.o filter.o \
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -90,6 +90,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/if_ether.h>
+ #include <linux/netdevice.h>
++#include <linux/rtl9617c-switch.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ethtool.h>
+ #include <linux/ethtool_netlink.h>
+@@ -8809,6 +8810,8 @@
+ 				   struct netdev_nested_priv *priv,
+ 				   struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct netdev_notifier_changeupper_info changeupper_info = {
+ 		.info = {
+ 			.dev = dev,
+@@ -8972,6 +8975,8 @@
+ void netdev_upper_dev_unlink(struct net_device *dev,
+ 			     struct net_device *upper_dev)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct netdev_nested_priv priv = {
+ 		.flags = NESTED_SYNC_TODO,
+ 		.data = NULL,
+@@ -9512,6 +9517,8 @@
+ 
+ static int __dev_set_promiscuity(struct net_device *dev, int inc, bool notify)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(inc ? dev : NULL);
++
+ 	unsigned int old_flags = dev->flags;
+ 	unsigned int promiscuity, flags;
+ 	kuid_t uid;
+@@ -9784,6 +9791,8 @@
+ int netif_change_flags(struct net_device *dev, unsigned int flags,
+ 		       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	int ret;
+ 	unsigned int changes, old_flags = dev->flags, old_gflags = dev->gflags;
+ 
+@@ -9838,6 +9847,8 @@
+ int netif_set_mtu_ext(struct net_device *dev, int new_mtu,
+ 		      struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	int err, orig_mtu;
+ 
+ 	netdev_ops_assert_locked(dev);
+@@ -9947,6 +9958,8 @@
+ int netif_set_mac_address(struct net_device *dev, struct sockaddr_storage *ss,
+ 			  struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	const struct net_device_ops *ops = dev->netdev_ops;
+ 	int err;
+ 
+@@ -10273,6 +10286,8 @@
+ 			   bpf_op_t bpf_op, struct netlink_ext_ack *extack,
+ 			   u32 flags, struct bpf_prog *prog)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct netdev_bpf xdp;
+ 	int err;
+ 
+@@ -10341,6 +10356,8 @@
+ 		return err;
+ 	}
+ 
++	rtl9617c_switch_xdp_change(dev, !!dev_xdp_prog(dev, mode), !!prog);
++
+ 	if (mode != XDP_MODE_HW)
+ 		bpf_prog_change_xdp(dev_xdp_prog(dev, mode), prog);
+ 
+@@ -12624,7 +12641,10 @@
+ 
+ 	/* Actually switch the network namespace */
+ 	netdev_lock(dev);
++	rtl9617c_switch_move_begin(dev, net);
+ 	dev_net_set(dev, net);
++	rtl9617c_switch_policy_end(net_old);
++	rtl9617c_switch_policy_end(net);
+ 	netdev_unlock(dev);
+ 	dev->ifindex = new_ifindex;
+ 
+diff --git a/net/netfilter/core.c b/net/netfilter/core.c
+--- a/net/netfilter/core.c
++++ b/net/netfilter/core.c
+@@ -16,6 +16,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/if.h>
+ #include <linux/netdevice.h>
++#include <linux/rtl9617c-switch.h>
+ #include <linux/netfilter_ipv6.h>
+ #include <linux/inetdevice.h>
+ #include <linux/proc_fs.h>
+@@ -24,6 +25,7 @@
+ #include <linux/rcupdate.h>
+ #include <net/net_namespace.h>
+ #include <net/netfilter/nf_queue.h>
++#include <net/netfilter/nf_flow_table.h>
+ #include <net/sock.h>
+ 
+ #include "nf_internals.h"
+@@ -390,6 +392,33 @@
+ #endif
+ }
+ 
++/* Pure route flowtable hooks cache previously authorized forwarding; they
++ * are not a bridge/ingress policy.  Ordinary nft/BPF/ebtables hooks, including
++ * an empty base chain or br_netfilter with its sysctl currently disabled,
++ * remain vetoes throughout their registration lifetime.  This also protects
++ * in-place rule replacement and a later br_netfilter sysctl change.
++ */
++static bool nf_hook_blocks_l2_switch(int pf, const struct nf_hook_ops *reg)
++{
++	const struct nf_flowtable *ft;
++
++	if (pf == NFPROTO_BRIDGE)
++		return true;
++	if (pf != NFPROTO_NETDEV &&
++	    !(pf == NFPROTO_INET && reg->hooknum == NF_INET_INGRESS))
++		return false;
++	if (pf == NFPROTO_NETDEV && reg->hooknum == NF_NETDEV_INGRESS &&
++	    reg->hook_ops_type == NF_HOOK_OP_NFT_FT && reg->priv) {
++		ft = reg->priv;
++		if (ft->type && reg->hook == ft->type->hook &&
++		    (ft->type->family == NFPROTO_IPV4 ||
++		     ft->type->family == NFPROTO_IPV6 ||
++		     ft->type->family == NFPROTO_INET))
++			return false;
++	}
++	return true;
++}
++
+ static int __nf_register_net_hook(struct net *net, int pf,
+ 				  const struct nf_hook_ops *reg)
+ {
+@@ -433,6 +462,8 @@
+ 
+ 	if (!IS_ERR(new_hooks)) {
+ 		hooks_validate(new_hooks);
++		if (nf_hook_blocks_l2_switch(pf, reg))
++			rtl9617c_switch_nf_block(net);
+ 		rcu_assign_pointer(*pp, new_hooks);
+ 	}
+ 
+@@ -501,6 +532,8 @@
+ 	}
+ 
+ 	if (nf_remove_net_hook(p, reg)) {
++		if (nf_hook_blocks_l2_switch(pf, reg))
++			rtl9617c_switch_nf_unblock(net);
+ #ifdef CONFIG_NETFILTER_INGRESS
+ 		if (nf_ingress_hook(reg, pf))
+ 			net_dec_ingress_queue();
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -26,6 +26,7 @@
+ #include <linux/slab.h>
+ #include <linux/hashtable.h>
+ #include <linux/bpf.h>
++#include <linux/rtl9617c-switch.h>
+ 
+ #include <net/netdev_lock.h>
+ #include <net/net_namespace.h>
+@@ -1106,9 +1107,14 @@
+ 		       struct Qdisc *new, struct Qdisc *old,
+ 		       struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(dev);
++
+ 	struct Qdisc *q = old;
+ 	struct net *net = dev_net(dev);
+ 
++	if (new && !(new->flags & TCQ_F_BUILTIN))
++		new->flags |= TCQ_F_SW_POLICY;
++
+ 	if (parent == NULL) {
+ 		unsigned int i, num_q, ingress;
+ 		struct netdev_queue *dev_queue;
+@@ -1392,9 +1398,15 @@
+ static int qdisc_change(struct Qdisc *sch, struct nlattr **tca,
+ 			struct netlink_ext_ack *extack)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(qdisc_dev(sch));
++
+ 	struct qdisc_size_table *ostab, *stab = NULL;
+ 	int err = 0;
+ 
++	/* A handle-zero automatic qdisc becomes policy when explicitly changed. */
++	if (!(sch->flags & TCQ_F_BUILTIN))
++		sch->flags |= TCQ_F_SW_POLICY;
++
+ 	if (tca[TCA_OPTIONS]) {
+ 		if (!sch->ops->change) {
+ 			NL_SET_ERR_MSG(extack, "Change operation not supported by specified qdisc");

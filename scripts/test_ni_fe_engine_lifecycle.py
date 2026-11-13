@@ -66,6 +66,7 @@ struct rtl_xram {
 static struct rtl_xram *current;
 static int fail_suspend,fail_resume,fail_dma,fail_qm;
 static unsigned int suspends,resumes,writes,admissions,stops,waits,warnings;
+static unsigned int dma_stops,qm_stops;
 static bool held,irq_off,rx_mode_done,completion_waited;
 static bool shutdown;
 static void lock(void) {assert(!held);held=true;}
@@ -116,12 +117,18 @@ static int rtl_dma_tx_start(struct engine *engine) {
 }
 static int rtl_qm_rx_start(struct engine *engine,unsigned int port) {
  (void)port;assert(suspends && !current->fe->ready && !current->fe->active);
+ /* Register setup may partially activate QM before a later timeout. The
+  * caller must stop it; a stub that failed without effects hid this edge. */
+ engine->active=true;
  if(fail_qm)return -ENOBUFS;
- engine->active=true;return 0;
+ return 0;
 }
-static void rtl_dma_tx_stop(struct engine *engine) {engine->active=false;stops++;}
+static void rtl_dma_tx_stop(struct engine *engine) {
+ assert(current->dma_tx);engine->active=false;stops++;dma_stops++;
+}
 static void rtl_qm_rx_stop(struct engine *engine) {
- assert(!current->napi.active);engine->active=false;stops++;
+ assert(current->qm_rx && !current->napi.active);
+ engine->active=false;stops++;qm_stops++;
 }
 static void rtl_mac_address(struct rtl_xram *p) {assert(p==current && writes);}
 static void rtl_rx_mode(struct net_device *dev) {assert(dev==current->netdev);rx_mode_done=true;}
@@ -153,6 +160,7 @@ int main(void) {
    .tx_pending=true,.port=0,.ports={1,0,1,0,1},.ni=(unsigned char *)registers};
   memset(registers,0x5a,sizeof(registers));current=&p;
   suspends=resumes=writes=admissions=stops=waits=warnings=0;
+  dma_stops=qm_stops=0;
   held=irq_off=rx_mode_done=shutdown=completion_waited=false;
   fail_suspend=failure==1;fail_dma=failure==2;fail_qm=failure==3;fail_resume=failure==4;
   int expected=fail_suspend?-ETIMEDOUT:
@@ -163,6 +171,7 @@ int main(void) {
    assert(!p.engine_users && !admissions && !p.timer && !fe.ready);
    assert(!p.dma.active && !p.qm.active && !p.napi.active);
    if(fail_suspend)assert(!writes && !resumes && !stops);
+   if(expected==-ENOBUFS)assert(qm_stops==1 && dma_stops==p.dma_tx);
    if(expected==-EIO)assert(resumes==1);
   } else {
    assert(p.engine_users==1 && fe.ready && fe.active && admissions==1 && p.timer);
@@ -207,6 +216,8 @@ with tempfile.TemporaryDirectory(prefix='ni-fe-lifecycle-') as directory:
     'suspend_before_shared_registers': True,
     'resume_before_napi_and_admission': True,
     'failed_resume_unwinds_dma_qm': True,
+    'partially_started_qm_failure_closes_admission': True,
+    'rollback_does_not_touch_unconfigured_dma': True,
     'failed_stop_blocks_next_start_before_register_writes': True,
     'hardware_access': False,
 }, indent=2) + '\n')

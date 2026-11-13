@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Prevent autonomous L2 authorization; preserve a historical EVTO test fixture.
+"""Keep the retired packet-observation learner disabled; retain its counterexample.
 
 The old learner is test-only: its positive paths are NOT production offload
-coverage. The live header is compiled separately below and must register no
-packet hooks or work. scripts/test_fe_evto.py reuses the historical host fixture
-to exercise the production EVTO compiler.
+coverage. The retired compatibility header is compiled separately below and
+must register no packet hooks or work. Native switchdev has independent L2
+policy/transaction/lifecycle tests; passing this legacy fixture is NOT native
+switch coverage. scripts/test_fe_evto.py reuses the historical fixture to
+exercise the production EVTO compiler.
 """
 from pathlib import Path
 import re
@@ -289,7 +291,7 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='bridge-learning-')
     subprocess.run(['cc','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),'-I'+str(root/'port/overlay/target/linux/rtl9617c/files-6.18/include'),str(directory/'bridge.c'),'-o',str(directory/'bridge')],check=True)
     subprocess.run([str(directory/'bridge')],check=True)
 
-# Compile the actual product boundary without any netfilter/workqueue stubs:
+# Compile the retired compatibility boundary without netfilter/workqueue stubs:
 # reintroducing packet hooks, queued observations, or background work will fail
 # compilation, rather than silently replacing them with a no-op host model.
 policy = r'''
@@ -321,7 +323,7 @@ int main(void)
  assert(fe_bridge_stats(bridge,small,sizeof(small))==sizeof(small)-1);
  assert(small[sizeof(small)-1]==0);
  fe_bridge_stop(bridge);
- puts("Production bridge policy: no autonomous hooks, no worker/allocation, explicit flowtable rules only");
+ puts("Retired observation learner: no autonomous hooks or worker/allocation; native switchdev is tested separately");
 }
 '''
 assert 'fe_install(' not in production

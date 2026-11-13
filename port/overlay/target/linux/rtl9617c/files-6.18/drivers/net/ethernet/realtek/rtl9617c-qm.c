@@ -16,6 +16,7 @@
 #include <linux/rcupdate.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-qm.h"
+#include "rtl9617c-fe.h"
 #include "rtl9617c-rx-checksum.h"
 
 #define EQ_ID 4
@@ -651,6 +652,10 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				trace[4] = h0; trace[5] = h1;
 				trace[6] = get_unaligned_be32(skb->data + 42);
 			}
+			/* Preserve the validated physical LSPID and complete Ethernet
+			 * frame for the switch owner. HeaderA packet type or mirror bits
+			 * alone do not prove that hardware already forwarded this skb. */
+			rtl_fe_switch_rx(rx->fe, skb, source, h0, h1);
 			skb->protocol = eth_type_trans(skb, input);
 			input->stats.rx_packets++;
 			input->stats.rx_bytes += length;

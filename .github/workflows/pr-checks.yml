@@ -30,6 +30,14 @@ jobs:
           sudo apt-get install -y busybox
           python3 scripts/test_ubi_storage.py
           python3 scripts/test_storage_boards.py
+      - name: Upload native L2 host regression evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rtl9617c-l2-host-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: artifacts/l2-*.json
 
   sdk-contracts:
     runs-on: ubuntu-24.04
@@ -59,6 +67,7 @@ jobs:
         run: |
           kernel_version=$(python3 -c 'import json; print(json.load(open("port/sources.lock.json"))["openwrt"]["kernel"])')
           bash scripts/check_flowtable_contracts.sh "artifacts/kernel-objects/linux-$kernel_version"
+          python3 scripts/test_l2_bridge_eligibility.py --kernel "artifacts/kernel-objects/linux-$kernel_version"
       - name: Upload compile evidence without firmware or private inputs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

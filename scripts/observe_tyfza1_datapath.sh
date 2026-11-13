@@ -174,6 +174,7 @@ printf 'schema=tyfza1-datapath-v2 mode=read_only interval_seconds=%s details=%s\
 printf 'scope=two_non_atomic_snapshots_not_a_throughput_test\n'
 printf 'counter_note=FE_MIBs_are_raw_cumulative_rows_not_all_flows;compare_each_direction_only_without_flow_or_counter_reuse\n'
 printf 'offload_note=enabled_installs_and_HW_OFFLOAD_do_not_prove_two_direction_hardware_hits\n'
+printf 'l2_note=requested_is_not_active;LAN_LAN_known_unicast_and_routed_WAN_are_separate_test_paths\n'
 printf 'privacy=default_omits_flow_addresses_MACs_sessions_PON_identity_and_WAN_credentials\n'
 [ "$details" = 0 ] || printf 'warning=details_includes_flow_IP_MAC_ports_and_PPPoE_sessions;redact_before_sharing\n'
 printf 'optional_probe_timeout_seconds=3 timeout_available=%s\n' "$has_timeout"
@@ -207,10 +208,19 @@ snapshot() {
     flowtable
     link_state
     printf '\n[fe]\n'
-    fe_state=$(read_probe "$pon_dir/fe")
+    # Native-LAN-only boards need no PON device. New NI l2_state exposes the
+    # complete FE/fabric state; older firmware keeps that state under PON/fe.
+    # Never guess a NI/fe endpoint: it is not the old driver's FE ABI.
+    if [ -n "$ni_dir" ] && [ -r "$ni_dir/l2_state" ]; then
+        fe_state_file="$ni_dir/l2_state"
+    else
+        fe_state_file="$pon_dir/fe"
+    fi
+    printf 'state_source=%s\n' "$fe_state_file"
+    fe_state=$(read_probe "$fe_state_file")
     printf '%s\n' "$fe_state"
     fe_counters
-    for attribute in idle_poll_ms rx_prefetch pppoe_rx_checksum dma_state qm_voqs qm_state; do
+    for attribute in l2_switch rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum dma_state qm_voqs qm_state; do
         printf '\n[%s]\n' "$attribute"
         if [ -n "$ni_dir" ]; then
             read_probe "$ni_dir/$attribute"

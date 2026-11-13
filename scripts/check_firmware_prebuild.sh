@@ -19,7 +19,17 @@ python3 scripts/test_fe_hash_collision.py
 python3 scripts/test_fe_source_cam_timeout.py
 python3 scripts/test_fe_destination_timeout.py
 python3 scripts/test_fe_destination_status.py
+python3 scripts/test_fe_fdb_domain.py
 python3 scripts/test_fe_window_idle.py
+python3 scripts/test_l2_table_transactions.py
+python3 scripts/test_l2_hardware_recipe.py
+python3 scripts/test_l2_policy_races.py
+python3 scripts/test_l2_parent_id.py
+python3 scripts/test_l2_switch_lifecycle.py
+python3 scripts/test_l2_switch_control.py
+python3 scripts/test_l2_switch_worker.py
+python3 scripts/test_l2_switch_fdb.py
+python3 scripts/test_l2_bridge_eligibility.py
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py
 python3 scripts/test_fe_teardown_quarantine.py
@@ -37,6 +47,7 @@ python3 scripts/test_bridge_learning.py
 python3 scripts/test_fe_evto.py
 python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_qm_rx_bounds.py
+python3 scripts/test_qm_switch_rx.py
 python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py
 python3 scripts/test_dma_tx_fastpath.py

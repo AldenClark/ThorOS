@@ -130,8 +130,9 @@ int main(void)
  rtl_fe_ingress_lpb(lpb,0,16);
  assert(((lpb[2]>>4)&63)==16 && ((lpb[1]>>6)&15)==15);
  rtl_fe_fdb_key(fdb,(const unsigned char[]){2,0x77,0x66,0x55,0x44,0x33});
- assert(fdb[0]==0x003ffa00U);
- assert(fdb[1]==0x21980000U && fdb[2]==0x13bb32aaU && fdb[3]==0);
+ assert(fdb[0]==0x003ffa10U);
+ assert(fdb[1]==0x219fffc0U && fdb[2]==0x13bb32aaU && fdb[3]==0);
+ assert(rtl_fe_fdb_is_pin_domain(fdb) && rtl_fe_fdb_is_pin(fdb));
  unsigned int ttl_mask[8];rtl_fe_ipv4_mask(ttl_mask);
  assert(!(ttl_mask[1]&(3U<<23))); /* TTL is the ignore selector, not range3. */
  unsigned int c32;unsigned short c16;

@@ -46,26 +46,29 @@ struct rtl_fe_flow {
 };
 struct rtl_fe {
  struct list_head flows;
- unsigned int window[4],table[4],control,result;
- bool exists,timeout_append;
+ unsigned int window[4],table[4],control,result,writes,commands;
+ bool exists,timeout_append,limit_busy;
 };
 static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
 static void ether_addr_copy(u8 *a,const u8 *b){memcpy(a,b,6);}
 static unsigned int rd(void *p,unsigned int reg){
  struct rtl_fe *f=p;
  if(reg==0x1ca0)return 0;
+ if(reg==0x1cb4)return f->limit_busy?BIT(31):0;
  if(reg==0x1c00)return f->control;
  if(reg==0x1c2c)return f->result;
  assert(reg>=0x1ca4 && reg<=0x1cb0);return f->window[(0x1cb0-reg)/4];
 }
 static void wr(void *p,unsigned int reg,unsigned int value){
  struct rtl_fe *f=p;
+ f->writes++;
  if(reg==0x1c00){f->control=value;return;}
  if(reg==0x1c2c){f->result=value;return;}
  assert(reg>=0x1ca4 && reg<=0x1cb0);f->window[(0x1cb0-reg)/4]=value;
 }
 static int req(void *p,unsigned int reg,unsigned int value){
  struct rtl_fe *f=p;assert(reg==0x1ca0);
+ f->commands++;
  switch(value&255){
  case 4:
   if(f->exists){memcpy(f->window,f->table,sizeof(f->window));f->result=(7<<4)|5;}
@@ -88,12 +91,25 @@ int main(void){
  for(unsigned int existing=0;existing<2;existing++){
   struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};unsigned int original[4];
   init(&f.flows);add(&a.list,&f.flows);add(&b.list,&f.flows);
-  rtl_fe_fdb_key(original,mac);original[0]&=~(BIT(9)|BIT(19)|BIT(20)|BIT(21));
+  rtl_fe_fdb_key(original,mac);
+  /* A legitimate old private reference may have refreshed/changed ageing
+   * state. Foreign dynamic or non-private rows must no longer be borrowed. */
+  original[0]=(original[0]&~(255U<<11))|(37U<<11)|BIT(6);
   memcpy(f.table,original,sizeof(original));f.exists=existing;f.timeout_append=true;
+  f.limit_busy=true;
+  assert(fe_destination_get(&f,&a,mac)==-EBUSY);
+  assert(!a.destination_owned && !f.writes && !f.commands);
+  f.limit_busy=false;
   assert(fe_destination_get(&f,&a,mac)==-ETIMEDOUT);
   assert(a.destination_owned && !a.destination_ready);
   assert(a.destination_created==!existing);
   assert(fe_destination_get(&f,&b,mac)==-EBUSY && !b.destination_owned);
+  /* A late MAC-limit command must also block rollback, without discarding
+   * the destination's ownership or changing the shared mode/DATA windows. */
+  f.limit_busy=true;unsigned int writes=f.writes,commands=f.commands;
+  assert(fe_destination_put(&f,&a)==-EBUSY && a.destination_owned);
+  assert(f.writes==writes && f.commands==commands && f.exists);
+  f.limit_busy=false;
   assert(!fe_destination_put(&f,&a));a.destination_owned=false;
   assert(f.exists==existing);
   if(existing)assert(!memcmp(f.table,original,sizeof(original)));

@@ -17,7 +17,7 @@ relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
 source = subprocess.check_output(['git', 'show', args.revision + ':' + relative], text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
 
 def function(name):
-    start = re.search(r'^(?:static )?(?:int|void) ' + name + r'\(', source, re.M).start()
+    start = re.search(r'^(?:static )?(?:int|void|bool|unsigned int) ' + name + r'\(', source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -43,51 +43,51 @@ common = r'''
 #define FE_LAN_RX_CTRL(p) (0xa5f8+0x90*(p))
 #define lower_32_bits(v) ((unsigned int)(v))
 #define upper_32_bits(v) ((unsigned int)((uint64_t)(v)>>32))
-struct mutex {int unused;};
+#define WRITE_ONCE(dst,value) ((dst)=(value))
+struct spinlock {bool held;};
+#define spin_lock_irqsave(lock,flags) do{(flags)=0;assert(!(lock)->held);(lock)->held=true;}while(0)
+#define spin_unlock_irqrestore(lock,flags) do{(void)(flags);assert((lock)->held);(lock)->held=false;}while(0)
+struct mutex {bool held;};
 enum rtl_fe_mode {RTL_FE_MODE_OFF,RTL_FE_MODE_CPU,RTL_FE_MODE_HARDWARE};
 struct rtl_fe_flow {struct rtl_fe_flow *next;};
 struct list_head {struct rtl_fe_flow *first;};
 #define list_for_each_entry_safe(p,n,h,m) for(p=(h)->first,n=p?p->next:NULL;p;p=n,n=p?p->next:NULL)
-static void mutex_lock(struct mutex *m){(void)m;}
-static void mutex_unlock(struct mutex *m){(void)m;}
+static void mutex_lock(struct mutex *m){assert(!m->held);m->held=true;}
+static void mutex_unlock(struct mutex *m){assert(m->held);m->held=false;}
 struct rtl_fe {
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
- unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][7],map_saved[2][4];
+ struct spinlock route_lock;bool route_gate_ready,route_admitted;
+ unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][4][2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
- unsigned int reg[0x10000/4],mask[8],cls[1040][7],map[256];
+ unsigned int reg[0x10000/4],mask[8],cls[1056][7],map[256],cls_keys[256];
  struct rtl_fe_cam_protocol protocol_cam[3];unsigned char ppp_protocol_ids[2];
  unsigned int cam[9][64][5];
  unsigned int admission_writes,cache_ready,fail_mask,fail_mask_writes,deletes,fail_delete;
+ unsigned int switch_quiesces,switch_reconciles,register_writes;
+ unsigned int key_reads,fail_key_read,fail_route_open;
+ int switch_error;
  unsigned int expected_lan[5];
 };
 static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;assert(reg<0x10000);return f->reg[reg/4];}
 static void fe_write(void *ctx,unsigned int reg,unsigned int value){
  struct rtl_fe *f=ctx;assert(reg<0x10000);
+ f->register_writes++;
  if(reg==0x38c4)f->cache_ready=value==0xa0000000;
  if(reg==0x351c && (value&BIT(10)) && ((value>>4)&63)==32) {
   assert(f->cache_ready && f->reg[0x3860/4]==0x020d0000);
-  assert(((f->reg[0x3418/4]>>10)&15)==1 && ((f->reg[0x3424/4]>>10)&15)==0);
+  assert(((f->reg[0x3418/4]>>10)&15)==1 && ((f->reg[0x3424/4]>>10)&15)==1);
   assert(((f->cls[1024][4]>>26)&7)==7 && ((f->cls[1028][4]>>26)&7)==7);
+ }
+ if((reg==0x3418 || reg==0x3424) && f->route_gate_ready && ((value>>10)&15)==0){
+  assert(f->route_lock.held && f->prepared && f->enabled);
+  if(f->fail_route_open){f->fail_route_open--;return;}
  }
  if(reg==0x38c4 && value==0)assert(!(f->reg[0x351c/4]&BIT(10)));
  if(reg>=0xa5f8 && reg<=0xa838 && !((reg-0xa5f8)%0x90) && ((value>>16)&63)==25){
-  /* Admission follows table bases, cache setup and five output selectors. */
-  assert(f->prepared && f->cache_ready && f->reg[0x383c/4]==0x03800000);
-  /* Vendor Hash AXI errata must be applied before admitting any LAN. */
-  assert((f->reg[0x3944/4]&0x80000001U)==0x80000001U);
-  assert(f->reg[0x3948/4]&1U);
-  assert((f->reg[0x3c80/4]&255)==255);
-  assert((f->reg[0x3940/4]&0xffff)==0xd0d0); /* Failed checks bypass the hit action. */
-  assert(!(f->mask[6]&BIT(25)));
-  for(unsigned int i=0;i<3;i++)assert(!(f->bridge_mask[i][6]&BIT(25)));
-  assert(f->reg[0x351c/4]&BIT(12)); /* PE pads shortened Ethernet frames. */
-  assert((f->reg[0x3508/4]&0x1f00)==0x1f00); /* TX MIB deltas require wrap mode. */
-  assert((f->reg[0x30cc/4]&0xfff)==0xf21); /* TTL exceptions retain the original packet. */
-  assert(f->reg[0x30a4/4]==0x8001b000U); /* Preserve the active PON stream before admission. */
-  assert((f->reg[0xa1e0/4]&1023)==1023 && (f->reg[0x3400/4]&BIT(19)));
-  assert(!(f->cls[1028][6]&BIT(16)));f->admission_writes++;
+  f->admission_writes++;
+  assert(!"FE mode setup cannot reopen route25 outside the generation gate");
  }
  f->reg[reg/4]=value;
 }
@@ -106,8 +106,12 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
   unsigned int *selected=slot==63?f->mask:f->bridge_mask[(61-slot)/2];
   for(i=0;i<4;i++)if(value&BIT(30))selected[bank*4+i]=f->reg[(0x3920-i*4)/4];
   else f->reg[(0x3920-i*4)/4]=selected[bank*4+i];
+ } else if(reg==0x3380){
+  assert(!(value&BIT(30)) && (value&~(BIT(31)|255U))==0);f->key_reads++;
+  if(f->fail_key_read==index+1)return -ETIMEDOUT;
+  f->reg[0x3384/4]=f->cls_keys[index];
  } else if(reg==0x33b0){
-  unsigned int side=value&0x3fff;assert(side<1040);
+  unsigned int side=value&0x3fff;assert(side<1056);
   if(value&BIT(30))assert(!(f->reg[0x351c/4]&BIT(10)));
   for(i=0;i<7;i++)if(value&BIT(30))f->cls[side][i]=f->reg[(0x33cc-i*4)/4];
   else f->reg[(0x33cc-i*4)/4]=f->cls[side][i];
@@ -121,6 +125,12 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
  return 0;
 }
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,fe_read,fe_write,fe_access};}
+static __attribute__((unused)) int fe_switch_quiesce_locked(struct rtl_fe *f){
+ assert(f->lock.held);f->switch_quiesces++;return f->switch_error;
+}
+static __attribute__((unused)) void fe_switch_reconcile_locked(struct rtl_fe *f){
+ assert(f->lock.held);f->switch_reconciles++;
+}
 static void fe_collect_ports(struct rtl_fe *f){(void)f;}
 static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){
  assert(!f->enabled && f->flows.first==p);
@@ -134,12 +144,12 @@ if lan_defines:
     common = common.replace('#define FE_LAN_PORTS 5\n#define FE_LAN_RX_CTRL(p) (0xa5f8+0x90*(p))', lan_defines.group())
 test = r'''
 int main(void){
- struct rtl_fe f={.dma=0x03800000,.engine_ready=true};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1040][7],old_map[256],old_demux;
+ struct rtl_fe f={.dma=0x03800000,.engine_ready=true};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1056][7],old_map[256],old_demux;
  unsigned int old_bridge_mask[3][8];
  for(unsigned int i=0;i<0x10000/4;i++)f.reg[i]=0x80000000U+i;
  /* Configuration snapshots may contain high bits; ACCESS registers must
   * start idle. Real stuck/busy commands have their own window fault test. */
- const unsigned int access[]={0x1654,0x1ca0,0x3000,0x3200,0x33b0,
+ const unsigned int access[]={0x1654,0x1ca0,0x1cb4,0x3000,0x3200,0x3380,0x33b0,
   0x35c8,0x38b0,0x38e0,0x38e4,0x3910,0x3928,0x393c};
  for(unsigned int i=0;i<ARRAY_SIZE(access);i++)f.reg[access[i]/4]=0;
  f.reg[0x30a4/4]=0x0001b000U;
@@ -147,30 +157,95 @@ int main(void){
  for(unsigned int i=0;i<8;i++)f.mask[i]=old_mask[i]=0x55000000+i;
  for(unsigned int s=0;s<3;s++)for(unsigned int i=0;i<8;i++)
   f.bridge_mask[s][i]=old_bridge_mask[s][i]=0x5a000000+s*8+i;
- for(unsigned int s=0;s<1040;s++)for(unsigned int i=0;i<7;i++)f.cls[s][i]=old_cls[s][i]=0x11000000+s*7+i;
+ for(unsigned int s=0;s<1056;s++)for(unsigned int i=0;i<7;i++)f.cls[s][i]=old_cls[s][i]=0x11000000+s*7+i;
+ /* Deliberately non-zero stale second-row format bits must be owned, cleared
+  * for the installed standard FIB, and restored exactly on release. */
+ const unsigned int base[2][4]={{1024,1026,1040,1042},{1028,1030,1044,1046}};
+ for(unsigned int p=0;p<2;p++)for(unsigned int type=0;type<4;type++)
+  f.cls[base[p][type]+1][6]=old_cls[base[p][type]+1][6]=0xffffffff;
  for(unsigned int i=0;i<256;i++)f.map[i]=old_map[i]=0x100+i;
  for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)old_regs[i]=fe_read(&f,fe_registers[i]);
  old_demux=fe_read(&f,0xa1e0);
+ /* An uncertain L2 withdrawal must block ALL shared FE mode transitions,
+  * before preparing tables, restoring snapshots or admitting LAN packets. */
+ f.switch_error=-ETIMEDOUT;
+ unsigned int before_switch_writes=f.register_writes;
+ assert(rtl_fe_enable(&f)==-ETIMEDOUT && !f.enabled && !f.prepared);
+ assert(rtl_fe_cpu_path(&f)==-ETIMEDOUT && !f.cpu_path && !f.prepared);
+ assert(rtl_fe_disable(&f)==-ETIMEDOUT && f.desired_mode==RTL_FE_MODE_OFF);
+ assert(f.register_writes==before_switch_writes && f.switch_quiesces==3);
+ f.switch_error=0;
+ /* A foreign key of any of the four valid forms, at any TCAM index, makes
+  * default-only classifier ownership unsafe. Real prepare must not write. */
+ for(unsigned int index=0;index<256;index++)for(unsigned int bit=27;bit<=30;bit++){
+  f.cls_keys[index]=BIT(bit);before_switch_writes=f.register_writes;
+  assert(rtl_fe_enable(&f)==-EBUSY && !f.enabled && !f.prepared && !f.route_gate_ready);
+  assert(f.register_writes==before_switch_writes);f.cls_keys[index]=0;
+ }
+ for(unsigned int index=0;index<256;index++){
+  f.fail_key_read=index+1;before_switch_writes=f.register_writes;
+  assert(rtl_fe_enable(&f)==-ETIMEDOUT && !f.prepared && !f.enabled);
+  assert(f.register_writes==before_switch_writes);
+ }
+ f.fail_key_read=0;f.reg[0x3380/4]=BIT(31);before_switch_writes=f.register_writes;
+ unsigned int key_reads=f.key_reads;
+ assert(rtl_fe_enable(&f)==-EBUSY && f.key_reads==key_reads && f.register_writes==before_switch_writes);
+ f.reg[0x3380/4]=0;
  for(unsigned int cycle=0;cycle<3;cycle++){
   assert(!rtl_fe_enable(&f) && f.enabled && f.prepared);
-  for(unsigned int row=1024;row<=1028;row+=4){
+  /* Table/errata preparation remains checked even though admission itself
+   * now belongs to a different, generation-gated hardware owner. */
+  assert(f.cache_ready && f.reg[0x383c/4]==0x03800000);
+  assert((f.reg[0x3944/4]&0x80000001U)==0x80000001U);
+  assert(f.reg[0x3948/4]&1U);
+  assert((f.reg[0x3c80/4]&255)==255);
+  assert((f.reg[0x3940/4]&0xffff)==0xd0d0);
+  assert(!(f.mask[6]&BIT(25)));
+  for(unsigned int i=0;i<3;i++)assert(!(f.bridge_mask[i][6]&BIT(25)));
+  assert(f.reg[0x351c/4]&BIT(12));
+  assert((f.reg[0x3508/4]&0x1f00)==0x1f00);
+  assert((f.reg[0x30cc/4]&0xfff)==0xf21);
+  assert(f.reg[0x30a4/4]==0x8001b000U);
+  assert((f.reg[0xa1e0/4]&1023)==1023 && (f.reg[0x3400/4]&BIT(19)));
+  for(unsigned int profile=0;profile<2;profile++)for(unsigned int type=0;type<4;type++){
+   unsigned int row=base[profile][type];
+   assert(fe_classifier_default_index(profile,type,0)==row);
+   assert(fe_classifier_default_index(profile,type,1)==row+1);
    assert(((f.cls[row][4]>>26)&7)==7);
    assert(((f.cls[row][4]>>30)|(f.cls[row][5]<<2))%1024==16);
+   assert(!(f.cls[row][6]&BIT(16))); /* Every profile preserves physical LSPID. */
+   assert(((f.cls[row][6]>>11)&31)==(profile?31:1)); /* valid + T2 selector */
+   assert(((f.cls[row][5]>>22)&3)==(profile?3:0)); /* keep original frame */
+   for(unsigned int word=0;word<7;word++)assert(!f.cls[row+1][word]);
   }
   assert(fe_read(&f,0x3700)==4 && fe_read(&f,0x3704)==63 && fe_read(&f,0x3708)==(61|1U<<8));
   assert(fe_read(&f,0x370c)==(59|2U<<8) && fe_read(&f,0x3710)==(57|3U<<8));
   assert(f.ppp_protocol_ids[0]==1 && f.ppp_protocol_ids[1]==2);
   assert(f.cam[2][0][0]==0x18864 && f.cam[8][0][0]==0x10021 && f.cam[8][1][0]==0x10057);
-  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==((lan[i]&~(63U<<16))|(25U<<16)));
-  assert(!(f.cls[1028][6]&BIT(16)) && (f.cls[1024][6]&BIT(16)) && ((f.cls[1024][6]>>17)&63)==7);
-  assert(((fe_read(&f,0x3418)>>10)&15)==1 && ((fe_read(&f,0x3424)>>10)&15)==0);
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==lan[i]);
+  assert(f.switch_reconciles && !f.admission_writes); /* Worker admission is deferred. */
+  assert(f.route_gate_ready && !f.route_admitted);
+  assert(((fe_read(&f,0x3418)>>10)&15)==1 && ((fe_read(&f,0x3424)>>10)&15)==1);
   assert((fe_read(&f,0x351c)&BIT(10)) && ((fe_read(&f,0x351c)>>4)&63)==32);
-  /* Profile defaults start at 1024 | (profile << 2); all other rows survive. */
-  for(unsigned int row=0;row<1040;row++)
-   if(row!=1024 && row!=1028)assert(!memcmp(f.cls[row],old_cls[row],sizeof(old_cls[row])));
+  /* The SDK owns two rows per result group, not one consecutive block. */
+  for(unsigned int row=0;row<1056;row++){
+   bool owned=false;
+   for(unsigned int profile=0;profile<2;profile++)for(unsigned int type=0;type<4;type++)
+    owned|=row==base[profile][type] || row==base[profile][type]+1;
+   if(!owned)assert(!memcmp(f.cls[row],old_cls[row],sizeof(old_cls[row])));
+  }
+  /* Only explicit fabric arm opens BOTH LAN and PON hash profiles; an
+   * unsuccessful readback must reclose both without indirect operations. */
+  unsigned int before_keys=f.key_reads;
+  assert(fe_route_arm(&f) && f.route_admitted);
+  assert(!((fe_read(&f,0x3418)>>10)&15) && !((fe_read(&f,0x3424)>>10)&15));
+  fe_route_gate(&f);assert(!f.route_admitted);
+  f.fail_route_open=1;assert(!fe_route_arm(&f) && !f.route_admitted);
+  assert(((fe_read(&f,0x3418)>>10)&15)==1 && ((fe_read(&f,0x3424)>>10)&15)==1);
+  assert(f.key_reads==before_keys);
   assert(fe_read(&f,0xa1e0)==(old_demux|0x3ff));
   unsigned int writes=f.admission_writes;assert(!rtl_fe_enable(&f) && f.admission_writes==writes);
-  assert(!rtl_fe_disable(&f) && !f.enabled && !f.prepared);
+  assert(!rtl_fe_disable(&f) && !f.enabled && !f.prepared && !f.route_gate_ready && !f.route_admitted);
   assert(fe_read(&f,0x30a4)==0x0001b000U);
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==lan[i]);
   for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
@@ -180,7 +255,7 @@ int main(void){
   assert(!rtl_fe_disable(&f));
   assert(!f.cam[2][0][0] && !f.cam[8][0][0] && !f.cam[8][1][0]);
  }
- assert(f.admission_writes==15);
+ assert(f.admission_writes==0);
  f.fail_mask=1;assert(rtl_fe_enable(&f)==-ETIMEDOUT && !f.enabled && !f.prepared);
  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,0xa5f8+i*0x90)==lan[i]);
  /* Warm parser state can place the PPP protocols at arbitrary CAM rows. */
@@ -263,7 +338,7 @@ int main(void){
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
   if(admit){
    assert(!rtl_fe_enable(&f) && f.enabled);
-   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==((native[i]&~(63U<<16))|(25U<<16)));
+   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
    assert(!rtl_fe_cpu_path(&f) && !f.enabled && f.cpu_path);
    for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
   }
@@ -290,7 +365,7 @@ int main(void){
   assert(!rtl_fe_engine_resume(&f) && f.engine_ready && f.prepared);
   assert(f.enabled==(mode==RTL_FE_MODE_HARDWARE));
   assert(f.cpu_path==(mode==RTL_FE_MODE_CPU));
-  for(unsigned int i=0;i<5;i++)assert(((fe_read(&f,FE_LAN_RX_CTRL(i))>>16)&63)==(mode==RTL_FE_MODE_HARDWARE?25:16));
+  for(unsigned int i=0;i<5;i++)assert(((fe_read(&f,FE_LAN_RX_CTRL(i))>>16)&63)==16);
   assert(!rtl_fe_disable(&f) && f.desired_mode==RTL_FE_MODE_OFF);
   assert(fe_read(&f,0x2300)==scheduler);
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==f.expected_lan[i]);
@@ -309,16 +384,31 @@ int main(void){
  assert(!rtl_fe_engine_suspend(&f));
  assert(!rtl_fe_engine_resume(&f) && f.engine_ready && f.enabled);
  assert(!rtl_fe_disable(&f));
+ /* The same gate applies when a live L3 engine owns the previous snapshot. */
+ assert(!rtl_fe_enable(&f));
+ before_switch_writes=f.register_writes;f.switch_error=-EBUSY;
+ assert(rtl_fe_disable(&f)==-EBUSY && f.enabled && f.prepared);
+ assert(rtl_fe_cpu_path(&f)==-EBUSY && f.enabled && !f.cpu_path);
+ assert(f.register_writes==before_switch_writes && f.desired_mode==RTL_FE_MODE_HARDWARE);
+ f.switch_error=0;assert(!rtl_fe_disable(&f));
+ /* A stale saved selector is data, not permission to bypass a newer gate. */
+ f.lan_redirected=true;
+ for(unsigned int i=0;i<5;i++)f.lan_saved[i]=(f.expected_lan[i]&~(BIT(28)|(63U<<16)))|((i&1?i:25U)<<16);
+ mutex_lock(&f.lock);fe_lan_restore_locked(&f);mutex_unlock(&f.lock);
+ for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==
+  ((f.lan_saved[i]&~(63U<<16))|BIT(28)|(16U<<16)));
+ assert(!f.lan_redirected && !f.admission_writes);
  f.shutting_down=true;
  assert(rtl_fe_enable(&f)==-ENODEV && rtl_fe_cpu_path(&f)==-ENODEV);
  assert(rtl_fe_engine_resume(&f)==-ENODEV && !f.engine_ready);
  puts("NI/FE lifecycle: CPU/HW desired mode, fresh restart snapshots, failed suspend/restore and offline admission guards passed");
  puts("CPU-only FE: first prepare, idempotence, on/off snapshots, cleanup failure and final full restore passed");
- puts("Five-LAN FE:ordered admission,physical source preservation,direct L2TM output,three exact restore cycles and failed preparation passed");
+ puts("Five-LAN FE:deferred guarded admission,physical source preservation,direct L2TM output,three restore cycles and failed preparation passed");
  puts("FE rollback: failed prepare/disable preserves original snapshots across re-enable and repeated rollback failure");
 }
 '''
-functions = ['fe_prepare', 'fe_restore']
+functions = ['fe_route_select_locked', 'fe_route_gate', 'fe_route_arm',
+             'fe_classifier_default_index', 'fe_prepare', 'fe_restore']
 if re.search(r'^static void fe_lan_restore_locked\(', source, re.M):
     functions.append('fe_lan_restore_locked')
 if re.search(r'^static int fe_disable_locked\(', source, re.M):
@@ -339,6 +429,8 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'production_source_sha256': hashlib.sha256(source.encode()).hexdigest(),
     'LAN_ports': [0, 1, 2, 3, 4], 'exact_enable_disable_cycles': 3,
     'failed_prepare_admits_no_LAN': True,
+    'mode_setup_never_bypasses_single_fabric_admission_owner': True,
+    'stale_saved_RX_selector_cannot_reopen_native_or_route_admission': True,
     'CPU_only_prepares_without_LAN_admission_and_preserves_snapshot': True,
     'CPU_only_cleanup_failure_requires_retry': True,
     'cold_CPU_request_waits_for_NI_ready': True,
@@ -346,7 +438,10 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'failed_suspend_blocks_resume_and_retains_owners': True,
     'GEM_gate_opens_after_CLS_defaults_LPB_cache_and_closes_before_restore': True,
     'PON_stream_identity_enabled_before_admission_and_restored': True,
-    'both_CLS_defaults_supply_CPU16': True, 'physical_LSPID_preserved': True,
+    'two_profiles_four_result_groups_two_rows_saved_programmed_and_restored': True,
+    'all_foreign_TCAM_valid_flags_rejected_without_data_writes': True,
+    'CPU_original_profile_stops_both_LAN_and_PON_hash_admission': True,
+    'physical_LSPID_preserved': True,
     'failed_rollback_preserves_original_snapshot_on_reenable': True,
     'post_PE_LAN_output': 'NI demux3 to L2TM; upper selectors preserved',
     'sanitizers': ['ASan', 'UBSan'], 'hardware_verified_by_this_test': False,
