@@ -30,7 +30,6 @@ pub struct Observation {
 pub enum Event {
     Probe(Observation),
     RouterSample { at: u128, text: String },
-    Evidence { title: String, text: String },
 }
 
 pub fn epoch_ms() -> u128 {

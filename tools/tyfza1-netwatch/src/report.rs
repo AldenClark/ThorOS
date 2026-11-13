@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::probe::{epoch_ms, Observation};
 use crate::router::{self, Router};
 use std::collections::{BTreeMap, VecDeque};
@@ -400,7 +399,7 @@ mod tests {
     #[test]
     fn csv_escaping() {
         assert_eq!(csv("ok"), "ok");
-        assert_eq!(csv("a,\"b\""), "\"a,\"\"b\"\"\"\"\"");
+        assert_eq!(csv("a,\"b\""), "\"a,\"\"b\"\"\"");
     }
 }
 
