@@ -29,6 +29,8 @@ with tempfile.TemporaryDirectory(prefix='tyfza1-apk-config-') as directory:
         shutil.copyfile(patch, port / 'host-patches' / patch.name)
     shutil.copyfile(root / 'port/scripts/apply-openwrt-patches.sh',
                     port / 'scripts/apply-openwrt-patches.sh')
+    shutil.copyfile(root / 'port/scripts/write-build-info.sh',
+                    port / 'scripts/write-build-info.sh')
     shutil.copyfile(root / 'port/tools/project_paths.py',
                     port / 'tools/project_paths.py')
     shutil.copytree(root / 'port/openwrt-patches', port / 'openwrt-patches')

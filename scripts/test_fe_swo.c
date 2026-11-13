@@ -9,6 +9,7 @@ struct model {unsigned int tuple, index, header[33], mask, calls;int fail;};
 static unsigned int read_reg(void *context, unsigned int reg)
 {
  struct model *m=context;
+ if(reg==0x38e0)return 0;
  if(reg==0x3704)return m->tuple;
  assert(reg==0x38dc);
  return m->index++==33?0x96170000U|m->mask:0xc000U|m->mask;

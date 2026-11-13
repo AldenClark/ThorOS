@@ -21,6 +21,7 @@
 #include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
+#include <linux/tc_act/tc_csum.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <net/flow_offload.h>
@@ -28,6 +29,7 @@
 #include "rtl9617c-fe.h"
 #include "rtl9617c-fe-pipeline.h"
 #include "rtl9617c-fe-cache-snapshot.h"
+#include "rtl9617c-fe-observe.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
@@ -42,6 +44,12 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_
 #define FE_LAN_PORTS 5
 #define FE_LAN_RX_CTRL(port) (0xa5f8+0x90*(port))
 
+enum rtl_fe_mode {
+ RTL_FE_MODE_OFF,
+ RTL_FE_MODE_CPU,
+ RTL_FE_MODE_HARDWARE,
+};
+
 struct rtl_fe_port {
  struct list_head list;
  struct rtl_fe *fe;
@@ -51,6 +59,7 @@ struct rtl_fe_port {
 };
 struct rtl_fe_mac {
  unsigned int users, saved[5];
+ bool ready;
  u8 address[ETH_ALEN];
 };
 struct rtl_fe_interface {
@@ -85,7 +94,7 @@ struct rtl_fe_flow {
  u16 crc16;
  u32 crc32;
  unsigned char ethernet_bytes;
- bool destination_created;
+ bool destination_created, destination_ready;
  bool mtu_owned;
  bool published, source_owned, destination_owned, interface_owned, counted, installed, deleting;
  u8 destination[ETH_ALEN];
@@ -114,9 +123,13 @@ struct rtl_fe {
  void *memory;
  dma_addr_t dma;
  bool enabled, prepared, cpu_path, lan_redirected;
+ /* NI stop/start must not confuse requested policy with live ASIC state. */
+ bool engine_ready, shutting_down;
+ enum rtl_fe_mode desired_mode;
  unsigned int cache_target;
  int error;
  u64 installs, deletes, misses;
+ struct rtl_fe_observe observe;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
  unsigned int bridge_mask_saved[3][8];
  struct rtl_fe_cam_protocol protocol_cam[3];
@@ -145,7 +158,13 @@ static void fe_write(void *context,unsigned int address,unsigned int value)
 static int fe_access(void *context,unsigned int address,unsigned int value)
 {
  struct rtl_fe *fe=context;
- u32 status, busy=(address==0x38b0 || address==0x393c)?1:BIT(31);
+ u32 status, busy=(address==0x38b0 || address==0x393c || address==0x38e0)?1:BIT(31);
+ int ret;
+
+ /* A timed-out command can still complete later. Do not overwrite its
+  * ACCESS register. DATA-window writers must also check before staging. */
+ ret=readl_poll_timeout(fe->registers+address,status,!(status&busy),1,100000);
+ if(ret)return ret;
  writel(value,fe->registers+address);
  return readl_poll_timeout(fe->registers+address,status,!(status&busy),1,100000);
 }
@@ -228,7 +247,9 @@ static int fe_prepare(struct rtl_fe *fe)
  }
  fe->prepared=true;
  /* Original aal_l3fe_l4_chksum: EPP checksum status requires this engine. */
- fe_write(fe,0x3218,fe_read(fe,0x3218)|BIT(16));
+ /* SDK L3FE checksum engines: explicitly enable IPv4 and L4 checking.
+  * Invalid parser classes still miss the exact routing hash templates. */
+ fe_write(fe,0x3218,fe_read(fe,0x3218)|BIT(15)|BIT(16));
  /* Keep GEM rewriting disabled until its classifier/default chain is ready. */
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
  rtl_fe_dma_tables(&io,lower_32_bits(fe->dma),(upper_32_bits(fe->dma)&255)|2);
@@ -279,6 +300,8 @@ static int fe_prepare(struct rtl_fe *fe)
   rtl_fe_bits_set(lpb,42,4,i?0:1); /* Native WAN0/LAN1 selectors. */
   for(side=0;side<3;side++)fe_write(fe,0x3414+i*12+side*4,lpb[side]);
   for(side=0;side<4;side++) {
+   ret=rtl_fe_window_idle(&io,0x1654);
+   if(ret)return ret;
    fe_write(fe,0x1658,i?12:13);
    ret=fe_access(fe,0x1654,BIT(31)|BIT(30)|(i?24:25)|(side<<6));
    if(ret)return ret;
@@ -331,6 +354,8 @@ static int fe_restore(struct rtl_fe *fe)
  }
  for(i=0;i<2;i++) {
   for(side=0;side<4;side++) {
+   ret=rtl_fe_window_idle(&io,0x1654);
+   if(ret)return ret;
    fe_write(fe,0x1658,fe->map_saved[i][side]);
    ret=fe_access(fe,0x1654,BIT(31)|BIT(30)|(24+i)|(side<<6));
    if(ret)return ret;
@@ -357,6 +382,7 @@ static int fe_source_get(struct rtl_fe *fe,const u8 *address,unsigned int *index
 
  for(i=0;i<FE_SOURCE_MACS;i++)
   if(fe->source_macs[i].users && ether_addr_equal(address,fe->source_macs[i].address)) {
+   if(!fe->source_macs[i].ready)return -EBUSY;
    fe->source_macs[i].users++;
    *index=i;
    return 0;
@@ -371,9 +397,11 @@ static int fe_source_get(struct rtl_fe *fe,const u8 *address,unsigned int *index
   * the saved row before issuing it, so a failed restore stays on retries. */
  ether_addr_copy(fe->source_macs[i].address,address);
  fe->source_macs[i].users=1;
+ fe->source_macs[i].ready=false;
  *index=i;
  ret=rtl_fe_source_mac_write(&io,i,words);
  if(ret)return ret;
+ fe->source_macs[i].ready=true;
  return 0;
 }
 static int fe_source_put(struct rtl_fe *fe,unsigned int index)
@@ -381,7 +409,9 @@ static int fe_source_put(struct rtl_fe *fe,unsigned int index)
  struct rtl_dq_io io=fe_io(fe);
  int ret;
 
+ if(index>=FE_SOURCE_MACS || !fe->source_macs[index].users)return -EINVAL;
  if(fe->source_macs[index].users>1){fe->source_macs[index].users--;return 0;}
+ fe->source_macs[index].ready=false;
  ret=rtl_fe_source_mac_write(&io,index,fe->source_macs[index].saved);
  if(!ret)fe->source_macs[index].users=0;
  return ret;
@@ -506,30 +536,42 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  ether_addr_copy(flow->destination,address);
  list_for_each_entry(other,&fe->flows,list)
   if(other!=flow && other->destination_owned && ether_addr_equal(other->destination,address)) {
+   if(!other->destination_ready || other->deleting)return -EBUSY;
    flow->destination_index=other->destination_index;
    memcpy(flow->destination_saved,other->destination_saved,sizeof(flow->destination_saved));
    flow->destination_created=other->destination_created;
    flow->destination_owned=true;
+   flow->destination_ready=true;
    return 0;
   }
  rtl_fe_fdb_key(words,address);
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
- flow->destination_created=(result&15)!=5;
+ /* The SDK CMD_RETURN status is distinct from ACCESS completion. Only
+  * HIT and MISS establish whether an original row exists. */
+ if((result&15)!=5 && (result&15)!=15)return -EIO;
+ flow->destination_created=(result&15)==15;
  if(!flow->destination_created)memcpy(flow->destination_saved,words,sizeof(words));
  /* APPEND updates an existing key in place. Pin its MAC/permissions until
   * the last Linux flow releases it, then restore its original contents. */
  if(flow->destination_created)rtl_fe_fdb_key(words,address);
  else words[0]|=BIT(9)|BIT(19)|BIT(20)|BIT(21);
+ /* APPEND can change the table before its completion poll times out.
+  * Retain the original row/key for rollback before issuing the command. */
+ flow->destination_owned=true;
+ flow->destination_ready=false;
  ret=rtl_fe_fdb_command(&io,0x45,words,&result);
  if(ret)return ret;
- if((result&15)!=5)return -ENOSPC;
- flow->destination_owned=true;
+ if((result&15)==10)return -ENOSPC;
+ /* 4 is the SDK's successful append with a port-limit warning. Status 11
+  * may have updated a row but is not success; retain rollback ownership. */
+ if((result&15)!=5 && (result&15)!=4)return -EIO;
  rtl_fe_fdb_key(words,address);
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
  if((result&15)!=5)return -EIO;
  flow->destination_index=(result>>4)&0x1fff;
+ flow->destination_ready=true;
  return 0;
 }
 static int fe_destination_put(struct rtl_fe *fe,struct rtl_fe_flow *flow)
@@ -537,15 +579,23 @@ static int fe_destination_put(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  struct rtl_dq_io io=fe_io(fe);
  struct rtl_fe_flow *other;
  unsigned int words[4],result;
+ int ret;
 
+ flow->destination_ready=false;
  list_for_each_entry(other,&fe->flows,list)
   if(other!=flow && other->destination_owned && ether_addr_equal(other->destination,flow->destination))return 0;
  if(flow->destination_created) {
   rtl_fe_fdb_key(words,flow->destination);
-  return rtl_fe_fdb_command(&io,0x85,words,&result);
+  ret=rtl_fe_fdb_command(&io,0x85,words,&result);
+  if(ret)return ret;
+  /* Deletion is idempotent only for the documented HIT/MISS results. */
+  return (result&15)==5 || (result&15)==15?0:-EIO;
  }
  memcpy(words,flow->destination_saved,sizeof(words));
- return rtl_fe_fdb_command(&io,0x45,words,&result);
+ ret=rtl_fe_fdb_command(&io,0x45,words,&result);
+ if(ret)return ret;
+ if((result&15)==10)return -ENOSPC;
+ return (result&15)==5 || (result&15)==4?0:-EIO;
 }
 
 struct rtl_fe_rule {
@@ -563,6 +613,7 @@ struct rtl_fe_rule {
  struct rtl_fe_vlan vlan[2];
  unsigned char vlan_count,ethernet_bytes;
  u8 source[ETH_ALEN],destination[ETH_ALEN];
+ unsigned int reject_reason;
 };
 static int fe_vlan_tpid(__be16 protocol)
 {
@@ -577,7 +628,8 @@ static int fe_vlan_match(const struct flow_match_vlan *match,struct rtl_fe_vlan 
  int tpid;
 
  if(match->mask->vlan_id!=VLAN_VID_MASK || match->mask->vlan_tpid!=htons(0xffff) ||
-    match->mask->vlan_priority || match->mask->vlan_dei)return -EOPNOTSUPP;
+    match->mask->vlan_priority || match->mask->vlan_dei ||
+    match->mask->vlan_eth_type)return -EOPNOTSUPP;
  tpid=fe_vlan_tpid(match->key->vlan_tpid);
  if(tpid<0)return tpid;
  *vlan=(struct rtl_fe_vlan){.vid=match->key->vlan_id,.tpid=tpid};
@@ -596,6 +648,7 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
  unsigned int count,key;
  int i,ret;
 
+ data->reject_reason=FE_REJECT_KEYS;
  for(key=0;key<FLOW_DISSECTOR_KEY_MAX;key++) {
   if(!flow_rule_match_key(rule,key))continue;
   switch(key) {
@@ -607,21 +660,25 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
   }
  }
  if(!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_BASIC))return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_PROTOCOL;
  flow_rule_match_basic(rule,&basic);
  if(basic.mask->n_proto!=htons(0xffff) || basic.mask->ip_proto)return -EOPNOTSUPP;
  if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_CONTROL)) {
   struct flow_match_control control;
+  data->reject_reason=FE_REJECT_CONTROL;
   flow_rule_match_control(rule,&control);
   if(control.mask->thoff || control.mask->addr_type || control.mask->flags)return -EOPNOTSUPP;
  }
  if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_META)) {
   struct flow_match_meta meta;
+  data->reject_reason=FE_REJECT_META;
   flow_rule_match_meta(rule,&meta);
   if(meta.mask->ingress_iftype || meta.mask->l2_miss || (meta.mask->ingress_ifindex &&
      (meta.mask->ingress_ifindex!=-1 || meta.key->ingress_ifindex!=port->netdev->ifindex)))
    return -EOPNOTSUPP;
  }
  flow_rule_match_eth_addrs(rule,&ethernet);
+ data->reject_reason=FE_REJECT_KEYS;
  for(i=0;i<ETH_ALEN;i++)
   if(ethernet.mask->src[i]!=255 || ethernet.mask->dst[i]!=255)return -EOPNOTSUPP;
  if(!is_valid_ether_addr(ethernet.key->src) || !is_valid_ether_addr(ethernet.key->dst))return -EINVAL;
@@ -631,6 +688,7 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
   .mask=61};
  ether_addr_copy(data->source,ethernet.key->src);
  ether_addr_copy(data->destination,ethernet.key->dst);
+ data->reject_reason=FE_REJECT_PROTOCOL;
  if(data->ethernet_protocol==ETH_P_PPP_SES) {
   struct flow_match_pppoe pppoe;
   if(!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PPPOE))return -EOPNOTSUPP;
@@ -640,6 +698,7 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
      pppoe.key->type!=htons(ETH_P_PPP_SES))))return -EOPNOTSUPP;
   data->pppoe_input=true;data->pppoe_session=ntohs(pppoe.key->session_id);
  } else if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PPPOE))return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_VLAN;
  if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_VLAN)) {
   flow_rule_match_vlan(rule,&vlan);
   ret=fe_vlan_match(&vlan,&data->vlan[data->vlan_count++]);
@@ -653,9 +712,12 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
  }
  count=data->vlan_count;
  memcpy(data->action.vlan,data->vlan,sizeof(data->vlan));
+ data->reject_reason=FE_REJECT_ACTION;
  flow_action_for_each(i,act,&rule->action) {
   switch(act->id) {
-  case FLOW_ACTION_REDIRECT:output=act->dev;break;
+  case FLOW_ACTION_REDIRECT:
+   if(output || i!=(int)rule->action.num_entries-1)return -EOPNOTSUPP;
+   output=act->dev;break;
   case FLOW_ACTION_VLAN_POP:
    if(!count)return -EOPNOTSUPP;
    data->action.vlan[0]=data->action.vlan[1];known[0]=known[1];
@@ -671,6 +733,7 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
   }
  }
  if(changed)for(i=0;i<count;i++)if(!known[i])return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_PORT;
  data->output=fe_port(port->fe,output);
  if(!data->output || data->input==data->output)return -EOPNOTSUPP;
  data->action.bridge=1;
@@ -694,13 +757,13 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  struct flow_match_vlan vlan_match;
  struct flow_action_entry *act;
  struct net_device *output=NULL;
- u8 ethernet[ETH_HLEN]={};
+ u8 ethernet[ETH_HLEN]={},ethernet_known[ETH_ALEN*2]={};
  __be32 new_source,new_destination;
  __be16 new_sport,new_dport;
  bool source_changed,destination_changed;
  struct rtl_fe_vlan output_vlan[2];
  bool vlan_known[2]={false,false},vlan_changed=false;
- unsigned int output_vlan_count;
+ unsigned int output_vlan_count,key;
  int i,ret;
  __be16 protocol;
 
@@ -709,13 +772,31 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   if(ret)return ret;
   goto itu_paths;
  }
+ /* Never silently drop match predicates. In particular, an IP TOS/TTL,
+  * tunnel, connection-state or arbitrary TCP flag restriction cannot be
+  * widened into this fixed five-tuple hardware template. */
+ data->reject_reason=FE_REJECT_KEYS;
+ for(key=0;key<FLOW_DISSECTOR_KEY_MAX;key++) {
+  if(!flow_rule_match_key(rule,key))continue;
+  switch(key) {
+  case FLOW_DISSECTOR_KEY_META:case FLOW_DISSECTOR_KEY_CONTROL:
+  case FLOW_DISSECTOR_KEY_BASIC:case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
+  case FLOW_DISSECTOR_KEY_IPV6_ADDRS:case FLOW_DISSECTOR_KEY_PORTS:
+  case FLOW_DISSECTOR_KEY_VLAN:case FLOW_DISSECTOR_KEY_CVLAN:
+  case FLOW_DISSECTOR_KEY_PPPOE:case FLOW_DISSECTOR_KEY_TCP:break;
+  default:return -EOPNOTSUPP;
+  }
+ }
  if(!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_META) ||
     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_BASIC) ||
     (!flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV4_ADDRS) &&
      !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV6_ADDRS)) ||
     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PORTS))return -EOPNOTSUPP;
  flow_rule_match_meta(rule,&meta);
- if(meta.key->ingress_ifindex!=port->netdev->ifindex)return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_META;
+ if(meta.mask->ingress_ifindex!=-1 || meta.mask->ingress_iftype || meta.mask->l2_miss ||
+    meta.key->ingress_ifindex!=port->netdev->ifindex)return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_PROTOCOL;
  flow_rule_match_basic(rule,&basic);
  protocol=basic.key->n_proto;
  if(protocol==htons(ETH_P_PPP_SES)) {
@@ -727,12 +808,30 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   else if(pppoe.key->ppp_proto==htons(PPP_IPV6))protocol=htons(ETH_P_IPV6);
   else return -EOPNOTSUPP;
   data->pppoe_input=true;data->pppoe_session=ntohs(pppoe.key->session_id);
- }
+ } else if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PPPOE))return -EOPNOTSUPP;
  data->ipv6=protocol==htons(ETH_P_IPV6);
  if((protocol!=htons(ETH_P_IP) && !data->ipv6) || basic.mask->n_proto!=htons(0xffff) ||
     basic.mask->ip_proto!=255 || (basic.key->ip_proto!=IPPROTO_TCP && basic.key->ip_proto!=IPPROTO_UDP))
   return -EOPNOTSUPP;
- if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_ENC_CONTROL))return -EOPNOTSUPP;
+ if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV4_ADDRS)==data->ipv6 ||
+    flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_IPV6_ADDRS)!=data->ipv6)return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_CONTROL;
+ if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_CONTROL)) {
+  struct flow_match_control control;
+  flow_rule_match_control(rule,&control);
+  if(control.mask->thoff || control.mask->flags ||
+     control.mask->addr_type!=0xffff || control.key->addr_type!=
+     (data->ipv6?FLOW_DISSECTOR_KEY_IPV6_ADDRS:FLOW_DISSECTOR_KEY_IPV4_ADDRS))return -EOPNOTSUPP;
+ }
+ if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_TCP)) {
+  struct flow_match_tcp tcp;
+  flow_rule_match_tcp(rule,&tcp);
+  /* ASIC mask retains FIN/SYN/RST (bits0..2) as zero. It ignores all
+   * other TCP flags: accept only predicates implied by that template. */
+  if(basic.key->ip_proto!=IPPROTO_TCP || tcp.key->flags ||
+     (ntohs(tcp.mask->flags)&~7U))return -EOPNOTSUPP;
+ }
+ data->reject_reason=FE_REJECT_VLAN;
  data->vlan_count=0;
  if(flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_VLAN)) {
   flow_rule_match_vlan(rule,&vlan_match);
@@ -747,6 +846,7 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  }
  output_vlan_count=data->vlan_count;
  memcpy(output_vlan,data->vlan,sizeof(output_vlan));
+ data->reject_reason=FE_REJECT_KEYS;
  flow_rule_match_ports(rule,&ports);
  if(ports.mask->src!=htons(0xffff) || ports.mask->dst!=htons(0xffff))return -EOPNOTSUPP;
  data->input=port;
@@ -774,13 +874,15 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   new_source=addresses.key->src;new_destination=addresses.key->dst;
  }
  new_sport=ports.key->src;new_dport=ports.key->dst;
+ data->reject_reason=FE_REJECT_ACTION;
  flow_action_for_each(i,act,&rule->action) {
   unsigned int offset=act->mangle.offset;
   u32 value;
 
   switch(act->id) {
   case FLOW_ACTION_PPPOE_PUSH:
-   if(!act->pppoe.sid || !act->pppoe.mtu || act->pppoe.mtu>0x3fff)return -EOPNOTSUPP;
+   if(data->egress_pppoe || !act->pppoe.sid || !act->pppoe.mtu ||
+      act->pppoe.mtu>0x3fff)return -EOPNOTSUPP;
    data->egress_pppoe=3U|((unsigned int)act->pppoe.sid<<2);
    data->mtu=act->pppoe.mtu;
    break;
@@ -798,13 +900,23 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
    output_vlan[0]=(struct rtl_fe_vlan){.vid=act->vlan.vid,.tpid=ret,.priority=act->vlan.prio};
    vlan_known[0]=true;output_vlan_count++;vlan_changed=true;
    break;
-  case FLOW_ACTION_REDIRECT:output=act->dev;break;
-  case FLOW_ACTION_CSUM:break;
+  case FLOW_ACTION_REDIRECT:
+   if(output || i!=(int)rule->action.num_entries-1)return -EOPNOTSUPP;
+   output=act->dev;break;
+  case FLOW_ACTION_CSUM:
+   /* The packet editor supports the checksums implied by this IPv4
+    * TCP/UDP template, not arbitrary tc checksum-repair requests. */
+   if(data->ipv6 || act->csum_flags&~(TCA_CSUM_UPDATE_FLAG_IPV4HDR|
+      (basic.key->ip_proto==IPPROTO_TCP?TCA_CSUM_UPDATE_FLAG_TCP:TCA_CSUM_UPDATE_FLAG_UDP)))
+    return -EOPNOTSUPP;
+   break;
   case FLOW_ACTION_MANGLE:
    if(act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_ETH) {
-    if(offset>ETH_HLEN-sizeof(value))return -EOPNOTSUPP;
+    if(offset>sizeof(ethernet_known)-sizeof(value))return -EOPNOTSUPP;
     value=get_unaligned((u32 *)(ethernet+offset));
     put_unaligned((value&act->mangle.mask)|act->mangle.val,(u32 *)(ethernet+offset));
+    value=get_unaligned((u32 *)(ethernet_known+offset));
+    put_unaligned(value|~act->mangle.mask,(u32 *)(ethernet_known+offset));
    } else if(act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_IP4) {
     if(data->ipv6)return -EOPNOTSUPP;
     if(act->mangle.mask)return -EOPNOTSUPP;
@@ -813,6 +925,8 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
     else return -EOPNOTSUPP;
    } else if(act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_TCP || act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_UDP) {
     __be16 pair[2]={new_sport,new_dport};
+    if((act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_TCP)!=(basic.key->ip_proto==IPPROTO_TCP))
+     return -EOPNOTSUPP;
     if(offset)return -EOPNOTSUPP;
     memcpy(&value,pair,4);
     value=(value&act->mangle.mask)|act->mangle.val;
@@ -824,6 +938,9 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   default:return -EOPNOTSUPP;
   }
  }
+ for(i=0;i<ETH_ALEN*2;i++)
+  if(ethernet_known[i]!=255)return -EOPNOTSUPP;
+ data->reject_reason=FE_REJECT_PORT;
  data->output=fe_port(port->fe,output);
  if(!data->output || data->input==data->output)return -EOPNOTSUPP;
  ether_addr_copy(data->destination,ethernet);
@@ -831,9 +948,11 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  if(!is_valid_ether_addr(data->source) || !is_valid_ether_addr(data->destination))return -EINVAL;
  source_changed=!data->ipv6 && (new_source!=addresses.key->src || new_sport!=ports.key->src);
  destination_changed=!data->ipv6 && (new_destination!=addresses.key->dst || new_dport!=ports.key->dst);
+ data->reject_reason=FE_REJECT_NAT;
  if(source_changed && destination_changed)return -EOPNOTSUPP;
  /* A remaining input tag has unknown PCP/DEI. Leave it untouched, or let
   * Linux perform a partial-stack edit; a new tag is fully specified. */
+ data->reject_reason=FE_REJECT_VLAN;
  if(vlan_changed)
   for(i=0;i<output_vlan_count;i++)if(!vlan_known[i])return -EOPNOTSUPP;
  data->action=(struct rtl_fe_ipv4_action){.destination=data->output->destination,.check_mask=63,
@@ -846,6 +965,7 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  memcpy(data->action.vlan,output_vlan,sizeof(output_vlan));
  data->ethernet_bytes=ETH_HLEN+VLAN_HLEN*output_vlan_count+(data->egress_pppoe?8:0);
 itu_paths:
+ data->reject_reason=FE_REJECT_PON;
  if(port->fe->itu_paths) {
   bool mapped=port->fe->itu_paths->profile_count!=0;
   for(i=0;!mapped && i<(int)port->fe->itu_paths->count;i++)mapped=port->fe->itu_paths->path[i].unmarked_mode!=0;
@@ -916,7 +1036,7 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 retry:
  /* Keep the cookie reserved until every hardware owner is released. */
  if(list_empty(&flow->retry))list_add_tail(&flow->retry,&fe->retries);
- mod_delayed_work(system_wq,&fe->cleanup_work,HZ);
+ if(!fe->shutting_down)mod_delayed_work(system_wq,&fe->cleanup_work,HZ);
  return ret;
 }
 static void fe_cleanup_work(struct work_struct *work)
@@ -925,9 +1045,11 @@ static void fe_cleanup_work(struct work_struct *work)
  struct rtl_fe_flow *flow,*next;
 
  mutex_lock(&fe->lock);
+ if(fe->shutting_down)goto unlock;
  list_for_each_entry_safe(flow,next,&fe->retries,retry)
   fe_delete(fe,flow);
  fe_collect_ports(fe);
+unlock:
  mutex_unlock(&fe->lock);
 }
 static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned long cookie)
@@ -1040,9 +1162,18 @@ rollback:
 static int fe_replace(struct rtl_fe_port *port,struct flow_cls_offload *cls)
 {
  struct rtl_fe_rule data={};
- int ret=fe_parse(port,cls,&data);
+ struct rtl_fe_observe *observe=&port->fe->observe;
+ int ret;
 
- return ret?ret:fe_install(port,data,cls->cookie);
+ observe->replace_requests++;
+ ret=fe_parse(port,cls,&data);
+ if(ret) {
+  rtl_fe_observe_parse(observe,data.reject_reason);
+  return ret;
+ }
+ ret=fe_install(port,data,cls->cookie);
+ rtl_fe_observe_install(observe,ret);
+ return ret;
 }
 static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *flow,struct flow_cls_offload *cls)
 {
@@ -1087,24 +1218,30 @@ static int fe_block_callback(enum tc_setup_type type,void *data,void *private)
 
  if(type!=TC_SETUP_CLSFLOWER || cls->common.chain_index)return -EOPNOTSUPP;
  mutex_lock(&fe->lock);
+ if(fe->shutting_down){ret=-ENODEV;goto unlock;}
  list_for_each_entry_safe(flow,next,&fe->retries,retry) {
   ret=fe_delete(fe,flow);
   if(ret)goto unlock;
  }
  flow=fe_flow(fe,cls->cookie);
  switch(cls->command) {
- case FLOW_CLS_REPLACE:ret=fe_replace(port,cls);break;
+ case FLOW_CLS_REPLACE:
+  ret=port->retired?-ENODEV:fe_replace(port,cls);
+  break;
  case FLOW_CLS_DESTROY:
   ret=flow && flow->input==port?fe_delete(fe,flow):-ENOENT;
   break;
  case FLOW_CLS_STATS:
-  ret=flow && flow->input==port?fe_stats(fe,flow,cls):-ENOENT;
+  ret=port->retired?-ENODEV:
+      flow && flow->input==port?fe_stats(fe,flow,cls):-ENOENT;
   break;
  default:ret=-EOPNOTSUPP;
  }
- if(ret && ret!=-EOPNOTSUPP && ret!=-ENOENT && ret!=-EEXIST)fe->misses++;
  fe_collect_ports(fe);
 unlock:
+ /* Legacy rejected reports failed admission, including unsupported rules;
+  * it is not a packet-miss counter, nor a count of stats/destroy callbacks. */
+ if(ret && cls->command==FLOW_CLS_REPLACE && ret!=-EEXIST)fe->misses++;
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -1125,16 +1262,32 @@ int rtl_fe_setup_tc(struct rtl_fe *fe,struct net_device *netdev,enum tc_setup_ty
  struct flow_block_cb *callback;
  int ret;
 
- if(!fe || (type!=TC_SETUP_FT && type!=TC_SETUP_BLOCK))return -EOPNOTSUPP;
+ /* This backend implements exact, policy-authorized nft flowtable rules.
+  * Bare clsact flower has priorities/chains and policy invalidation semantics
+  * that the fixed hash templates cannot implement safely. */
+ if(!fe || type!=TC_SETUP_FT)return -EOPNOTSUPP;
  if(block->binder_type!=FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)return -EOPNOTSUPP;
  mutex_lock(&fe->lock);
- port=fe_port(fe,netdev);
- if(!port && block->command==FLOW_BLOCK_UNBIND)
+ /* UNBIND must remain available to release a quarantined callback owner;
+  * new binds and all hardware callbacks are rejected after shutdown. */
+ if(fe->shutting_down && block->command!=FLOW_BLOCK_UNBIND){ret=-ENODEV;goto unlock;}
+ if(block->command==FLOW_BLOCK_UNBIND) {
+  /* A retired callback can outlive free_netdev, and a new netdev may reuse
+   * the same address. Resolve its block/private identity, not whichever
+   * active port now happens to have that netdev pointer. */
+  port=NULL;callback=NULL;
   list_for_each_entry(candidate,&fe->ports,list)
-   if(candidate->retired && candidate->netdev==netdev){port=candidate;break;}
- if(!port){ret=-ENODEV;goto unlock;}
+   if(candidate->netdev==netdev) {
+    callback=flow_block_cb_lookup(block->block,fe_block_callback,candidate);
+    if(callback){port=candidate;break;}
+   }
+  if(!callback){ret=-ENOENT;goto unlock;}
+ } else {
+  port=fe_port(fe,netdev);
+  if(!port){ret=-ENODEV;goto unlock;}
+  callback=flow_block_cb_lookup(block->block,fe_block_callback,port);
+ }
  block->driver_block_list=&fe->blocks;
- callback=flow_block_cb_lookup(block->block,fe_block_callback,port);
  switch(block->command) {
  case FLOW_BLOCK_BIND:
   /* fw4 probes a second flowtable while the active one remains bound. */
@@ -1172,9 +1325,13 @@ static int fe_counters_show(struct seq_file *file,void *unused)
  int ret;
 
  mutex_lock(&fe->lock);
+ if(fe->shutting_down){mutex_unlock(&fe->lock);return -ENODEV;}
  seq_puts(file,"hash input output pol_id dpid ingress_sid egress_sid age protocol source destination counter bytes packets drop_bytes drop_packets egress_word\n");
  list_for_each_entry(flow,&fe->flows,list) {
   if(!flow->published)continue;
+  /* A failed hardware withdrawal may outlive unregister/free_netdev.
+   * Retired ports retain pointer identity for UNBIND, not a netdev owner. */
+  if(flow->input->retired || flow->output->retired)continue;
   ret=rtl_fe_main_age_read(&io,flow->hash_index,&age);
   interface=0;
   if(!ret && flow->interface_owned)ret=fe_interface_transfer(fe,flow->counter,&interface,false);
@@ -1261,6 +1418,7 @@ static ssize_t fe_cache_target_write(struct file *file,const char __user *buffer
  /* 65536 disables queries;0..65535 select an active main-hash index. */
  if(target>RTL_FE_HASH_ENTRIES)return -ERANGE;
  if(!mutex_trylock(&fe->lock))return -EBUSY;
+ if(fe->shutting_down){mutex_unlock(&fe->lock);return -ENODEV;}
  fe->cache_target=target;
  mutex_unlock(&fe->lock);
  return count;
@@ -1291,6 +1449,7 @@ static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
   seq_puts(file,"status=busy complete=0\n");
   return 0;
  }
+ if(fe->shutting_down){status="backend_shutdown";goto no_query;}
  if(fe->cache_target==RTL_FE_HASH_ENTRIES) {
   status="disabled";
   goto no_query;
@@ -1300,7 +1459,8 @@ static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
   goto no_query;
  }
  list_for_each_entry(flow,&fe->flows,list)
-  if(flow->hash_index==fe->cache_target && flow->published && !flow->deleting) {
+  if(flow->hash_index==fe->cache_target && flow->published && !flow->deleting &&
+     !flow->input->retired && !flow->output->retired) {
    expected.hash_index=flow->hash_index;
    expected.crc16=flow->crc16;
    expected.crc32=le32_to_cpu(((__le32 *)fe->memory)[flow->hash_index]);
@@ -1382,6 +1542,7 @@ int rtl_fe_add_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int sou
  if(!port)return -ENOMEM;
  port->fe=fe;port->netdev=netdev;port->source=source;port->destination=destination;port->llid=llid;
  mutex_lock(&fe->lock);
+ if(fe->shutting_down){mutex_unlock(&fe->lock);kfree(port);return -ENODEV;}
  list_add_tail(&port->list,&fe->ports);
  netdev->hw_features|=NETIF_F_HW_TC;
  netdev->features|=NETIF_F_HW_TC;
@@ -1390,7 +1551,7 @@ int rtl_fe_add_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int sou
 }
 bool rtl_fe_enabled(struct rtl_fe *fe)
 {
- return fe && READ_ONCE(fe->enabled);
+ return fe && !READ_ONCE(fe->shutting_down) && READ_ONCE(fe->enabled);
 }
 
 void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
@@ -1403,7 +1564,7 @@ void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
  port=fe_port(fe,netdev);
  if(port) {
   port->retired=true;
-  list_for_each_entry_safe(flow,next,&fe->flows,list)
+  if(!fe->shutting_down)list_for_each_entry_safe(flow,next,&fe->flows,list)
    if(flow->input==port || flow->output==port) {
     int ret=fe_delete(fe,flow);
     if(ret)fe->error=ret;
@@ -1420,6 +1581,7 @@ int rtl_fe_flush_port(struct rtl_fe *fe,struct net_device *netdev)
 
  if(!fe)return 0;
  mutex_lock(&fe->lock);
+ if(fe->shutting_down){mutex_unlock(&fe->lock);return -ENODEV;}
  port=fe_port(fe,netdev);
  list_for_each_entry_safe(flow,next,&fe->flows,list)
   if(flow->input==port || flow->output==port) {
@@ -1439,6 +1601,7 @@ int rtl_fe_set_itu_paths(struct rtl_fe *fe,struct net_device *netdev,const struc
  if(paths && !copy)return -ENOMEM;
  if(copy)memcpy(copy,paths,rtl_itu_paths_bytes(paths));
  mutex_lock(&fe->lock);
+ if(fe->shutting_down){ret=-ENODEV;goto unlock;}
  port=fe_port(fe,netdev);
  list_for_each_entry_safe(flow,next,&fe->flows,list)
   if(flow->input==port || flow->output==port) {
@@ -1481,93 +1644,182 @@ static int fe_disable_locked(struct rtl_fe *fe)
  fe_collect_ports(fe);
  return ret;
 }
-int rtl_fe_enable(struct rtl_fe *fe)
+static int fe_enable_locked(struct rtl_fe *fe)
 {
  unsigned int i;
  int ret;
 
- if(!fe)return -EOPNOTSUPP;
- mutex_lock(&fe->lock);
- if(fe->enabled){ret=0;goto unlock;}
+ if(fe->enabled)return 0;
  /* An unfinished rollback still owns the original register snapshot. */
  if(fe->prepared && !fe->cpu_path) {
   ret=fe_disable_locked(fe);
-  if(ret)goto unlock;
+  if(ret)return ret;
  }
  if(!fe->prepared) {
   ret=fe_prepare(fe);
-  if(ret){fe_restore(fe);goto unlock;}
+  if(ret){fe_restore(fe);return ret;}
  }
  /* The DMA tables, miss actions and port maps exist before admitting LAN. */
- /* CPU-only preparation can precede the first NI engine start. Own LAN
-  * only at admission, so a later disable restores its active CPU mapping. */
+ /* A CPU-only trap does not own LAN admission. Snapshot the current NI
+  * baseline only when admitting LAN, including after an engine restart. */
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
  fe->lan_redirected=true;
  for(i=0;i<FE_LAN_PORTS;i++)
   fe_write(fe,FE_LAN_RX_CTRL(i),(fe_read(fe,FE_LAN_RX_CTRL(i))&~(63U<<16))|(25U<<16));
  fe->enabled=true;
  fe->cpu_path=false;
- ret=0;
-unlock:
- fe->error=ret;
- mutex_unlock(&fe->lock);
- return ret;
+ return 0;
 }
 /* ITU CPU delivery still traverses the packet editor. A raw PDC bypass
  * does not apply the keep_orig_pkt miss action and can rebuild LCP as
  * PPP IPv4. Keep the classifier/miss tables, but admit no hardware flows. */
-int rtl_fe_cpu_path(struct rtl_fe *fe)
+static int fe_cpu_path_locked(struct rtl_fe *fe)
 {
  struct rtl_fe_flow *flow,*next;
  int ret=0;
 
- if(!fe)return -EOPNOTSUPP;
- mutex_lock(&fe->lock);
- if(fe->cpu_path)goto unlock;
+ if(fe->cpu_path)return 0;
  if(fe->prepared && !fe->enabled) {
   ret=fe_disable_locked(fe);
-  if(ret)goto unlock;
+  if(ret)return ret;
  }
  if(!fe->prepared) {
   ret=fe_prepare(fe);
-  if(ret){fe_restore(fe);goto unlock;}
+  if(ret){fe_restore(fe);return ret;}
  }
- /* The lock also gates route callbacks and queued bridge learning. */
+ /* The lock also gates route callbacks while changing admission mode. */
  fe->enabled=false;
  fe_lan_restore_locked(fe);
  usleep_range(1000,2000);
  list_for_each_entry_safe(flow,next,&fe->flows,list) {
   ret=fe_delete(fe,flow);
-  if(ret)goto unlock;
+  if(ret)return ret;
  }
  fe_collect_ports(fe);
  fe->cpu_path=true;
-unlock:
+ return 0;
+}
+
+int rtl_fe_enable(struct rtl_fe *fe)
+{
+ int ret;
+
+ if(!fe)return -EOPNOTSUPP;
+ mutex_lock(&fe->lock);
+ if(fe->shutting_down)ret=-ENODEV;
+ else if(!fe->engine_ready)ret=-EAGAIN;
+ else {
+  ret=fe_enable_locked(fe);
+  if(!ret)fe->desired_mode=RTL_FE_MODE_HARDWARE;
+ }
  fe->error=ret;
  mutex_unlock(&fe->lock);
  return ret;
 }
+
+int rtl_fe_cpu_path(struct rtl_fe *fe)
+{
+ int ret;
+
+ if(!fe)return -EOPNOTSUPP;
+ mutex_lock(&fe->lock);
+ if(fe->shutting_down)ret=-ENODEV;
+ else if(!fe->engine_ready)ret=-EAGAIN;
+ else {
+  ret=fe_cpu_path_locked(fe);
+  if(!ret)fe->desired_mode=RTL_FE_MODE_CPU;
+ }
+ fe->error=ret;
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+
 int rtl_fe_disable(struct rtl_fe *fe)
 {
  int ret;
 
  if(!fe)return 0;
  mutex_lock(&fe->lock);
- ret=fe_disable_locked(fe);
+ ret=fe->shutting_down?-ENODEV:fe_disable_locked(fe);
+ if(!ret)fe->desired_mode=RTL_FE_MODE_OFF;
  fe->error=ret;
  mutex_unlock(&fe->lock);
  return ret;
 }
+
+/* Called under RTNL, outside NI spinlocks. Never acquire a PON lock here:
+ * an OMCI ndo_stop can already hold pon->lock while releasing its NI user.
+ * Also called before every NI start so a failed earlier teardown cannot be
+ * hidden by overwriting the registers owned by its still-live snapshot. */
+int rtl_fe_engine_suspend(struct rtl_fe *fe)
+{
+ int ret;
+
+ if(!fe)return 0;
+ mutex_lock(&fe->lock);
+ fe->engine_ready=false;
+ ret=fe->shutting_down?-ENODEV:fe_disable_locked(fe);
+ fe->error=ret;
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+
+/* NI/QM/DMA have established a new CPU baseline, but NAPI and port admission
+ * are not live yet. Build a fresh FE snapshot and restore the requested mode
+ * before reporting a successful NI open. A failure must not silently change
+ * PON's requested hardware/CPU mode or expose an enabled-but-bypassed engine. */
+int rtl_fe_engine_resume(struct rtl_fe *fe)
+{
+ int ret=0;
+
+ if(!fe)return 0;
+ mutex_lock(&fe->lock);
+ if(fe->shutting_down){ret=-ENODEV;goto unlock;}
+ if(fe->prepared){ret=-EBUSY;goto unlock;}
+ if(fe->desired_mode==RTL_FE_MODE_HARDWARE)ret=fe_enable_locked(fe);
+ else if(fe->desired_mode==RTL_FE_MODE_CPU)ret=fe_cpu_path_locked(fe);
+ if(ret) {
+  /* Keep an incomplete rollback and its DMA owners for the next suspend. */
+  fe_disable_locked(fe);
+ } else fe->engine_ready=true;
+unlock:
+ if(ret)fe->engine_ready=false;
+ fe->error=ret;
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+
 void rtl_fe_free(struct rtl_fe *fe)
 {
  struct rtl_fe_port *port,*next;
  struct rtl_fe_flow *flow,*flow_next;
+ bool bound=false;
+ int ret;
 
  if(!fe)return;
+ mutex_lock(&fe->lock);
+ fe->shutting_down=true;
+ fe->engine_ready=false;
+ fe->desired_mode=RTL_FE_MODE_OFF;
+ mutex_unlock(&fe->lock);
  fe_bridge_stop(fe->bridge);
  debugfs_remove_recursive(fe->debug);
- rtl_fe_disable(fe);
  cancel_delayed_work_sync(&fe->cleanup_work);
+ mutex_lock(&fe->lock);
+ ret=fe_disable_locked(fe);
+ fe->error=ret;
+ list_for_each_entry(port,&fe->ports,list)if(port->bindings)bound=true;
+ /* Failure can leave Hash/Cache DMA using this memory. A removed callback
+  * can also still own its private port until its release runs. Without a
+  * proven hardware drain and zero callback references, leaking a quarantined
+  * owner until reboot is safer than DMA/use-after-free. No work or callbacks
+  * may perform MMIO once shutting_down is set. */
+ if(ret || bound || !list_empty(&fe->blocks) || !list_empty(&fe->flows)) {
+  mutex_unlock(&fe->lock);
+  dev_err(fe->device,"FE teardown quarantined: error=%d callbacks=%u; DMA memory retained, reboot required\n",ret,bound);
+  return;
+ }
+ mutex_unlock(&fe->lock);
  list_for_each_entry_safe(flow,flow_next,&fe->flows,list){list_del(&flow->list);kfree(flow);}
  list_for_each_entry_safe(port,next,&fe->ports,list){list_del(&port->list);kfree(port);}
  dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
@@ -1590,6 +1842,22 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u cpu_path=%u\n",
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
   FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned,fe->cpu_path);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "engine_ready=%u requested_mode=%u shutting_down=%u\n",
+  fe->engine_ready,fe->desired_mode,fe->shutting_down);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "admission_requests=%llu parse_rejected=%llu install_failed=%llu reject_unspecified=%llu reject_keys=%llu reject_meta=%llu reject_control=%llu reject_protocol=%llu reject_vlan=%llu reject_action=%llu reject_nat=%llu reject_port=%llu reject_pon=%llu\n",
+  fe->observe.replace_requests,fe->observe.parse_rejected,fe->observe.install_failed,
+  fe->observe.reason[FE_REJECT_UNSPECIFIED],fe->observe.reason[FE_REJECT_KEYS],
+  fe->observe.reason[FE_REJECT_META],fe->observe.reason[FE_REJECT_CONTROL],
+  fe->observe.reason[FE_REJECT_PROTOCOL],fe->observe.reason[FE_REJECT_VLAN],
+  fe->observe.reason[FE_REJECT_ACTION],fe->observe.reason[FE_REJECT_NAT],
+  fe->observe.reason[FE_REJECT_PORT],fe->observe.reason[FE_REJECT_PON]);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "install_unavailable=%llu install_duplicate=%llu install_collision=%llu install_no_space=%llu install_no_memory=%llu install_io=%llu install_other=%llu\n",
+  fe->observe.install_unavailable,fe->observe.install_duplicate,fe->observe.install_collision,
+  fe->observe.install_no_space,fe->observe.install_no_memory,fe->observe.install_io,
+  fe->observe.install_other);
  mutex_unlock(&fe->lock);
  length+=fe_bridge_stats(fe->bridge,buffer+length,PAGE_SIZE-length);
  return length;

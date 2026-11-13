@@ -2,6 +2,7 @@
 #ifndef RTL9617C_PON_ITU_PUC_H
 #define RTL9617C_PON_ITU_PUC_H
 
+#include <linux/errno.h>
 #include "rtl9617c-pon-queue.h"
 
 static inline int rtl_itu_puc_tcont_weights(const struct rtl_dq_io *io,
@@ -10,6 +11,9 @@ static inline int rtl_itu_puc_tcont_weights(const struct rtl_dq_io *io,
 	unsigned int data[5] = {0}, cos;
 	unsigned long long field;
 
+	/* A previous timeout does not release the shared DATA window. */
+	if (io->read(io->context, 0x8000) & 0x80000000U)
+		return -EBUSY;
 	for (cos = 0; cos < 8; cos++) {
 		unsigned int bit = cos * 9;
 
@@ -42,7 +46,11 @@ static inline int rtl_itu_puc_schedule(const struct rtl_dq_io *io,
 		unsigned int index, unsigned int enabled, const unsigned char weights[8])
 {
 	unsigned int data[5] = {0}, cos, shift = 7 + (io->read(io->context, 0x8048) & 3);
-	int ret = rtl_itu_puc_tcont_weights(io, index, enabled, weights);
+	int ret;
+
+	if (io->read(io->context, 0x8060) & 0x80000000U)
+		return -EBUSY;
+	ret = rtl_itu_puc_tcont_weights(io, index, enabled, weights);
 
 	if (ret)
 		return ret;

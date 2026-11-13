@@ -8,7 +8,6 @@
 #include <linux/rcupdate.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
-#include <linux/rtl9617c-bridge.h>
 #include "rtl9617c-pon.h"
 #include "rtl9617c-gpon-hw.h"
 #include "rtl9617c-xgpon-hw.h"
@@ -31,6 +30,8 @@ static int path_access(void *context, unsigned int address, unsigned int value)
 	u32 status;
 	int ret;
 
+	if (readl(pon->mac + address) & BIT(31))
+		return -EBUSY;
 	writel(value, pon->mac + address);
 	ret = readl_poll_timeout(pon->mac + address, status, !(status & BIT(31)), 1, 100000);
 	if (ret)
@@ -150,6 +151,8 @@ static int path_program(struct rtl9617c_pon *pon, const struct rtl_itu_paths *pa
 			if (ret) return ret;
 		}
 		/* Original GEM add uses its internal index as disabled-policer metadata. */
+		if (readl(pon->mac + 0x9020) & BIT(31))
+			return -EBUSY;
 		writel((((pon->fe_enabled || pon->fe_cpu_path) ? 24 : 16) << 3) | (7 << 9) |
 			((pon->fe_enabled || pon->fe_cpu_path) ? 0 : BIT(15)), pon->mac + 0x9028);
 		writel(index << 4, pon->mac + 0x9024);
@@ -455,7 +458,7 @@ void rtl_pon_itu_data_receive(struct rtl9617c_pon *pon, struct napi_struct *napi
 	unsigned int index = source >> 8, wire_tags;
 	struct rtl_evto_packet input, output;
 
-	if ((source & 255) != 7 || !state || !READ_ONCE(pon->itu_paths_ready) ||
+	if ((source & 255) != 7 || !dev || !state || !READ_ONCE(pon->itu_paths_ready) ||
 	    !netif_running(dev) || !netif_carrier_ok(dev) || skb->len < ETH_HLEN) goto drop;
 	if (rtl_evto_skb_read(&state->paths, skb, &input, &wire_tags)) goto drop;
 	input.service_entry = 1;
@@ -465,16 +468,6 @@ void rtl_pon_itu_data_receive(struct rtl9617c_pon *pon, struct napi_struct *napi
 		path = rtl_itu_path_receive_vlan(&state->paths, index, &input, &output);
 	}
 	if (!path || rtl_evto_skb_write(skb, &input, &output, wire_tags)) goto drop;
-	{
-		struct rtl9617c_bridge_frame *wire = skb_ext_add(skb, SKB_EXT_RTL9617C_BRIDGE);
-		if (wire) {
-			memset(wire, 0, sizeof(*wire));
-			wire->pon_gem = index; wire->pon_generation = state->paths.generation;
-			wire->tags = input.count;
-			for (unsigned int i = 0; i < input.count && i < 2; i++)
-				wire->tag[i] = (struct rtl9617c_bridge_tag){input.tag[i].tci, input.tag[i].tpid};
-		}
-	}
 	dev->stats.rx_packets++;
 	dev->stats.rx_bytes += skb->len;
 	skb->protocol = eth_type_trans(skb, dev);

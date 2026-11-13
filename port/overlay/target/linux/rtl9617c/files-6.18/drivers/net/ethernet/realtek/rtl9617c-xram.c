@@ -518,6 +518,10 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	u32 config;
 	int ret;
 
+	/* Finish any previous FE rollback before replacing shared NI/QM state. */
+	ret = rtl_fe_engine_suspend(priv->fe);
+	if (ret)
+		return ret;
 	if (priv->dma_tx) {
 		/* The bootloader's XRAM path leaves the normal LAN scheduler off. */
 		/* Original aal_l2_qm_init: EQ1 has4K64-byte pages, with29 pages
@@ -561,6 +565,14 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	       priv->ni + XRAM_CFG);
 	rtl_rx_mode(dev);
 	priv->tx_pending = false;
+	ret = rtl_fe_engine_resume(priv->fe);
+	if (ret) {
+		if (priv->qm_rx)
+			rtl_qm_rx_stop(&priv->qm);
+		if (priv->dma_tx)
+			rtl_dma_tx_stop(&priv->dma);
+		return ret;
+	}
 	napi_enable(&priv->napi);
 	if (priv->qm_rx) {
 		unsigned long flags;
@@ -577,7 +589,13 @@ static int rtl_engine_start(struct rtl_xram *priv)
 static void rtl_engine_stop(struct rtl_xram *priv)
 {
 	unsigned long flags;
+	int ret;
 
+	/* Last-user stop must retire FE rules and its register snapshot before
+	 * QM/DMA stop. Failure is retained and blocks the next NI start. */
+	ret = rtl_fe_engine_suspend(priv->fe);
+	if (ret)
+		netdev_err(priv->netdev, "FE suspend failed: %d; next NI start requires cleanup\n", ret);
 	hrtimer_cancel(&priv->timer);
 	if (priv->qm_rx) {
 		spin_lock_irqsave(&priv->rx_lock, flags);

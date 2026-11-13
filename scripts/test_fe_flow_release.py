@@ -38,6 +38,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 typedef uint32_t __le32;typedef uint64_t u64;
 #define ETH_ALEN 6
 #define FE_INTERFACES 32
+#define FE_SOURCE_MACS 15
 #define BIT(n) (1U<<(n))
 static unsigned int dma_barriers;
 #define dma_wmb() (++dma_barriers)
@@ -61,7 +62,7 @@ static bool list_empty(struct list_head *h){return h->next==h;}
 struct rtl_fe;
 struct net_device {};
 struct rtl_fe_port {struct list_head list;struct rtl_fe *fe;struct net_device *netdev;unsigned int source,destination,llid,bindings;bool retired;};
-struct rtl_fe_mac {unsigned int users,saved[5];u8 address[6];};
+struct rtl_fe_mac {unsigned int users,saved[5];bool ready;u8 address[6];};
 struct rtl_fe_interface {unsigned int users,saved,source_mac,pppoe;bool counted,ready;};
 struct rtl_fe_mtu {unsigned int users,size,saved;};
 struct work_struct {int unused;};
@@ -81,6 +82,7 @@ struct rtl_fe {
  bool fail_CAM,fail_IF,fail_age,fail_age_write,fail_cache;
  unsigned int oracle_hash_index,age_withdraw_barriers;
  struct delayed_work cleanup_work;
+ bool shutting_down;
  int lock;
 };
 #define system_wq 0
@@ -202,6 +204,20 @@ int main(void){
  assert(!((u32 *)fe.memory)[1413] && !test_bit(1413,fe.hashes));
  assert(fe.cache_invalidates==before_invalidations && dma_barriers>before_barriers);
  assert(fe.deletes==2 && fe.cookies.erases==3 && list_empty(&fe.flows));
+ /* Removal can fail while the hardware is stuck. Once the FE owner is
+  * quarantined, no retry may re-arm work or perform MMIO after unmapping. */
+ struct rtl_fe_flow *d=calloc(1,sizeof(*d));assert(d);
+ d->hash_index=1536;d->crc16=1536;d->published=true;
+ init_list(&d->retry);list_add_tail(&d->list,&fe.flows);
+ set_bit(d->hash_index,fe.hashes);((u32 *)fe.memory)[d->hash_index]=0xfeedbeef;
+ fe.oracle_hash_index=d->hash_index;fe.shutting_down=true;fe.fail_age=true;
+ unsigned int queued=fe.cleanup_work.queued;
+ assert(fe_delete(&fe,d)==-ETIMEDOUT && d->published);
+ assert(fe.cleanup_work.queued==queued);
+ fe.fail_age=true;fe_cleanup_work(&fe.cleanup_work.work);
+ assert(fe.fail_age && d->published && fe.cleanup_work.queued==queued);
+ fe.shutting_down=false;fe.fail_age=false;assert(!fe_delete(&fe,d));
+ assert(list_empty(&fe.flows) && list_empty(&fe.retries));
  free(fe.memory);
  assert(!fe.mtus[0].users && fe_read(&fe,0x3520)==0x23451234);
  puts("G3 removal order: DDR key zero and DMA barrier precede invalidation; age/cache failures retain ownership; unpublished rollback clears without invalidation");

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Reproduce DIRECT union misuse and exercise PPP/physical flow cleanup."""
+import argparse
 from pathlib import Path
 import subprocess
 import tempfile
 
 root = Path(__file__).resolve().parents[1]
-kernel = Path(subprocess.check_output([
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--kernel', type=Path,
+                    help='Prepared kernel tree (default: OpenWrt build directory)')
+args = parser.parse_args()
+kernel = args.kernel or Path(subprocess.check_output([
     'python3', str(root / 'port/tools/project_paths.py'),
     '--kernel-directory', str(root / 'sources/openwrt')], text=True).strip())
 source = (kernel / 'net/netfilter/nf_flow_table_core.c').read_text()
@@ -32,7 +37,7 @@ enum { FLOW_OFFLOAD_XMIT_UNSPEC, FLOW_OFFLOAD_XMIT_NEIGH,
  FLOW_OFFLOAD_XMIT_XFRM, FLOW_OFFLOAD_XMIT_DIRECT };
 struct flow_offload_tuple {
  int iifidx,xmit_type;
- union {struct dst_entry *dst_cache;struct {int ifidx,hw_ifidx;} out;};
+ union {struct dst_entry *dst_cache;struct {int ifidx,hw_ifidx,bridge_ifidx,bridge_port;} out;};
 };
 struct flow_offload {
  struct {struct flow_offload_tuple tuple;} tuplehash[2];
@@ -44,7 +49,8 @@ static int dev_net(struct net_device *dev){return dev->net;}
 static bool net_eq(int a,int b){return a==b;}
 static void flow_offload_teardown(struct flow_offload *flow){flow->torn_down=true;}
 struct notifier_block {};
-enum {NETDEV_DOWN,NETDEV_CHANGEMTU,NETDEV_CHANGE,NETDEV_UP,NETDEV_CHANGEADDR};
+enum {NETDEV_DOWN,NETDEV_CHANGEMTU,NETDEV_CHANGE,NETDEV_UP,NETDEV_CHANGEADDR,
+ NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA};
 #define NOTIFY_DONE 0
 static unsigned int cleanups;
 static struct net_device *netdev_notifier_info_to_dev(void *ptr){return ptr;}
@@ -56,7 +62,7 @@ int main(void) {
  struct net_device pon={4,1,1},lan={2,1,1},ppp={6,1,1},other_ppp={7,1,1};
  struct dst_entry ppp_dst={&ppp},lan_dst={&lan};
  struct flow_offload flow={.type=NF_FLOW_OFFLOAD_ROUTE,.ct=1,
-  .tuplehash={{{.iifidx=2,.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT,.out={7,7}}},
+  .tuplehash={{{.iifidx=2,.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT,.out={.ifidx=7,.hw_ifidx=7}}},
               {{.iifidx=4,.xmit_type=FLOW_OFFLOAD_XMIT_NEIGH,.dst_cache=&lan_dst}}}};
  nf_flow_table_do_cleanup(NULL,&flow,&ppp);
  assert(!flow.torn_down);
@@ -79,18 +85,26 @@ int main(void) {
  flow.tuplehash[1].tuple.dst_cache=NULL;
  nf_flow_table_do_cleanup(NULL,&flow,&ppp);
  assert(!flow.torn_down);
- for(unsigned int event=0;event<=NETDEV_CHANGEADDR;event++) {
+ for(unsigned int event=0;event<=NETDEV_CHANGEINFODATA;event++) {
   unsigned int before=cleanups;
   nf_flow_table_netdev_event(NULL,event,&pon);
-  assert(cleanups-before==(event==NETDEV_DOWN || event==NETDEV_CHANGEMTU));
+  assert(cleanups-before==(event==NETDEV_DOWN || event==NETDEV_CHANGEMTU ||
+   event==NETDEV_CHANGEADDR || event==NETDEV_CHANGEUPPER || event==NETDEV_CHANGEINFODATA));
  }
  pon.carrier=0;
  nf_flow_table_netdev_event(NULL,NETDEV_CHANGE,&pon);
- assert(cleanups==3);
+ assert(cleanups==6);
  pon.carrier=1;
  nf_flow_table_netdev_event(NULL,NETDEV_CHANGE,&pon);
- assert(cleanups==3);
- puts("DIRECT/PPP flow cleanup and PON carrier-loss teardown passed");
+ assert(cleanups==6);
+ struct net_device br={10,1,1},logical={11,1,1};
+ flow.type=NF_FLOW_OFFLOAD_ROUTE;flow.ct=1;flow.torn_down=false;
+ flow.tuplehash[0].tuple.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT;
+ flow.tuplehash[0].tuple.out.bridge_ifidx=br.ifindex;
+ flow.tuplehash[0].tuple.out.bridge_port=logical.ifindex;
+ nf_flow_table_do_cleanup(NULL,&flow,&br);assert(flow.torn_down);
+ flow.torn_down=false;nf_flow_table_do_cleanup(NULL,&flow,&logical);assert(flow.torn_down);
+ puts("DIRECT/PPP/bridge cleanup: carrier loss, MAC, MTU and topology teardown passed");
 }
 '''
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='pppoe-cleanup-') as work:

@@ -37,7 +37,7 @@ struct net_device {int id;};
 struct rtl_fe;
 struct rtl_fe_port {struct list_head list;struct rtl_fe *fe;struct net_device *netdev;unsigned int bindings;bool retired;};
 struct rtl_fe_flow {struct list_head list;struct rtl_fe_port *input,*output;};
-struct rtl_fe {struct list_head ports,flows,blocks;int lock;};
+struct rtl_fe {struct list_head ports,flows,blocks;int lock;bool shutting_down;};
 struct flow_block_cb {struct list_head list,driver_list;void *cb_priv;void (*release)(void *);unsigned int references;};
 struct flow_block_offload {int binder_type,command;struct list_head cb_list;struct list_head *driver_block_list;struct flow_block_cb *bound;void *block;};
 static unsigned int freed;
@@ -72,16 +72,53 @@ int main(void){
   struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);
   port->fe=&fe;port->netdev=&dev;list_add_tail(&port->list,&fe.ports);
   struct flow_block_offload block={.binder_type=FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS};init(&block.cb_list);block.block=&block;
+  if(type==TC_SETUP_BLOCK) {
+   assert(rtl_fe_setup_tc(&fe,&dev,type,&block)==-EOPNOTSUPP);
+   assert(!port->bindings && !block.bound);
+   list_del(&port->list);free(port);continue;
+  }
   assert(!rtl_fe_setup_tc(&fe,&dev,type,&block));assert(port->bindings==1 && block.bound->release);
+  assert(!rtl_fe_setup_tc(&fe,&dev,type,&block));
+  assert(port->bindings==1 && block.bound->references==2);
   port->retired=true;fe_collect_ports(&fe);
   assert(fe.ports.next==&port->list && !fe_block_callback(type,NULL,block.bound->cb_priv));
   block.command=FLOW_BLOCK_UNBIND;
+  assert(!rtl_fe_setup_tc(&fe,&dev,type,&block));
+  assert(block.bound->references==1 && fe.blocks.next==&block.bound->driver_list);
   assert(!rtl_fe_setup_tc(&fe,&dev,type,&block));fe_collect_ports(&fe);
   assert(port->bindings==1 && fe.ports.next==&port->list);
   block.bound->release(block.bound->cb_priv);free(block.bound);
   assert(fe.ports.next==&fe.ports && freed==i+1);
  }
- puts("FE callback lifetime: flowtable and clsact retain private state until their block is released");
+ /* A pending old callback and a new active port can have the same netdev
+  * pointer after allocator reuse, but they belong to different blocks. */
+ struct rtl_fe fe={};struct net_device reused={};
+ init(&fe.ports);init(&fe.flows);init(&fe.blocks);
+ struct rtl_fe_port *old=calloc(1,sizeof(*old)),*fresh=calloc(1,sizeof(*fresh));assert(old && fresh);
+ old->fe=fresh->fe=&fe;old->netdev=fresh->netdev=&reused;
+ list_add_tail(&old->list,&fe.ports);
+ struct flow_block_offload prior={.binder_type=FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS};
+ struct flow_block_offload current={.binder_type=FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS};
+ init(&prior.cb_list);init(&current.cb_list);prior.block=&prior;current.block=&current;
+ assert(!rtl_fe_setup_tc(&fe,&reused,TC_SETUP_FT,&prior));
+ old->retired=true;fe_collect_ports(&fe);
+ list_add_tail(&fresh->list,&fe.ports);
+ assert(!rtl_fe_setup_tc(&fe,&reused,TC_SETUP_FT,&current));
+ assert(prior.bound->cb_priv==old && current.bound->cb_priv==fresh);
+ prior.command=FLOW_BLOCK_UNBIND;
+ assert(!rtl_fe_setup_tc(&fe,&reused,TC_SETUP_FT,&prior));
+ assert(!prior.bound->references && current.bound->references==1);
+ prior.bound->release(prior.bound->cb_priv);free(prior.bound);
+ assert(fe.ports.next==&fresh->list && fresh->bindings==1);
+ /* Shutdown rejects new binds, while a final UNBIND/release remains safe. */
+ fe.shutting_down=true;
+ assert(rtl_fe_setup_tc(&fe,&reused,TC_SETUP_FT,&current)==-ENODEV);
+ assert(current.bound->references==1 && fresh->bindings==1);
+ fresh->retired=true;current.command=FLOW_BLOCK_UNBIND;
+ assert(!rtl_fe_setup_tc(&fe,&reused,TC_SETUP_FT,&current));
+ current.bound->release(current.bound->cb_priv);free(current.bound);
+ assert(fe.ports.next==&fe.ports && fe.blocks.next==&fe.blocks && freed==3);
+ puts("FE callback lifetime: refcounted bind, retired/new pointer reuse and shutdown unbind passed; bare clsact rejected");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fe-callback-', dir=root / 'artifacts') as directory:

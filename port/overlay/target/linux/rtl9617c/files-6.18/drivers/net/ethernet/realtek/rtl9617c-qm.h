@@ -40,6 +40,9 @@ struct rtl_qm_rx {
 	u64 host_poll_ns, host_polls;
 	u64 voq_packets[RTL_QM_VOQS];
 	u64 poll_budget_hits;
+	/* Valid L2 bytes delivered to the CPU, including allocation drops. */
+	u64 cpu_packets, cpu_bytes;
+	u64 ring_errors, buffer_errors;
 	bool rx_prefetch;
 	bool pppoe_rx_checksum;
 };

@@ -31,6 +31,8 @@ static inline int rtl_fe_cam_protocol_get(const struct rtl_dq_io *io,
   }
  }
  if(free_index==count)return -ENOSPC;
+ ret=rtl_fe_window_idle(io,0x3200);
+ if(ret)return ret;
  binding->index=free_index;binding->created=1;
  for(word=0;word<width;word++)io->write(io->context,0x3214-word*4,word?0:protocol|(1U<<16));
  ret=io->indirect(io->context,0x3200,0xc0000000U|(bank<<16)|free_index);
@@ -44,6 +46,8 @@ static inline int rtl_fe_cam_protocol_put(const struct rtl_dq_io *io,struct rtl_
  int ret;
 
  if(!binding->created)return 0;
+ ret=rtl_fe_window_idle(io,0x3200);
+ if(ret)return ret;
  for(word=0;word<(binding->bank==2?5U:3U);word++)io->write(io->context,0x3214-word*4,binding->saved[word]);
  ret=io->indirect(io->context,0x3200,0xc0000000U|(binding->bank<<16)|binding->index);
  if(!ret)binding->created=0;
@@ -93,6 +97,8 @@ static inline int rtl_fe_classifier_read(const struct rtl_dq_io *io,unsigned int
 static inline int rtl_fe_classifier_write(const struct rtl_dq_io *io,unsigned int index,const unsigned int words[7])
 {
  unsigned int i;
+ int ret=rtl_fe_window_idle(io,0x33b0);
+ if(ret)return ret;
  for(i=0;i<7;i++)io->write(io->context,0x33cc-i*4,words[i]);
  return io->indirect(io->context,0x33b0,0xc0000000U|index);
 }
@@ -108,11 +114,14 @@ static inline int rtl_fe_source_mac_read(const struct rtl_dq_io *io,unsigned int
 static inline int rtl_fe_source_mac_write(const struct rtl_dq_io *io,unsigned int index,const unsigned int words[5])
 {
  unsigned int i;
+ int ret=rtl_fe_window_idle(io,0x3200);
+ if(ret)return ret;
  for(i=0;i<5;i++)io->write(io->context,0x3214-i*4,words[i]);
  return io->indirect(io->context,0x3200,0xc0030000U|index);
 }
 /* TX interface MIB is224 bits:bytes64,UC32,non-UC32,drop-bytes64,
- * drop-packets32. A flow can own one of64 egress-interface counter slots. */
+ * drop-packets32. This driver uses its allocated EIF index (0..31) as
+ * the counter selector; counter address width is not EIF table capacity. */
 static inline int rtl_fe_tx_counter_read(const struct rtl_dq_io *io,
  unsigned int index,unsigned int words[7])
 {
@@ -134,8 +143,10 @@ static inline void rtl_fe_fdb_key(unsigned int words[4],const unsigned char mac[
 }
 static inline int rtl_fe_fdb_command(const struct rtl_dq_io *io,unsigned int command,unsigned int words[4],unsigned int *result)
 {
- unsigned int i,control=io->read(io->context,0x1c00);
- int ret;
+ unsigned int i,control;
+ int ret=rtl_fe_window_idle(io,0x1ca0);
+ if(ret)return ret;
+ control=io->read(io->context,0x1c00);
  io->write(io->context,0x1c00,control|0x80000000U);
  for(i=0;i<4;i++)io->write(io->context,0x1cb0-i*4,words[i]);
  io->write(io->context,0x1c2c,0);

@@ -100,9 +100,13 @@ static struct net_device *br_fdb_find_port_rcu(const struct net_device *dev,cons
  struct net_bridge_fdb_entry *e=br_fdb_find_rcu(&bridge,addr,vid);
  return dev==&brdev&&e?e->dst->dev:NULL;
 }
+static bool br_flowtable_path_cookie_rcu(const struct net_device *br,const struct net_device *port,
+ const u8 *addr,u16 vid,u32 *cookie){
+ *cookie=0;return br_fdb_find_port_rcu(br,addr,vid)==port;
+}
 struct nf_conn {struct net *net;};
 struct flow_offload_tuple {unsigned xmit_type;struct {
- unsigned bridge_ifidx,bridge_port;u16 bridge_vid;u8 h_dest[6];
+ unsigned bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_dest[6];
 } out;};
 struct flow_offload {unsigned type;unsigned long flags;u64 timeout;struct nf_conn *ct;struct {struct flow_offload_tuple tuple;}tuplehash[2];};
 static struct net *nf_ct_net(struct nf_conn *ct){return ct->net;}

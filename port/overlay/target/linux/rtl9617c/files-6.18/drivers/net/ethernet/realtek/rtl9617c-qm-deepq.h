@@ -2,6 +2,8 @@
 #ifndef RTL9617C_QM_DEEPQ_H
 #define RTL9617C_QM_DEEPQ_H
 
+#include <linux/errno.h>
+
 /* Native WAN private/shared DRAM pools. CPU EQ4/5 own BIDs0..511;
  * these two hardware-managed pools own BIDs512..1535. */
 #define RTL_DQ_BUFFERS 512
@@ -48,6 +50,10 @@ static inline int rtl_qm_deepq_prepare(const struct rtl_dq_io *io, unsigned int 
 	io->write(io->context, 0x959c, 0x3fff3fff); /* Group admission thresholds disabled. */
 	io->write(io->context, 0x95a4, ~0U); /* PON DQ ports16..31 use port profile3. */
 	/* WAN VOQ profile3: high/low derived from its shared native pool. */
+	/* ACCESS owns the shared DATA words until it completes, including after
+	 * a previous startup timed out. Never corrupt that pending transaction. */
+	if (io->read(io->context, 0x95b0) & 0x80000000U)
+		return -EBUSY;
 	io->write(io->context, 0x95b4, 0);
 	io->write(io->context, 0x95b8, (25U << 24) | (0x3fffU << 10) | 0x3ffU);
 	io->write(io->context, 0x95bc, low | (count << 14) | 0xf0000000U);
@@ -59,11 +65,15 @@ static inline int rtl_qm_deepq_prepare(const struct rtl_dq_io *io, unsigned int 
 		io->write(io->context, 0x63c4 + port * 4, 255);
 		io->write(io->context, 0x6444 + port * 8, 0x01010101);
 		io->write(io->context, 0x6448 + port * 8, 0x01010101);
+		if (io->read(io->context, 0x95a8) & 0x80000000U)
+			return -EBUSY;
 		io->write(io->context, 0x95ac, count | (1U << 14) | (count << 16) | (1U << 30));
 		ret = io->indirect(io->context, 0x95a8, 0xc0000000U | port);
 		if (ret)
 			return ret;
 		for (voq = port * 8; voq < port * 8 + 8; voq++) {
+			if (io->read(io->context, 0x95c0) & 0x80000000U)
+				return -EBUSY;
 			io->write(io->context, 0x95c4, 3);
 			ret = io->indirect(io->context, 0x95c0, 0xc0000000U | voq);
 			if (ret)

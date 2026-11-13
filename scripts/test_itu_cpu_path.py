@@ -109,8 +109,9 @@ int main(void){
 '''
 pdc_source = production_source('rtl9617c-pon-pdc.c')
 constants = '\n'.join(re.findall(r'^#define .*$', pdc_source, re.M))
+pdc_helpers = ['rtl_pdc_write'] if 'static int rtl_pdc_write(' in pdc_source else []
 functions = '\n'.join([function('rtl9617c-pon-pdc.c', n) for n in
-                       ['rtl_pdc_itu_configure', 'rtl_pon_pdc_configure_locked']]
+                       pdc_helpers + ['rtl_pdc_itu_configure', 'rtl_pon_pdc_configure_locked']]
                       + [function('rtl9617c-pon-path.c', 'path_program')])
 with tempfile.TemporaryDirectory(prefix='itu-cpu-path-', dir=root / 'artifacts') as directory:
     cfile = Path(directory) / 'test.c'

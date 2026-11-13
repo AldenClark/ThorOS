@@ -19,5 +19,7 @@ int rtl_fe_setup_tc(struct rtl_fe *fe, struct net_device *netdev,
 int rtl_fe_enable(struct rtl_fe *fe);
 int rtl_fe_cpu_path(struct rtl_fe *fe);
 int rtl_fe_disable(struct rtl_fe *fe);
+int rtl_fe_engine_suspend(struct rtl_fe *fe);
+int rtl_fe_engine_resume(struct rtl_fe *fe);
 ssize_t rtl_fe_state(struct rtl_fe *fe, char *buffer);
 #endif

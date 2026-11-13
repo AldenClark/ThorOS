@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-fe-pipeline.h"

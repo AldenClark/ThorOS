@@ -39,11 +39,11 @@ struct spinlock {pthread_mutex_t mutex;};
 struct napi_struct {int unused;};
 struct rtl_qm_rx {bool stopped;};
 struct rtl_xram {bool qm_rx,dma_tx,rx_active;struct spinlock rx_lock;
- struct napi_struct napi;struct rtl_qm_rx qm;int timer,rx_irq,dma;unsigned int mask;};
+ struct napi_struct napi;struct rtl_qm_rx qm;int timer,rx_irq,dma,fe,netdev;unsigned int mask;};
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t event=PTHREAD_COND_INITIALIZER;
 static bool owned,window,attempted,masked,sync_wait,finished,poll_live;
-static unsigned int scenario,grace_periods,rearms;
+static unsigned int scenario,grace_periods,rearms,fe_suspends;
 static _Thread_local bool closing,irq_off,held;
 static void signal_event(void) {assert(!pthread_cond_broadcast(&event));}
 static void wait_event(void) {assert(!pthread_cond_wait(&event,&gate));}
@@ -69,6 +69,10 @@ static void unlock(struct spinlock *p) {assert(held);held=false;assert(!pthread_
 #define spin_unlock_irqrestore(p,f) do{unlock(p);irq_off=(f);}while(0)
 #define XRAM_CFG 0xaa28
 #define CPU_DISABLE 0x201
+static int __attribute__((unused)) rtl_fe_engine_suspend(int fe) {
+ (void)fe;assert(closing && !irq_off && !held);fe_suspends++;return 0;
+}
+#define netdev_err(dev,fmt,...) do{(void)(dev);fprintf(stderr,fmt,##__VA_ARGS__);}while(0)
 static void rtl_update(struct rtl_xram *p,unsigned reg,unsigned mask,unsigned value) {
  if(reg==0x6110) {
   assert(held && irq_off);
@@ -135,7 +139,7 @@ int main(void) {
   struct rtl_xram priv={.qm_rx=true,.dma_tx=true,.rx_active=true,.mask=255,.dma=1};
   pthread_t closer;
   owned=poll_live=true;window=attempted=masked=sync_wait=finished=false;
-  grace_periods=rearms=0;irq_off=held=closing=false;
+  grace_periods=rearms=fe_suspends=0;irq_off=held=closing=false;
   assert(!pthread_mutex_init(&priv.rx_lock.mutex,NULL));
   assert(!pthread_create(&closer,NULL,close_engine,&priv));
   assert(poll_completion(&priv,64)==1);assert(!irq_off && !held);

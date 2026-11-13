@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Replay VLAN subinterfaces, PPPoE and FDB movement through the real bridge learner."""
+"""Prevent autonomous L2 authorization; preserve a historical EVTO test fixture.
+
+The old learner is test-only: its positive paths are NOT production offload
+coverage. The live header is compiled separately below and must register no
+packet hooks or work. scripts/test_fe_evto.py reuses the historical host fixture
+to exercise the production EVTO compiler.
+"""
 from pathlib import Path
 import re
 import subprocess
@@ -7,7 +13,8 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
-source = (drivers / 'rtl9617c-fe-bridge.h').read_text()
+production = (drivers / 'rtl9617c-fe-bridge.h').read_text()
+source = (root / 'scripts/fixtures/rtl9617c-bridge-legacy-model.h').read_text()
 fe = (drivers / 'rtl9617c-fe.c').read_text()
 
 def function(name):
@@ -198,6 +205,29 @@ int main(void){
  assert(last.action.vlan[0].vid==100 && last.action.vlan[0].priority==4);
  assert(last.pppoe_session==0x1234 && !last.action.pppoe_pop && !last.egress_pppoe);
  assert(last.key.mask==57 && last.action.destination==32 && last.ppp_protocol_slot==4);
+ /* Counterexample: two actual Ethernet/IPv4/TCP frames have the same MACs
+  * and differ only in dport 443/22. A bridge policy may accept the former
+  * and reject the latter, but the historical production parser and its
+  * L2 key discard the very field on which that policy depends. */
+ assert(last.key.source_port==0 && last.key.destination_port==0);
+ struct sk_buff allowed={.len=54},denied;
+ struct rtl9617c_bridge_frame allowed_frame={},denied_frame={};
+ memcpy(allowed.frame,skb.frame,12);
+ allowed.frame[12]=0x08;allowed.frame[13]=0x00;
+ allowed.frame[14]=0x45;allowed.frame[23]=6;
+ allowed.frame[36]=1;allowed.frame[37]=0xbb;
+ denied=allowed;denied.frame[36]=0;denied.frame[37]=22;
+ assert(get_unaligned_be16(allowed.frame+36)==443);
+ assert(get_unaligned_be16(denied.frame+36)!=443);
+ assert(!fe_bridge_frame(&allowed,&allowed_frame));
+ assert(!fe_bridge_frame(&denied,&denied_frame));
+ assert(!memcmp(&allowed_frame,&denied_frame,sizeof(allowed_frame)));
+ unsigned int https[RTL_FE_KEY_WORDS],ssh[RTL_FE_KEY_WORDS];
+ rtl_fe_bridge_key(https,allowed_frame.source,allowed_frame.destination,
+                   allowed_frame.protocol,0,0,59);
+ rtl_fe_bridge_key(ssh,denied_frame.source,denied_frame.destination,
+                   denied_frame.protocol,0,0,59);
+ assert(!memcmp(https,ssh,sizeof(https)));
  /* Age-read MMIO can fail transiently. The next maintenance must remain armed. */
  fail_age_read=true;jiffies+=HZ;fe_bridge_work(&bridge.work.work);
  assert(bridge.active && bridge.work.queued>=3 && deleted==0);
@@ -249,7 +279,7 @@ int main(void){
  fe_bridge_forwarded(&bridge,&skb,&output);fe_bridge_work(&bridge.work.work);
  assert(installed==3);
  assert(!net.references && fe.cookies.count==0);
- puts("Bridge learner: real wire/bridge hooks, VLAN subinterfaces, PCP/DEI, access VID, PPPoE preservation, FDB ageing/movement, STP and link changes passed");
+ puts("Historical learner counterexample/EVTO fixture: same L2 key cannot authorize different L4 policies; model lifecycle passed (not production offload)");
 }
 '''
 functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_frame','fe_bridge_wire','fe_bridge_capture','fe_bridge_same','fe_bridge_forwarded','fe_bridge_ports','fe_bridge_learn','fe_bridge_work'])
@@ -258,3 +288,47 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='bridge-learning-')
     (directory/'bridge.c').write_text(common+structs+backend+(drivers/'rtl9617c-fe-vlan.h').read_text()+functions+test)
     subprocess.run(['cc','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),'-I'+str(root/'port/overlay/target/linux/rtl9617c/files-6.18/include'),str(directory/'bridge.c'),'-o',str(directory/'bridge')],check=True)
     subprocess.run([str(directory/'bridge')],check=True)
+
+# Compile the actual product boundary without any netfilter/workqueue stubs:
+# reintroducing packet hooks, queued observations, or background work will fail
+# compilation, rather than silently replacing them with a no-op host model.
+policy = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/types.h>
+struct rtl_fe {bool enabled;};
+struct rtl_fe_bridge;
+static int scnprintf(char *buffer,size_t size,const char *format,...)
+{
+ va_list args;va_start(args,format);int result=vsnprintf(buffer,size,format,args);va_end(args);
+ return result<0?0:result>=(int)size?(size?(int)size-1:0):result;
+}
+#include "rtl9617c-fe-bridge.h"
+int main(void)
+{
+ struct rtl_fe fe={.enabled=true};char buffer[512],small[8];
+ struct rtl_fe_bridge *bridge=fe_bridge_start(&fe);
+ assert(bridge==NULL);
+ assert(fe_bridge_stats(bridge,buffer,sizeof(buffer))>0);
+ assert(strstr(buffer,"bridge_autolearn=0"));
+ assert(strstr(buffer,"bridge_policy=explicit_flowtable_only"));
+ assert(strstr(buffer,"bridge_work=0"));
+ memset(small,'X',sizeof(small));
+ assert(fe_bridge_stats(bridge,small,sizeof(small))==sizeof(small)-1);
+ assert(small[sizeof(small)-1]==0);
+ fe_bridge_stop(bridge);
+ puts("Production bridge policy: no autonomous hooks, no worker/allocation, explicit flowtable rules only");
+}
+'''
+assert 'fe_install(' not in production
+assert 'fe_bridge_learn(' not in production
+with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='bridge-policy-') as directory:
+    directory=Path(directory)
+    (directory/'policy.c').write_text(policy)
+    subprocess.run(['cc','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',
+                    '-I'+str(drivers),str(directory/'policy.c'),'-o',str(directory/'policy')],check=True)
+    subprocess.run([str(directory/'policy')],check=True)

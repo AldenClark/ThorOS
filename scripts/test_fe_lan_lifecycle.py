@@ -44,6 +44,7 @@ common = r'''
 #define lower_32_bits(v) ((unsigned int)(v))
 #define upper_32_bits(v) ((unsigned int)((uint64_t)(v)>>32))
 struct mutex {int unused;};
+enum rtl_fe_mode {RTL_FE_MODE_OFF,RTL_FE_MODE_CPU,RTL_FE_MODE_HARDWARE};
 struct rtl_fe_flow {struct rtl_fe_flow *next;};
 struct list_head {struct rtl_fe_flow *first;};
 #define list_for_each_entry_safe(p,n,h,m) for(p=(h)->first,n=p?p->next:NULL;p;p=n,n=p?p->next:NULL)
@@ -52,6 +53,7 @@ static void mutex_unlock(struct mutex *m){(void)m;}
 struct rtl_fe {
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
+ bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
  unsigned int reg[0x10000/4],mask[8],cls[1040][7],map[256];
@@ -132,9 +134,14 @@ if lan_defines:
     common = common.replace('#define FE_LAN_PORTS 5\n#define FE_LAN_RX_CTRL(p) (0xa5f8+0x90*(p))', lan_defines.group())
 test = r'''
 int main(void){
- struct rtl_fe f={.dma=0x03800000};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1040][7],old_map[256],old_demux;
+ struct rtl_fe f={.dma=0x03800000,.engine_ready=true};unsigned int lan[5],old_regs[64],old_mask[8],old_cls[1040][7],old_map[256],old_demux;
  unsigned int old_bridge_mask[3][8];
  for(unsigned int i=0;i<0x10000/4;i++)f.reg[i]=0x80000000U+i;
+ /* Configuration snapshots may contain high bits; ACCESS registers must
+  * start idle. Real stuck/busy commands have their own window fault test. */
+ const unsigned int access[]={0x1654,0x1ca0,0x3000,0x3200,0x33b0,
+  0x35c8,0x38b0,0x38e0,0x38e4,0x3910,0x3928,0x393c};
+ for(unsigned int i=0;i<ARRAY_SIZE(access);i++)f.reg[access[i]/4]=0;
  f.reg[0x30a4/4]=0x0001b000U;
  for(unsigned int i=0;i<5;i++)f.reg[(0xa5f8+i*0x90)/4]=f.expected_lan[i]=lan[i]=0x18100400U|(i<<24);
  for(unsigned int i=0;i<8;i++)f.mask[i]=old_mask[i]=0x55000000+i;
@@ -196,6 +203,7 @@ int main(void){
  assert(!rtl_fe_enable(&f));
  f.fail_mask_writes=1;
  assert(rtl_fe_disable(&f)==-ETIMEDOUT && !f.enabled && f.prepared);
+ assert(f.desired_mode==RTL_FE_MODE_HARDWARE);
  assert(!rtl_fe_enable(&f));
  assert(!rtl_fe_disable(&f));
  for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
@@ -232,23 +240,25 @@ int main(void){
  assert(rtl_fe_cpu_path(&f)==-ETIMEDOUT && !f.enabled && !f.prepared && !f.cpu_path);
  assert(!rtl_fe_cpu_path(&f) && f.cpu_path && f.prepared && f.admission_writes==before);
  assert(!rtl_fe_disable(&f) && !f.prepared && !f.cpu_path);
- /* FE CPU preparation can precede NI engine startup on a cold boot.
-  * LAN RX is then reset, and the engine later establishes native CPU16.
-  * The trap-only owner must never restore its earlier reset snapshot. */
+ /* A cold CPU request must wait for NI startup, matching the production
+  * init ordering (NI/OMCI up before PDC admits business GEMs). No premature
+  * snapshot may restore boot/reset values over the NI's active scheduler. */
  for(unsigned int admit=0;admit<2;admit++){
   unsigned int reset[5],native[5];
+  assert(!rtl_fe_engine_suspend(&f) && !f.engine_ready);
   for(unsigned int i=0;i<5;i++){
    reset[i]=0x08000400U|(i<<24);
    f.expected_lan[i]=reset[i];
    fe_write(&f,FE_LAN_RX_CTRL(i),reset[i]);
   }
-  assert(!rtl_fe_cpu_path(&f) && f.cpu_path && f.prepared);
+  assert(rtl_fe_cpu_path(&f)==-EAGAIN && !f.prepared && !f.cpu_path);
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==reset[i]);
   for(unsigned int i=0;i<5;i++){
    native[i]=(reset[i]&~(BIT(28)|(63U<<16)|BIT(31)))|BIT(28)|(16U<<16);
    f.expected_lan[i]=native[i];
    fe_write(&f,FE_LAN_RX_CTRL(i),native[i]);
   }
+  assert(!rtl_fe_engine_resume(&f) && f.engine_ready);
   assert(!rtl_fe_cpu_path(&f));
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
   if(admit){
@@ -260,7 +270,49 @@ int main(void){
   assert(!rtl_fe_disable(&f) && !f.prepared);
   for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==native[i]);
  }
- puts("Cold CPU prepare: trap-only never owns LAN; later admission restores the engine's current CPU16 registers");
+ /* Full NI restart: requested mode survives but every register snapshot is
+  * re-created after the new native baseline. Do not leave enabled=1 while
+  * all LAN selectors have silently reverted to CPU16. */
+ for(unsigned int mode=RTL_FE_MODE_CPU;mode<=RTL_FE_MODE_HARDWARE;mode++){
+  assert(!(mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path(&f):rtl_fe_enable(&f)));
+  assert((unsigned int)f.desired_mode==mode);
+  assert(!rtl_fe_engine_suspend(&f));
+  assert(!f.engine_ready && !f.enabled && !f.prepared && !f.cpu_path);
+  assert((unsigned int)f.desired_mode==mode);
+  assert(rtl_fe_enable(&f)==-EAGAIN && !f.prepared);
+  assert(!rtl_fe_engine_suspend(&f)); /* start preflight is idempotent */
+  unsigned int scheduler=0x81000000U|mode;
+  fe_write(&f,0x2300,scheduler);
+  for(unsigned int i=0;i<5;i++){
+   f.expected_lan[i]=(0x18100400U|(i<<24))+mode;
+   fe_write(&f,FE_LAN_RX_CTRL(i),f.expected_lan[i]);
+  }
+  assert(!rtl_fe_engine_resume(&f) && f.engine_ready && f.prepared);
+  assert(f.enabled==(mode==RTL_FE_MODE_HARDWARE));
+  assert(f.cpu_path==(mode==RTL_FE_MODE_CPU));
+  for(unsigned int i=0;i<5;i++)assert(((fe_read(&f,FE_LAN_RX_CTRL(i))>>16)&63)==(mode==RTL_FE_MODE_HARDWARE?25:16));
+  assert(!rtl_fe_disable(&f) && f.desired_mode==RTL_FE_MODE_OFF);
+  assert(fe_read(&f,0x2300)==scheduler);
+  for(unsigned int i=0;i<5;i++)assert(fe_read(&f,FE_LAN_RX_CTRL(i))==f.expected_lan[i]);
+ }
+ /* Failed suspend retains its owners. Resume refuses an uncleared snapshot;
+  * successful retry must precede NI reset and a later prepare. */
+ assert(!rtl_fe_enable(&f));
+ f.flows.first=&stuck;stuck.next=NULL;f.fail_delete=1;
+ assert(rtl_fe_engine_suspend(&f)==-ETIMEDOUT && !f.engine_ready && f.prepared);
+ assert(f.desired_mode==RTL_FE_MODE_HARDWARE && f.flows.first==&stuck);
+ assert(rtl_fe_engine_resume(&f)==-EBUSY && !f.engine_ready);
+ assert(!rtl_fe_engine_suspend(&f) && !f.prepared && !f.flows.first);
+ f.fail_mask=1;
+ assert(rtl_fe_engine_resume(&f)==-ETIMEDOUT && !f.engine_ready && !f.enabled);
+ assert(f.desired_mode==RTL_FE_MODE_HARDWARE);
+ assert(!rtl_fe_engine_suspend(&f));
+ assert(!rtl_fe_engine_resume(&f) && f.engine_ready && f.enabled);
+ assert(!rtl_fe_disable(&f));
+ f.shutting_down=true;
+ assert(rtl_fe_enable(&f)==-ENODEV && rtl_fe_cpu_path(&f)==-ENODEV);
+ assert(rtl_fe_engine_resume(&f)==-ENODEV && !f.engine_ready);
+ puts("NI/FE lifecycle: CPU/HW desired mode, fresh restart snapshots, failed suspend/restore and offline admission guards passed");
  puts("CPU-only FE: first prepare, idempotence, on/off snapshots, cleanup failure and final full restore passed");
  puts("Five-LAN FE:ordered admission,physical source preservation,direct L2TM output,three exact restore cycles and failed preparation passed");
  puts("FE rollback: failed prepare/disable preserves original snapshots across re-enable and repeated rollback failure");
@@ -272,6 +324,10 @@ if re.search(r'^static void fe_lan_restore_locked\(', source, re.M):
 if re.search(r'^static int fe_disable_locked\(', source, re.M):
     functions.append('fe_disable_locked')
 functions += ['rtl_fe_enable', 'rtl_fe_cpu_path', 'rtl_fe_disable']
+for helper in ('fe_enable_locked', 'fe_cpu_path_locked'):
+    if re.search(r'^static int ' + helper + r'\(', source, re.M):
+        functions.insert(functions.index('rtl_fe_enable'), helper)
+functions += ['rtl_fe_engine_suspend', 'rtl_fe_engine_resume']
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycle-') as work:
     path = Path(work) / 'test.c'
     binary = Path(work) / 'test'
@@ -285,7 +341,9 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'failed_prepare_admits_no_LAN': True,
     'CPU_only_prepares_without_LAN_admission_and_preserves_snapshot': True,
     'CPU_only_cleanup_failure_requires_retry': True,
-    'cold_CPU_prepare_does_not_own_LAN_and_admission_snapshots_current_engine_state': True,
+    'cold_CPU_request_waits_for_NI_ready': True,
+    'NI_restart_restores_requested_mode_after_fresh_register_snapshot': True,
+    'failed_suspend_blocks_resume_and_retains_owners': True,
     'GEM_gate_opens_after_CLS_defaults_LPB_cache_and_closes_before_restore': True,
     'PON_stream_identity_enabled_before_admission_and_restored': True,
     'both_CLS_defaults_supply_CPU16': True, 'physical_LSPID_preserved': True,

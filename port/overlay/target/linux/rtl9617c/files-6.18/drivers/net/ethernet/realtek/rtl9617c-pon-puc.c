@@ -42,6 +42,8 @@ static int rtl_puc_access(struct rtl9617c_pon *pon, unsigned int reg,
 			  unsigned int index, bool write)
 {
 	u32 status;
+	if (readl(pon->mac + reg) & BIT(31))
+		return -EBUSY;
 	writel(BIT(31) | (write ? BIT(30) : 0) | index, pon->mac + reg);
 	return readl_poll_timeout(pon->mac + reg, status, !(status & BIT(31)), 1, 100000);
 }
@@ -52,6 +54,8 @@ static int rtl_puc_port(struct rtl9617c_pon *pon, unsigned int port,
 	u32 data[5] = {};
 	unsigned int cos;
 
+	if (readl(pon->mac + PVT_ACCESS) & BIT(31))
+		return -EBUSY;
 	/* Eight nine-bit queue fields span DATA0..2; zero weights select SP. */
 	for (cos = 0; cos < 8; cos++) {
 		unsigned int bit = cos * 9;
@@ -76,11 +80,15 @@ static int rtl_puc_token_buckets(struct rtl9617c_pon *pon, unsigned int first)
 
 	for (queue = first; queue < 256; queue++) {
 		/* CIR disabled; PIR unlimited, as stock EPON initialization. */
+		if (readl(pon->mac + CIR_ACCESS) & BIT(31))
+			return -EBUSY;
 		writel(0, pon->mac + CIR_DATA0);
 		writel(2 << 6, pon->mac + CIR_DATA1);
 		ret = rtl_puc_access(pon, CIR_ACCESS, queue, true);
 		if (ret)
 			return ret;
+		if (readl(pon->mac + PIR_ACCESS) & BIT(31))
+			return -EBUSY;
 		writel(~0U, pon->mac + PIR_DATA0);
 		writel(0x3f | (2 << 6), pon->mac + PIR_DATA1);
 		ret = rtl_puc_access(pon, PIR_ACCESS, queue, true);
@@ -109,6 +117,8 @@ static int rtl_puc_bp_access(void *context, unsigned int reg, unsigned int value
 	struct rtl9617c_pon *pon = context;
 	u32 status;
 
+	if (readl(pon->mac + reg) & BIT(31))
+		return -EBUSY;
 	writel(value, pon->mac + reg);
 	return readl_poll_timeout(pon->mac + reg, status, !(status & BIT(31)), 1,
 		reg == 0x80dc ? 1000000 : 100000);

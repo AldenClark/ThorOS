@@ -63,7 +63,12 @@ static inline int rtl_epon_sla_flush(const struct rtl_dq_io *io, unsigned int po
 {
 	unsigned int limit_reg = 0x8090 + queue / 16 * 4;
 	unsigned int limit, drop, command;
-	int ret = io->indirect(io->context, 0x802c, 0x80000000U | queue);
+	int ret;
+
+	/* A prior flush owns both the queue selector and temporary drop state. */
+	if (io->read(io->context, 0x80dc) & 0x80000000U)
+		return -EBUSY;
+	ret = io->indirect(io->context, 0x802c, 0x80000000U | queue);
 
 	if (ret)
 		return ret;

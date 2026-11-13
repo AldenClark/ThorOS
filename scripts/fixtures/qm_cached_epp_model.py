@@ -31,6 +31,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned lo
 #define RTL_QM_RING_BYTES 1024
 #define RTL_QM_COMMAND_BYTES 8
 #define RTL_QM_VOQS 8
+#define RTL_QM_BUFFERS_PER_EQ 256
 #include "rtl9617c-qm-layout.h"
 #define RTL_QM_MEMORY_BYTES (8192+512*2048)
 #define EQ_ID 4
@@ -46,6 +47,7 @@ struct rtl_qm_rx {
  u32 last_address,last_size,last_header[2],trace[32][7];unsigned trace_count;
  struct rtl_qm_refill refill;struct rtl9617c_ni_endpoint *pon;struct net_device *lan[5];bool profile;
  u64 host_poll_ns,host_polls,voq_packets[8],poll_budget_hits;
+ u64 cpu_packets,cpu_bytes,ring_errors,buffer_errors;
  bool rx_prefetch,pppoe_rx_checksum;
 };
 static struct rtl_qm_rx *active;

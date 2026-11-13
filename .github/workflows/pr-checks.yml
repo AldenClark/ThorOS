@@ -1,4 +1,4 @@
-name: Check LAN initialization, PON VLANs and QSPI
+name: Check datapath, SDK contracts and ARM64 kernel objects
 
 on:
   pull_request:
@@ -30,3 +30,48 @@ jobs:
           sudo apt-get install -y busybox
           python3 scripts/test_ubi_storage.py
           python3 scripts/test_storage_boards.py
+
+  sdk-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify hardware encodings against pinned public GPL SDK sources
+        run: bash scripts/check_sdk_contracts.sh
+
+  kernel-objects:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install ARM64 object-check dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            flex bison bc libssl-dev libelf-dev pkg-config python3 perl git curl patch xz-utils
+      - name: Apply complete locked patch stack and compile real ARM64 objects
+        run: bash scripts/check_kernel_objects.sh --jobs 2
+      - name: Run flowtable contracts against the same prepared kernel
+        run: |
+          kernel_version=$(python3 -c 'import json; print(json.load(open("port/sources.lock.json"))["openwrt"]["kernel"])')
+          bash scripts/check_flowtable_contracts.sh "artifacts/kernel-objects/linux-$kernel_version"
+      - name: Upload compile evidence without firmware or private inputs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rtl9617c-kernel-object-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            artifacts/kernel-objects/build.log
+            artifacts/kernel-objects/result.txt
+            artifacts/kernel-objects/thoros-build-info
+            artifacts/kernel-objects/applied-patches.sha256
+            artifacts/kernel-objects/compile-targets.txt
+            artifacts/kernel-objects/objects.sha256
+            artifacts/kernel-objects/config.seed
+            artifacts/kernel-objects/kernel.config

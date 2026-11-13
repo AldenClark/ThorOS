@@ -55,7 +55,6 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef int netdev_
 #define NETDEV_TX_OK 0
 #define NETDEV_TX_BUSY 1
 #define GFP_ATOMIC 0
-#define SKB_EXT_RTL9617C_BRIDGE 0
 #define rcu_read_lock() ((void)0)
 #define rcu_read_unlock() ((void)0)
 #define rcu_dereference(x) (x)
@@ -74,8 +73,6 @@ static struct net_device *__vlan_find_dev_deep_rcu(struct net_device*d,unsigned 
 }
 struct napi_struct {unsigned unused;};
 struct rtl9617c_ni_frame {u32 header_high,header_low;const u8 *prefix;unsigned prefix_length;bool raw_payload;};
-struct rtl9617c_bridge_tag {u16 tci,tpid;};
-struct rtl9617c_bridge_frame {unsigned pon_gem;unsigned long long pon_generation;unsigned tags;struct rtl9617c_bridge_tag tag[2];};
 struct rtl_itu_path_state {struct rtl_itu_paths paths;};
 struct rtl9617c_pon {struct rtl_itu_path_state *itu_paths;bool itu_paths_ready;void *ni_dev;struct net_device *data_devices[1];};
 static unsigned freed,delivered;static u8 received[2048];static unsigned received_length;
@@ -112,7 +109,6 @@ static struct sk_buff *skb_clone(struct sk_buff*s,int flags){
  (void)flags;struct sk_buff*c=malloc(sizeof(*c));assert(c);*c=*s;c->data=c->memory+(s->data-s->memory);return c;
 }
 static int skb_copy_bits(struct sk_buff*s,unsigned off,void*p,unsigned n){assert(off+n<=s->len);memcpy(p,s->data+off,n);return 0;}
-static void *skb_ext_add(struct sk_buff*s,int type){(void)s;(void)type;return NULL;}
 static u16 eth_type_trans(struct sk_buff*s,struct net_device*d){(void)d;return htons(get_unaligned_be16(s->data+12));}
 static void napi_gro_receive(struct napi_struct*n,struct sk_buff*s){(void)n;delivered++;received_length=s->len;memcpy(received,s->data,s->len);dev_kfree_skb_any(s);}
 #define RTL_DMA_COUNT 64
@@ -132,7 +128,9 @@ static netdev_tx_t rtl9617c_ni_transmit(void*d,struct net_device*n,struct sk_buf
 model += re.sub(r'^#include .*$', '', (drivers / 'rtl9617c-pon-vlan-skb.h').read_text(), flags=re.M)
 model += function('rtl9617c-pon-path.c', 'rtl_pon_itu_service_entry')
 model += function('rtl9617c-pon-path.c', 'rtl_pon_itu_data_transmit')
-model += function('rtl9617c-pon-path.c', 'rtl_pon_itu_data_receive')
+receive = function('rtl9617c-pon-path.c', 'rtl_pon_itu_data_receive')
+assert 'skb_ext_add' not in receive, 'PON slow path must not allocate metadata for the retired autonomous learner'
+model += receive
 model += r'''
 static struct sk_buff *packet(unsigned vid,bool metadata,unsigned code){
  /* Match NET_IP_ALIGN when the fixture carries an IPv4 header. */
@@ -329,6 +327,11 @@ int main(int argc,char**argv){
  inner.vlan_id=900;inner.vlan_proto=htons(0x88a8);assert(!rtl_pon_itu_service_entry(&dev,&tags));
  tags.count=0;assert(!rtl_pon_itu_service_entry(&dev,&tags));
  puts("IPTV VLAN48: DHCP Discover reaches GEM10/DMA and Offer retains VLAN48 on RX, routed/bridged and inline/metadata; QinQ lookup remains exact");
+ /* A detached logical endpoint must drop safely before dereferencing it. */
+ pon.data_devices[0]=NULL;
+ unsigned before_free=freed,before_rx=delivered;
+ rtl_pon_itu_data_receive(&pon,&napi,packet(0,false,7),7|(8<<8));
+ assert(freed==before_free+1 && delivered==before_rx);
  free(dma.memory);free(dma.registers);free(state);
  puts(retry?"PADI DMA BUSY retry preserves original SKB and single VLAN edit; PADO return passed":"PADI VLAN46/GEM1033/TCONT1/queue0 -> DMA bytes; PADO GEM8 -> VLAN46; inline/metadata and IWTP rewrite passed");
 }

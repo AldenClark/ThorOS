@@ -1,0 +1,258 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: validate cached bridge policy, not only its FDB port
+
+DIRECT route actions cache VLAN treatment and source MACs. A stable FDB
+entry does not establish STP forwarding or an unchanged VLAN policy. Capture
+an exact VLAN-state cookie under RCU and validate it on lookup and GC. Check
+that the path's VLAN action matches that same cookie: RCU does not serialize
+in-place VLAN updates while the path stack is being built. Also retire cached
+bridge/upper paths on MAC and topology notifications.
+
+This uses ordinary asynchronous flowtable hardware teardown. It is not a
+claim of synchronous ASIC port blocking; hardware STP transition timing still
+requires device validation.
+
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -175,6 +175,10 @@ static inline int br_mst_get_state(const struct net_device *dev, u16 msti,
+ #if IS_ENABLED(CONFIG_BRIDGE)
+ struct net_device *br_fdb_find_port_rcu(const struct net_device *br_dev,
+ 				     const unsigned char *addr, __u16 vid);
++bool br_flowtable_path_cookie_rcu(const struct net_device *br_dev,
++				  const struct net_device *dev,
++				  const unsigned char *addr, u16 vid,
++				  u32 *cookie);
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr,
+ 				    __u16 vid);
+@@ -188,6 +192,14 @@ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
++static inline bool br_flowtable_path_cookie_rcu(const struct net_device *br_dev,
++						const struct net_device *dev,
++						const unsigned char *addr,
++						u16 vid, u32 *cookie)
++{
++	return false;
++}
++
+ static inline struct net_device *
+ br_fdb_find_port_rcu(const struct net_device *br_dev,
+ 		     const unsigned char *addr, __u16 vid)
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -153,6 +153,7 @@ struct flow_offload_tuple {
+ 			u32		hw_ifidx;
+ 			u32		bridge_ifidx, bridge_port;
+ 			u16		bridge_vid;
++			u32		bridge_cookie;
+ 			u8		h_source[ETH_ALEN];
+ 			u8		h_dest[ETH_ALEN];
+ 		} out;
+@@ -222,6 +223,7 @@ struct nf_flow_route {
+ 			u32			hw_ifindex;
+ 			u32			bridge_ifindex, bridge_port;
+ 			u16			bridge_vid;
++			u32			bridge_cookie;
+ 			u8			h_source[ETH_ALEN];
+ 			u8			h_dest[ETH_ALEN];
+ 			u8			bridge_path:1,
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -256,6 +256,53 @@ struct net_device *br_fdb_find_port_rcu(const struct net_device *br_dev,
+ }
+ EXPORT_SYMBOL_GPL(br_fdb_find_port_rcu);
+ 
++/* RCU-only validation for cached routed flowtable paths. FDB membership alone
++ * is insufficient: STP, VLAN membership and tag treatment can change while
++ * the destination remains on the same port. The cookie is an exact packing
++ * of wire-affecting VLAN state, not a lossy hash. */
++bool br_flowtable_path_cookie_rcu(const struct net_device *br_dev,
++				  const struct net_device *dev,
++				  const unsigned char *addr, u16 vid,
++				  u32 *cookie)
++{
++	const struct net_bridge_fdb_entry *fdb;
++	const struct net_bridge_port *port;
++	struct net_bridge *br;
++
++	RCU_LOCKDEP_WARN(!rcu_read_lock_held(), "bridge path validation without RCU");
++	if (!br_dev || !dev || !netif_is_bridge_master(br_dev) ||
++	    !netif_running(br_dev) || !netif_running(dev) || !netif_carrier_ok(dev))
++		return false;
++	br = netdev_priv(br_dev);
++	port = br_port_get_check_rcu(dev);
++	if (!port || port->br != br || READ_ONCE(port->state) != BR_STATE_FORWARDING)
++		return false;
++	fdb = br_fdb_find_rcu(br, addr, vid);
++	if (!fdb || READ_ONCE(fdb->dst) != port)
++		return false;
++	*cookie = 0;
++#ifdef CONFIG_BRIDGE_VLAN_FILTERING
++	if (br_opt_get(br, BROPT_VLAN_ENABLED)) {
++		struct net_bridge_vlan_group *vg = nbp_vlan_group_rcu(port);
++		struct net_bridge_vlan_group *brvg = br_vlan_group_rcu(br);
++		const struct net_bridge_vlan *v = br_vlan_find(vg, vid);
++		const struct net_bridge_vlan *master = br_vlan_find(brvg, vid);
++
++		if (!v || !master || !br_vlan_should_use(v) || !br_vlan_should_use(master) ||
++		    br_vlan_get_state(v) != BR_STATE_FORWARDING ||
++		    br_vlan_get_state(master) != BR_STATE_FORWARDING)
++			return false;
++		*cookie = (u32)ntohs(READ_ONCE(br->vlan_proto)) | BIT(16) |
++			  (!!(READ_ONCE(v->flags) & BRIDGE_VLAN_INFO_UNTAGGED) << 17) |
++			  ((vid == br_get_pvid(vg)) << 18) |
++			  (!!(READ_ONCE(v->priv_flags) & BR_VLFLAG_ADDED_BY_SWITCHDEV) << 19) |
++			  ((u32)br_get_pvid(brvg) << 20);
++	}
++#endif
++	return true;
++}
++EXPORT_SYMBOL_GPL(br_flowtable_path_cookie_rcu);
++
+ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
+ 				    const unsigned char *addr, __u16 vid)
+ {
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -4,6 +4,7 @@
+ #include <linux/init.h>
+ #include <linux/netlink.h>
+ #include <linux/netfilter.h>
++#include <linux/if_bridge.h>
+ #include <linux/spinlock.h>
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+@@ -92,6 +93,7 @@ struct nft_forward_info {
+ 	u8 ingress_vlans;
+ 	u32 bridge_ifindex, bridge_port;
+ 	u16 bridge_vid;
++	u32 bridge_cookie;
+ 	u8 h_source[ETH_ALEN];
+ 	u8 h_dest[ETH_ALEN];
+ 	u8 bridge_path:1,
+@@ -100,6 +102,49 @@ struct nft_forward_info {
+ 	enum flow_offload_xmit_type xmit_type;
+ };
+ 
++/* RCU protects lifetime, not in-place VLAN policy updates. The path may have
++ * been built before the cookie was sampled. Derive its expected wire action
++ * from that single cookie and reject an old action/new cookie combination.
++ * Otherwise a concurrent tag/TPID/PVID change could stay hidden forever.
++ */
++static bool nft_bridge_path_matches_cookie(const struct net_device_path *path,
++					  const struct nft_forward_info *info)
++{
++	u32 cookie = info->bridge_cookie;
++	unsigned int mode;
++	__be16 proto;
++	u16 vid;
++	int i;
++
++	if (!(cookie & BIT(16)))
++		return !path->bridge.vlan_id && !path->bridge.vlan_proto &&
++		       path->bridge.vlan_mode == DEV_PATH_BR_VLAN_KEEP;
++	proto = htons(cookie & 0xffff);
++	vid = cookie >> 20;
++	mode = DEV_PATH_BR_VLAN_TAG;
++	/* PPPoE encapsulation shares this array but is not a ctx->vlan entry. */
++	for (i = info->num_encaps - 1; i >= 0; i--) {
++		if (info->encap[i].proto != htons(ETH_P_8021Q) &&
++		    info->encap[i].proto != htons(ETH_P_8021AD))
++			continue;
++		if (info->encap[i].proto == proto) {
++			vid = info->encap[i].id;
++			mode = DEV_PATH_BR_VLAN_KEEP;
++		}
++		break;
++	}
++	if (cookie & BIT(17)) {
++		if (mode == DEV_PATH_BR_VLAN_TAG)
++			mode = DEV_PATH_BR_VLAN_KEEP;
++		else if (cookie & BIT(19))
++			mode = DEV_PATH_BR_VLAN_UNTAG_HW;
++		else
++			mode = DEV_PATH_BR_VLAN_UNTAG;
++	}
++	return path->bridge.vlan_id == vid && path->bridge.vlan_proto == proto &&
++	       path->bridge.vlan_mode == mode;
++}
++
+ static int nft_dev_path_info(const struct net_device_path_stack *stack,
+ 			     struct nft_forward_info *info,
+ 			     unsigned char *ha, struct nf_flowtable *flowtable)
+@@ -144,6 +189,14 @@ static int nft_dev_path_info(const struct net_device_path_stack *stack,
+ 				memcpy(info->h_dest, path->encap.h_dest, ETH_ALEN);
+ 			break;
+ 		case DEV_PATH_BRIDGE:
++			/* A cached DIRECT path must retain the bridge policy it used,
++			 * not just the FDB's destination port. */
++			if (info->bridge_ifindex || i + 1 >= stack->num_paths ||
++			    !br_flowtable_path_cookie_rcu(path->dev,
++					stack->path[i + 1].dev, info->h_dest,
++					path->bridge.vlan_id, &info->bridge_cookie) ||
++			    !nft_bridge_path_matches_cookie(path, info))
++				return -1;
+ 			info->bridge_ifindex = path->dev->ifindex;
+ 			info->bridge_port = stack->path[i + 1].dev->ifindex;
+ 			info->bridge_vid = path->bridge.vlan_id;
+@@ -256,6 +309,7 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+ 		route->tuple[dir].out.bridge_ifindex = info.bridge_ifindex;
+ 		route->tuple[dir].out.bridge_port = info.bridge_port;
+ 		route->tuple[dir].out.bridge_vid = info.bridge_vid;
++		route->tuple[dir].out.bridge_cookie = info.bridge_cookie;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
+ 
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -135,6 +135,7 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 		flow_tuple->out.bridge_ifidx = route->tuple[dir].out.bridge_ifindex;
+ 		flow_tuple->out.bridge_port = route->tuple[dir].out.bridge_port;
+ 		flow_tuple->out.bridge_vid = route->tuple[dir].out.bridge_vid;
++		flow_tuple->out.bridge_cookie = route->tuple[dir].out.bridge_cookie;
+ 		dst_release(dst);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+@@ -416,14 +417,16 @@ static bool nf_flow_bridge_changed(const struct flow_offload *flow)
+ 	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
+ 		const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
+ 		struct net_device *bridge, *port;
++		u32 cookie;
+ 
+ 		if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT || !tuple->out.bridge_ifidx)
+ 			continue;
+ 		bridge = dev_get_by_index_rcu(net, tuple->out.bridge_ifidx);
+-		if (!bridge)
+-			return true;
+-		port = br_fdb_find_port_rcu(bridge, tuple->out.h_dest, tuple->out.bridge_vid);
+-		if (!port || port->ifindex != tuple->out.bridge_port)
++		port = dev_get_by_index_rcu(net, tuple->out.bridge_port);
++		if (!bridge || !port ||
++		    !br_flowtable_path_cookie_rcu(bridge, port, tuple->out.h_dest,
++					  tuple->out.bridge_vid, &cookie) ||
++		    cookie != tuple->out.bridge_cookie)
+ 			return true;
+ 	}
+ 	return false;
+@@ -816,7 +819,9 @@ static bool nf_flow_tuple_uses_dev(const struct flow_offload_tuple *tuple,
+ 		return tuple->dst_cache->dev == dev;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+ 		return tuple->out.ifidx == dev->ifindex ||
+-		       tuple->out.hw_ifidx == dev->ifindex;
++		       tuple->out.hw_ifidx == dev->ifindex ||
++		       tuple->out.bridge_ifidx == dev->ifindex ||
++		       tuple->out.bridge_port == dev->ifindex;
+ 	default:
+ 		return false;
+ 	}
+@@ -927,6 +932,8 @@ static int nf_flow_table_netdev_event(struct notifier_block *this,
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 
+ 	if (event != NETDEV_DOWN && event != NETDEV_CHANGEMTU &&
++	    event != NETDEV_CHANGEADDR && event != NETDEV_CHANGEUPPER &&
++	    event != NETDEV_CHANGEINFODATA &&
+ 	    (event != NETDEV_CHANGE || netif_carrier_ok(dev)))
+ 		return NOTIFY_DONE;
+ 
