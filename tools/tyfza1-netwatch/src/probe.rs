@@ -95,10 +95,17 @@ fn parse_curl_metrics(o: &mut Observation, stdout: &str) {
     }
     o.http = fields[0].into();
     o.ip = fields[1].into();
-    o.dns_ms = fields[2].parse::<f64>().ok().map(|v| v * 1000.0);
-    o.tcp_ms = fields[3].parse::<f64>().ok().map(|v| v * 1000.0);
-    o.tls_ms = fields[4].parse::<f64>().ok().map(|v| v * 1000.0);
-    o.ttfb_ms = fields[5].parse::<f64>().ok().map(|v| v * 1000.0);
+    // curl's time_connect/appconnect/starttransfer values are cumulative
+    // since request start. Store per-stage costs to avoid misleading the user.
+    let ms = |index: usize| fields[index].parse::<f64>().ok().map(|v| v * 1000.0);
+    let lookup = ms(2);
+    let connected = ms(3);
+    let tls_finished = ms(4).filter(|v| *v > 0.0);
+    let response_started = ms(5).filter(|v| *v > 0.0);
+    o.dns_ms = lookup;
+    o.tcp_ms = connected.zip(lookup).map(|(end, begin)| (end - begin).max(0.0));
+    o.tls_ms = tls_finished.zip(connected).map(|(end, begin)| (end - begin).max(0.0));
+    o.ttfb_ms = response_started.zip(tls_finished).map(|(end, begin)| (end - begin).max(0.0));
     o.elapsed_ms = fields[6].parse::<f64>().unwrap_or(0.0).mul_add(1000.0, 0.0).round() as u64;
     o.bytes = fields[7].parse::<f64>().unwrap_or(0.0) as u64;
     o.speed_bps = fields[8].parse::<f64>().unwrap_or(0.0);
@@ -262,6 +269,10 @@ mod tests {
         assert_eq!(o.http, "403");
         assert_eq!(o.ip, "1.2.3.4");
         assert_eq!(o.elapsed_ms, 50);
+        assert_eq!(o.dns_ms, Some(10.0));
+        assert_eq!(o.tcp_ms, Some(10.0));
+        assert_eq!(o.tls_ms, Some(10.0));
+        assert_eq!(o.ttfb_ms, Some(10.0));
     }
 }
 
