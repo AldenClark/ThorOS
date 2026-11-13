@@ -41,6 +41,7 @@ typedef uint64_t u64;
     "linux/list.h": r'''
 #pragma once
 #include <stddef.h>
+#include <stdbool.h>
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(name) struct list_head name = { &(name), &(name) }
 #define container_of(p, type, member) ((type *)((char *)(p) - offsetof(type, member)))
@@ -60,6 +61,7 @@ static inline bool list_empty(const struct list_head *head) { return head->next 
 #pragma once
 #include <assert.h>
 #include <pthread.h>
+#include <stdbool.h>
 static _Thread_local unsigned int test_gate_depth;
 static unsigned int test_warnings;
 #define DEFINE_SPINLOCK(name) pthread_mutex_t name = PTHREAD_MUTEX_INITIALIZER
