@@ -13,6 +13,8 @@
 #include <linux/ipv6.h>
 #include <linux/ppp_defs.h>
 #include <linux/list.h>
+#include <linux/ktime.h>
+#include <linux/uaccess.h>
 #include <linux/rbtree.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
@@ -25,6 +27,7 @@
 #include <net/pkt_cls.h>
 #include "rtl9617c-fe.h"
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-fe-cache-snapshot.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
@@ -110,6 +113,7 @@ struct rtl_fe {
  void *memory;
  dma_addr_t dma;
  bool enabled, prepared, cpu_path, lan_redirected;
+ unsigned int cache_target;
  int error;
  u64 installs, deletes, misses;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
@@ -953,7 +957,12 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  rtl_fe_key_set(words,RTL_FE_KEY_TABLE_ID,0);
  rtl_fe_key_crc(words,&crc32,&crc16);
  start=rtl_fe_hash_bucket(crc16);
- for(index=start;index<start+32;index++)if(!test_bit(index,fe->hashes))break;
+ /* RTL9617C cache-age0 erratum: invalidating CRC16[12:0]=0/slot0
+  * can select an empty cache row instead of this flow. Keep slot0 free.
+  * SDK aal_hash.c (__hash_tbl_entry_add), ca-network-drivers commit
+  * 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0, lines3777..3783. */
+ for(index=start+(!(crc16&0x1fff));index<start+32;index++)
+  if(!test_bit(index,fe->hashes))break;
  if(index==start+32)return -ENOSPC;
  flow=kzalloc(sizeof(*flow),GFP_KERNEL);
  if(!flow)return -ENOMEM;
@@ -1191,6 +1200,121 @@ static int fe_counters_show(struct seq_file *file,void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(fe_counters);
 
+
+/* Opt-in diagnostics; never scheduled or called by packet/flow callbacks. */
+struct fe_cache_read_context {
+ struct rtl_fe *fe;
+ u64 deadline;
+};
+
+/* Both idle precheck and completion wait are at most1ms, constrained by the
+ * remaining50ms soft budget. No second request follows any access failure. */
+static int fe_cache_read_access(void *context,unsigned int address,unsigned int value)
+{
+ struct fe_cache_read_context *ctx=context;
+ u64 now;
+ unsigned int timeout;
+ u32 status;
+ int ret;
+
+ if(address!=0x38e4 || !(value&BIT(31)) || (value&~(BIT(31)|0xfffU)))
+  return -EINVAL;
+ now=ktime_get_ns();
+ if(now>=ctx->deadline || ctx->deadline-now<1000)return -ETIMEDOUT;
+ timeout=min_t(u64,1000,(ctx->deadline-now)/1000);
+ ret=readl_poll_timeout(ctx->fe->registers+address,status,!(status&BIT(31)),1,timeout);
+ if(ret)return ret;
+ now=ktime_get_ns();
+ if(now>=ctx->deadline || ctx->deadline-now<1000)return -ETIMEDOUT;
+ timeout=min_t(u64,1000,(ctx->deadline-now)/1000);
+ writel(value,ctx->fe->registers+address);
+ return readl_poll_timeout(ctx->fe->registers+address,status,!(status&BIT(31)),1,timeout);
+}
+static unsigned int fe_cache_read_reg(void *context,unsigned int address)
+{
+ struct fe_cache_read_context *ctx=context;
+ return fe_read(ctx->fe,address);
+}
+
+static ssize_t fe_cache_target_write(struct file *file,const char __user *buffer,
+ size_t count,loff_t *position)
+{
+ struct rtl_fe *fe=file->private_data;
+ unsigned int target;
+ int ret=kstrtouint_from_user(buffer,count,0,&target);
+
+ if(ret)return ret;
+ /* 65536 disables queries;0..65535 select an active main-hash index. */
+ if(target>RTL_FE_HASH_ENTRIES)return -ERANGE;
+ if(!mutex_trylock(&fe->lock))return -EBUSY;
+ fe->cache_target=target;
+ mutex_unlock(&fe->lock);
+ return count;
+}
+static const struct file_operations fe_cache_target_fops={
+ .owner=THIS_MODULE,.open=simple_open,.write=fe_cache_target_write,
+};
+
+static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
+{
+ static const char *const observations[]={
+  "layout_unsupported","io_incomplete","key_changed","fib_changed",
+  "check_action_only","not_in_expected_set","observed_equal","observed_different",
+ };
+ struct rtl_fe *fe=file->private;
+ struct rtl_fe_flow *flow;
+ struct rtl_fe_cache_expected expected={};
+ struct rtl_fe_cache_snapshot result;
+ struct fe_cache_read_context context={.fe=fe};
+ const struct rtl_dq_io io={.context=&context,.read=fe_cache_read_reg,
+  .indirect=fe_cache_read_access};
+ char input[IFNAMSIZ],output[IFNAMSIZ];
+ unsigned int i,protocol=0,source_port=0,destination_port=0;
+ const __le32 *action;
+ const char *status="target_inactive";
+
+ if(!mutex_trylock(&fe->lock)) {
+  seq_puts(file,"status=busy complete=0\n");
+  return 0;
+ }
+ if(fe->cache_target==RTL_FE_HASH_ENTRIES) {
+  status="disabled";
+  goto no_query;
+ }
+ if(!fe->prepared) {
+  status="backend_unprepared";
+  goto no_query;
+ }
+ list_for_each_entry(flow,&fe->flows,list)
+  if(flow->hash_index==fe->cache_target && flow->published && !flow->deleting) {
+   expected.hash_index=flow->hash_index;
+   expected.crc16=flow->crc16;
+   expected.crc32=le32_to_cpu(((__le32 *)fe->memory)[flow->hash_index]);
+   action=fe->memory+RTL_FE_ACTION_OFFSET+flow->hash_index*RTL_FE_ACTION_BYTES;
+   for(i=0;i<7;i++)expected.action[i]=le32_to_cpu(action[i]);
+   strscpy(input,flow->input->netdev->name,sizeof(input));
+   strscpy(output,flow->output->netdev->name,sizeof(output));
+   protocol=flow->protocol;source_port=flow->source_port;destination_port=flow->destination_port;
+   context.deadline=ktime_get_ns()+50ULL*1000*1000;
+   rtl_fe_cache_snapshot(&io,&expected,&result);
+   mutex_unlock(&fe->lock);
+   /* KEY/FIB bracketing observes stability, not hardware atomicity: cache
+    * replacement/ABA remains possible. Raw addresses/actions never leave. */
+   seq_printf(file,"status=%s complete=%u error=%d hash=%u input=%s output=%s proto=%u sport=%u dport=%u crc32=%08x crc16=%04x scanned=%u cache=%u loc=%u age=%u check_actions=%u word_mask=%02x",
+    observations[result.observation],result.complete,result.error,expected.hash_index,
+    input,output,protocol,source_port,destination_port,expected.crc32,expected.crc16,
+    result.scanned,result.cache_index,result.location,result.age,result.check_actions,result.word_mask);
+   for(i=0;i<7;i++)seq_printf(file," diff%u=%08x",i,result.diff[i]);
+   seq_putc(file,'\n');
+   return 0;
+  }
+no_query:
+ mutex_unlock(&fe->lock);
+ seq_printf(file,"status=%s complete=0\n",status);
+ return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(fe_cache_snapshot);
+
 struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
 {
  void __iomem *reo=devm_platform_ioremap_resource_byname(to_platform_device(device),"l3fe-axi-reorder");
@@ -1206,6 +1330,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  INIT_LIST_HEAD(&fe->ports);INIT_LIST_HEAD(&fe->flows);INIT_LIST_HEAD(&fe->blocks);
  INIT_LIST_HEAD(&fe->retries);
  fe->cookies=RB_ROOT;
+ fe->cache_target=RTL_FE_HASH_ENTRIES;
  fe->memory=dma_alloc_coherent(device,RTL_FE_MEMORY_BYTES,&fe->dma,GFP_KERNEL);
  if(!fe->memory){kfree(fe);return ERR_PTR(-ENOMEM);}
  defaults=fe->memory+RTL_FE_DEFAULT_OFFSET;
@@ -1213,6 +1338,8 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  dma_wmb();
  fe->debug=debugfs_create_dir("rtl9617c-fe",NULL);
  debugfs_create_file("flows",0400,fe->debug,fe,&fe_counters_fops);
+ debugfs_create_file("cache_target",0200,fe->debug,fe,&fe_cache_target_fops);
+ debugfs_create_file("cache_snapshot",0400,fe->debug,fe,&fe_cache_snapshot_fops);
  fe->bridge=fe_bridge_start(fe);
  if(IS_ERR(fe->bridge)) {
   int ret=PTR_ERR(fe->bridge);
