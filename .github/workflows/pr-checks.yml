@@ -20,6 +20,10 @@ jobs:
           sh scripts/check_firmware_prebuild.sh
           python3 scripts/test_package_timeout.py
           python3 scripts/test_wired_only.py
+      - name: Test pinned OMCI Rust codec and MIB
+        run: |
+          rustup toolchain install 1.96.1 --profile minimal
+          cargo +1.96.1 test --locked --manifest-path port/packages/tyfza1-pon-control/omci/Cargo.toml
       - name: Verify storage migration before firmware builds
         run: |
           sudo apt-get update
