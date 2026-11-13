@@ -74,6 +74,8 @@ int main(void){
  const unsigned int *ddr=f.memory;
  assert(ddr[16416]==0x07b0aa2b);
  assert(ret==-EEXIST && !ddr[16417]);
+ free(container_of(f.flows.next,struct rtl_fe_flow,list));
+ free(f.memory);
  return 0;
 }
 '''
