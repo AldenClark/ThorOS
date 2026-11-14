@@ -6,6 +6,9 @@ root=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser(description='Check pinned netifd/firewall4 patches and hotplug behavior')
 parser.add_argument('--source-tree', type=Path, default=root/'sources/openwrt')
 parser.add_argument('--patches-only', action='store_true', help='Validate patch application before the firmware build')
+parser.add_argument('--netifd-source', type=Path, help='Official git checkout at the pinned netifd revision')
+parser.add_argument('--firewall4-source', type=Path, help='Official git checkout at the pinned firewall4 revision')
+parser.add_argument('--libubox-source', type=Path, help='libubox source directory containing list.h')
 args=parser.parse_args()
 tree=args.source_tree.resolve()
 temporary=tempfile.TemporaryDirectory(prefix='fw4-topology-',dir=root/'artifacts')
@@ -13,9 +16,16 @@ out=Path(temporary.name)
 for package in ('netifd','firewall4'):
     makefile=(tree/'package/network/config'/package/'Makefile').read_text()
     date=re.search(r'^PKG_SOURCE_DATE:=(.+)$',makefile,re.M)[1].replace('-','.')
-    revision=re.search(r'^PKG_SOURCE_VERSION:=(.+)$',makefile,re.M)[1][:8]
-    name=f'{package}-{date}~{revision}'
-    subprocess.run(['tar','--zstd','-xf',str(tree/'dl'/(name+'.tar.zst')),'-C',str(out)],check=True)
+    revision=re.search(r'^PKG_SOURCE_VERSION:=(.+)$',makefile,re.M)[1]
+    name=f'{package}-{date}~{revision[:8]}'
+    provided=getattr(args,package+'_source')
+    if provided:
+        provided=provided.resolve()
+        observed=subprocess.check_output(['git','-C',str(provided),'rev-parse','HEAD'],text=True).strip()
+        assert observed==revision,(package,'source does not match OpenWrt pin',observed,revision)
+        shutil.copytree(provided,out/name,ignore=shutil.ignore_patterns('.git'))
+    else:
+        subprocess.run(['tar','--zstd','-xf',str(tree/'dl'/(name+'.tar.zst')),'-C',str(out)],check=True)
     for side in ('before','after'):
         (out/side).mkdir(exist_ok=True)
         shutil.copytree(out/name,out/side/package)
@@ -29,6 +39,12 @@ if args.patches_only:
     temporary.cleanup()
     raise SystemExit(0)
 original=out/'before/netifd'
+include=tree/'staging_dir/host/include'
+if args.libubox_source:
+    assert (args.libubox_source/'list.h').is_file()
+    include=out/'include'
+    include.mkdir()
+    (include/'libubox').symlink_to(args.libubox_source.resolve(),target_is_directory=True)
 def function(text,name):
  m=re.search(r'(?:static void\s+|void\s+)'+name+r'\([^;]*?\)\s*\{',text);assert m,name
  start=m.start();pos=m.end();depth=1
@@ -124,7 +140,7 @@ int main(int argc,char **argv) {
  (work/'hotplug').write_text('#!/bin/sh\nprintf "%s|%s|%s\\n" "$ACTION" "$IFUPDATE_TOPOLOGY" "$IFUPDATE_ADDRESSES" >> "$EVENT_LOG"\nexec sh "'+str(work/'hook')+'"\n')
  for f in ('firewall','fw4','logger','hotplug'):(work/f).chmod(0o755)
  for f in ('reloads','events'):(work/f).write_text('')
- subprocess.run(['cc','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-I'+str(tree/'staging_dir/host/include'),str(work/'events.c'),'-o',str(work/'check')],check=True)
+ subprocess.run(['cc','-std=gnu11','-O2','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-I'+str(include),str(work/'events.c'),'-o',str(work/'check')],check=True)
  env=dict(os.environ,PATH=str(work)+':'+os.environ['PATH'],RELOAD_LOG=str(work/'reloads'),EVENT_LOG=str(work/'events'))
  subprocess.run([str(work/'check'),str(work/'hotplug')],env=env,check=True)
  events=(work/'events').read_text().splitlines();reloads=len((work/'reloads').read_text().splitlines())

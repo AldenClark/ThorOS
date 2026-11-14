@@ -83,12 +83,19 @@ int main(void) {
     fail_access=accesses+1;
     assert(rtl_pon_pdc_refresh(&pon)==-ETIMEDOUT && !pon.pdc_configured && pon.pdc_error==-ETIMEDOUT);
     pon.lock.held=false;fail_access=0;
+    /* Timeout is not cancellation: a new request must not overwrite DATA
+     * while the old hardware operation still owns its staging window. */
+    u32 data0=registers[0x9028/4],data1=registers[0x9024/4];before=accesses;
+    assert(rtl_pon_pdc_configure_locked(&pon)==-EBUSY && !pon.pdc_configured);
+    assert(accesses==before && registers[0x9028/4]==data0 && registers[0x9024/4]==data1);
+    assert(rtl_pdc_access(&pon,7,false)==-EBUSY && accesses==before);
+    registers[0x9020/4]&=~BIT(31); /* Hardware eventually completes. */
     assert(rtl_pon_pdc_configure_locked(&pon)==0&&pon.pdc_configured);
-    puts("Actual PDC: 256 entries, LLID slot-to-MAC mapping, business/control banks, changed-only refresh and table failure recovery passed");
+    puts("Actual PDC: 256 entries, LLID mapping, business/control banks, refresh and timeout/busy staging preservation passed");
 }
 '''
 constants = '\n'.join(re.findall(r'^#define .*$', source, re.M))
-code = model + constants + '\n' + ''.join(function(name) for name in ('rtl_pdc_access', 'rtl_pon_pdc_refresh', 'rtl_pdc_itu_configure', 'rtl_pon_pdc_configure_locked')) + tests
+code = model + constants + '\n' + ''.join(function(name) for name in ('rtl_pdc_access', 'rtl_pdc_write', 'rtl_pon_pdc_refresh', 'rtl_pdc_itu_configure', 'rtl_pon_pdc_configure_locked')) + tests
 with tempfile.TemporaryDirectory(prefix='pdc-map-test-', dir=root / 'artifacts') as directory:
     directory = Path(directory)
     cfile = directory / 'pdc.c'

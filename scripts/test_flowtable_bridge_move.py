@@ -34,8 +34,11 @@ common = r'''
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <arpa/inet.h>
 typedef uint8_t u8;typedef uint16_t u16,__u16,__be16;typedef uint32_t u32;
 #define ETH_ALEN 6
+#define ETH_P_8021Q 0x8100
+#define ETH_P_8021AD 0x88a8
 #define NF_FLOW_TABLE_ENCAP_MAX 2
 #define FLOW_OFFLOAD_DIR_MAX 2
 #define NF_FLOW_OFFLOAD_ROUTE 1
@@ -66,14 +69,14 @@ struct flow_offload_tuple {
  unsigned dir,xmit_type,l3proto,mtu,iifidx,encap_num,in_vlan_ingress,ifidx,dst_cookie;
  unsigned bridge_path,bridge_vlan,port_vlans;
  struct {u16 id;__be16 proto;}encap[2];struct dst_entry *dst_cache;
- struct {u32 ifidx,hw_ifidx,bridge_ifidx,bridge_port;u16 bridge_vid;u8 h_source[6],h_dest[6];}out;
+ struct {u32 ifidx,hw_ifidx,bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_source[6],h_dest[6];}out;
 };
 struct flow_offload_tuple_rhash {struct flow_offload_tuple tuple;};
 struct flow_offload {struct nf_conn *ct;unsigned type;unsigned long flags;struct flow_offload_tuple_rhash tuplehash[2];bool hw_rules[2];};
 struct nf_flowtable {struct flow_offload_tuple_rhash *rhashtable;bool hw;};
 struct nft_flowtable {struct nf_flowtable data;};
 struct nf_flow_route {struct {struct dst_entry *dst;struct {u32 ifindex;struct {u16 id;__be16 proto;}encap[2];unsigned num_encaps,ingress_vlans;}in;
- struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u8 h_source[6],h_dest[6];unsigned bridge_path,bridge_vlan,port_vlans;}out;unsigned xmit_type;}tuple[2];};
+ struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_source[6],h_dest[6];unsigned bridge_path,bridge_vlan,port_vlans;}out;unsigned xmit_type;}tuple[2];};
 struct net_device_path {unsigned type;struct net_device *dev;struct {unsigned vlan_mode;u16 vlan_id,vlan_proto;}bridge;struct {u16 id,proto;u8 h_dest[6];}encap;};
 struct net_device_path_stack {int num_paths;struct net_device_path path[4];};
 static struct net_device_path_stack path_stack;
@@ -81,9 +84,17 @@ static struct net_device bridge[2],ports[2][2];
 static unsigned moved,hw_deletes,freed;
 static int nf_flow_offload_rhash_params;
 static struct net *nf_ct_net(struct nf_conn *ct){return ct->net;}
-static struct net_device *dev_get_by_index_rcu(struct net *net,unsigned index){return bridge[net->id].ifindex==index?&bridge[net->id]:NULL;}
+static struct net_device *dev_get_by_index_rcu(struct net *net,unsigned index){
+ if(bridge[net->id].ifindex==index)return &bridge[net->id];
+ for(unsigned p=0;p<2;p++)if(ports[net->id][p].ifindex==index)return &ports[net->id][p];
+ return NULL;
+}
 static struct net_device *br_fdb_find_port_rcu(struct net_device *br,const u8 *mac,u16 vid){
  return &ports[br->net->id][br->net->id==0&&mac[5]==1&&vid==7&&moved];}
+static bool br_flowtable_path_cookie_rcu(struct net_device *br,struct net_device *port,
+ const u8 *mac,u16 vid,u32 *cookie){
+ *cookie=(7U<<20)|BIT(16)|BIT(17)|ETH_P_8021Q;return br_fdb_find_port_rcu(br,mac,vid)==port;
+}
 static void flow_offload_teardown(struct flow_offload *f){f->flags|=BIT(NF_FLOW_TEARDOWN);f->ct->offloaded=false;}
 static void *rhashtable_lookup(void *table,void *key,int params){(void)key;(void)params;return *(void **)table;}
 static bool nf_ct_is_dying(struct nf_conn *ct){return ct->dying;}
@@ -117,8 +128,8 @@ int main(void){
  struct net_device physical={.ifindex=4,.net=&nets[0]};struct dst_entry dst={&bridge[0]};
  /* VLAN logical port2 and physical port4 must not be confused. */
  path_stack=(struct net_device_path_stack){.num_paths=3,.path={
-  {.type=DEV_PATH_BRIDGE,.dev=&bridge[0],.bridge={DEV_PATH_BR_VLAN_KEEP,7,0x8100}},
-  {.type=DEV_PATH_VLAN,.dev=&ports[0][0],.encap={7,0x8100,{0}}},
+  {.type=DEV_PATH_BRIDGE,.dev=&bridge[0],.bridge={DEV_PATH_BR_VLAN_KEEP,7,htons(ETH_P_8021Q)}},
+  {.type=DEV_PATH_VLAN,.dev=&ports[0][0],.encap={7,htons(ETH_P_8021Q),{0}}},
   {.type=DEV_PATH_ETHERNET,.dev=&physical}}};
  struct nf_conn ct={.net=&nets[0],.offloaded=true};
  struct nf_flow_route route={};route.tuple[0].dst=&dst;
@@ -136,6 +147,12 @@ int main(void){
  return 0;
 #else
  assert(tuple->out.bridge_ifidx==10 && tuple->out.bridge_port==2 && tuple->out.bridge_vid==7 && tuple->out.hw_ifidx==4);
+ assert(tuple->out.bridge_cookie==((7U<<20)|BIT(16)|BIT(17)|ETH_P_8021Q));
+ struct nft_forward_info invalid={};u8 ha[6]={0,0,0,0,0,1};
+ struct net_device_path_stack incomplete=path_stack;incomplete.num_paths=1;
+ assert(nft_dev_path_info(&incomplete,&invalid,ha,&ft)<0);
+ invalid=(struct nft_forward_info){.bridge_ifindex=10};
+ assert(nft_dev_path_info(&path_stack,&invalid,ha,&ft)<0);
  ft.rhashtable=&flow.tuplehash[0];assert(flow_offload_lookup(&ft,tuple));
  moved=1;
  nf_flow_offload_gc_step(&ft,&flow,NULL);
@@ -170,12 +187,18 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
             target = work / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        policy = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/219-flowtable-bridge-policy.patch'
+        if 'br_flowtable_path_cookie_rcu' in (work / 'net/netfilter/nf_flow_table_core.c').read_text():
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(policy)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
         # Backported upstream flowtable layout shifts several context hunks.
         subprocess.run(['patch', '-R', '-p1', '--fuzz=2', '-i', str(patch)], cwd=work, check=True, stdout=subprocess.DEVNULL)
         kernel = work
     core = (kernel / 'net/netfilter/nf_flow_table_core.c').read_text()
     path = (kernel / 'net/netfilter/nf_flow_table_path.c').read_text()
     code = common + re.search(r'struct nft_forward_info \{.*?\n\};', path, re.S)[0] + '\n'
+    if 'static bool nft_bridge_path_matches_cookie(' in path:
+        code += function(path, 'nft_bridge_path_matches_cookie')
     code += function(path, 'nft_dev_path_info') + function(path, 'nft_dev_forward_path')
     code += function(core, 'flow_offload_fill_route')
     if 'static bool nf_flow_bridge_changed(' in core:

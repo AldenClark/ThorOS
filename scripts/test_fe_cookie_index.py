@@ -2,7 +2,9 @@
 """Actual FE callback/index with Linux's userspace rbtree and injected retries.
 
 --before runs the same workload against the original linear callback and
-expects the traversal bound to fail. Hardware access/concurrency are not modeled.
+expects the traversal bound to fail. Retired/shutdown callbacks are checked for
+strict early rejection without retry or index access; hardware and concurrency
+are not modeled.
 """
 import argparse
 from pathlib import Path
@@ -53,10 +55,10 @@ static unsigned long long visits, deleted, stats;
 #undef rb_entry
 #define rb_entry(p,t,m) (++visits,container_of(p,t,m))
 struct rtl_fe;
-struct rtl_fe_port {struct rtl_fe *fe;};
+struct rtl_fe_port {struct rtl_fe *fe;bool retired;};
 struct rtl_fe_flow {struct list_head list,retry;struct rb_node cookie_node;
  unsigned long cookie;bool installed,deleting;struct rtl_fe_port *input;};
-struct rtl_fe {struct list_head flows,retries;struct rb_root cookies;
+struct rtl_fe {struct list_head flows,retries;struct rb_root cookies;bool shutting_down;
  unsigned int lock,misses;};
 struct flow_cls_offload {struct {unsigned int chain_index;}common;
  unsigned long cookie;unsigned int command;};
@@ -97,13 +99,32 @@ int main(void){
  assert(!fe_flow(&fe,7));assert(fe_flow(&fe,0)==&f[0]);
  struct flow_cls_offload c={.cookie=f[count-1].cookie,.command=FLOW_CLS_DESTROY};
  assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&other)==-ENOENT);
+ c.command=FLOW_CLS_STATS;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&other)==-ENOENT);
+ assert(stats==count);
+ port.retired=true;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-ENODEV);
+ c.command=FLOW_CLS_REPLACE;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-ENODEV);
+ port.retired=false;
  /* One failed deletion remains indexed and queued exactly once. */
- f[17].deleting=true;list_add_tail(&f[17].retry,&fe.retries);fail_delete=true;
+ f[17].deleting=true;list_add_tail(&f[17].retry,&fe.retries);
+ /* A quarantined instance must not touch owners, retries or the hardware. */
+ fe.shutting_down=true;
+ unsigned long long saved_visits=visits,saved_deleted=deleted,saved_stats=stats;
+ for(unsigned int command=FLOW_CLS_REPLACE;command<=FLOW_CLS_STATS;command++){
+  c.command=command;
+  assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-ENODEV);
+  assert(visits==saved_visits && deleted==saved_deleted && stats==saved_stats);
+  assert(fe.retries.next==&f[17].retry && fe.retries.prev==&f[17].retry);
+  assert(!fe.lock);
+ }
+ fe.shutting_down=false;c.command=FLOW_CLS_DESTROY;fail_delete=true;
  assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-ETIMEDOUT);
  assert(fe_flow(&fe,f[17].cookie)==&f[17]);assert(fe.retries.next==&f[17].retry);
  fail_delete=false;assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
  assert(deleted==2 && list_empty(&fe.retries));assert(!fe_flow(&fe,c.cookie));
- /* Reuse the deleted cookie, then rekey exactly as the bridge learner does. */
+ /* Reuse the deleted cookie, then exercise a synthetic rekey workload. */
  f[count-1].installed=true;list_add_tail(&f[count-1].list,&fe.flows);
  fe_index_flow(&fe,&f[count-1]);assert(fe_flow(&fe,c.cookie)==&f[count-1]);
  rb_erase(&f[count-1].cookie_node,&fe.cookies);f[count-1].cookie=~0UL;
@@ -127,7 +148,7 @@ int main(void){
  assert(list_empty(&fe.retries)&&!fe_flow(&fe,f[3].cookie)&&!fe_flow(&fe,f[5].cookie));
  for(unsigned int i=0;i<count;i++)if(i!=17&&i!=3&&i!=5)fe_delete(&fe,&f[i]);
  assert(RB_EMPTY_ROOT(&fe.cookies)&&list_empty(&fe.flows));free(f);
- puts("FE indexed lookup, zero/high/reused cookies, bridge rekey, wrong-port destroy and retry passed");
+ puts("FE indexed lookup, zero/high/reused cookies, rekey, wrong-port stats/destroy, retired/shutdown rejection and retry passed");
 }
 '''
 text = old if a.before else source

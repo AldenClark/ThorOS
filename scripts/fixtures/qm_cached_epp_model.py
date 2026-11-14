@@ -31,6 +31,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned lo
 #define RTL_QM_RING_BYTES 1024
 #define RTL_QM_COMMAND_BYTES 8
 #define RTL_QM_VOQS 8
+#define RTL_QM_BUFFERS_PER_EQ 256
 #include "rtl9617c-qm-layout.h"
 #define RTL_QM_MEMORY_BYTES (8192+512*2048)
 #define EQ_ID 4
@@ -41,11 +42,13 @@ struct net_device {bool running;struct {u64 rx_errors,rx_dropped,rx_packets,rx_b
 struct napi_struct {struct net_device *dev;};
 struct sk_buff {u8 storage[128],*data;unsigned len,priority,protocol,ip_summed;struct net_device *dev;};
 struct rtl9617c_ni_endpoint {void (*receive)(struct rtl9617c_ni_endpoint *,struct napi_struct *,struct sk_buff *,unsigned);};
+struct rtl_fe {unsigned int unused;};
 struct rtl_qm_rx {
  void *ni,*ring_memory,*memory,*device;dma_addr_t memory_dma,ring_dma;unsigned read[8];
  u32 last_address,last_size,last_header[2],trace[32][7];unsigned trace_count;
- struct rtl_qm_refill refill;struct rtl9617c_ni_endpoint *pon;struct net_device *lan[5];bool profile;
+ struct rtl_qm_refill refill;struct rtl9617c_ni_endpoint *pon;struct net_device *lan[5];struct rtl_fe *fe;bool profile;
  u64 host_poll_ns,host_polls,voq_packets[8],poll_budget_hits;
+ u64 cpu_packets,cpu_bytes,ring_errors,buffer_errors;
  bool rx_prefetch,pppoe_rx_checksum;
 };
 static struct rtl_qm_rx *active;
@@ -77,6 +80,10 @@ static struct sk_buff *napi_alloc_skb(struct napi_struct *n,unsigned length){(vo
 static void *skb_put(struct sk_buff *s,unsigned n){void *p=s->data+s->len;s->len+=n;return p;}
 static void dev_kfree_skb_any(struct sk_buff *s){free(s);}
 static bool netif_running(struct net_device *d){return d->running;}
+static void rtl_fe_switch_rx(struct rtl_fe *fe,struct sk_buff *s,unsigned source,u32 h0,u32 h1) {
+ (void)h0;assert(fe==active->fe && source<5 && source==((h1>>9)&63));
+ assert(s->data==s->storage && s->len==64 && !s->protocol);
+}
 static unsigned eth_type_trans(struct sk_buff *s,struct net_device *d){(void)d;s->data+=14;s->len-=14;return ETH_P_IP;}
 static void packet_bytes(unsigned id,u8 *b){memset(b,0xa5,64);b[0]=2;b[12]=8;b[13]=0;b[14]=0x45;b[23]=17;b[36]=18081>>8;b[37]=18081&255;put(__builtin_bswap32(id),b+42);}
 static void enqueue(unsigned id){

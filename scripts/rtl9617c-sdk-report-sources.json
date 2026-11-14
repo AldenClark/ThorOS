@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "checked_on": "2026-11-14",
+  "repository": "BPI-SINOVOIP/BPI-RT2",
+  "commit": "c24c6c03c6466cfb1b9e4eacadab8225a457a771",
+  "scope": "Selected public source evidence only. No vendor SDK source is vendored in the product. This provenance checker does not compile or execute the selected inputs; separate field-oracle tests may compile isolated external declarations or converters. License labels describe notices, not a legal grant or formal clean-room certification.",
+  "files": [
+    {
+      "cache_name": "target.Makefile",
+      "path": "rtk_openwrt/target/linux/realtek_bb/Makefile",
+      "bytes": 2569,
+      "git_blob_sha1": "fe818bc55310f57780d0d5f026f6e2aa77e941e8",
+      "sha256": "307a77edde5f857492fbe50ff894be800eddfdc7a617dc663673909aed020e33",
+      "license_evidence": "copyright-only-no-file-license",
+      "limit": "Target declaration is not evidence of a complete buildable 9617C SDK."
+    },
+    {
+      "cache_name": "image.Makefile",
+      "path": "rtk_openwrt/target/linux/realtek_bb/image/Makefile",
+      "bytes": 7212,
+      "git_blob_sha1": "9714202abd159ec8fd0fcc151e8947d09b83f42d",
+      "sha256": "683f14d78d0660ba56366464fdb2bcb777fe6ce42308593af7bc72ace4e61927",
+      "license_evidence": "copyright-only-no-file-license",
+      "limit": "Taurus selects rtl8277C DTS naming; not TYFZA1 board mapping proof."
+    },
+    {
+      "cache_name": "registers.h",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/include/soc/cortina/registers.h",
+      "bytes": 2330,
+      "git_blob_sha1": "3165b2dd664aead49c175b9e5d0b8d2e2eb455bd",
+      "sha256": "8905c414564c54c352b0aff7d7c92ea2914f7ceeb67d97dfd9a57e358bc2a17e",
+      "license_evidence": "generated-no-file-license",
+      "limit": "Taurus non-FPGA register-header selection only."
+    },
+    {
+      "cache_name": "rtl8277c_registers.h",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/include/soc/cortina/rtl8277c_registers.h",
+      "bytes": 4043775,
+      "git_blob_sha1": "9f7aaf1bb0badeea31ef85f8bee1c405fa9c180d",
+      "sha256": "ce5940a274a14c91e5bf3cf96e4583d2d1d086ae601eb716566dfc70d87633e0",
+      "license_evidence": "generated-no-file-license",
+      "limit": "Byte-identical to pinned GP3000 header; counter width/default does not prove read side effects or drain semantics."
+    },
+    {
+      "cache_name": "dal_rtl8277c_l2.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/sdk/src/dal/rtl8277c/dal_rtl8277c_l2.c",
+      "bytes": 51891,
+      "git_blob_sha1": "fb2a9d8eb76c7f245f77f218559a1cdb37912fc9",
+      "sha256": "4cc834209695e433dd2b692771063ea0540845f450e29bfa68c8d3a64fa34369",
+      "license_evidence": "proprietary-notice",
+      "limit": "Real AAL calls, but different error, aging and static-flush behavior from pinned GP3000; not a drop-in upgrade."
+    },
+    {
+      "cache_name": "dal_rtl8277c_vlan.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/sdk/src/dal/rtl8277c/dal_rtl8277c_vlan.c",
+      "bytes": 12578,
+      "git_blob_sha1": "39ed31c77cc13335282bb6a8aebae4ae045f4bee",
+      "sha256": "73b5ff4bc8c3003f10f50434b15aabd99c3cb294083d1689ee7116ba2b3be509",
+      "license_evidence": "proprietary-notice",
+      "limit": "Key VLAN/PVID/member/FID entry points are successful no-op stubs; setters do not establish hardware configuration."
+    },
+    {
+      "cache_name": "FC.Makefile",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/Makefile",
+      "bytes": 11711,
+      "git_blob_sha1": "b3c8bff5e03a27505537a6f0ad5c6deaa12e839b",
+      "sha256": "02caa231968a1b169e990854c2f9fc79c53cfc363d908ea21223f41a75f9ffe7",
+      "license_evidence": "no-file-license-notice",
+      "limit": "77C build selects core/asicDrv/rtk_8277c_asicDriver.o, not the report-linked core/asicDriver/ca8277 source."
+    },
+    {
+      "cache_name": "rtk_rg_ca8277_asicDriver.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/core/asicDriver/rtk_rg_ca8277_asicDriver.c",
+      "bytes": 29789,
+      "git_blob_sha1": "7fd148f2781d346312529fd14af2c428e00234e3",
+      "sha256": "05a67962dcc689e090331e35eac2c91644d581d707c3608cfc80351b59f6f8f1",
+      "license_evidence": "proprietary-notice",
+      "limit": "Report-linked file states G3/8277B variants; must not be treated as the 77C implementation."
+    },
+    {
+      "cache_name": "rtk_8277c_asicDriver.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/core/asicDrv/rtk_8277c_asicDriver.c",
+      "bytes": 170806,
+      "git_blob_sha1": "c1bedf8e0166899f64c541d55f0bc3926416cb58",
+      "sha256": "d6f4c4c14d2449cfc8f3d00784e4a085a437658aec05bc2773081e15daff117a",
+      "license_evidence": "proprietary-notice",
+      "limit": "Actual 77C source exists in asicDrv; its QM/port path policy differs from GP3000 and must not be imported wholesale."
+    },
+    {
+      "cache_name": "rtk_fc_driver.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/core/rtk_fc_driver.c",
+      "bytes": 535689,
+      "git_blob_sha1": "408b675b981609ef726c99d8ad37803dd00a72da",
+      "sha256": "c26a8c4ae506d8261a3cf0c9b92ecef800236f171bf42fa550c23c1a016507ed",
+      "license_evidence": "proprietary-notice-plus-module-gpl",
+      "limit": "Contains both a proprietary header and MODULE_LICENSE GPL; no blanket redistribution conclusion. MC group replacement/free is not a CPU/EPP completion fence."
+    },
+    {
+      "cache_name": "rtk_fc_mgrTRx.c",
+      "path": "rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/src/rtk_fc_mgrTRx.c",
+      "bytes": 103615,
+      "git_blob_sha1": "ca2253f2e90f3b9dd331bfe20d8c07bd3f03ed1b",
+      "sha256": "f1547388923f56ef903af2b4fc0f24d0e8cf25f056f67cbc08514ad267a2eb58",
+      "license_evidence": "proprietary-notice",
+      "limit": "POL token handling still depends on full vendor setup; does not settle aa60 bit17 ordering for ThorOS."
+    }
+  ],
+  "comparison": {
+    "repository": "jameywine/GPL-for-GP3000",
+    "commit": "5090fbcb6ba743dd7b1314811ef557bad0460147",
+    "path": "linux-5.10.x/include/soc/cortina/rtl8277c_registers.h",
+    "bytes": 4043775,
+    "git_blob_sha1": "9f7aaf1bb0badeea31ef85f8bee1c405fa9c180d",
+    "sha256": "ce5940a274a14c91e5bf3cf96e4583d2d1d086ae601eb716566dfc70d87633e0",
+    "expected_relation": "byte-identical"
+  }
+}

@@ -111,15 +111,16 @@ int rtl_dma_tx_start(struct rtl_dma_tx *tx)
 	return 0;
 }
 
-void rtl_dma_tx_stop(struct rtl_dma_tx *tx)
+void rtl_dma_tx_quiesce(struct rtl_dma_tx *tx)
 {
 	void __iomem *base = tx->registers;
 
+	/* Withdraw new descriptor admission without resetting a prefetched
+	 * descriptor or reassigning its buffer. Readback is not an AXI drain;
+	 * the caller must retain all exposed DMA storage until reboot. */
 	writel(0, rtl_dma_vp(tx) + VP_ENABLE);
 	writel(readl(base + CTRL) & ~CTRL_ENABLE, base + CTRL);
-	writel(readl(base + CTRL) | CTRL_RESET, base + CTRL);
-	udelay(10);
-	writel(readl(base + CTRL) & ~CTRL_RESET, base + CTRL);
+	readl(base + CTRL);
 }
 
 void rtl_dma_tx_free(struct device *dev, struct rtl_dma_tx *tx)

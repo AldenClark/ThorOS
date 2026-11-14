@@ -43,6 +43,9 @@ rm -f "$TREE/files/lib/firmware/regulatory.db" \
     "$TREE/files/lib/firmware/regulatory.db.p7s" \
     "$TREE/files/etc/config/wireless"
 VERSION=$(cat "$PORT/../VERSION")
+# Project VERSION and OpenWrt's revision alone cannot distinguish ThorOS builds.
+# Embed public source identity, without build-host paths, timestamps or secrets.
+sh "$PORT/scripts/write-build-info.sh" "$TREE/files/etc/thoros-build-info"
 # Keep package choices, but always identify firmware by the project version.
 sed -i '/^CONFIG_VERSIONOPT=/d; /^# CONFIG_VERSIONOPT is not set$/d; /^CONFIG_VERSION_NUMBER=/d; /^CONFIG_VERSION_REPO=/d; /^CONFIG_SIGNED_PACKAGES=/d; /^# CONFIG_SIGNED_PACKAGES is not set$/d; /^CONFIG_SIGN_EACH_PACKAGE=/d; /^# CONFIG_SIGN_EACH_PACKAGE is not set$/d' "$TREE/.config"
 printf 'CONFIG_VERSIONOPT=y\nCONFIG_VERSION_NUMBER="%s"\n' "$VERSION" >> "$TREE/.config"

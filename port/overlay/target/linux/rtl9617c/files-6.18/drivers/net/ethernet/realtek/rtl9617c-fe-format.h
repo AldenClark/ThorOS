@@ -428,6 +428,11 @@ static inline void rtl_fe_ipv4_mask(unsigned int words[RTL_FE_MASK_WORDS])
  for (i = 0; i < 7; i++)
   words[i] = ~0U;
  words[7] = 0;
+ /* The key leaves l4_chksum_zero=0. Send zero-checksum traffic to Linux,
+  * including otherwise-valid IPv4 UDP, rather than depend on warm parser
+  * state for the separate IPv6 UDP zero-checksum policy. This is not a
+  * generic L4 checksum-error check; transparent L2 masks are unchanged. */
+ rtl_fe_bits_set(words,0,1,0);
  /* TTL mask is a two-bit selector:0 ignores TTL;3 hashes a range code. */
  words[1] &= ~(3U << 23);
  words[0] = (words[0] & ~0x07fffc00U) | 0x00000000U; /* l4_dp_exact_range */
@@ -452,6 +457,10 @@ static inline void rtl_fe_ipv4_mask(unsigned int words[RTL_FE_MASK_WORDS])
 static inline void rtl_fe_ipv6_mask(unsigned int words[RTL_FE_MASK_WORDS])
 {
  rtl_fe_ipv4_mask(words);
+ /* aal_hash_mask_t keeps separate destination/routing/hop-by-hop flags.
+  * Do not assume ip_options covers these IPv6 extension headers. The
+  * installed key leaves each flag zero, so such packets use the CPU path. */
+ rtl_fe_bits_set(words,49,3,0);
  rtl_fe_bits_set(words,58,9,128); /* full128-bit destination */
  rtl_fe_bits_set(words,67,9,128); /* full128-bit source */
 }

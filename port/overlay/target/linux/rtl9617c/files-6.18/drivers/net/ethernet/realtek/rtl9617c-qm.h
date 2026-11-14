@@ -15,6 +15,8 @@
 #define RTL_QM_BUFFERS (2 * RTL_QM_BUFFERS_PER_EQ)
 #define RTL_QM_MEMORY_BYTES (RTL_QM_RING_BYTES * RTL_QM_VOQS + RTL_QM_BUFFERS * RTL_QM_BUFFER_BYTES)
 
+struct rtl_fe;
+
 struct rtl_qm_rx {
 	void __iomem *ni;
 	void __iomem *axi_reorder;
@@ -34,12 +36,17 @@ struct rtl_qm_rx {
 	u32 trace[32][7];
 	unsigned int trace_count;
 	struct net_device __rcu *lan[5];
+	/* Shared lifetime: allocated before LAN registration, freed after NAPI. */
+	struct rtl_fe *fe;
 	struct rtl_qm_refill refill;
 	struct rtl9617c_ni_endpoint __rcu *pon;
 	bool profile;
 	u64 host_poll_ns, host_polls;
 	u64 voq_packets[RTL_QM_VOQS];
 	u64 poll_budget_hits;
+	/* Valid L2 bytes delivered to the CPU, including allocation drops. */
+	u64 cpu_packets, cpu_bytes;
+	u64 ring_errors, buffer_errors;
 	bool rx_prefetch;
 	bool pppoe_rx_checksum;
 };

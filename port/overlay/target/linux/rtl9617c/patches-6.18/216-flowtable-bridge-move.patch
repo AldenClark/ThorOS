@@ -1,6 +1,13 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: retire cached DIRECT paths after bridge FDB moves
+
+Refreshed against Linux v6.18.60 with the pinned OpenWrt generic patches.
+No semantic change from the original 216 patch; do not rely on patch fuzz to
+place the flowtable path and garbage-collection hooks.
+
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -148,6 +148,8 @@
+@@ -151,6 +151,8 @@ struct flow_offload_tuple {
  		struct {
  			u32		ifidx;
  			u32		hw_ifidx;
@@ -9,7 +16,7 @@
  			u8		h_source[ETH_ALEN];
  			u8		h_dest[ETH_ALEN];
  		} out;
-@@ -214,6 +216,8 @@
+@@ -218,6 +220,8 @@ struct nf_flow_route {
  		struct {
  			u32			ifindex;
  			u32			hw_ifindex;
@@ -17,10 +24,10 @@
 +			u16			bridge_vid;
  			u8			h_source[ETH_ALEN];
  			u8			h_dest[ETH_ALEN];
- 		} out;
+ 			u8			bridge_path:1,
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
-@@ -84,6 +84,8 @@
+@@ -90,6 +90,8 @@ struct nft_forward_info {
  	} encap[NF_FLOW_TABLE_ENCAP_MAX];
  	u8 num_encaps;
  	u8 ingress_vlans;
@@ -28,8 +35,8 @@
 +	u16 bridge_vid;
  	u8 h_source[ETH_ALEN];
  	u8 h_dest[ETH_ALEN];
- 	enum flow_offload_xmit_type xmit_type;
-@@ -130,6 +132,9 @@
+ 	u8 bridge_path:1,
+@@ -142,6 +144,9 @@ static int nft_dev_path_info(const struct net_device_path_stack *stack,
  				memcpy(info->h_dest, path->encap.h_dest, ETH_ALEN);
  			break;
  		case DEV_PATH_BRIDGE:
@@ -39,29 +46,29 @@
  			if (is_zero_ether_addr(info->h_source))
  				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
  
-@@ -223,6 +228,9 @@
- 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
- 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+@@ -248,6 +253,9 @@ static int nft_dev_forward_path(struct nf_flow_route *route,
+ 		route->tuple[dir].out.bridge_vlan = info.bridge_vlan;
+ 		route->tuple[dir].out.port_vlans = info.port_vlans;
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
 +		route->tuple[dir].out.bridge_ifindex = info.bridge_ifindex;
 +		route->tuple[dir].out.bridge_port = info.bridge_port;
 +		route->tuple[dir].out.bridge_vid = info.bridge_vid;
  		route->tuple[dir].xmit_type = info.xmit_type;
  	}
- }
+ 
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -5,6 +5,7 @@
- #include <linux/netfilter.h>
+@@ -6,6 +6,7 @@
  #include <linux/rhashtable.h>
+ #include <linux/if_vlan.h>
  #include <linux/netdevice.h>
 +#include <linux/if_bridge.h>
  #include <net/ip.h>
  #include <net/ip6_route.h>
  #include <net/netfilter/nf_flow_table.h>
-@@ -127,6 +128,9 @@
- 		       ETH_ALEN);
- 		flow_tuple->out.ifidx = route->tuple[dir].out.ifindex;
+@@ -131,6 +132,9 @@ static int flow_offload_fill_route(struct flow_offload *flow,
+ 		flow_tuple->bridge_vlan = route->tuple[dir].out.bridge_vlan;
+ 		flow_tuple->port_vlans = route->tuple[dir].out.port_vlans;
  		flow_tuple->out.hw_ifidx = route->tuple[dir].out.hw_ifindex;
 +		flow_tuple->out.bridge_ifidx = route->tuple[dir].out.bridge_ifindex;
 +		flow_tuple->out.bridge_port = route->tuple[dir].out.bridge_port;
@@ -69,7 +76,7 @@
  		dst_release(dst);
  		break;
  	case FLOW_OFFLOAD_XMIT_XFRM:
-@@ -396,6 +400,31 @@
+@@ -400,6 +404,31 @@ void flow_offload_teardown(struct flow_offload *flow)
  }
  EXPORT_SYMBOL_GPL(flow_offload_teardown);
  
@@ -101,7 +108,7 @@
  struct flow_offload_tuple_rhash *
  flow_offload_lookup(struct nf_flowtable *flow_table,
  		    struct flow_offload_tuple *tuple)
-@@ -416,6 +445,10 @@
+@@ -420,6 +449,10 @@ flow_offload_lookup(struct nf_flowtable *flow_table,
  
  	if (unlikely(nf_ct_is_dying(flow->ct)))
  		return NULL;
@@ -112,9 +119,7 @@
  
  	return tuplehash;
  }
-@@ -617,8 +650,9 @@
- 
- 	if (nf_flow_has_expired(flow) ||
+@@ -615,6 +648,7 @@ static void nf_flow_offload_gc_step(struct nf_flowtable *flow_table,
  	    nf_ct_is_dying(flow->ct) ||
  	    !nf_flow_dst_valid(flow_table, flow, FLOW_OFFLOAD_DIR_ORIGINAL) ||
  	    !nf_flow_dst_valid(flow_table, flow, FLOW_OFFLOAD_DIR_REPLY) ||
@@ -124,7 +129,7 @@
  		teardown = true;
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h
-@@ -174,6 +174,8 @@
+@@ -173,6 +173,8 @@ static inline int br_mst_get_state(const struct net_device *dev, u16 msti,
  #endif
  
  #if IS_ENABLED(CONFIG_BRIDGE)
@@ -133,7 +138,7 @@
  struct net_device *br_fdb_find_port(const struct net_device *br_dev,
  				    const unsigned char *addr,
  				    __u16 vid);
-@@ -185,6 +187,12 @@
+@@ -184,6 +186,12 @@ u8 br_port_get_stp_state(const struct net_device *dev);
  clock_t br_get_ageing_time(const struct net_device *br_dev);
  #else
  static inline struct net_device *
@@ -148,7 +153,7 @@
  		 __u16 vid)
 --- a/net/bridge/br_fdb.c
 +++ b/net/bridge/br_fdb.c
-@@ -232,7 +232,7 @@
+@@ -232,7 +232,7 @@ static struct net_bridge_fdb_entry *br_fdb_find(struct net_bridge *br,
  	return fdb;
  }
  
@@ -157,7 +162,7 @@
  				    const unsigned char *addr,
  				    __u16 vid)
  {
-@@ -241,21 +241,30 @@
+@@ -241,23 +241,32 @@ struct net_device *br_fdb_find_port(const struct net_device *br_dev,
  	struct net_device *dev = NULL;
  	struct net_bridge *br;
  
@@ -174,9 +179,10 @@
  		if (dst)
  			dev = dst->dev;
  	}
-+
-+	return dev;
-+}
+-	rcu_read_unlock();
+ 
+ 	return dev;
+ }
 +EXPORT_SYMBOL_GPL(br_fdb_find_port_rcu);
 +
 +struct net_device *br_fdb_find_port(const struct net_device *br_dev,
@@ -187,8 +193,9 @@
 +	ASSERT_RTNL();
 +	rcu_read_lock();
 +	dev = br_fdb_find_port_rcu(br_dev, addr, vid);
- 	rcu_read_unlock();
--
- 	return dev;
- }
++	rcu_read_unlock();
++	return dev;
++}
  EXPORT_SYMBOL_GPL(br_fdb_find_port);
+ 
+ /* A hardware hit has the same ageing effect as a packet seen by the bridge. */

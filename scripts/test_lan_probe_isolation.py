@@ -63,7 +63,8 @@ struct rtl_xram;
 struct rtl_lan {struct rtl_xram *shared;unsigned int port;};
 struct net_device {
  struct rtl_lan lan;struct phy_device *phydev;char name[16];
- void *netdev_ops,*ethtool_ops;int max_mtu;u8 dev_addr[6];
+ void *netdev_ops,*ethtool_ops;int max_mtu;u8 dev_addr[6];unsigned long netns_immutable:1;
+ unsigned int dev_port;
 };
 struct tyfza1_led {void *output;int requested;struct {char *name;int max_brightness;} cdev;};
 struct rtl_xram {
@@ -73,7 +74,7 @@ struct rtl_xram {
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
  bool phy_led_registered,qm_rx,native_groups_created;
- int tx_lock;void *fe;
+ int tx_lock,dma;void *fe;
 };
 static struct device_node nodes[5];
 static struct phy_device phys[5];
@@ -122,8 +123,11 @@ static int rtl_fe_add_port(void *fe,struct net_device *d,int p,int q,int r){
  fe_ports|=BIT(d->lan.port);return 0;
 }
 static void rtl_fe_remove_port(void *fe,struct net_device *d){fe_ports&=~BIT(d->lan.port);}
+static void rtl_dma_tx_forget(int *dma,struct net_device *d){(void)dma;(void)d;}
 static int register_netdevice(struct net_device *d){
  assert(rtnl_held);
+ assert(d->netns_immutable);
+ assert(d->dev_port==d->lan.port);
  if(stage==8 && current_port==fail_port)return -EIO;
  assert(d->phydev);active|=BIT(d->lan.port);return 0;
 }
@@ -179,6 +183,7 @@ int main(void){
     assert(!strcmp(priv.ports[p]->name,name));
     assert(priv.ports[p]->lan.port==(unsigned int)p && priv.ports[p]->phydev==&phys[p]);
     assert(priv.ports[p]->dev_addr[5]==3+p);
+    assert(priv.ports[p]->netns_immutable);
    }
   }
   if(board_ports==5 && !(expected&BIT(4)))assert(!power && !actions);

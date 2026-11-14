@@ -146,8 +146,15 @@ int main(void) {
    assert(program(&pon,&paths)==-ETIMEDOUT);
    fail_register=0;
   }
+  /* A prior PDC timeout still owns DATA0/1 while ACCESS remains busy. */
+  registers[0x9020/4]=BIT(31)|8;
+  registers[0x9028/4]=0x12345678;registers[0x9024/4]=0x9abcdef0;
+  assert(program(&pon,&paths)==-EBUSY);
+  assert(registers[0x9028/4]==0x12345678 && registers[0x9024/4]==0x9abcdef0);
+  registers[0x9020/4]=0;
+  assert(!program(&pon,&paths));
  }
- puts("GTC/XGTC business tables: empty/add/replace, PLOAM ownership, OMCC retained; one burst wait after all business schedulers stop, no global flush; table timeout propagates");
+ puts("GTC/XGTC business tables: directions, PLOAM/OMCC ownership, one burst wait, timeout propagation and PDC staging ownership passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='tyfza1-gem-direction-') as directory:

@@ -1,0 +1,14 @@
+--- a/drivers/net/ethernet/realtek/Kconfig
++++ b/drivers/net/ethernet/realtek/Kconfig
+@@ -17,8 +17,9 @@
+ config RTL9617C_XRAM_ETH
+-	tristate "RTL9617C management XRAM Ethernet"
++	bool "RTL9617C management XRAM Ethernet"
+-	depends on OF && ARCH_RTL9617C && PHYLIB
++	depends on OF && ARCH_RTL9617C && PHYLIB=y && INET && NET_SWITCHDEV
+ 	select CRC32
++	select RTL9617C_SWITCH_GUARD
+ 	select NETFILTER
+ 	select NETFILTER_INGRESS
+ 	select SKB_EXTENSIONS
+ 	select NET_CLS_ACT

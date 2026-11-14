@@ -4,6 +4,18 @@
 #include "rtl9617c-fe-format.h"
 #include "rtl9617c-qm-deepq.h"
 
+/* A failed indirect access can leave the hardware using its DATA window.
+ * The owner mutex excludes other software users, not a timed-out command.
+ * Do not stage another command's data until that window is idle. Normal
+ * transactions already completed their previous access; busy is a retryable
+ * fault here, not a reason to overwrite the in-flight request. */
+static inline int rtl_fe_window_idle(const struct rtl_dq_io *io, unsigned int reg)
+{
+ unsigned int busy=(reg==0x38b0 || reg==0x38e0 || reg==0x393c)?1U:0x80000000U;
+
+ return (io->read(io->context,reg)&busy)?-EBUSY:0;
+}
+
 /* A 224-bit mask occupies two 128-bit hardware banks. Addr bit6 selects
  * the upper bank; DATA0..3 are arranged in reverse register-address order.
  * The owner serializes these transactions with the FE table mutex. */
@@ -14,6 +26,9 @@ static inline int rtl_fe_mask_write(const struct rtl_dq_io *io, unsigned int ind
  int ret;
 
  for (bank = 0; bank < 2; bank++) {
+  ret = rtl_fe_window_idle(io, 0x3910);
+  if (ret)
+   return ret;
   for (word = 0; word < 4; word++)
    io->write(io->context, 0x3920 - word * 4, words[bank * 4 + word]);
   ret = io->indirect(io->context, 0x3910, 0xc0000000U | (bank << 6) | index);
@@ -46,9 +61,13 @@ static inline int rtl_fe_crc_hardware(const struct rtl_dq_io *io,
  const unsigned int header[RTL_FE_HEADER_WORDS], unsigned int mask,
  unsigned int *crc32, unsigned short *crc16)
 {
- unsigned int i, tuple=io->read(io->context,0x3704);
+ unsigned int i, tuple;
  int ret;
 
+ ret = rtl_fe_window_idle(io, 0x38e0);
+ if (ret)
+  return ret;
+ tuple=io->read(io->context,0x3704);
  io->write(io->context, 0x38d8, 0);
  for (i = 0; i < RTL_FE_HEADER_WORDS; i++)
   io->write(io->context, 0x38dc, header[i]);
@@ -152,6 +171,8 @@ static inline int rtl_fe_main_age_read(const struct rtl_dq_io *io,
 static inline int rtl_fe_cache_command(const struct rtl_dq_io *io,unsigned int index,
  unsigned short crc16,unsigned int command)
 {
+ int ret=rtl_fe_window_idle(io,0x38b0);
+ if(ret)return ret;
  io->write(io->context,0x38ac,(index&31)|((unsigned int)crc16<<5)|(3U<<26)|(command<<30));
  return io->indirect(io->context,0x38b0,1);
 }

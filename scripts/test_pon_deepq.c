@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /* Execute native DQ/PUC sequences against ownership and indirect-table models. */
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-qm-deepq.h"

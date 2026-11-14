@@ -16,6 +16,7 @@
 #include <linux/rcupdate.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-qm.h"
+#include "rtl9617c-fe.h"
 #include "rtl9617c-rx-checksum.h"
 
 #define EQ_ID 4
@@ -30,16 +31,34 @@
 #define CPU_READY 0x6368
 #define CB_CTRL 0x950c
 
+static int rtl_qm_window_idle(struct rtl_qm_rx *rx, unsigned int reg)
+{
+	/* A timed-out transaction still owns its DATA window. An engine restart
+	 * must not overwrite that staging area until ACCESS is idle again. */
+	return readl(rx->ni + reg) & BIT(31) ? -EBUSY : 0;
+}
+
 static int rtl_qm_indirect(struct rtl_qm_rx *rx, unsigned int reg, u32 value)
 {
 	u32 status;
+	int ret = rtl_qm_window_idle(rx, reg);
 
+	if (ret)
+		return ret;
 	writel(value, rx->ni + reg);
 	return readl_poll_timeout(rx->ni + reg, status, !(status & BIT(31)), 1, 100000);
 }
 
 static int rtl_qm_attribute(struct rtl_qm_rx *rx, unsigned int entry, u32 value)
 {
+	int ret = rtl_qm_window_idle(rx, 0x66a4);
+
+	if (ret)
+		return ret;
+	/* DATA1 holds the upper two bits of the eight-bit AXI address prefix.
+	 * Native DMA uses prefix 0x02 (or zero for disabled attributes), so do
+	 * not inherit high address bits from an earlier window transaction. */
+	writel(0, rx->ni + 0x66a8);
 	writel(value, rx->ni + 0x66ac);
 	return rtl_qm_indirect(rx, 0x66a4, BIT(31) | BIT(30) | entry);
 }
@@ -52,6 +71,9 @@ static int rtl_qm_pon_destination_map(struct rtl_qm_rx *rx)
 	/* LDPID32..63 must enter PDPID8 (QM) for both my-MAC and deep-Q flags. */
 	for (flags = 0; flags < 256; flags += 64)
 		for (port = 32; port < 64; port++) {
+			ret = rtl_qm_window_idle(rx, 0x1654);
+			if (ret)
+				return ret;
 			writel(8, rx->ni + 0x1658);
 			ret = rtl_qm_indirect(rx, 0x1654, BIT(31) | BIT(30) | flags | port);
 			if (ret)
@@ -109,13 +131,22 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	 * Port0 previously worked with the reset default;ports1..3 need their
 	 * own mapping rather than inheriting port0 as the egress destination. */
 	for (i = 0; i < 256; i += 64) {
+		ret = rtl_qm_window_idle(rx, 0x1654);
+		if (ret)
+			return ret;
 		writel(i & 64 ? 8 : port, rx->ni + 0x1658);
 		ret = rtl_qm_indirect(rx, 0x1654, BIT(31) | BIT(30) | i | port);
 		if (ret)
 			return ret;
 	}
+	ret = rtl_qm_window_idle(rx, 0x11dc);
+	if (ret)
+		return ret;
 	writel(port, rx->ni + 0x11e0);
 	ret = rtl_qm_indirect(rx, 0x11dc, BIT(31) | BIT(30) | port);
+	if (ret)
+		return ret;
+	ret = rtl_qm_window_idle(rx, 0x11e4);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(ilpb); i++)
@@ -123,9 +154,15 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	ret = rtl_qm_indirect(rx, 0x11e4, BIT(31) | BIT(30) | port);
 	if (ret)
 		return ret;
+	ret = rtl_qm_window_idle(rx, 0x1b0c);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(key); i++)
 		writel(key[i], rx->ni + 0x1b40 - 4 * i);
 	ret = rtl_qm_indirect(rx, 0x1b0c, BIT(31) | BIT(30));
+	if (ret)
+		return ret;
+	ret = rtl_qm_window_idle(rx, 0x1b44);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(fib); i++)
@@ -134,6 +171,9 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	if (ret)
 		return ret;
 	/* Vendor mapping: logical CPU port 16 uses PDPID9, distinct from deep-Q8. */
+	ret = rtl_qm_window_idle(rx, 0x1654);
+	if (ret)
+		return ret;
 	writel(9, rx->ni + 0x1658);
 	ret = rtl_qm_indirect(rx, 0x1654, BIT(31) | BIT(30) | 16);
 	if (ret)
@@ -148,10 +188,16 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	if (ret)
 		return ret;
 	/* PONCLE TCAM: match this LAN source port and redirect it to CPU0. */
+	ret = rtl_qm_window_idle(rx, 0x1e04);
+	if (ret)
+		return ret;
 	writel(~(port << 6), rx->ni + 0x1e10);
 	writel(~0U, rx->ni + 0x1e0c);
 	writel(~0U, rx->ni + 0x1e08);
 	ret = rtl_qm_indirect(rx, 0x1e04, BIT(31) | BIT(30) | port);
+	if (ret)
+		return ret;
+	ret = rtl_qm_window_idle(rx, 0x1e04);
 	if (ret)
 		return ret;
 	writel(~0xfc0U | (port << 6), rx->ni + 0x1e10);
@@ -160,10 +206,16 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	ret = rtl_qm_indirect(rx, 0x1e04, BIT(31) | BIT(30) | (512 + port));
 	if (ret)
 		return ret;
+	ret = rtl_qm_window_idle(rx, 0x1e14);
+	if (ret)
+		return ret;
 	writel(0, rx->ni + 0x1e20);
 	writel((3 << 5) | (16 << 8), rx->ni + 0x1e1c);
 	writel(BIT(6), rx->ni + 0x1e18);
 	ret = rtl_qm_indirect(rx, 0x1e14, BIT(31) | BIT(30) | port);
+	if (ret)
+		return ret;
+	ret = rtl_qm_window_idle(rx, 0x1420);
 	if (ret)
 		return ret;
 	writel(BIT(1), rx->ni + 0x1428);
@@ -254,6 +306,9 @@ static int rtl_qm_cpu_credits(struct rtl_qm_rx *rx)
 	writel((RTL_QM_BUFFERS_PER_EQ / 8) << 16 |
 	       (RTL_QM_BUFFERS_PER_EQ / 64), rx->ni + 0x9580);
 	writel(0x3fff3fff, rx->ni + 0x9590);
+	ret = rtl_qm_window_idle(rx, 0x95a8);
+	if (ret)
+		return ret;
 	writel(RTL_QM_BUFFERS_PER_EQ | BIT(14) |
 	       (RTL_QM_BUFFERS_PER_EQ << 16) | BIT(30), rx->ni + 0x95ac);
 	ret = rtl_qm_indirect(rx, 0x95a8, BIT(31) | BIT(30));
@@ -261,11 +316,17 @@ static int rtl_qm_cpu_credits(struct rtl_qm_rx *rx)
 		return ret;
 	writel(12 | (12 << 16), rx->ni + 0x9560 + EQ_ID * 4);
 	for (voq = 0; voq < RTL_QM_VOQS; voq++) {
+		ret = rtl_qm_window_idle(rx, 0x95c0);
+		if (ret)
+			return ret;
 		writel(0, rx->ni + 0x95c4);
 		ret = rtl_qm_indirect(rx, 0x95c0, BIT(31) | BIT(30) | voq);
 		if (ret)
 			return ret;
 	}
+	ret = rtl_qm_window_idle(rx, 0x95b0);
+	if (ret)
+		return ret;
 	writel(0, rx->ni + 0x95b4);
 	writel(3 << 24, rx->ni + 0x95b8);
 	writel(((RTL_QM_BUFFERS_PER_EQ * 7 / 8) << 14) |
@@ -296,6 +357,10 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	ret = readl_poll_timeout(ni + 0x6850, value, value & BIT(30), 1, 100000);
 	if (ret)
 		return ret;
+	/* ES_CTRL1's declared reset value enables every PUC port. Do not rely
+	 * on a pre-reset gate write surviving the reset's implementation. */
+	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
+	readl(ni + 0x610c);
 	/* TQM reset invalidates old BIDs; all buffers are loaded anew below. */
 	memset(&rx->refill, 0, sizeof(rx->refill));
 	writel(readl(ni + RMU_CTRL) & ~BIT(31), ni + RMU_CTRL);
@@ -383,6 +448,9 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		return ret;
 	/* The vendor credit table marks counter MSBs valid during initialization. */
 	for (i = 0; i < 16; i++) {
+		ret = rtl_qm_window_idle(rx, 0x2db4);
+		if (ret)
+			return ret;
 		writel(0x8e308000, ni + 0x2db8);
 		ret = rtl_qm_indirect(rx, 0x2db4, BIT(31) | BIT(30) | i);
 		if (ret)
@@ -393,13 +461,19 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 8);
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 9);
 	/* Stock aal_l3_te_init starts CB scanning after credit initialization. */
+	/* Reassert the closed PON gate before either ES or RMU is enabled.
+	 * NI alone publishes the requested mask after full host activation. */
+	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
+	readl(ni + 0x610c);
 	writel(readl(ni + CB_CTRL) | BIT(31), ni + CB_CTRL);
 	/* The CB conditions only govern admission when L3 tail-drop is enabled. */
 	writel(readl(ni + 0x9004) | BIT(2), ni + 0x9004);
 	/* CRC is stripped by QM; CPU0 dequeue and normal NI input are enabled. */
 	/* Keep the reset EPP wait setting, as the vendor RMW sequence does. */
 	writel(0x8462ff01, ni + ES_CTRL);
-	writel(readl(ni + 0x610c) | 0xffffU, ni + 0x610c);
+	/* NI's lifetime owner enables the requested PON ports under tx_lock
+	 * only after FE validation and host publication. Do not race its saved
+	 * recovery mask or open PON egress during a failed cold initialization. */
 	writel(readl(ni + RMU_CTRL) | BIT(31), ni + RMU_CTRL);
 	rx->deepq_configured = true;
 	return 0;
@@ -449,12 +523,23 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 		/* Stock ca_ni_rx_napi consumes only the published pointer interval.
 		 * Queue status can precede DDR publication and does not republish EPPs. */
 		unsigned int wr = readl(rx->ni + EPP_WRITE + cos * 4) & 0xffffff;
+		unsigned int rd, end;
+
+		/* SDK CPUEPP64 pointers are byte offsets of 8-byte commands. Do not
+		 * turn a corrupt/reset-in-progress pointer into an out-of-mapping DMA
+		 * sync or consume another VOQ's ring. Leave its ownership unchanged. */
+		if (wr >= RTL_QM_RING_BYTES || rx->read[cos] >= RTL_QM_RING_BYTES ||
+		    ((wr | rx->read[cos]) & (RTL_QM_COMMAND_BYTES - 1))) {
+			rx->ring_errors++;
+			dev->stats.rx_errors++;
+			continue;
+		}
 
 		/* Only published commands are CPU-owned. The ring is CPU read-only
 		 * after startup; invalidate again for each newly sampled interval,
 		 * including a shared cache line that hardware extended since then. */
-		unsigned int rd = round_down(rx->read[cos], L1_CACHE_BYTES);
-		unsigned int end = round_up(wr, L1_CACHE_BYTES);
+		rd = round_down(rx->read[cos], L1_CACHE_BYTES);
+		end = round_up(wr, L1_CACHE_BYTES);
 		if (rx->read[cos] != wr) {
 			unsigned int base = cos * RTL_QM_RING_BYTES;
 			if (wr < rx->read[cos]) {
@@ -475,24 +560,31 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			struct sk_buff *skb;
 			struct net_device *input;
 			unsigned int source;
-			bool refill_buffer = false;
+			bool refill_buffer = false, valid_buffer;
 
 			dma_rmb();
 			command = get_unaligned_le32(entry);
 			length_word = get_unaligned_le32(entry + 4);
 			address = command & 0xffffff80;
-			if (((command & 15) == EQ_ID || (command & 15) == EQ_ID + 1) &&
+			offset = address - lower_32_bits(rx->memory_dma);
+			/* Each CPU EQ owns a separate 256-buffer partition. Returning an
+			 * address from EQ4 as EQ5 (or vice versa) would create two owners
+			 * of that RAM, even though the address is in the overall pool. */
+			valid_buffer = offset >= RTL_QM_RING_BYTES * RTL_QM_VOQS &&
+				offset <= RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES &&
+				!(offset & (RTL_QM_BUFFER_BYTES - 1)) &&
+				(command & 15) == EQ_ID +
+				(offset - RTL_QM_RING_BYTES * RTL_QM_VOQS) /
+				(RTL_QM_BUFFERS_PER_EQ * RTL_QM_BUFFER_BYTES);
+			if (valid_buffer &&
 			    rx->refill.count[(command & 15) - EQ_ID] == RTL_QM_REFILL_SIZE)
 				break;
 			rx->last_address = command;
 			rx->last_size = length_word;
-			offset = address - lower_32_bits(rx->memory_dma);
 			count++;
 			rx->voq_packets[cos]++;
-			if (offset < RTL_QM_RING_BYTES * RTL_QM_VOQS ||
-			    offset > RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES ||
-			    (offset & (RTL_QM_BUFFER_BYTES - 1)) ||
-			    ((command & 0xf) != EQ_ID && (command & 0xf) != EQ_ID + 1)) {
+			if (!valid_buffer) {
+				rx->buffer_errors++;
 				dev->stats.rx_errors++;
 				goto consume;
 			}
@@ -514,6 +606,8 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				dev->stats.rx_errors++;
 				goto consume;
 			}
+			rx->cpu_packets++;
+			rx->cpu_bytes += length;
 			/* Warm only validated, CPU-owned bytes while allocating the skb. */
 			if (READ_ONCE(rx->rx_prefetch))
 				for (unsigned int i = 0; i < length; i += L1_CACHE_BYTES)
@@ -568,6 +662,10 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				trace[4] = h0; trace[5] = h1;
 				trace[6] = get_unaligned_be32(skb->data + 42);
 			}
+			/* Preserve the validated physical LSPID and complete Ethernet
+			 * frame for the switch owner. HeaderA packet type or mirror bits
+			 * alone do not prove that hardware already forwarded this skb. */
+			rtl_fe_switch_rx(rx->fe, skb, source, h0, h1);
 			skb->protocol = eth_type_trans(skb, input);
 			input->stats.rx_packets++;
 			input->stats.rx_bytes += length;
@@ -591,26 +689,31 @@ consume:
 
 ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 {
-	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u\n",
+	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u cpu_packets=%llu cpu_bytes=%llu ring_errors=%llu buffer_errors=%llu\n",
 		READ_ONCE(rx->voq_packets[7]), READ_ONCE(rx->voq_packets[6]),
 		READ_ONCE(rx->voq_packets[5]), READ_ONCE(rx->voq_packets[4]),
 		READ_ONCE(rx->voq_packets[3]), READ_ONCE(rx->voq_packets[2]),
 		READ_ONCE(rx->voq_packets[1]), READ_ONCE(rx->voq_packets[0]),
 		READ_ONCE(rx->poll_budget_hits), READ_ONCE(rx->rx_prefetch),
-		READ_ONCE(rx->pppoe_rx_checksum));
+		READ_ONCE(rx->pppoe_rx_checksum), READ_ONCE(rx->cpu_packets),
+		READ_ONCE(rx->cpu_bytes), READ_ONCE(rx->ring_errors),
+		READ_ONCE(rx->buffer_errors));
 }
 
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 {
 	u32 drop_info = readl(rx->ni + 0x6814);
-	writel(0x82, rx->ni + 0x105c);
-	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
+	/* Observing state must not overwrite another diagnostic owner's debug
+	 * selector. The returned bus sample is labeled with the observed selector,
+	 * not silently interpreted as the formerly forced bus 0x82. */
+	u32 monitor_selector = readl(rx->ni + 0x105c);
+	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
 		&rx->memory_dma, readl(rx->ni + RMU_CTRL), readl(rx->ni + ES_CTRL),
 		readl(rx->ni + 0x6850), readl(rx->ni + 0x6328 + EQ_ID * 4),
 		readl(rx->ni + CPU_READY), readl(rx->ni + 0x659c),
 		readl(rx->ni + EPP_WRITE), readl(rx->ni + EPP_READ),
 		rx->last_address, rx->last_size, rx->last_header[0], rx->last_header[1],
-		readl(rx->ni + 0x1060), readl(rx->ni + 0xa1dc), readl(rx->ni + 0x67d8),
+		readl(rx->ni + 0x1060), monitor_selector, readl(rx->ni + 0xa1dc), readl(rx->ni + 0x67d8),
 		readl(rx->ni + 0x67ec), readl(rx->ni + 0x6818), drop_info & 15,
 		(drop_info >> 16) & 511, readl(rx->ni + 0x681c),
 		readl(rx->ni + 0x6824), readl(rx->ni + 0x2d60), readl(rx->ni + 0x2d64),

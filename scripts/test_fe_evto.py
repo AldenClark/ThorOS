@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Feed the OLT snapshot through production FE conversion and bridge hooks."""
+"""Feed an OLT snapshot through the production EVTO compiler.
+
+The retired bridge learner is a historical host-only input fixture, not an
+enabled datapath or evidence that autonomous bridge acceleration is supported.
+"""
 from pathlib import Path
 import struct
 import subprocess
@@ -120,7 +124,7 @@ int main(void) {
  routed.bridge=true;assert(fe_itu_rule(&routed)==-EOPNOTSUPP);
  free(service);
  puts("Local VLAN WAN: both routed hardware directions start after UNI; tagged bridge traffic still rejected by OLT policy");
- puts("EVTO FE: routed upstream editor words, both learned bridge directions, original wire GEM/TCI and configuration generation passed");
+ puts("Production EVTO compiler: routed editor words and historical bridge-fixture GEM/TCI/generation vectors passed (no production learner)");
 }
 '''
 functions = ''.join(function(name) for name in ['fe_bridge_physical','fe_bridge_frame',

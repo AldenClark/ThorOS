@@ -99,7 +99,10 @@ static void dma_sync_single_for_device(void *d,unsigned address,unsigned bytes,i
 }
 '''
 lifecycle+=source[stop:stop_end]
-lifecycle+='static void reopen(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;\n'+source[start:end]+'\n}\n'
+# This low-level test covers independent cold-start pointer/cache states,
+# not ordinary NI reopen. test_ni_owner_lifetime proves warm reopen must not
+# execute this reset/republish sequence against an already-exposed owner.
+lifecycle+='static void cold_prepare(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;\n'+source[start:end]+'\n}\n'
 lifecycle+=r'''
 int main(void){
  struct rtl_qm_rx rx={.ni=registers,.ring_memory=cpu,.ring_dma=0x6000000,.memory_dma=0x4000000};
@@ -109,12 +112,12 @@ int main(void){
   writel(~0U,registers+CB_CTRL);writel(~0U,registers+RMU_CTRL);writel(~0U,registers+ES_CTRL);writel(~0U,registers+0x610c);
   rx.deepq_configured=true;rtl_qm_rx_stop(&rx);
   assert(!rx.deepq_configured&&!(readl(registers+CB_CTRL)&BIT(31))&&!(readl(registers+RMU_CTRL)&BIT(31))&&!(readl(registers+ES_CTRL)&BIT(31))&&!(readl(registers+0x610c)&0xffff));
-  synced=retired=reordered=0;rx.trace_count=99;reopen(&rx);
+  synced=retired=reordered=0;rx.trace_count=99;cold_prepare(&rx);
   assert(synced==1&&rx.trace_count==0);
   for(unsigned i=0;i<8;i++)assert(rx.read[i]==readl(registers+EPP_WRITE+i*4)&&rx.read[i]==readl(registers+EPP_READ+i*4));
   for(unsigned i=0;i<sizeof(hardware);i++)assert(hardware[i]==0);
  }
- puts("Cached EPP lifecycle: native stop and repeated ring reinitialization retire all eight pointers and publish cleared cache lines");
+ puts("Cached EPP cold initialization: four independent pointer/cache states retire all eight pointers and publish cleared lines; warm reuse tested separately");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='cached-epp-reopen-', dir=root/'artifacts') as work:
