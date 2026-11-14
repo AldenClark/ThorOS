@@ -357,6 +357,10 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	ret = readl_poll_timeout(ni + 0x6850, value, value & BIT(30), 1, 100000);
 	if (ret)
 		return ret;
+	/* ES_CTRL1's declared reset value enables every PUC port. Do not rely
+	 * on a pre-reset gate write surviving the reset's implementation. */
+	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
+	readl(ni + 0x610c);
 	/* TQM reset invalidates old BIDs; all buffers are loaded anew below. */
 	memset(&rx->refill, 0, sizeof(rx->refill));
 	writel(readl(ni + RMU_CTRL) & ~BIT(31), ni + RMU_CTRL);
@@ -457,13 +461,19 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 8);
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 9);
 	/* Stock aal_l3_te_init starts CB scanning after credit initialization. */
+	/* Reassert the closed PON gate before either ES or RMU is enabled.
+	 * NI alone publishes the requested mask after full host activation. */
+	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
+	readl(ni + 0x610c);
 	writel(readl(ni + CB_CTRL) | BIT(31), ni + CB_CTRL);
 	/* The CB conditions only govern admission when L3 tail-drop is enabled. */
 	writel(readl(ni + 0x9004) | BIT(2), ni + 0x9004);
 	/* CRC is stripped by QM; CPU0 dequeue and normal NI input are enabled. */
 	/* Keep the reset EPP wait setting, as the vendor RMW sequence does. */
 	writel(0x8462ff01, ni + ES_CTRL);
-	writel(readl(ni + 0x610c) | 0xffffU, ni + 0x610c);
+	/* NI's lifetime owner enables the requested PON ports under tx_lock
+	 * only after FE validation and host publication. Do not race its saved
+	 * recovery mask or open PON egress during a failed cold initialization. */
 	writel(readl(ni + RMU_CTRL) | BIT(31), ni + RMU_CTRL);
 	rx->deepq_configured = true;
 	return 0;

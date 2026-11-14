@@ -35,10 +35,10 @@ test = r'''
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
-struct spinlock {pthread_mutex_t mutex;};
+struct spinlock {pthread_mutex_t mutex;bool rx;};
 struct napi_struct {int unused;};
 struct rtl_qm_rx {bool stopped;};
-struct rtl_xram {bool qm_rx,dma_tx,rx_active;struct spinlock rx_lock;
+struct rtl_xram {bool qm_rx,dma_tx,rx_active,host_active;struct spinlock rx_lock,tx_lock;
  struct napi_struct napi;struct rtl_qm_rx qm;int timer,rx_irq,dma,fe,netdev;unsigned int mask;};
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t event=PTHREAD_COND_INITIALIZER;
@@ -53,12 +53,12 @@ static void wait_for_stop(void) {
  assert(!finished);assert(!pthread_mutex_unlock(&gate));
 }
 static void lock(struct spinlock *p) {
- if(closing) {
+ if(closing && p->rx) {
   assert(!pthread_mutex_lock(&gate));attempted=true;signal_event();
   assert(!pthread_mutex_unlock(&gate));
- } else if(scenario==2) wait_for_stop();
+ } else if(!closing && p->rx && scenario==2) wait_for_stop();
  assert(!pthread_mutex_lock(&p->mutex));held=true;
- if(!closing && scenario==3) {
+ if(!closing && p->rx && scenario==3) {
   assert(!pthread_mutex_lock(&gate));window=true;signal_event();
   while(!attempted)wait_event();
   assert(!pthread_mutex_unlock(&gate));
@@ -69,8 +69,12 @@ static void unlock(struct spinlock *p) {assert(held);held=false;assert(!pthread_
 #define spin_unlock_irqrestore(p,f) do{unlock(p);irq_off=(f);}while(0)
 #define XRAM_CFG 0xaa28
 #define CPU_DISABLE 0x201
+#define WRITE_ONCE(x,y) ((x)=(y))
 static int __attribute__((unused)) rtl_fe_engine_suspend(int fe) {
  (void)fe;assert(closing && !irq_off && !held);fe_suspends++;return 0;
+}
+static void rtl_pon_host_gate(struct rtl_xram *priv,bool active) {
+ assert(held && irq_off && !priv->host_active && !active);
 }
 #define netdev_err(dev,fmt,...) do{(void)(dev);fprintf(stderr,fmt,##__VA_ARGS__);}while(0)
 static void rtl_update(struct rtl_xram *p,unsigned reg,unsigned mask,unsigned value) {
@@ -95,12 +99,6 @@ static void __attribute__((unused)) synchronize_net(void) {
  while(poll_live)wait_event();
  assert(!pthread_mutex_unlock(&gate));
 }
-static void rtl_qm_rx_stop(struct rtl_qm_rx *qm) {
- assert(!pthread_mutex_lock(&gate));
- assert(!poll_live && "QM stop must wait beyond NAPI ownership release for the poll tail");
- assert(!pthread_mutex_unlock(&gate));qm->stopped=true;
-}
-static void rtl_dma_tx_stop(int *dma) {*dma=0;}
 static int rtl_qm_rx_poll(struct rtl_qm_rx *qm,struct napi_struct *napi,int budget) {
  (void)qm;(void)napi;(void)budget;assert(!irq_off && !held);
  if(scenario==0) {
@@ -123,7 +121,7 @@ static void *close_engine(void *arg) {
  struct rtl_xram *priv=arg;closing=true;
  assert(!pthread_mutex_lock(&gate));while(!window)wait_event();assert(!pthread_mutex_unlock(&gate));
  rtl_engine_stop(priv);
- assert(!priv->rx_active && !priv->mask && priv->qm.stopped && !priv->dma);
+ assert(!priv->rx_active && !priv->host_active && !priv->mask && !priv->qm.stopped && priv->dma==1);
  /* A subsequent open must never overlap the previous poll's rearm tail. */
  assert(!pthread_mutex_lock(&gate));assert(!poll_live);assert(!pthread_mutex_unlock(&gate));
  assert(!pthread_mutex_lock(&priv->rx_lock.mutex));
@@ -136,18 +134,20 @@ int main(void) {
  unsigned cases=0;
  for(unsigned repeat=0;repeat<25;repeat++)for(unsigned index=0;index<4;index++) {
   scenario=(index+1)%4;
-  struct rtl_xram priv={.qm_rx=true,.dma_tx=true,.rx_active=true,.mask=255,.dma=1};
+  struct rtl_xram priv={.qm_rx=true,.dma_tx=true,.rx_active=true,.host_active=true,.mask=255,.dma=1,.rx_lock={.rx=true}};
   pthread_t closer;
   owned=poll_live=true;window=attempted=masked=sync_wait=finished=false;
   grace_periods=rearms=fe_suspends=0;irq_off=held=closing=false;
   assert(!pthread_mutex_init(&priv.rx_lock.mutex,NULL));
+  assert(!pthread_mutex_init(&priv.tx_lock.mutex,NULL));
   assert(!pthread_create(&closer,NULL,close_engine,&priv));
   assert(poll_completion(&priv,64)==1);assert(!irq_off && !held);
   assert(!pthread_mutex_lock(&gate));poll_live=false;signal_event();assert(!pthread_mutex_unlock(&gate));
   assert(!pthread_join(closer,NULL));
   assert(finished && grace_periods==1 && priv.rx_active && priv.mask==255 && !priv.qm.stopped);
   assert(rearms==(scenario==3));
-  assert(!pthread_mutex_destroy(&priv.rx_lock.mutex));cases++;
+  assert(!pthread_mutex_destroy(&priv.rx_lock.mutex));
+  assert(!pthread_mutex_destroy(&priv.tx_lock.mutex));cases++;
  }
  printf("NI stop/poll: %u controlled races passed (stop during RX, completion, before rearm, during rearm; reopen after tail)\n",cases);
 }

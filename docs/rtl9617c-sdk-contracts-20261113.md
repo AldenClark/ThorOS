@@ -44,6 +44,7 @@ SDK-NE 是包含厂商署名实现的公开 GPL 源码镜像；SDK-REG 是同系
 | `scripts/test_qm_sdk_registers.py` | 真实 SDK-REG union、16 个地址宏及 SDK `aal_l3qm_get_buffer_size_index()`，解码生产 QM/DQ 初始化 | PASS |
 | `scripts/test_pon_sdk_registers.py` | 真实 SDK-REG union 解码生产 PDC/PVT/VSTBL/CIR/PIR 写入 | PASS |
 | `scripts/test_l2_sdk_contract.py` | 真实 register unions、SDK FDB MAC encoder、PONCLE encoder、MAC-limit 实际操作函数及 CLS/LPB 类型 | PASS |
+| `scripts/test_fe_base_contract.py` | 真实 CLS mode0 字段、第二行 format、LPB v32 与 STG0 generated unions；提取生产 readback 掩码并运行三个错误变体 | PASS |
 
 这些外部 oracle 均已执行，使用 hosted C、ASan/UBSan；运行过程不读写设备寄存器。
 FE source oracle 覆盖 67 个 action 字段 × 32 单 bit、512 个随机 action、33 个 key 字段 × 32 单 bit。
@@ -151,7 +152,7 @@ OMCI/OLT grant、GPON/XG-PON framing、GEM 方向、EVTO 语义和实际排队�
 
 ### 6.1 原生 L2 与原包 CPU gate：新增契约
 
-- L2 oracle 已比较 128 个字段、15 个 indirect windows、16,384 个 FDB 向量、448 个 PONCLE key 与 128 条 SDK MAC-limit 成功写序列；计数随新增字段测试更新。
+- L2 oracle 已比较 129 个字段、16 个 indirect windows、16,384 个 FDB 向量、448 个 PONCLE key 与 128 条 SDK MAC-limit 成功写序列；计数随新增字段测试更新。
 - FDB 是 4,096 主表 + 32 overflow；`aal_fdb.c:149–159` 的 L3 Hash 容量不能套用到 L2 FDB。
 - L2 key 为 MAC/VID/SC/可选 PCP，没有独立 Linux bridge/FID 字段；不能靠 port mask 解决同 VID、同 MAC 的多 bridge key 冲突。
 - `aal_fdb.c:4950–4952,5113–5115,5166–5168` 在 SVL 软件 key 中明确清 VID/SC；不以 ILPB 的默认 SC/PVID 推断 tagged key 隔离。
@@ -170,10 +171,15 @@ OMCI/OLT grant、GPON/XG-PON framing、GEM 方向、EVTO 语义和实际排队�
 - `ca_aal_proc.c:2894–2922` 的 bypass recipe 同时设置 `keep_orig_pkt=1`、`t2_ctrl=15` 和 CPU destination；不等同 raw PDC bypass。
 - LPB `t1_ctrl` 位于 mid-word `[13:10]`；LAN/PON 对应 `0x3418/0x3424`，可直接选择预置原包 CPU profile，不能在原子 gate 内写间接 FIB。
 - L3 parsing-error / over-VLAN / DDoS 控制也能覆盖 T1/T2；只有 default FIB 正确，不能排除这些 foreign override。
+- 新增只读 PP override 准入：`0x3248/0x324c/0x3314/0x3318` 必须是 keep-original CPU0/blackhole、T0 disable、T1–T5 bypass，先于 TCAM 查询和任何配置写入。拒绝时暴露寄存器与原值，不覆盖 foreign 策略。独立 generated-union oracle 实际通过 436,864 组合，4 个破坏生产逻辑的变体被拒绝。
+- 设备生命周期 FE base 的 warm readback 使用真实 CLS mode0 语义掩码：第一行七个 word 分别为 `ffffcfff/cfffffff/ffffffff/fffffffb/ffffffff/ecffffff/03ffffff`，第二行只检查 DATA6 的 `03800000` format bits。LPB 使用 `aal_l3fe.h` 的 v32 实际结构，HI 的高两位保留；不用同文件早先未使用的 G3 v25 结构推断偏移。独立 oracle 从字段赋值构造期望值，不从生产常量反推答案。
+- STG0 `my_mac_fail_pkt_bypass_cls` 不因名称可疑就擅自清零；SDK CPU-force 调用链禁用 LPB MAC filter，当前 LPB 同样禁用。只核对本 owner 的 STG0 bits 和映射，保留未接管位。
 - PDC 控制寄存器没有已证实的 all-data 原包 CPU force；关闭 map、改 raw bypass 或仅关闭 LAN RX 都不是完整 PON→L3 gate。
 - FDB 扫描只作有界 reconciliation，不是硬件 atomic snapshot；失败/部分扫描不证明未见条目已删除，private L3 DA-index 域不得被清除。
 - 当前 BUM 走 CPU-only trap，没有设置“已硬件转发”标志；这不应表述为广播/多播/未知单播已经全硬件交换。
 - 上述源码契约不替代实际 SVL/IPPB/aging clock 基础配置检查、policy 变化中的流量截断抓包、MAC move、PPPoE/LCP 与 line-rate 验收。
+
+BUM、CPU-copy、精确 MDB/SSM、VLAN 及 L3/REO reset 的重新核证见 [完整 L2 资料矩阵](rtl9617c-full-l2-evidence-20261114.md)。该矩阵明确区分已有 SDK 配方、尚未实现的控制面与未证明的完整 DMA/行退休契约；当前没有把公共源码镜像称为 Realtek 官方 NDA 手册。
 
 ## 7. 重现命令
 
@@ -186,6 +192,8 @@ THOROS_SDK_AAL="$THOROS_SDK_NE/ca-network-engine/1.0-r0/ca-network-engine-1.0/aa
 export ASAN_OPTIONS=detect_leaks=0
 python3 scripts/test_fe_sdk_contract.py --sdk "$THOROS_SDK_NE"
 python3 scripts/test_fe_register_contract.py --registers "$THOROS_SDK_REG"
+python3 scripts/test_fe_pp_exception_contract.py --sdk "$THOROS_SDK_NE" --registers "$THOROS_SDK_REG"
+python3 scripts/test_fe_base_contract.py --sdk "$THOROS_SDK_NE" --registers "$THOROS_SDK_REG"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$THOROS_SDK_REG" --sdk-qm "$THOROS_SDK_AAL/aal_l3qm.c"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$THOROS_SDK_REG"
 python3 scripts/test_l2_sdk_contract.py --sdk "$THOROS_SDK_NE" --registers "$THOROS_SDK_REG"

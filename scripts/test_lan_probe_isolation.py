@@ -73,7 +73,7 @@ struct rtl_xram {
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
  bool phy_led_registered,qm_rx,native_groups_created;
- int tx_lock;void *fe;
+ int tx_lock,dma;void *fe;
 };
 static struct device_node nodes[5];
 static struct phy_device phys[5];
@@ -122,6 +122,7 @@ static int rtl_fe_add_port(void *fe,struct net_device *d,int p,int q,int r){
  fe_ports|=BIT(d->lan.port);return 0;
 }
 static void rtl_fe_remove_port(void *fe,struct net_device *d){fe_ports&=~BIT(d->lan.port);}
+static void rtl_dma_tx_forget(int *dma,struct net_device *d){(void)dma;(void)d;}
 static int register_netdevice(struct net_device *d){
  assert(rtnl_held);
  assert(d->netns_immutable);

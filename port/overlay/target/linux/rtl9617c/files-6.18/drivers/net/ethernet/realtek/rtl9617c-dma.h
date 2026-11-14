@@ -43,7 +43,7 @@ static inline u32 rtl_dma_direct_lan(unsigned int port, unsigned int length)
 
 int rtl_dma_tx_alloc(struct device *dev, struct rtl_dma_tx *tx);
 int rtl_dma_tx_start(struct rtl_dma_tx *tx);
-void rtl_dma_tx_stop(struct rtl_dma_tx *tx);
+void rtl_dma_tx_quiesce(struct rtl_dma_tx *tx);
 void rtl_dma_tx_free(struct device *dev, struct rtl_dma_tx *tx);
 void rtl_dma_tx_complete(struct rtl_dma_tx *tx, struct net_device *dev);
 netdev_tx_t rtl_dma_tx_frame(struct rtl_dma_tx *tx, struct sk_buff *skb,

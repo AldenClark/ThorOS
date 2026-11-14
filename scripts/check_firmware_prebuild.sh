@@ -34,7 +34,7 @@ python3 scripts/test_l2_bridge_eligibility.py
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py
 python3 scripts/test_fe_teardown_quarantine.py
-python3 scripts/test_ni_fe_engine_lifecycle.py
+python3 scripts/test_ni_fe_engine_lifecycle.py --mutants
 python3 scripts/test_nand_upgrade_write_errors.py
 python3 scripts/test_fe_cache_snapshot.py
 python3 scripts/test_itu_cpu_path.py

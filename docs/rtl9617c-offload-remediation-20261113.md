@@ -32,6 +32,8 @@ flowchart TD
 
 引擎状态分为 `requested_mode`（0 OFF、1 CPU、2 HARDWARE）、`engine_ready` 和实际 `enabled/cpu_path/prepared`：
 
+**以下四点是 11 月 13 日的历史方案，已被 11 月 14 日的设备生命周期 owner 修复取代。** 当前实现不在正常 stop/open 时重新建立 QM/DMA 或恢复 FE 启动快照；保留已曝光基础配置并核验复用，partial 失败隔离。以 [最新生命周期章节](rtl9617c-native-l2-20261114.md#5-fe-基础配置与-ni-队列改为设备生命周期所有权) 为准，不能按下述旧流程重新实施。
+
 - NI 停止或重建前，必须先撤销旧 FE 状态；失败保留资源与快照，下一次启动不能覆盖它们。
 - NI/QM/DMA 建立新 CPU 基线之后，重新建立 FE 快照并恢复已成功提交的模式；成功后才开放 NAPI。
 - OFF/CPU/HARDWARE 请求只有在转换成功后更新意图；失败不能在下次重启时悄悄改变模式。

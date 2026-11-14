@@ -72,6 +72,11 @@ struct rtl_fe_switch_hw {bool owned;};
 struct rtl_fe_bridge;
 struct rtl_fe {bool lock,shutting_down;struct rtl_fe_bridge *bridge;};
 struct switchdev_notifier_info {struct net_device *dev;const void *ctx;};
+enum {NETDEV_UP=1,NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_CHANGE,NETDEV_CHANGEADDR,
+ NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_UNREGISTER,NETDEV_PRECHANGEUPPER};
+struct netdev_notifier_info {struct net_device *dev;};
+struct netdev_notifier_changeupper_info {struct netdev_notifier_info info;bool linking;};
+static struct net_device *netdev_notifier_info_to_dev(void *p){return ((struct netdev_notifier_info *)p)->dev;}
 struct switchdev_notifier_fdb_info {
  struct switchdev_notifier_info info;const u8 *addr;
  unsigned int vid;bool is_local,locked,added_by_user,offloaded;
@@ -87,7 +92,6 @@ static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
 static int notifier_from_errno(int error){return error;}
 static void fe_switch_work(struct work_struct *work){(void)work;assert(!"fixture does not execute worker");}
 static void fe_switch_scan(struct work_struct *work){(void)work;assert(!"fixture does not execute scan");}
-static int fe_switch_netdev_event(struct notifier_block *nb,unsigned long event,void *data){(void)nb;(void)event;(void)data;return 0;}
 static const unsigned int fe_switch_guard_ops=7;
 static unsigned int init_net;
 '''
@@ -165,6 +169,7 @@ static void mutex_lock(bool *lock){assert(!*lock);*lock=true;}
 static void mutex_unlock(bool *lock){assert(*lock);*lock=false;}
 static void fe_switch_gate(void *private){assert(private==live && fe.lock && rtnl_held);live->active=false;gates++;}
 static int fe_switch_restore_locked(struct rtl_fe_bridge *sw){assert(sw==live && fe.lock && rtnl_held);restores++;return restore_error;}
+static int fe_switch_quiesce_locked(struct rtl_fe *owner){assert(owner==&fe && fe.lock && rtnl_held);gates++;return restore_error;}
 static void fe_switch_unoffload(struct rtl_fe_bridge *sw){assert(sw==live && !fe.lock && rtnl_held);unoffloads++;sw->offloaded=0;}
 static void reset(void){
  assert(!live);memset(&fe,0,sizeof(fe));memset(allocations,0,sizeof(allocations));memset(registered,0,sizeof(registered));
@@ -252,8 +257,36 @@ static void notifier_and_replay(void){
  fe_switch_blocking_event(&sw->blocking_nb,SWITCHDEV_PORT_OBJ_ADD,&port_event);assert(queues==1);
  assert(!fe_bridge_stop(sw) && !live && freed==4);cases++;
 }
-int main(void){construction_and_stop();notifier_and_replay();
- printf("Native switch production control: %u allocation/registration/stop/replay scenarios; 2048 ordinary-learning notifications do not rebuild; quarantine retains owners and cancels every callback before free PASS\n",cases);return 0;}
+static void netdev_notifications(void){
+ reset();struct rtl_fe_bridge *sw=fe_bridge_start(&fe);assert(!IS_ERR(sw));fe.bridge=sw;
+ for(unsigned int i=0;i<5;i++)sw->ports[i]=&ports[i];
+ sw->master=&master;
+ struct netdev_notifier_changeupper_info event={.info={.dev=&ports[0]},.linking=true};
+ const unsigned int changes[]={NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_UP,NETDEV_CHANGE,
+  NETDEV_CHANGEADDR,NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA};
+ /* Synchronous invalidation must happen in the early GOING_DOWN callback,
+  * not just after ndo_stop in DOWN. Actual gate MMIO/races have own tests. */
+ for(unsigned int i=0;i<sizeof(changes)/sizeof(changes[0]);i++){
+  unsigned int before=invalidates;
+  assert(!fe_switch_netdev_event(&sw->netdev_nb,changes[i],&event));
+  assert(invalidates==before+1 && !fe.lock && !gates);
+ }
+ unsigned int before=invalidates;
+ event.info.dev=&foreign;assert(!fe_switch_netdev_event(&sw->netdev_nb,NETDEV_GOING_DOWN,&event));
+ assert(invalidates==before);
+ event.info.dev=&master;assert(!fe_switch_netdev_event(&sw->netdev_nb,NETDEV_GOING_DOWN,&event));
+ assert(invalidates==before+1);
+ rtnl_lock();event.info.dev=&ports[0];event.linking=false;
+ assert(!fe_switch_netdev_event(&sw->netdev_nb,NETDEV_PRECHANGEUPPER,&event));
+ assert(gates==1 && unoffloads==1 && sw->ports[0]==&ports[0]);
+ restore_error=-ETIMEDOUT;
+ assert(fe_switch_netdev_event(&sw->netdev_nb,NETDEV_UNREGISTER,&event)==-ETIMEDOUT);
+ assert(gates==2 && unoffloads==2 && !sw->ports[0]);
+ rtnl_unlock();restore_error=0;
+ assert(!fe_bridge_stop(sw) && !live && freed==4);cases++;
+}
+int main(void){construction_and_stop();notifier_and_replay();netdev_notifications();
+ printf("Native switch production control: %u allocation/registration/stop/replay/early-down scenarios; 2048 ordinary-learning notifications do not rebuild; quarantine retains owners and cancels every callback before free PASS\n",cases);return 0;}
 '''
 
 definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
@@ -263,7 +296,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
 ])
 functions = "\n".join(function(name) for name in [
     "fe_switch_queue", "fe_switch_port_index", "fe_switch_replay_fdb",
-    "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_bridge_start", "fe_bridge_stop",
+    "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_switch_netdev_event", "fe_bridge_start", "fe_bridge_stop",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
     temporary = Path(directory)

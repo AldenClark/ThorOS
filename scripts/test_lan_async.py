@@ -45,6 +45,7 @@ static void flush_work(struct work_struct *work){(void)work;assert(!pthread_join
 code = shim[:start] + threading + shim[end:]
 code = code.replace('#include <assert.h>', '#include <assert.h>\n#include <pthread.h>')
 code = code.replace('unsigned int registered_ports,port;', 'unsigned int registered_ports,port,engine_users;')
+code = code.replace('struct rtl_xram {', 'struct rtl_xram {bool engine_poisoned,removing;')
 start = code.index('static int register_netdevice(')
 end = code.index('static void unregister_netdev(', start)
 code = code[:start] + 'static int register_netdevice(struct net_device *d);\n' + code[end:]

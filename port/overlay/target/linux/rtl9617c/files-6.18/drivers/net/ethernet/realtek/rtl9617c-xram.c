@@ -16,6 +16,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of_mdio.h>
@@ -25,6 +26,7 @@
 #include <linux/platform_device.h>
 #include <linux/rcupdate.h>
 #include <linux/rtnetlink.h>
+#include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/tyfza1-led.h>
 #include <linux/workqueue.h>
@@ -62,6 +64,67 @@
 #define PKT_ERRORS (GENMASK(23, 20) | BIT(25) | BIT(26))
 
 struct rtl_xram;
+
+/* There is no verified complete NI/QM/AXI drain predicate in the public
+ * RTL8277C SDK. A physical engine which has seen our DMA addresses cannot be
+ * rebound to a new allocation after unbind. Built-in lifetime plus this
+ * aperture claim also covers forced platform removal, not just sysfs unbind.
+ * Unexposed probe failures release the claim and remain retryable. */
+struct rtl_ni_owner {
+	struct list_head list;
+	resource_size_t start, end;
+	struct device *device;
+	bool exposed;
+};
+
+static LIST_HEAD(rtl_ni_owners);
+static DEFINE_MUTEX(rtl_ni_owners_lock);
+
+static struct rtl_ni_owner *rtl_ni_owner_claim(struct device *dev,
+					    const struct resource *resource)
+{
+	struct rtl_ni_owner *owner, *entry;
+
+	if (!resource)
+		return ERR_PTR(-EINVAL);
+	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
+	if (!owner)
+		return ERR_PTR(-ENOMEM);
+	owner->start = resource->start;
+	owner->end = resource->end;
+	owner->device = get_device(dev);
+	mutex_lock(&rtl_ni_owners_lock);
+	list_for_each_entry(entry, &rtl_ni_owners, list) {
+		if (entry->start <= owner->end && owner->start <= entry->end) {
+			mutex_unlock(&rtl_ni_owners_lock);
+			put_device(owner->device);
+			kfree(owner);
+			return ERR_PTR(-EBUSY);
+		}
+	}
+	list_add_tail(&owner->list, &rtl_ni_owners);
+	mutex_unlock(&rtl_ni_owners_lock);
+	return owner;
+}
+
+static void rtl_ni_owner_expose(struct rtl_ni_owner *owner)
+{
+	/* The owning instance is serialized by RTNL. This bit is monotonic and
+	 * the claim remains on the global list even after the instance is gone. */
+	WRITE_ONCE(owner->exposed, true);
+}
+
+static void rtl_ni_owner_release(struct rtl_ni_owner *owner)
+{
+	if (!owner || READ_ONCE(owner->exposed))
+		return;
+	mutex_lock(&rtl_ni_owners_lock);
+	list_del(&owner->list);
+	mutex_unlock(&rtl_ni_owners_lock);
+	put_device(owner->device);
+	kfree(owner);
+}
+
 struct rtl_lan {
 	struct rtl_xram *shared;
 	unsigned int port;
@@ -107,6 +170,13 @@ struct rtl_xram {
 	bool irq_requested;
 	unsigned int engine_users;
 	struct rtl_fe *fe;
+	struct rtl_ni_owner *owner;
+	bool base_ready;
+	bool dma_exposed;
+	bool engine_poisoned;
+	bool host_active;
+	bool pon_gate_valid;
+	u32 pon_gate_requested;
 	bool removing;
 };
 
@@ -253,16 +323,42 @@ u32 rtl9617c_ni_pon_gate(struct device *dev, u32 enabled)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
 	unsigned long flags;
-	u32 saved;
+	u32 saved, control;
 
 	spin_lock_irqsave(&priv->tx_lock, flags);
-	saved = readl(priv->ni + 0x610c);
-	writel((saved & ~0xffffU) | (enabled & 0xffffU), priv->ni + 0x610c);
+	control = readl(priv->ni + 0x610c);
+	saved = priv->pon_gate_valid ? priv->pon_gate_requested : control & 0xffffU;
+	priv->pon_gate_requested = enabled & 0xffffU;
+	priv->pon_gate_valid = true;
+	/* Remember recovery's desired gate while host RX is inactive, but do
+	 * not let a delayed restore reopen it after close or NI quarantine. */
+	if (!priv->host_active || priv->engine_poisoned || priv->removing)
+		enabled = 0;
+	writel((control & ~0xffffU) | (enabled & 0xffffU), priv->ni + 0x610c);
 	readl(priv->ni + 0x610c);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
-	return saved & 0xffffU;
+	return saved;
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_pon_gate);
+
+/* Caller holds tx_lock. Gate publication is separate from queue ownership;
+ * keep the requested PON mask across host close/open, without resetting QM. */
+static void rtl_pon_host_gate(struct rtl_xram *priv, bool active)
+{
+	u32 control, enabled = 0;
+
+	if (!priv->qm_rx)
+		return;
+	control = readl(priv->ni + 0x610c);
+	if (!priv->pon_gate_valid) {
+		priv->pon_gate_requested = control & 0xffffU;
+		priv->pon_gate_valid = true;
+	}
+	if (active && priv->host_active && !priv->engine_poisoned && !priv->removing)
+		enabled = priv->pon_gate_requested;
+	writel((control & ~0xffffU) | enabled, priv->ni + 0x610c);
+	readl(priv->ni + 0x610c);
+}
 
 static unsigned int rtl_pointer(struct rtl_xram *priv, unsigned int reg)
 {
@@ -472,6 +568,12 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 	spin_lock_irqsave(&priv->tx_lock, flags);
+	if (unlikely(!priv->host_active || priv->removing || priv->engine_poisoned)) {
+		dev->stats.tx_dropped++;
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 	if (priv->dma_tx) {
 		const struct rtl9617c_ni_frame frame = {
 			.header_high = BIT(13),
@@ -511,17 +613,50 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	return NETDEV_TX_OK;
 }
 
-static int rtl_engine_start(struct rtl_xram *priv)
+static void rtl_engine_poison(struct rtl_xram *priv)
+{
+	unsigned long flags;
+
+	/* Serialize the shared PON gate with recovery's rtl9617c_ni_pon_gate(). */
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	WRITE_ONCE(priv->engine_poisoned, true);
+	/* Do not reset/reassign BIDs, descriptors or in-flight DMA addresses.
+	 * These gates stop new admission, not previously accepted transactions. */
+	if (priv->dma_exposed) {
+		if (priv->qm_rx)
+			rtl_qm_rx_stop(&priv->qm);
+		if (priv->dma_tx)
+			rtl_dma_tx_quiesce(&priv->dma);
+	}
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+}
+
+static int rtl_engine_prepare(struct rtl_xram *priv)
 {
 	struct net_device *dev = priv->netdev;
+	unsigned long flags;
 	unsigned int port;
 	u32 config;
 	int ret;
 
-	/* Finish any previous FE rollback before replacing shared NI/QM state. */
-	ret = rtl_fe_engine_suspend(priv->fe);
-	if (ret)
-		return ret;
+	/* This routine is called once for this physical owner. In particular,
+	 * never TQM-reset, memset a ring, or push all BIDs again on ndo_open. */
+	if (priv->dma_tx || priv->qm_rx) {
+		priv->dma_exposed = true;
+		rtl_ni_owner_expose(priv->owner);
+	}
+	if (priv->qm_rx) {
+		/* Cold defaults may not overwrite an explicit PON recovery mask.
+		 * Keep its egress closed throughout sleeping QM/FE initialization;
+		 * only the final host publication may enable the requested ports. */
+		spin_lock_irqsave(&priv->tx_lock, flags);
+		if (!priv->pon_gate_valid) {
+			priv->pon_gate_requested = 0xffffU;
+			priv->pon_gate_valid = true;
+		}
+		rtl_pon_host_gate(priv, false);
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+	}
 	if (priv->dma_tx) {
 		/* The bootloader's XRAM path leaves the normal LAN scheduler off. */
 		/* Original aal_l2_qm_init: EQ1 has4K64-byte pages, with29 pages
@@ -544,14 +679,8 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	}
 	if (priv->qm_rx) {
 		ret = rtl_qm_rx_start(&priv->qm, priv->port);
-		if (ret) {
-			/* A failure may follow partial queue/credit programming. Close
-			 * admission explicitly before unwinding the TX engine. */
-			rtl_qm_rx_stop(&priv->qm);
-			if (priv->dma_tx)
-				rtl_dma_tx_stop(&priv->dma);
+		if (ret)
 			return ret;
-		}
 		for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
 			if (priv->ports[port])
 				rtl_update(priv, 0xa5f8 + PORT_STRIDE * port,
@@ -569,25 +698,62 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	       priv->ni + XRAM_CFG);
 	rtl_rx_mode(dev);
 	priv->tx_pending = false;
+	priv->base_ready = true;
+	return 0;
+}
+
+static int rtl_engine_start(struct rtl_xram *priv)
+{
+	unsigned long flags;
+	int ret;
+
+	if (priv->removing)
+		return -ENODEV;
+	if (priv->engine_poisoned)
+		return -EIO;
+	/* FE owns its installed CPU profile for the same device lifetime. Gate
+	 * flows before first setup, but never restore a boot-time profile while
+	 * the PON classifier can still send packets to that profile. */
+	ret = rtl_fe_engine_suspend(priv->fe);
+	if (ret)
+		return ret;
+	if (!priv->base_ready) {
+		ret = rtl_engine_prepare(priv);
+		if (ret)
+			goto poison;
+		spin_lock_irqsave(&priv->tx_lock, flags);
+		rtl_pon_host_gate(priv, false);
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+	}
 	ret = rtl_fe_engine_resume(priv->fe);
 	if (ret) {
-		if (priv->qm_rx)
-			rtl_qm_rx_stop(&priv->qm);
-		if (priv->dma_tx)
-			rtl_dma_tx_stop(&priv->dma);
+		/* NI is complete. FE owns whether its failure is retryable or a
+		 * permanent base quarantine; never destroy this queue allocation
+		 * just because a flow-table transaction was temporarily busy. */
+		netdev_err(priv->netdev, "FE resume failed: %d; NI base retained, next open retries FE\n", ret);
 		return ret;
 	}
 	napi_enable(&priv->napi);
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	WRITE_ONCE(priv->host_active, true);
+	rtl_pon_host_gate(priv, true);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	if (priv->qm_rx) {
-		unsigned long flags;
-
 		spin_lock_irqsave(&priv->rx_lock, flags);
 		priv->rx_active = true;
 		rtl_update(priv, 0x6110, 0xff, 0xff);
 		spin_unlock_irqrestore(&priv->rx_lock, flags);
 	}
+	/* A retained EPP can already contain packets when IRQs are rearmed.
+	 * Poll explicitly instead of depending on a new interrupt edge. */
+	napi_schedule(&priv->napi);
 	hrtimer_start(&priv->timer, ms_to_ktime(1), HRTIMER_MODE_REL);
 	return 0;
+
+poison:
+	rtl_engine_poison(priv);
+	netdev_err(priv->netdev, "NI initialization failed: %d; DMA owner retained, reboot required\n", ret);
+	return ret;
 }
 
 static void rtl_engine_stop(struct rtl_xram *priv)
@@ -595,11 +761,18 @@ static void rtl_engine_stop(struct rtl_xram *priv)
 	unsigned long flags;
 	int ret;
 
-	/* Last-user stop must retire FE rules and its register snapshot before
-	 * QM/DMA stop. Failure is retained and blocks the next NI start. */
+	if (!priv->host_active)
+		return;
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	WRITE_ONCE(priv->host_active, false);
+	rtl_pon_host_gate(priv, false);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+	/* Retire routing authorization, not the lifetime CPU/NI/QM allocation.
+	 * CPU-profile PON arrivals can still be in flight when the last user
+	 * closes; their queues and DMA buffers remain valid while host RX sleeps. */
 	ret = rtl_fe_engine_suspend(priv->fe);
 	if (ret)
-		netdev_err(priv->netdev, "FE suspend failed: %d; next NI start requires cleanup\n", ret);
+		netdev_err(priv->netdev, "FE suspend failed: %d; NI base retained, next open retries FE\n", ret);
 	hrtimer_cancel(&priv->timer);
 	if (priv->qm_rx) {
 		spin_lock_irqsave(&priv->rx_lock, flags);
@@ -611,14 +784,9 @@ static void rtl_engine_stop(struct rtl_xram *priv)
 	napi_disable(&priv->napi);
 	if (priv->qm_rx) {
 		/* Completion releases NAPI ownership before the final rearm check.
-		 * Wait for the BH-disabled poll tail before stopping or reopening QM. */
+		 * Wait for the BH-disabled poll tail; this is not a hardware drain. */
 		synchronize_net();
-		rtl_qm_rx_stop(&priv->qm);
 	}
-	if (priv->dma_tx)
-		rtl_dma_tx_stop(&priv->dma);
-	rtl_update(priv, XRAM_CFG, CPU_DISABLE, CPU_DISABLE);
-	return;
 }
 
 static int rtl_engine_get(struct rtl_xram *priv)
@@ -626,6 +794,10 @@ static int rtl_engine_get(struct rtl_xram *priv)
 	int ret;
 
 	/* Both netdev open/stop paths are serialized by RTNL. */
+	if (priv->removing)
+		return -ENODEV;
+	if (priv->engine_poisoned)
+		return -EIO;
 	if (priv->engine_users) {
 		priv->engine_users++;
 		return 0;
@@ -640,6 +812,8 @@ static int rtl_engine_get(struct rtl_xram *priv)
 
 static void rtl_engine_put(struct rtl_xram *priv)
 {
+	if (WARN_ON_ONCE(!priv->engine_users))
+		return;
 	if (!--priv->engine_users)
 		rtl_engine_stop(priv);
 }
@@ -671,9 +845,10 @@ static int rtl_stop(struct net_device *dev)
 
 	netif_stop_queue(dev);
 	phy_stop(dev->phydev);
-	rtl_update(priv, PORT_RX + lan->port * PORT_STRIDE, BIT(0), 0);
-	rtl_update(priv, PORT_TX + lan->port * PORT_STRIDE, BIT(0), 0);
 	rtl_fe_flush_port(priv->fe, dev);
+	rtl_update(priv, PORT_RX + lan->port * PORT_STRIDE, BIT(0), 0);
+	/* aal-77c/aal_port.c keeps TX enabled on disable to avoid a buffer hang.
+	 * Admission is already gated; allow previously accepted frames to exit. */
 	if (priv->dma_tx) {
 		spin_lock_irqsave(&priv->tx_lock, flags);
 		rtl_dma_tx_forget(&priv->dma, dev);
@@ -732,6 +907,12 @@ netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 	netdev_tx_t result;
 
 	spin_lock_irqsave(&priv->tx_lock, flags);
+	if (unlikely(!priv->host_active || priv->removing || priv->engine_poisoned)) {
+		owner->stats.tx_dropped++;
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 	result = rtl_dma_tx_frame(&priv->dma, skb, owner, frame);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	return result;
@@ -816,6 +997,11 @@ static void rtl_unregister_lan(struct rtl_xram *priv, unsigned int port)
 	rcu_assign_pointer(priv->qm.lan[port], NULL);
 	if (priv->registered_ports & BIT(port))
 		unregister_netdev(dev);
+	/* Also cover an already-down device: a retained TX descriptor must
+	 * never leave a completion owner pointing at a freed secondary netdev. */
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	rtl_dma_tx_forget(&priv->dma, dev);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	rtl_fe_remove_port(priv->fe, dev);
 	synchronize_net();
 	if (dev->phydev)
@@ -985,10 +1171,13 @@ static ssize_t xram_state_show(struct device *dev, struct device_attribute *attr
 	struct net_device *netdev = dev_get_drvdata(dev);
 	struct rtl_xram *priv = netdev_priv(netdev);
 
-	return sysfs_emit(buf, "port=%u cfg=%08x static=%08x rx=%u/%u tx=%u/%u pending=%u\n",
+	return sysfs_emit(buf, "port=%u cfg=%08x static=%08x rx=%u/%u tx=%u/%u pending=%u base_ready=%u dma_exposed=%u engine_poisoned=%u host_active=%u reboot_required=%u\n",
 		priv->port, readl(priv->ni + XRAM_CFG), readl(priv->ni + GLB_STATIC),
 		rtl_pointer(priv, RX_READ), rtl_pointer(priv, RX_WRITE),
-		rtl_pointer(priv, TX_READ), rtl_pointer(priv, TX_WRITE), priv->tx_pending);
+		rtl_pointer(priv, TX_READ), rtl_pointer(priv, TX_WRITE), priv->tx_pending,
+		READ_ONCE(priv->base_ready), READ_ONCE(priv->dma_exposed),
+		READ_ONCE(priv->engine_poisoned), READ_ONCE(priv->host_active),
+		READ_ONCE(priv->engine_poisoned));
 }
 static DEVICE_ATTR_RO(xram_state);
 
@@ -1159,21 +1348,9 @@ static ssize_t qm_wait_show(struct device *dev, struct device_attribute *attr, c
 	return sysfs_emit(buf, "%u\n", value);
 }
 
-static ssize_t qm_wait_store(struct device *dev, struct device_attribute *attr,
-			    const char *buf, size_t count)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	unsigned int value;
-	int ret = kstrtouint(buf, 0, &value);
-
-	if (ret)
-		return ret;
-	if (value > 3)
-		return -EINVAL;
-	rtl_update(priv, 0x6108, GENMASK(27, 26), FIELD_PREP(GENMASK(27, 26), value));
-	return count;
-}
-static DEVICE_ATTR_RW(qm_wait);
+/* Queue registers belong to the lifecycle owner. Raw diagnostic writes can
+ * reset admission or race stop/resume without preserving BID ownership. */
+static DEVICE_ATTR_RO(qm_wait);
 
 static ssize_t qm_es_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -1181,18 +1358,7 @@ static ssize_t qm_es_show(struct device *dev, struct device_attribute *attr, cha
 	return sysfs_emit(buf, "%08x\n", readl(priv->ni + 0x6108));
 }
 
-static ssize_t qm_es_store(struct device *dev, struct device_attribute *attr,
-			  const char *buf, size_t count)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	u32 value;
-	int ret = kstrtou32(buf, 0, &value);
-	if (ret)
-		return ret;
-	writel(value, priv->ni + 0x6108);
-	return count;
-}
-static DEVICE_ATTR_RW(qm_es);
+static DEVICE_ATTR_RO(qm_es);
 
 static ssize_t qm_buffer_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -1200,18 +1366,7 @@ static ssize_t qm_buffer_show(struct device *dev, struct device_attribute *attr,
 	return sysfs_emit(buf, "%08x\n", readl(priv->ni + 0x68b0));
 }
 
-static ssize_t qm_buffer_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	u32 value;
-	int ret = kstrtou32(buf, 0, &value);
-	if (ret)
-		return ret;
-	writel(value, priv->ni + 0x68b0);
-	return count;
-}
-static DEVICE_ATTR_RW(qm_buffer);
+static DEVICE_ATTR_RO(qm_buffer);
 
 /* Diagnostic only: the epoch-checked FE/switch owner selects CPU/L2/L3 RX. */
 static ssize_t rx_bypass_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -1295,6 +1450,31 @@ static const struct attribute_group *rtl_native_groups[] = {
 	NULL,
 };
 
+static bool rtl_ni_release_dma(struct rtl_xram *priv, struct device *dev)
+{
+	bool fe_released = rtl_fe_free(priv->fe);
+
+	if (fe_released) {
+		priv->fe = NULL;
+		priv->qm.fe = NULL;
+	}
+	/* A never-opened interface may still have a bound flow callback. In that
+	 * case FE deliberately keeps its private owner even without DMA exposure.
+	 * Keep the physical claim and parent device as well; do not let another
+	 * probe reuse the registers beneath that callback. */
+	if (priv->dma_exposed || !fe_released) {
+		rtl_ni_owner_expose(priv->owner);
+		dev_err(dev, "NI teardown quarantined: DMA=%u FE_released=%u; buffers and physical owner retained, reboot required\n",
+			priv->dma_exposed, fe_released);
+		return false;
+	}
+	if (priv->qm_rx && priv->qm.memory)
+		rtl_qm_rx_free(dev, &priv->qm);
+	if (priv->dma_tx && priv->dma.memory)
+		rtl_dma_tx_free(dev, &priv->dma);
+	return true;
+}
+
 static int rtl_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1302,6 +1482,7 @@ static int rtl_probe(struct platform_device *pdev)
 	struct rtl_xram *priv;
 	u8 mac[ETH_ALEN];
 	u32 value;
+	bool release_owner = true;
 	int ret;
 
 	netdev = alloc_etherdev(sizeof(*priv));
@@ -1312,6 +1493,13 @@ static int rtl_probe(struct platform_device *pdev)
 	priv->lan.shared = priv;
 	priv->netdev = netdev;
 	priv->idle_poll_ms = 4;
+	priv->owner = rtl_ni_owner_claim(dev,
+		platform_get_resource(pdev, IORESOURCE_MEM, 0));
+	if (IS_ERR(priv->owner)) {
+		ret = PTR_ERR(priv->owner);
+		priv->owner = NULL;
+		goto free_netdev;
+	}
 	priv->ni = devm_platform_ioremap_resource(pdev, 0);
 	priv->xram = devm_platform_ioremap_resource(pdev, 1);
 	if (IS_ERR(priv->ni) || IS_ERR(priv->xram)) {
@@ -1401,17 +1589,16 @@ static int rtl_probe(struct platform_device *pdev)
 	return 0;
 
 free_dma:
-	rtl_fe_free(priv->fe);
 	if (priv->irq_requested)
 		free_irq(priv->rx_irq, priv);
-	if (priv->qm_rx && priv->qm.memory)
-		rtl_qm_rx_free(dev, &priv->qm);
-	if (priv->dma_tx)
-		rtl_dma_tx_free(dev, &priv->dma);
+	release_owner = rtl_ni_release_dma(priv, dev);
 del_napi:
 	netif_napi_del(&priv->napi);
 free_netdev:
-	free_netdev(netdev);
+	if (release_owner) {
+		rtl_ni_owner_release(priv->owner);
+		free_netdev(netdev);
+	}
 	return ret;
 }
 
@@ -1419,26 +1606,39 @@ static void rtl_remove(struct platform_device *pdev)
 {
 	struct net_device *dev = platform_get_drvdata(pdev);
 	struct rtl_xram *priv = netdev_priv(dev);
+	unsigned long flags;
 	unsigned int port;
+	bool release_owner;
 
 	if (priv->lan4_phy)
 		flush_work(&priv->lan4_work);
 	cancel_delayed_work_sync(&priv->mib_work);
-	priv->removing = true;
+	WRITE_ONCE(priv->removing, true);
 	if (priv->native_groups_created)
 		sysfs_remove_groups(&pdev->dev.kobj, rtl_native_groups);
 	for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
 		rtl_unregister_lan(priv, port);
+	/* Device links normally remove PON consumers first. Independently sever
+	 * every software callback before devm MMIO mappings can disappear. */
+	rtnl_lock();
+	rcu_assign_pointer(priv->qm.pon, NULL);
+	rtl_engine_stop(priv);
+	priv->engine_users = 0;
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	memset(priv->dma.owners, 0, sizeof(priv->dma.owners));
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+	rtl_engine_poison(priv);
+	rtnl_unlock();
 	synchronize_net();
-	rtl_fe_free(priv->fe);
 	if (priv->irq_requested)
 		free_irq(priv->rx_irq, priv);
-	if (priv->qm_rx)
-		rtl_qm_rx_free(&pdev->dev, &priv->qm);
-	if (priv->dma_tx)
-		rtl_dma_tx_free(&pdev->dev, &priv->dma);
+	release_owner = rtl_ni_release_dma(priv, &pdev->dev);
 	netif_napi_del(&priv->napi);
-	free_netdev(dev);
+	platform_set_drvdata(pdev, NULL);
+	if (release_owner) {
+		rtl_ni_owner_release(priv->owner);
+		free_netdev(dev);
+	}
 }
 
 static const struct of_device_id rtl_match[] = {
@@ -1449,7 +1649,8 @@ MODULE_DEVICE_TABLE(of, rtl_match);
 static struct platform_driver rtl_driver = {
 	.probe = rtl_probe,
 	.remove = rtl_remove,
-	.driver = { .name = "rtl9617c-xram", .of_match_table = rtl_match },
+	.driver = { .name = "rtl9617c-xram", .of_match_table = rtl_match,
+		    .suppress_bind_attrs = true },
 };
 module_platform_driver(rtl_driver);
 MODULE_LICENSE("GPL");

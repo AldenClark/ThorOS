@@ -622,6 +622,10 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 	}
 	switch (event) {
 	case NETDEV_UP:
+	/* __dev_close_many() sends this before clearing RUNNING and before
+	 * ndo_stop disables the MAC. Do not leave other ports forwarding to an
+	 * output until the later NETDEV_DOWN notification. */
+	case NETDEV_GOING_DOWN:
 	case NETDEV_DOWN:
 	case NETDEV_CHANGE:
 	case NETDEV_CHANGEADDR:

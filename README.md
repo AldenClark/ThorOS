@@ -31,6 +31,8 @@ ThorOS 是基于 PonWRT-TYFZA1 的 TYFZA1 有线固件分支。设备采用 Real
 
 开发分支新增了由 Linux bridge/switchdev 控制的 **LAN–LAN 原生 L2 单播交换后端**，与 WAN 硬件流量卸载独立。当前为默认关闭的实验能力：广播、未知单播、组播和标签报文仍由 CPU/Linux 处理，复杂桥策略明确回退；尚未完成实机线速验收。能力边界、SDK 证据和验证方法见 [原生 L2 实现记录](docs/rtl9617c-native-l2-20261114.md)。不要把“LAN–LAN 可用”理解成全部二层业务已经硬件化。
 
+当前审计分支将已曝光的 FE/NI/QM/DMA 基础资源保留为设备生命周期所有权：普通接口停启复用，不支持驱动热卸载后重新绑定；部分初始化失败可能要求重启。完整 BUM、MDB、VLAN 硬件化与未闭合的硬件完成语义见 [完整 L2 证据矩阵](docs/rtl9617c-full-l2-evidence-20261114.md)。
+
 ## 下载固件
 
 前往 **[ThorOS Releases](https://github.com/AldenClark/ThorOS/releases)** 下载适用于原生 U-Boot 的固件，版本变化见 [更新日志](RELEASE_NOTES.md)。

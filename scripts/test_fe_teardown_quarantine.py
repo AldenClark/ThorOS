@@ -7,7 +7,7 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 source = (root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-fe.c').read_text()
-start = re.search(r'^void rtl_fe_free\(', source, re.M).start()
+start = re.search(r'^bool rtl_fe_free\(', source, re.M).start()
 end = source.index('{', start) + 1
 depth = 1
 while depth:
@@ -38,7 +38,7 @@ struct rtl_fe_port {struct list_head list;unsigned int bindings;};
 struct rtl_fe_flow {struct list_head list;};
 struct rtl_fe {
  struct list_head ports,blocks,flows;
- bool shutting_down,engine_ready,dma_exposed;
+ bool shutting_down,engine_ready,dma_exposed,prepared,base_failed;
  enum rtl_fe_mode desired_mode;
  int lock,error,fail_disable,fail_switch_stop;
  unsigned int fdb_cmd_mode_saved,fdb_control,fdb_access,limit_access;
@@ -85,16 +85,16 @@ static struct rtl_fe *make_owner(void){
 '''
 tests = r'''
 int main(void){
- rtl_fe_free(NULL);
+ assert(rtl_fe_free(NULL));
  struct rtl_fe *fe=make_owner();
  struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
- rtl_fe_free(fe);
+ assert(rtl_fe_free(fe));
  assert(dma_frees==1 && path_frees==1 && frees==2 && !warnings && cancelled==1 && debug_removed==1);
  assert(mode_writes==1 && last_mode==0x25123456);
  fe=make_owner();fe->fdb_cmd_mode_saved=BIT(31);fe->fdb_control=0x12345678;
- rtl_fe_free(fe);assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
+ assert(rtl_fe_free(fe));assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
- for(unsigned int fault=0;fault<8;fault++){
+ for(unsigned int fault=0;fault<10;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
   struct rtl_fe_flow flow={};struct list_head block;
   if(fault==0)fe->fail_disable=-ETIMEDOUT;
@@ -105,17 +105,18 @@ int main(void){
   if(fault==5)fe->fdb_access=BIT(31); /* An in-flight FDB command still owns CMD mode. */
   if(fault==6)fe->limit_access=BIT(31); /* A late MAC-limit command shares that mode lease. */
   if(fault==7)fe->dma_exposed=true; /* No documented complete AXI drain. */
-  rtl_fe_free(fe);
+  if(fault==8)fe->base_failed=true; /* Partial setup cannot release shared leases. */
+  if(fault==9)fe->prepared=true; /* A surviving base snapshot is still an owner. */
+  assert(!rtl_fe_free(fe));
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
   assert(!dma_frees && !path_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
-  if(fault==7)assert(mode_writes==1 && fe->fdb_control==0x25123456);
-  else assert(!mode_writes && fe->fdb_control==0xa5123456);
+  assert(!mode_writes && fe->fdb_control==0xa5123456);
   assert(fe->error==(fault>=5?-EBUSY:fault==4?-ETIMEDOUT:fe->fail_disable));
   /* Test-only deallocation of deliberately quarantined model objects. Real
    * hardware owners stay allocated until a reboot/drain can be proved. */
   free(port);free(fe->memory);free(fe->itu_paths);free(fe);
  }
- puts("FE teardown: never-exposed success restores only FDB CMD-mode bit; exposed DMA, timeout, callback references, residual flows, L2-stop failure or busy FDB/MAC-limit quarantine owners");
+ puts("FE teardown: release result distinguishes never-exposed cleanup from quarantine; exposed/partial bases preserve FDB leases and DMA, with async users stopped");
 }
 '''
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-quarantine-') as directory:

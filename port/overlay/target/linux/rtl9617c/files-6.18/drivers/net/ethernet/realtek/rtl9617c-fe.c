@@ -112,11 +112,19 @@ static const unsigned int fe_registers[] = {
  0x3854,0x3858,0x385c,0x38a0,0x38b8,0x38bc,0x38c4,0x3924,0x3724,
  0x3400,0x3404,0x3414,0x3418,0x341c,0x3420,0x3424,0x3428,
  0x3700,0x3704,0x3708,0x370c,0x3710,0x3714,0x3718,0x371c,0x3720,0x3860,0x394c,0x3950,0x3954,0x3958,0x395c,
- 0x2300,0x23a0,0x23a4,0xa1e0,
+ 0x2300,0x2394,0x23a0,0xa1e0,
  0x3278,0x327c,0x3280,
  0x3500,0x3504,0x351c,
  0x3940,0x3944,0x3948,0x3c80,
  0x3508,0x30cc,0x30a4,0x3218,
+};
+/* aal-77c/include/aal_l3_cls.h cls_fib_mod_0_t and
+ * l3_cls_fib_tbl_entry_t: mode0 occupies only the first row's payload.
+ * The second row supplies fib_format_sel, not another zero payload. */
+static const unsigned int fe_cls_mode0_mask[2][7] = {
+ {0xffffcfffU,0xcfffffffU,0xffffffffU,0xfffffffbU,
+  0xffffffffU,0xecffffffU,0x03ffffffU},
+ {0,0,0,0,0,0,0x03800000U},
 };
 struct rtl_fe {
  struct device *device;
@@ -134,10 +142,15 @@ struct rtl_fe {
  /* NI stop/start must not confuse requested policy with live ASIC state. */
  bool engine_ready, shutting_down;
  bool route_gate_ready, route_admitted, dma_exposed;
+ /* prepared owns the pre-write snapshot; base_ready is only published
+  * after every base table/profile has been installed. An exposed partial
+  * setup is not a reusable CPU path and is quarantined until reboot. */
+ bool base_ready, base_failed;
  enum rtl_fe_mode desired_mode;
  unsigned int fdb_cmd_mode_saved;
  unsigned int cache_target;
  unsigned int pp_rejected_register, pp_rejected_value;
+ unsigned int base_rejected_register, base_rejected_value;
  int error;
  u64 installs, deletes, misses;
  struct rtl_fe_observe observe;
@@ -444,6 +457,7 @@ static int fe_prepare(struct rtl_fe *fe)
  fe_write(fe,0xa1e0,fe_read(fe,0xa1e0)|0x3ff);
  rtl_fe_cache_start(&io);
  fe_write(fe,0x351c,fe_read(fe,0x351c)|BIT(10));
+ fe->base_ready=true;
  return 0;
 }
 static int fe_restore(struct rtl_fe *fe)
@@ -455,6 +469,11 @@ static int fe_restore(struct rtl_fe *fe)
 
  if(!fe->prepared)return 0;
  fe_route_gate(fe);
+ /* A PDC source may still name connector24 after the last Linux NI user
+  * closes. Neither an idle table command nor cache invalidation proves
+  * that the full L3/AXI pipeline has drained. Never restore the old LPB,
+  * classifier or DMA bases after publication, even during device remove. */
+ if(fe->dma_exposed)return -EBUSY;
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
  fe_write(fe,0x38c4,0);
  ret=fe_access(fe,0x393c,1);
@@ -493,6 +512,7 @@ static int fe_restore(struct rtl_fe *fe)
  }
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe_write(fe,fe_registers[i],fe->saved[i]);
  fe_read(fe,0x383c);
+ fe->base_ready=false;
  fe->prepared=false;
  return 0;
 }
@@ -1826,25 +1846,154 @@ static void fe_lan_restore_locked(struct rtl_fe *fe)
  fe->lan_redirected=false;
 }
 
+static bool fe_base_match(struct rtl_fe *fe,unsigned int reg,
+                          unsigned int mask,unsigned int expected)
+{
+ unsigned int value=fe_read(fe,reg);
+
+ if((value&mask)==(expected&mask))return true;
+ fe->base_rejected_register=reg;
+ fe->base_rejected_value=value;
+ return false;
+}
+
+/* Warm NI reopen does not reset or repopulate the shared QM any more.
+ * Verify the retained connector contract instead of writing a fresh base
+ * over potentially in-flight packets. Only defined bits are compared in
+ * shared/register words (RTL8277C generated register definitions and the
+ * SDK's LPB/CLS layouts). This is a configuration check,
+ * NOT a complete L3/AXI drain or per-flow retirement proof. */
+static int fe_base_check_locked(struct rtl_fe *fe)
+{
+ struct rtl_dq_io io=fe_io(fe);
+ static const unsigned int high[]={0x3838,0x3840,0x384c,0x3858};
+ static const unsigned int low[]={0x383c,0x3844,0x3850,0x385c};
+ static const unsigned int offset[]={0,RTL_FE_ACTION_OFFSET,
+  RTL_FE_OVERFLOW_OFFSET,RTL_FE_DEFAULT_OFFSET};
+ unsigned int expected[7],actual[7],lpb[3],i,side,type,row,word;
+ unsigned int address_high=(upper_32_bits(fe->dma)&255)|2;
+ int ret;
+
+ if(!fe->prepared || !fe->base_ready || fe->base_failed ||
+    !fe->route_gate_ready)return -EIO;
+ fe->base_rejected_register=0;
+ fe->base_rejected_value=0;
+ ret=rtl_fe_pp_exceptions_check(&io,&fe->pp_rejected_register,
+                               &fe->pp_rejected_value);
+ if(ret)return ret;
+ /* Both connectors must already select the keep-original CPU profile. */
+ for(i=0;i<2;i++) {
+  rtl_fe_ingress_lpb(lpb,i?7:0,16);
+  rtl_fe_bits_set(lpb,42,4,1);
+  for(word=0;word<3;word++)
+   if(!fe_base_match(fe,0x3414+i*12+word*4,word==2?0x3fffffffU:~0U,lpb[word]))return -EIO;
+ }
+ for(i=0;i<ARRAY_SIZE(high);i++)
+  if(!fe_base_match(fe,high[i],255,address_high) ||
+     !fe_base_match(fe,low[i],~127U,lower_32_bits(fe->dma)+offset[i]))return -EIO;
+ if(!fe_base_match(fe,0x3848,7,4) || !fe_base_match(fe,0x3854,7,1) ||
+    !fe_base_match(fe,0x38c4,0xfc000000U,0xa0000000U) ||
+    !fe_base_match(fe,0x2300,BIT(12)|BIT(13),BIT(12)|BIT(13)) ||
+    !fe_base_match(fe,0x2394,0x00ff00ffU,0x000600ffU) ||
+    !fe_base_match(fe,0x23a0,0x00ff00ffU,0x000600ffU) ||
+    !fe_base_match(fe,0xa1e0,0x3ff,0x3ff) ||
+    !fe_base_match(fe,0x3400,BIT(0)|BIT(2)|BIT(3)|BIT(10)|BIT(19),
+                   BIT(2)|BIT(3)|BIT(19)) ||
+    !fe_base_match(fe,0x3404,0x03ffffffU,7U|(25U<<8)|(1U<<14)|(24U<<16)|(2U<<22)|(3U<<24)) ||
+    !fe_base_match(fe,0x30a4,BIT(31),BIT(31)) ||
+    !fe_base_match(fe,0x351c,BIT(31)|BIT(12)|BIT(10)|(63U<<4)|
+                   (63U<<16)|(7U<<24),BIT(31)|BIT(12)|BIT(10)|(32U<<4)|(16U<<16)))
+  return -EIO;
+ ret=rtl_fe_classifier_keys_empty(&io);
+ if(ret)return ret;
+ for(i=0;i<2;i++) {
+  for(side=0;side<4;side++) {
+   ret=fe_access(fe,0x1654,BIT(31)|(24+i)|(side<<6));
+   if(ret)return ret;
+   if(!fe_base_match(fe,0x1658,15,i?13:12))return -EIO;
+  }
+  for(type=0;type<4;type++)for(row=0;row<2;row++) {
+   memset(expected,0,sizeof(expected));
+   if(!row) {
+    if(i)rtl_fe_classify_cpu_original(expected);
+    else {rtl_fe_classify_hash(expected,0,0);rtl_fe_bits_set(expected,208,1,0);}
+   }
+   ret=rtl_fe_classifier_read(&io,fe_classifier_default_index(i,type,row),actual);
+   if(ret)return ret;
+   for(word=0;word<ARRAY_SIZE(expected);word++) {
+    unsigned int mask=fe_cls_mode0_mask[row][word];
+
+    if((actual[word]&mask)!=(expected[word]&mask)) {
+     fe->base_rejected_register=0x33cc-word*4;
+     fe->base_rejected_value=actual[word];
+     return -EIO;
+    }
+   }
+  }
+ }
+ return 0;
+}
+
+static void fe_base_quarantine_locked(struct rtl_fe *fe)
+{
+ /* Do not restore, recycle, or retry a half-programmed base. Existing
+  * async users already reject shutting_down; final free unregisters them
+  * before NI's devm mappings disappear. Unbind/release remain software-only. */
+ fe->base_failed=true;
+ fe->engine_ready=false;
+ fe->shutting_down=true;
+ fe->enabled=false;
+ fe->cpu_path=false;
+ fe_route_gate(fe);
+ fe_lan_restore_locked(fe);
+}
+
+static int fe_base_require_locked(struct rtl_fe *fe)
+{
+ int ret;
+
+ if(fe->base_failed)return -EIO;
+ if(!fe->prepared) {
+  ret=fe_prepare(fe);
+  if(ret) {
+   /* Read-only preflight/snapshot failures acquired no base or DMA owner. */
+   if(fe->prepared || fe->dma_exposed)fe_base_quarantine_locked(fe);
+   return ret;
+  }
+ }
+ ret=fe_base_check_locked(fe);
+ if(ret)fe_base_quarantine_locked(fe);
+ return ret;
+}
+
 static int fe_disable_locked(struct rtl_fe *fe)
 {
  struct rtl_fe_flow *flow,*next;
- int ret=fe_switch_quiesce_locked(fe);
+ int ret;
 
- /* L2 owns snapshots of some shared tables. Never overwrite those owners
-  * while its previous withdrawal still has an indeterminate command. */
- if(ret)return ret;
-
+ /* Publish no-admission even if a later L2/table withdrawal must retry. */
  fe->enabled=false;
  fe->cpu_path=false;
+ fe_route_gate(fe);
+ ret=fe_switch_quiesce_locked(fe);
+ if(ret)return ret;
+ fe_lan_restore_locked(fe);
+ if(fe->base_failed)return -EIO;
  if(fe->prepared) {
-  fe_lan_restore_locked(fe);
-  usleep_range(1000,2000);
+  if(!fe->base_ready || !fe->route_gate_ready ||
+     !fe_base_match(fe,0x3418,15U<<10,1U<<10) ||
+     !fe_base_match(fe,0x3424,15U<<10,1U<<10)) {
+   fe_base_quarantine_locked(fe);
+   return -EIO;
+  }
   list_for_each_entry_safe(flow,next,&fe->flows,list) {
    ret=fe_delete(fe,flow);
    if(ret)return ret;
   }
-  ret=fe_restore(fe);
+  /* Retire the SDK's individual route owners, not the permanent base.
+   * The original-packet CPU profile must remain valid while any PDC entry
+   * or previously accepted packet can still name an L3 connector. */
+  if(!fe->dma_exposed)ret=fe_restore(fe);
  }
  fe_collect_ports(fe);
  return ret;
@@ -1855,17 +2004,10 @@ static int fe_enable_locked(struct rtl_fe *fe)
  int ret;
 
  if(fe->enabled)return 0;
- ret=fe_switch_quiesce_locked(fe);
+ ret=fe_disable_locked(fe);
  if(ret)return ret;
- /* An unfinished rollback still owns the original register snapshot. */
- if(fe->prepared && !fe->cpu_path) {
-  ret=fe_disable_locked(fe);
-  if(ret)return ret;
- }
- if(!fe->prepared) {
-  ret=fe_prepare(fe);
-  if(ret){fe_restore(fe);return ret;}
- }
+ ret=fe_base_require_locked(fe);
+ if(ret)return ret;
  /* The DMA tables, miss actions and port maps exist before admitting LAN. */
  /* A CPU-only trap does not own LAN admission. Snapshot the current NI
   * baseline only when admitting LAN, including after an engine restart. */
@@ -1883,29 +2025,13 @@ static int fe_enable_locked(struct rtl_fe *fe)
  * PPP IPv4. Keep the classifier/miss tables, but admit no hardware flows. */
 static int fe_cpu_path_locked(struct rtl_fe *fe)
 {
- struct rtl_fe_flow *flow,*next;
- int ret=0;
+ int ret;
 
  if(fe->cpu_path)return 0;
- ret=fe_switch_quiesce_locked(fe);
+ ret=fe_disable_locked(fe);
  if(ret)return ret;
- if(fe->prepared && !fe->enabled) {
-  ret=fe_disable_locked(fe);
-  if(ret)return ret;
- }
- if(!fe->prepared) {
-  ret=fe_prepare(fe);
-  if(ret){fe_restore(fe);return ret;}
- }
- /* The lock also gates route callbacks while changing admission mode. */
- fe->enabled=false;
- fe_lan_restore_locked(fe);
- usleep_range(1000,2000);
- list_for_each_entry_safe(flow,next,&fe->flows,list) {
-  ret=fe_delete(fe,flow);
-  if(ret)return ret;
- }
- fe_collect_ports(fe);
+ ret=fe_base_require_locked(fe);
+ if(ret)return ret;
  fe->cpu_path=true;
  return 0;
 }
@@ -1962,8 +2088,8 @@ int rtl_fe_disable(struct rtl_fe *fe)
 
 /* Called under RTNL, outside NI spinlocks. Never acquire a PON lock here:
  * an OMCI ndo_stop can already hold pon->lock while releasing its NI user.
- * Also called before every NI start so a failed earlier teardown cannot be
- * hidden by overwriting the registers owned by its still-live snapshot. */
+ * Stopping the host user is not PON withdrawal. Keep the original-packet
+ * CPU profile and every exposed base allocation for the device lifetime. */
 int rtl_fe_engine_suspend(struct rtl_fe *fe)
 {
  int ret;
@@ -1977,10 +2103,10 @@ int rtl_fe_engine_suspend(struct rtl_fe *fe)
  return ret;
 }
 
-/* NI/QM/DMA have established a new CPU baseline, but NAPI and port admission
- * are not live yet. Build a fresh FE snapshot and restore the requested mode
- * before reporting a successful NI open. A failure must not silently change
- * PON's requested hardware/CPU mode or expose an enabled-but-bypassed engine. */
+/* NI/QM/DMA reuse their established queues on a warm open. No fresh base
+ * snapshot, MEM_INI or DMA pointer publication is permitted here. Validate
+ * the retained CPU connectors before reporting a successful NI open; only
+ * the generation-checked fabric owner can admit the requested route mode. */
 int rtl_fe_engine_resume(struct rtl_fe *fe)
 {
  int ret=0;
@@ -1988,12 +2114,18 @@ int rtl_fe_engine_resume(struct rtl_fe *fe)
  if(!fe)return 0;
  mutex_lock(&fe->lock);
  if(fe->shutting_down){ret=-ENODEV;goto unlock;}
- if(fe->prepared){ret=-EBUSY;goto unlock;}
+ if(!list_empty(&fe->flows)){ret=-EBUSY;goto unlock;}
+ if(fe->prepared) {
+  ret=fe_base_require_locked(fe);
+  if(ret)goto unlock;
+ }
  if(fe->desired_mode==RTL_FE_MODE_HARDWARE)ret=fe_enable_locked(fe);
  else if(fe->desired_mode==RTL_FE_MODE_CPU)ret=fe_cpu_path_locked(fe);
  if(ret) {
-  /* Keep an incomplete rollback and its DMA owners for the next suspend. */
-  fe_disable_locked(fe);
+  /* A failed mode transition never discards the permanent base owner. */
+  fe_route_gate(fe);
+  fe->enabled=false;
+  fe->cpu_path=false;
  } else fe->engine_ready=true;
 unlock:
  if(ret)fe->engine_ready=false;
@@ -2003,14 +2135,14 @@ unlock:
  return ret;
 }
 
-void rtl_fe_free(struct rtl_fe *fe)
+bool rtl_fe_free(struct rtl_fe *fe)
 {
  struct rtl_fe_port *port,*next;
  struct rtl_fe_flow *flow,*flow_next;
  bool bound=false;
  int ret, switch_ret;
 
- if(!fe)return;
+ if(!fe)return true;
  mutex_lock(&fe->lock);
  fe->shutting_down=true;
  fe->engine_ready=false;
@@ -2024,6 +2156,10 @@ void rtl_fe_free(struct rtl_fe *fe)
  ret=fe_disable_locked(fe);
  if(!ret)ret=switch_ret;
  list_for_each_entry(port,&fe->ports,list)if(port->bindings)bound=true;
+ /* This check precedes ALL ownership handoff, including the shared FDB
+  * command-mode lease. An exposed/partial base may still be referenced by
+  * a PON packet; do not restore a boot owner just because software is idle. */
+ if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed))ret=-EBUSY;
  if(!ret && !bound && list_empty(&fe->blocks) && list_empty(&fe->flows)) {
   struct rtl_dq_io io=fe_io(fe);
   ret=rtl_fe_window_idle(&io,0x1ca0);
@@ -2033,12 +2169,6 @@ void rtl_fe_free(struct rtl_fe *fe)
    fe_read(fe,0x1c00);
   }
  }
- /* The public SDK does not provide a verified complete L3/AXI drain
-  * predicate. Retain an exposed allocation even after a clean software
-  * teardown. Normal stop/start reuses it; device removal requires reboot
-  * before that owner can be reclaimed. This does not make table restore
-  * itself a proven pipeline drain. */
- if(!ret && fe->dma_exposed)ret=-EBUSY;
  fe->error=ret;
  /* Failure can leave Hash/Cache DMA using this memory. A removed callback
   * can also still own its private port until its release runs. Without a
@@ -2048,7 +2178,7 @@ void rtl_fe_free(struct rtl_fe *fe)
  if(ret || bound || !list_empty(&fe->blocks) || !list_empty(&fe->flows)) {
   mutex_unlock(&fe->lock);
   dev_err(fe->device,"FE teardown quarantined: error=%d callbacks=%u; DMA memory retained, reboot required\n",ret,bound);
-  return;
+  return false;
  }
  mutex_unlock(&fe->lock);
  list_for_each_entry_safe(flow,flow_next,&fe->flows,list){list_del(&flow->list);kfree(flow);}
@@ -2056,6 +2186,7 @@ void rtl_fe_free(struct rtl_fe *fe)
  dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
  kvfree(fe->itu_paths);
  kfree(fe);
+ return true;
 }
 ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
 {
@@ -2086,6 +2217,11 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "route_gate_ready=%u route_admitted=%u dma_exposed=%u\n",
   READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted),fe->dma_exposed);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "base_ready=%u base_failed=%u base_lifetime_owner=%u full_l3_drain_verified=0 "
+  "base_rejected_register=0x%x base_rejected_value=0x%x\n",
+  fe->base_ready,fe->base_failed,fe->dma_exposed,
+  fe->base_rejected_register,fe->base_rejected_value);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "pp_rejected_register=0x%x pp_rejected_value=0x%x\n",
   fe->pp_rejected_register,fe->pp_rejected_value);

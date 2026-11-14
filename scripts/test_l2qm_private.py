@@ -18,7 +18,8 @@ old = subprocess.check_output(['git', 'show', '71ae24a:' + relative], cwd=root, 
 
 
 def native_program(text, directory, name):
-    start = text.index('if (priv->dma_tx) {', text.index('static int rtl_engine_start('))
+    owner = 'rtl_engine_prepare' if 'static int rtl_engine_prepare(' in text else 'rtl_engine_start'
+    start = text.index('if (priv->dma_tx) {', text.index('static int ' + owner + '('))
     body = text[start + len('if (priv->dma_tx) {'):text.index('/* Port15 uses scheduler', start)]
     program = r'''
 #include <stdint.h>
