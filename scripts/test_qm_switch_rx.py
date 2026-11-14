@@ -8,6 +8,7 @@ This checks transport/integration, not ASIC forwarding or learning policy.
 """
 import ast
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 
@@ -176,7 +177,54 @@ assert 'priv->qm.fe = priv->fe;' in body(xram, 'rtl_probe')
 assert 'rx_bypass_store(' not in xram
 assert 'DEVICE_ATTR_RO(rx_bypass)' in xram
 assert '&dev_attr_l2_switch.attr' in xram
-assert 'attr == &dev_attr_l2_switch.attr && !priv->fe' in body(xram, 'rtl_native_visible')
+# Execute the real visibility callback. A textual match of the former single
+# L2 attribute condition missed the contract when new read-only attributes
+# were added, and cannot exercise FE/QM-present combinations.
+attribute_names = re.findall(r'&dev_attr_(\w+)\.attr',
+                            xram[xram.index('static struct attribute *rtl_native_attrs[]'):
+                                 xram.index('static umode_t rtl_native_visible')])
+attribute_definitions = []
+for attribute in attribute_names:
+    mode = re.search(r'DEVICE_ATTR_(RO|RW)\(' + attribute + r'\)', xram)
+    assert mode is not None, f'attribute mode not modeled: {attribute}'
+    attribute_definitions.append('static struct device_attribute dev_attr_' + attribute +
+                                 ' = {{' + ('0444' if mode[1] == 'RO' else '0644') + '}};')
+visibility_test = r'''
+#include <assert.h>
+#include <stdbool.h>
+typedef unsigned int umode_t;
+struct attribute {umode_t mode;};
+struct device_attribute {struct attribute attr;};
+struct rtl_xram {void *fe,*qm_rx;};
+struct device {struct rtl_xram *private;};
+struct kobject {struct device *device;};
+static struct device *kobj_to_dev(struct kobject *kobj){return kobj->device;}
+static struct rtl_xram *dev_get_drvdata(struct device *dev){return dev->private;}
+static struct rtl_xram *netdev_priv(struct rtl_xram *priv){return priv;}
+''' + '\n'.join(attribute_definitions) + '\n' + body(xram, 'rtl_native_visible') + r'''
+int main(void){
+ struct rtl_xram priv={0};struct device dev={&priv};struct kobject kobj={&dev};
+ struct attribute *fe_only[]={&dev_attr_l2_switch.attr,&dev_attr_l2_state.attr,
+                             &dev_attr_l2_evidence.attr};
+ struct attribute *qm_only[]={&dev_attr_qm_pool.attr,&dev_attr_qm_voqs.attr,
+  &dev_attr_rx_prefetch.attr,&dev_attr_pppoe_rx_checksum.attr,&dev_attr_pon_deepq.attr,
+  &dev_attr_qm_trace.attr,&dev_attr_qm_wait.attr,&dev_attr_qm_es.attr,&dev_attr_qm_buffer.attr};
+ struct attribute *always[]={&dev_attr_xram_state.attr,&dev_attr_dma_state.attr,
+                            &dev_attr_rx_bypass.attr,&dev_attr_lan_mib_evidence.attr};
+ assert(dev_attr_l2_switch.attr.mode==0644);
+ assert(dev_attr_l2_state.attr.mode==0444 && dev_attr_l2_evidence.attr.mode==0444);
+ assert(dev_attr_lan_mib_evidence.attr.mode==0444);
+ for(unsigned int fe=0;fe<2;fe++)for(unsigned int qm=0;qm<2;qm++){
+  priv.fe=fe?&priv:0;priv.qm_rx=qm?&priv:0;
+  for(unsigned int i=0;i<sizeof(fe_only)/sizeof(*fe_only);i++)
+   assert(rtl_native_visible(&kobj,fe_only[i],i)==(fe?fe_only[i]->mode:0));
+  for(unsigned int i=0;i<sizeof(qm_only)/sizeof(*qm_only);i++)
+   assert(rtl_native_visible(&kobj,qm_only[i],i)==(qm?qm_only[i]->mode:0));
+  for(unsigned int i=0;i<sizeof(always)/sizeof(*always);i++)
+   assert(rtl_native_visible(&kobj,always[i],i)==always[i]->mode);
+ }
+}
+'''
 sysfs_test = r'''
 #include <assert.h>
 #include <errno.h>
@@ -219,7 +267,8 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='qm-switch-') as directory:
     directory = Path(directory)
-    for name, contents in (('rx', test), ('parent', parent_test), ('sysfs', sysfs_test)):
+    for name, contents in (('rx', test), ('parent', parent_test), ('sysfs', sysfs_test),
+                           ('visibility', visibility_test)):
         cfile, binary = directory / (name + '.c'), directory / name
         cfile.write_text(contents)
         subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',

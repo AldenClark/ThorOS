@@ -64,6 +64,7 @@ struct rtl_lan {struct rtl_xram *shared;unsigned int port;};
 struct net_device {
  struct rtl_lan lan;struct phy_device *phydev;char name[16];
  void *netdev_ops,*ethtool_ops;int max_mtu;u8 dev_addr[6];unsigned long netns_immutable:1;
+ unsigned int dev_port;
 };
 struct tyfza1_led {void *output;int requested;struct {char *name;int max_brightness;} cdev;};
 struct rtl_xram {
@@ -126,6 +127,7 @@ static void rtl_dma_tx_forget(int *dma,struct net_device *d){(void)dma;(void)d;}
 static int register_netdevice(struct net_device *d){
  assert(rtnl_held);
  assert(d->netns_immutable);
+ assert(d->dev_port==d->lan.port);
  if(stage==8 && current_port==fail_port)return -EIO;
  assert(d->phydev);active|=BIT(d->lan.port);return 0;
 }

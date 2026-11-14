@@ -12,6 +12,7 @@ python3 scripts/test_lan_probe_isolation.py
 python3 scripts/test_lan_async.py
 python3 scripts/test_qspi_poll.py
 python3 scripts/test_lan_pm_mapping.py
+python3 scripts/test_ni_mib_evidence.py
 python3 scripts/test_lan_link_mode.py
 python3 scripts/test_fe_lan_lifecycle.py
 python3 scripts/test_fe_cache_slot_zero.py
@@ -30,6 +31,7 @@ python3 scripts/test_l2_switch_control.py
 python3 scripts/test_l2_switch_worker.py
 python3 scripts/test_l2_switch_fdb.py
 python3 scripts/test_l2_switch_topology.py
+python3 scripts/test_l2_evidence.py
 python3 scripts/test_l2_bridge_eligibility.py
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py
@@ -59,4 +61,5 @@ python3 scripts/test_fe_interface_capacity.py
 python3 scripts/test_fe_flow_release.py
 python3 scripts/test_release_uboot_archive.py
 python3 scripts/test_datapath_observer.py
+python3 scripts/test_datapath_summary.py
 python3 scripts/test_firmware_build_info.py

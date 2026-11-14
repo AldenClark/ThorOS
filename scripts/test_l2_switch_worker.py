@@ -3,8 +3,10 @@
 
 Topology discovery, the guard lock and hardware transactions are covered in
 separate tests. Here their boundary outcomes are injected into the unchanged
-production worker and admission callbacks, including changes while its FE
-mutex is released for RCU or switchdev replay. No hardware claim is made.
+production worker, notifier, replay and admission callbacks, including changes
+while its FE mutex is released for RCU or switchdev replay. The switchdev
+boundary replays actual FDB records, never fabricates rule_count. No hardware
+claim is made.
 """
 import hashlib
 import json
@@ -54,8 +56,17 @@ typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define min(a,b) ((a)<(b)?(a):(b))
 #define system_long_wq 7
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
+#define NOTIFY_DONE 0
+#define notifier_from_errno(error) (error)
+#define SWITCHDEV_FDB_ADD_TO_DEVICE 1
+#define SWITCHDEV_FDB_DEL_TO_DEVICE 2
 struct net_device {unsigned int index;};
-struct notifier_block {unsigned int unused;};
+struct notifier_block {int (*notifier_call)(struct notifier_block *,unsigned long,void *);};
+struct switchdev_notifier_info {struct net_device *dev;void *ctx;};
+struct switchdev_notifier_fdb_info {
+ struct switchdev_notifier_info info;const u8 *addr;
+ unsigned int vid;bool added_by_user,is_local,locked;
+};
 struct work_struct {unsigned int unused;};
 struct delayed_work {struct work_struct work;};
 struct rtl_fe_bridge;
@@ -71,6 +82,8 @@ static struct net_device ports[5],master;
 static unsigned int rules[RTL_L2_FDB_ENTRIES][4];
 static unsigned int closures,restores,unoffloads,snapshots,syncs,route_flushes,offloads,prepares,claims,appends,arms,scheduled,last_delay,cases;
 static unsigned int restore_fail_at,offload_fail_at,append_fail_at,replay_error_at,change_in_sync,change_in_replay;
+static unsigned int online_ports,static_port,offline_port,invalidates;
+static struct rtl_l2_fdb_entry installed[32];
 static int hw_error,domain_error,flush_error;
 static bool rtnl_held,arm_failure,epoch_during_append;
 static enum fe_switch_reason policy_reason;
@@ -90,6 +103,14 @@ static bool fe_switch_hw_arm(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u3
 }
 static void fe_switch_gate(void *private);
 static bool fe_switch_arm(void *private);
+static int fe_switch_atomic_event(struct notifier_block *,unsigned long,void *);
+static bool switchdev_fdb_is_dynamically_learned(const struct switchdev_notifier_fdb_info *info){return !info->added_by_user && !info->is_local;}
+static bool is_valid_ether_addr(const u8 *mac){unsigned int any=0;for(unsigned int i=0;i<6;i++)any|=mac[i];return any && !(mac[0]&1);}
+static void ether_addr_copy(u8 *dst,const u8 *src){memcpy(dst,src,6);}
+static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
+static void rtl9617c_switch_guard_invalidate(struct rtl9617c_switch_guard *guard){
+ assert(guard==&sw.guard);invalidates++;guard->generation++;fe_switch_gate(&sw);
+}
 static void rtl9617c_switch_guard_quiesce(struct rtl9617c_switch_guard *guard){assert(guard==&sw.guard);fe_switch_gate(&sw);}
 static u64 rtl9617c_switch_guard_generation(struct rtl9617c_switch_guard *guard){assert(guard==&sw.guard);return guard->generation;}
 static bool rtl9617c_switch_guard_blocked(struct rtl9617c_switch_guard *guard){return guard->blocked;}
@@ -108,7 +129,7 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *owner){
 }
 static enum fe_switch_reason fe_switch_snapshot(struct rtl_fe_bridge *owner,struct fe_switch_plan *plan){
  assert(owner==&sw && fe.lock && rtnl_held && !sw.hw.open);snapshots++;
- memset(plan,0,sizeof(*plan));plan->ports=3;sw.master=&master;sw.route_mask=fe.enabled?31:0;
+ memset(plan,0,sizeof(*plan));plan->ports=online_ports;sw.master=&master;sw.route_mask=fe.enabled?31:0;
  for(unsigned int i=0;i<5;i++)sw.ports[i]=&ports[i];
  return policy_reason;
 }
@@ -130,11 +151,24 @@ static int switchdev_bridge_port_offload(struct net_device *dev,struct net_devic
  assert(atomic==&sw.atomic_nb && blocking==&sw.blocking_nb && !tx_fwd_offload && !extack);
  offloads++;if(offloads==offload_fail_at)return -ENOMEM;
  if(offloads==replay_error_at)sw.replay_error=-ENOSPC;
- sw.rule_count=2;change_state(change_in_replay);return 0;
+ /* Linux br_switchdev_fdb_replay() replays the WHOLE bridge for each
+  * offloaded port. Invoke the actual atomic/replay functions with those
+  * records while native_mask is still deliberately unpublished. */
+ const u8 addresses[][6]={{2,0,0,0,0,10},{2,0,0,0,0,11},
+                         {2,0,0,0,0,12},{2,0,0,0,0,13}};
+ for(unsigned int i=0;i<4;i++){
+  struct switchdev_notifier_fdb_info item={.info={.dev=i==0?&master:
+    i==1?&ports[static_port]:i==2?&ports[offline_port]:&ports[0],.ctx=context},
+   .addr=addresses[i],.is_local=i==0,.added_by_user=i==1 || i==2};
+  int ret=atomic->notifier_call(atomic,SWITCHDEV_FDB_ADD_TO_DEVICE,&item);
+  if(ret)return ret;
+ }
+ assert(!sw.native_mask && !sw.active && sw.replay_ports==online_ports);
+ change_state(change_in_replay);return 0;
 }
 static int fe_switch_hw_prepare(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,unsigned long seconds,bool snooping){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open && !sw.active);
- assert(fe.engine_ready && native==3 && seconds==300 && snooping);prepares++;
+ assert(fe.engine_ready && native==online_ports && seconds==300 && snooping);prepares++;
  hw->owned=true;return hw_error;
 }
 static int fe_switch_domain_claim(struct rtl_fe_bridge *owner){
@@ -144,6 +178,8 @@ static int fe_switch_domain_claim(struct rtl_fe_bridge *owner){
 }
 static int fe_switch_fdb_write(struct rtl_fe_bridge *owner,enum rtl_l2_fdb_command command,const unsigned int *words){
  assert(owner==&sw && command==RTL_L2_FDB_APPEND && words && fe.lock && rtnl_held && sw.domain_owned && !sw.hw.open);
+ assert(!sw.native_mask && !sw.replay_ports && !sw.replaying);
+ assert(appends<32);rtl_l2_fdb_decode(words,&installed[appends]);
  appends++;if(epoch_during_append)sw.guard.generation++;
  return appends==append_fail_at?-ENOSPC:0;
 }
@@ -154,12 +190,14 @@ static void mod_delayed_work(unsigned int queue,struct delayed_work *work,unsign
 static void setup(void){
  fe=(struct rtl_fe){.enabled=true,.prepared=true,.engine_ready=true};memset(&sw,0,sizeof(sw));
  sw.fe=&fe;sw.guard.owner=&sw;sw.guard.generation=1;sw.rules=rules;sw.requested=true;
+ sw.atomic_nb.notifier_call=fe_switch_atomic_event;
+ online_ports=3;static_port=1;offline_port=2;invalidates=0;memset(installed,0,sizeof(installed));
  policy_reason=FE_SWITCH_OK;ageing=300*USER_HZ;
  closures=restores=unoffloads=snapshots=syncs=route_flushes=offloads=prepares=claims=appends=arms=scheduled=last_delay=0;
  restore_fail_at=offload_fail_at=append_fail_at=replay_error_at=change_in_sync=change_in_replay=0;
  hw_error=domain_error=flush_error=0;rtnl_held=arm_failure=epoch_during_append=false;
 }
-static void run(void){fe_switch_work(&sw.work);assert(!fe.lock && !rtnl_held);cases++;}
+static void run(void){fe_switch_work(&sw.work);assert(!fe.lock && !rtnl_held && !sw.replaying && !sw.replay_ports);cases++;}
 '''
 
 TEST = r'''
@@ -186,6 +224,26 @@ static void success_and_policy(void){
   setup();if(mode==0)sw.stopping=true;if(mode==1)fe.shutting_down=true;if(mode==2)fe.engine_ready=false;
   run();assert(!sw.hw.open && !prepares && !arms && !route_flushes);
  }
+}
+static void replay_to_publication(void){
+ /* First activation must install both the local row and the allowed
+  * sticky/static destination; clearing native_mask must not discard it. */
+ setup();run();assert(appends==2 && sw.native_mask==3 && !invalidates);
+ assert(installed[0].mac[5]==10 && installed[0].destination==25);
+ assert(installed[1].mac[5]==11 && installed[1].destination==1);
+ for(unsigned int i=0;i<2;i++)assert(installed[i].valid && installed[i].is_static);
+ /* New snapshot moves the static output and excludes the old/down port;
+  * switchdev still replays the down port's entry for every online port. */
+ online_ports=5;static_port=2;offline_port=1;sw.guard.generation++;run();
+ assert(appends==4 && sw.native_mask==5 && sw.offloaded==5 && !invalidates);
+ assert(installed[2].mac[5]==10 && installed[2].destination==25);
+ assert(installed[3].mac[5]==11 && installed[3].destination==2);
+ for(unsigned int i=0;i<appends;i++)assert(installed[i].mac[5]!=12 && installed[i].mac[5]!=13);
+ /* A later failed rebuild cannot publish the pending mask or retain an
+  * earlier active generation merely because its first local row worked. */
+ append_fail_at=appends+2;sw.guard.generation++;run();
+ assert(!sw.active && !sw.native_mask && !sw.hw.open && !sw.offloaded &&
+        sw.reason==FE_SWITCH_FDB_CAPACITY && !sw.replay_ports);
 }
 static void released_lock_changes(void){
  for(unsigned int place=0;place<2;place++)for(unsigned int change=1;change<=4;change++){
@@ -221,27 +279,50 @@ static void transaction_failures(void){
   if(retry<8)assert(scheduled==before+1 && last_delay==delays[retry]*HZ);else assert(scheduled==before);
  }
 }
-int main(void){success_and_policy();released_lock_changes();transaction_failures();
- printf("Native switch production worker: %u policy/RCU/replay/rollback cases; stale snapshots never program hardware, native/route masks never overlap, route-only fallback and bounded foreign-owner retries PASS\n",cases);return 0;}
+int main(void){success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();
+ printf("Native switch production worker: %u policy/RCU/actual-FDB-replay/rollback cases; static destinations survive staged publication, offline entries stay excluded, stale/failed snapshots never arm, route-only fallback and bounded retries PASS\n",cases);return 0;}
 '''
 
 definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"enum fe_switch_reason \{.*?\n\};", r"struct fe_switch_plan \{.*?\n\};",
     r"struct fe_switch_learned \{.*?\n\};", r"struct rtl_fe_bridge \{.*?\n\};",
 ])
-functions = "\n".join(function(name) for name in ["fe_switch_gate", "fe_switch_arm", "fe_switch_work"])
+functions = "\n".join(function(name) for name in [
+    "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_atomic_event",
+    "fe_switch_gate", "fe_switch_arm", "fe_switch_work",
+])
+mutants = {
+    "replay_uses_unpublished_native_mask": functions.replace(
+        "!(sw->replay_ports & BIT(port))", "!(sw->native_mask & BIT(port))", 1),
+    "native_mask_published_before_static_fdb": functions.replace(
+        "\tsw->native_mask = plan.ports;\n", "", 1).replace(
+        "\tfor (i = 0; i < sw->rule_count; i++) {\n\t\tret = fe_switch_fdb_write",
+        "\tsw->native_mask = plan.ports;\n\tfor (i = 0; i < sw->rule_count; i++) {\n\t\tret = fe_switch_fdb_write", 1),
+}
+for name, mutated in mutants.items():
+    if mutated == functions:
+        raise SystemExit(f"Mutation anchor missing: {name}")
+environment = dict(os.environ)
+environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
 with tempfile.TemporaryDirectory(prefix="l2-switch-worker-") as directory:
     temporary = Path(directory)
-    (temporary / "test.c").write_text(COMMON + definitions + "\nstatic void fe_switch_work(struct work_struct *work);\n" + BACKEND + functions + TEST)
-    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(DRIVERS),
-                    str(temporary / "test.c"), "-o", str(temporary / "test")], check=True)
-    environment = dict(os.environ)
-    environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
-    subprocess.run([str(temporary / "test")], check=True, env=environment)
+    for name, candidate in {"production": functions, **mutants}.items():
+        (temporary / "test.c").write_text(COMMON + definitions + "\nstatic void fe_switch_work(struct work_struct *work);\n" + BACKEND + candidate + TEST)
+        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                        "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(DRIVERS),
+                        str(temporary / "test.c"), "-o", str(temporary / "test")], check=True)
+        if name == "production":
+            subprocess.run([str(temporary / "test")], check=True, env=environment)
+        else:
+            result = subprocess.run([str(temporary / "test")], env=environment,
+                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode != -6 or "Assertion" not in result.stderr:
+                raise SystemExit(f"{name}: expected a contract assertion, got {result.returncode}: {result.stderr}")
+            print(f"Runtime regression mutant rejected: {name}")
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-worker.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),
-    "scope": "complete production reconciliation worker and admission callbacks; topology/guard/HW boundary outcomes injected",
+    "scope": "complete production reconciliation worker, atomic notifier, static FDB replay and admission callbacks; real records traverse replay before hardware publication; topology/guard/HW boundaries injected",
+    "runtime_mutants_rejected": list(mutants),
     "hardware_verified": False,
 }, indent=2) + "\n")

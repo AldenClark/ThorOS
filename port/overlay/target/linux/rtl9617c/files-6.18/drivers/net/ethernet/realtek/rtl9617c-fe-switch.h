@@ -108,6 +108,12 @@ struct rtl_fe_bridge {
 	 */
 	struct net_device *ports[FE_LAN_PORTS], *master;
 	u32 offloaded, native_mask, route_mask, armed_route_mask;
+	/* Synchronous switchdev replay belongs to the pending topology, not
+	 * the published datapath. native_mask stays zero until preparation and
+	 * every static FDB write have completed successfully. RTNL owns this
+	 * immutable mask while replaying; ordinary notifications never use it.
+	 */
+	u32 replay_ports;
 	unsigned int (*rules)[RTL_L2_FDB_WORDS];
 	unsigned int rule_count, local_target, retry_count;
 	struct fe_switch_learned *learned, *next;
@@ -446,7 +452,7 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	 * were flushed before this generation; do not recreate an output which
 	 * the snapshot deliberately excluded. Local MACs still belong to CPU.
 	 */
-	if (!info->is_local && port >= 0 && !(sw->native_mask & BIT(port)))
+	if (!info->is_local && port >= 0 && !(sw->replay_ports & BIT(port)))
 		return 0;
 	if (info->locked || (!info->is_local && port < 0) ||
 	    !is_valid_ether_addr(info->addr))
@@ -732,6 +738,7 @@ static void fe_switch_work(struct work_struct *work)
 	seconds = age_ticks / USER_HZ;
 	sw->rule_count = 0;
 	sw->replay_error = 0;
+	sw->replay_ports = plan.ports;
 	sw->replaying = true;
 	/* switchdev's replay invokes our supplied notifier synchronously with
 	 * ctx=sw. No live packet callback is permitted to append a static rule.
@@ -749,6 +756,7 @@ static void fe_switch_work(struct work_struct *work)
 	}
 	mutex_lock(&fe->lock);
 	sw->replaying = false;
+	sw->replay_ports = 0;
 	if (!ret)
 		ret = sw->replay_error;
 	if (ret)

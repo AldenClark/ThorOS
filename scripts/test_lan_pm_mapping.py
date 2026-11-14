@@ -31,10 +31,15 @@ shim = r'''
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define READ_ONCE(v) (v)
 #define BIT(n) (1U<<(n))
+#define GLB_STATIC 0xa01c
 #define RTL_NI_MIB_COUNTERS 52
 #define RTL_PON_PM_RECORD_BYTES (8+37*8)
 #define HZ 100
 #define dev_err_ratelimited(...) ((void)0)
+typedef uint32_t u32;
+typedef unsigned long long u64;
+/* Production evidence struct is inserted below the C primitive types. */
+EVIDENCE_STRUCT
 struct mutex {};
 struct work_struct {};
 struct delayed_work {struct work_struct work;};
@@ -44,6 +49,8 @@ struct rtl_xram {
  struct net_device *netdev,*ports[5];unsigned int registered_ports;
  struct delayed_work mib_work;struct mutex mib_lock;
  unsigned long long mib_total[5][RTL_NI_MIB_COUNTERS];
+ struct rtl_lan_mib_evidence mib_evidence[5];
+ void *ni;bool removing;
 };
 struct rtl9617c_pon {struct device *ni_dev;struct mutex lock,control_lock;uint64_t epon_mib_generation;};
 struct file {};struct bin_attribute {};struct kobject {struct device *dev;};
@@ -57,6 +64,8 @@ static void *netdev_priv(void *p){return p;}
 static struct device *kobj_to_dev(struct kobject *k){return k->dev;}
 static void mutex_lock(struct mutex *m){}
 static void mutex_unlock(struct mutex *m){}
+static u64 ktime_get_boottime_ns(void){static u64 now;return ++now;}
+static u32 readl(void *p){(void)p;return 0;}
 static bool of_machine_is_compatible(const char *s){return external_phy;}
 #define to_delayed_work(w) (w)
 #define container_of(p,t,m) worker_priv
@@ -78,6 +87,8 @@ static void put_unaligned_be64(uint64_t n,char *p){for(int i=0;i<8;i++)p[i]=n>>(
 # These are pointers in the real IO callback structure.
 shim = shim.replace('static int rtl_mib_read,rtl_mib_write,rtl_mib_indirect;',
                     'static void *rtl_mib_read,*rtl_mib_write,*rtl_mib_indirect;')
+shim = shim.replace('EVIDENCE_STRUCT', re.search(
+    r'struct rtl_lan_mib_evidence \{.*?^\};', ni, re.S | re.M).group(0))
 mib_slots = re.search(r'mib_total\[(\d+)\]\[RTL_NI_MIB_COUNTERS\]', ni).group(1)
 shim = shim.replace('mib_total[5][RTL_NI_MIB_COUNTERS]', f'mib_total[{mib_slots}][RTL_NI_MIB_COUNTERS]')
 code = shim + function(ni, 'rtl9617c_ni_pm_read') + function(ni, 'rtl_mib_work') + function(pon, 'pm_counters_read')

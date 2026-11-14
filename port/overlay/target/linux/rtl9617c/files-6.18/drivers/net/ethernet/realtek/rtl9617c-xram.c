@@ -16,6 +16,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -130,6 +131,23 @@ struct rtl_lan {
 	unsigned int port;
 };
 
+/* Raw MAC counters from one complete pre-existing PM sample, not the
+ * wrap-extended OAM totals. No reset-generation hardware contract is known;
+ * users must reject deltas after a counter decrease, failed/stale sample or
+ * changed device/boot identity. The interaction between the SDK's global
+ * cnt_op_mode=2 and explicit ACCESS READ_ONLY is not a verified silicon
+ * contract: a successful raw sample does not establish cumulative semantics.
+ * These are all-path MAC counters, not L2 hits.
+ */
+struct rtl_lan_mib_evidence {
+	u64 seq, attempts, begin_ns, end_ns, attempt_begin_ns, attempt_end_ns;
+	u64 rx_bytes, tx_bytes;
+	u32 rx_uc, rx_mc, rx_bc, tx_uc, tx_mc, tx_bc;
+	u32 config_begin, config_end;
+	int error;
+	bool valid;
+};
+
 struct rtl_xram {
 	/* Primary netdev embeds the shared engine;other LANs only carry this
 	 * initial per-port member and use the same NI/DMA/QM owner. */
@@ -157,6 +175,7 @@ struct rtl_xram {
 	struct mutex mib_lock;
 	struct delayed_work mib_work;
 	unsigned long long mib_total[5][RTL_NI_MIB_COUNTERS];
+	struct rtl_lan_mib_evidence mib_evidence[5];
 	bool rx_active;
 	u32 port;
 	bool tx_pending;
@@ -203,7 +222,15 @@ static int rtl_mib_indirect(void *context, unsigned int reg, unsigned int comman
 {
 	struct rtl_xram *priv = context;
 	u32 status;
+	int ret;
 
+	/* A previous timeout is not cancellation. Leave a late transaction's
+	 * ACCESS command intact until it is actually idle, including retries by
+	 * the next background/OAM reader under the same MIB owner mutex. */
+	ret = readl_poll_timeout(priv->ni + reg, status,
+				 !(status & BIT(31)), 1, 100000);
+	if (ret)
+		return ret;
 	writel(command, priv->ni + reg);
 	return readl_poll_timeout(priv->ni + reg, status, !(status & BIT(31)), 1, 100000);
 }
@@ -213,14 +240,45 @@ int rtl9617c_ni_pm_read(struct device *dev, unsigned int port, unsigned long lon
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
 	const struct rtl_dq_io io = {priv, rtl_mib_read, rtl_mib_write, rtl_mib_indirect};
 	unsigned long long raw[RTL_NI_MIB_COUNTERS];
+	struct rtl_lan_mib_evidence *sample;
+	u32 config_begin = 0, config_end = 0;
 	int ret;
 
-	if (port >= ARRAY_SIZE(priv->mib_total))
+	if (port >= ARRAY_SIZE(priv->mib_total) || !counters)
 		return -EINVAL;
 	mutex_lock(&priv->mib_lock);
-	ret = rtl_ni_mib_read(&io, port, raw);
-	if (!ret)
+	sample = &priv->mib_evidence[port];
+	sample->attempts++;
+	sample->attempt_begin_ns = ktime_get_boottime_ns();
+	if (READ_ONCE(priv->removing)) {
+		ret = -ENODEV;
+	} else {
+		/* Keep config evidence without altering the shared counter mode.
+		 * aal_ni_l2.c requests ACCESS op_code=0 for read_clear=false;
+		 * preserve that command, not a claim about silicon clear behavior. */
+		config_begin = readl(priv->ni + GLB_STATIC);
+		ret = rtl_ni_mib_read(&io, port, raw);
+		config_end = readl(priv->ni + GLB_STATIC);
+	}
+	sample->attempt_end_ns = ktime_get_boottime_ns();
+	sample->error = ret;
+	if (!ret) {
+		sample->rx_bytes = raw[25];
+		sample->tx_bytes = raw[51];
+		sample->rx_uc = raw[0];
+		sample->rx_mc = raw[1];
+		sample->rx_bc = raw[2];
+		sample->tx_uc = raw[26];
+		sample->tx_mc = raw[27];
+		sample->tx_bc = raw[28];
+		sample->config_begin = config_begin;
+		sample->config_end = config_end;
+		sample->begin_ns = sample->attempt_begin_ns;
+		sample->end_ns = sample->attempt_end_ns;
+		sample->seq++;
+		sample->valid = true;
 		rtl_ni_mib_pm(priv->mib_total[port], raw, counters);
+	}
 	mutex_unlock(&priv->mib_lock);
 	return ret;
 }
@@ -1057,6 +1115,8 @@ static int rtl_register_lan(struct rtl_xram *priv, struct device *parent,
 	lan = netdev_priv(dev);
 	lan->shared = priv;
 	lan->port = port;
+	/* Stable NI hardware identity survives a userspace interface rename. */
+	dev->dev_port = port;
 	dev->netdev_ops = &rtl_netdev_ops;
 	dev->ethtool_ops = &rtl_ethtool_ops;
 	dev->max_mtu = ETH_DATA_LEN;
@@ -1404,6 +1464,81 @@ static ssize_t l2_switch_store(struct device *dev, struct device_attribute *attr
 }
 static DEVICE_ATTR_RW(l2_switch);
 
+static ssize_t l2_state_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_state(priv->fe, buf);
+}
+static DEVICE_ATTR_RO(l2_state);
+
+static ssize_t l2_evidence_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_l2_evidence(priv->fe, buf);
+}
+static DEVICE_ATTR_RO(l2_evidence);
+
+static ssize_t lan_mib_evidence_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	struct rtl_lan_mib_evidence samples[5];
+	int ifindices[5] = {0};
+	u32 registered;
+	unsigned int port;
+	ssize_t length;
+
+	/* Never issue MMIO, an indirect command or a new PM sample from this
+	 * getter. A stalled background read must not block evidence collection.
+	 * Formatting happens after the small cache copy releases the lock. */
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!mutex_trylock(&priv->mib_lock)) {
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	memcpy(samples, priv->mib_evidence, sizeof(samples));
+	registered = READ_ONCE(priv->registered_ports);
+	for (port = 0; port < ARRAY_SIZE(samples); port++) {
+		struct net_device *netdev = READ_ONCE(priv->ports[port]);
+
+		/* RTNL prevents a registered netdev from being freed. Never
+		 * dereference a not-yet-registered asynchronous probe candidate. */
+		if ((registered & BIT(port)) && netdev)
+			ifindices[port] = netdev->ifindex;
+	}
+	mutex_unlock(&priv->mib_lock);
+	rtnl_unlock();
+	length = sysfs_emit(buf,
+		"schema=1 cached=1 clock=boottime raw=1 reset_tracking=0 "
+		"counter_mode_verified=0 "
+		"l2_attribution=0 atomic_hardware_snapshot=0 read_opcode=0 "
+		"capture_ns=%llu registered_mask=%#x\n",
+		ktime_get_boottime_ns(), registered);
+	for (port = 0; port < ARRAY_SIZE(samples); port++) {
+		const struct rtl_lan_mib_evidence *sample = &samples[port];
+
+		length += sysfs_emit_at(buf, length,
+			"port=%u ifindex=%d registered=%u valid=%u error=%d seq=%llu attempts=%llu "
+			"begin_ns=%llu end_ns=%llu attempt_begin_ns=%llu attempt_end_ns=%llu "
+			"rx_bytes=%llu tx_bytes=%llu rx_uc=%u rx_mc=%u rx_bc=%u "
+			"tx_uc=%u tx_mc=%u tx_bc=%u config_begin=%#x config_end=%#x\n",
+			port, ifindices[port], !!(registered & BIT(port)), sample->valid,
+			sample->attempts ? sample->error : -ENODATA,
+			sample->seq, sample->attempts, sample->begin_ns, sample->end_ns,
+			sample->attempt_begin_ns, sample->attempt_end_ns,
+			sample->rx_bytes, sample->tx_bytes, sample->rx_uc,
+			sample->rx_mc, sample->rx_bc, sample->tx_uc, sample->tx_mc,
+			sample->tx_bc, sample->config_begin, sample->config_end);
+	}
+	return length;
+}
+static DEVICE_ATTR_RO(lan_mib_evidence);
+
 static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_xram_state.attr,
 	&dev_attr_dma_state.attr,
@@ -1422,13 +1557,18 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_qm_buffer.attr,
 	&dev_attr_rx_bypass.attr,
 	&dev_attr_l2_switch.attr,
+	&dev_attr_l2_state.attr,
+	&dev_attr_l2_evidence.attr,
+	&dev_attr_lan_mib_evidence.attr,
 	NULL,
 };
 static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, int index)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(kobj_to_dev(kobj)));
 
-	if (attr == &dev_attr_l2_switch.attr && !priv->fe)
+	if ((attr == &dev_attr_l2_switch.attr || attr == &dev_attr_l2_state.attr ||
+	     attr == &dev_attr_l2_evidence.attr) &&
+	    !priv->fe)
 		return 0;
 	if (!priv->qm_rx &&
 	    (attr == &dev_attr_qm_pool.attr || attr == &dev_attr_qm_voqs.attr ||

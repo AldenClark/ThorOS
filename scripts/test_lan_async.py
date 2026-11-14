@@ -69,6 +69,7 @@ static void *open_first(void *arg){
 }
 static int register_netdevice(struct net_device *d){
  assert(rtnl_owned);
+ assert(d->dev_port==d->lan.port);
  if(stage==8 && d->lan.port==4)return -EIO;
  assert(d->phydev);active|=BIT(d->lan.port);
  if(d->lan.port==0){

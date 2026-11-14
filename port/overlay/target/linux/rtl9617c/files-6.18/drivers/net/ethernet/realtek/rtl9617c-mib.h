@@ -9,7 +9,10 @@
 
 /* PM wire order is the board's eponoamd:0x412d44, downstream then upstream.
  * Counter RAM access/widths follow actual aal_ni_eth_port_mib_get and
- * aal_epon_mac_stats_port_eth_get. Reads do not clear hardware counters. */
+ * aal_epon_mac_stats_port_eth_get. NI requests ACCESS opcode=0 (READ_ONLY),
+ * not an explicit clear. Its interaction with the global cnt_op_mode on
+ * RTL9617C remains a hardware validation item; do not infer uninterrupted
+ * cumulative counters from the command encoding alone. */
 static inline int rtl_ni_mib_read(const struct rtl_dq_io *io, unsigned int port,
 	unsigned long long raw[RTL_NI_MIB_COUNTERS])
 {
@@ -29,9 +32,11 @@ static inline int rtl_ni_mib_read(const struct rtl_dq_io *io, unsigned int port,
 			ret = io->indirect(io->context, access, (1U << 31) | (port << 5) | index);
 			if (ret)
 				return ret;
-			value = io->read(io->context, access + 8);
+			/* Match aal_ni_l2.c: read DATA1 before DATA0 for ALL_BYTE.
+			 * This follows the source sequence, not a proven latch contract. */
 			if (index == 25)
-				value |= (unsigned long long)io->read(io->context, access + 4) << 32;
+				value = (unsigned long long)io->read(io->context, access + 4) << 32;
+			value |= io->read(io->context, access + 8);
 			raw[direction * 26 + index] = value;
 		}
 	}

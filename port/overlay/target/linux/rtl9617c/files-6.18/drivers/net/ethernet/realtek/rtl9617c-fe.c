@@ -31,6 +31,7 @@
 #include "rtl9617c-fe-pipeline.h"
 #include "rtl9617c-fe-cache-snapshot.h"
 #include "rtl9617c-fe-observe.h"
+#include "rtl9617c-l2-evidence.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
@@ -2188,6 +2189,56 @@ bool rtl_fe_free(struct rtl_fe *fe)
  kfree(fe);
  return true;
 }
+ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
+{
+ static const char * const names[] = {
+#define RTL_L2_EVIDENCE_NAME(name, offset, label) label,
+  RTL_L2_EVIDENCE_REGISTERS(RTL_L2_EVIDENCE_NAME)
+#undef RTL_L2_EVIDENCE_NAME
+ };
+ struct rtl_l2_evidence sample;
+ struct rtl_dq_io io;
+ unsigned long flags;
+ unsigned int i;
+ ssize_t length;
+ u64 begin, end;
+
+ if(!fe)return sysfs_emit(buffer,"schema=1 available=0 reason=no_fe\n");
+ /* A diagnostic must not wait behind a slow FDB/FE transaction. Sysfs
+  * removal drains readers before the NI devm register mapping is removed. */
+ if(!mutex_trylock(&fe->lock))return -EBUSY;
+ if(!fe->engine_ready || fe->shutting_down) {
+  mutex_unlock(&fe->lock);
+  return sysfs_emit(buffer,"schema=1 available=0 reason=engine_down\n");
+ }
+ io=(struct rtl_dq_io){ .context=fe, .read=fe_read };
+ begin=ktime_get_ns();
+ /* Same lock order as the configuration owner; only 17 direct reads,
+  * no loops waiting for hardware and no selector/table command writes. */
+ spin_lock_irqsave(&fe->route_lock,flags);
+ rtl_l2_evidence_read(&io,&sample);
+ spin_unlock_irqrestore(&fe->route_lock,flags);
+ end=ktime_get_ns();
+ mutex_unlock(&fe->lock);
+ length=sysfs_emit(buffer,"schema=1 available=1 clock=monotonic begin_ns=%llu end_ns=%llu "
+  "mmio_writes=0 atomic_snapshot=0 forwarding_proven=0 retirement_proven=0\n",
+  begin,end);
+ for(i=0;i<RTL_L2_EVIDENCE_REG_COUNT;i++)
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,"%s=0x%08x\n",
+                    names[i],sample.words[i]);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "mce_copy_lspid_to_pol=%u mce_flush_requested=%u "
+  "arb_keep_original_lspid=%u arb_mc_membership_check=%u\n",
+  sample.mce_copy_lspid_to_pol,sample.mce_flush_requested,
+  sample.arb_keep_original_lspid,sample.arb_mc_membership_check);
+ for(i=0;i<RTL_L2_EVIDENCE_LAN_PORTS;i++)
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,
+   "hw_port=%u rx_control=0x%08x bypass=%u bypass_destination=%u\n",
+   i,sample.lan_rx[i],(sample.lan_rx[i]>>28)&1U,
+   (sample.lan_rx[i]>>16)&63U);
+ return length;
+}
+
 ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
 {
  ssize_t length;

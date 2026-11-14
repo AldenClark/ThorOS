@@ -703,14 +703,17 @@ ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 {
 	u32 drop_info = readl(rx->ni + 0x6814);
-	writel(0x82, rx->ni + 0x105c);
-	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
+	/* Observing state must not overwrite another diagnostic owner's debug
+	 * selector. The returned bus sample is labeled with the observed selector,
+	 * not silently interpreted as the formerly forced bus 0x82. */
+	u32 monitor_selector = readl(rx->ni + 0x105c);
+	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
 		&rx->memory_dma, readl(rx->ni + RMU_CTRL), readl(rx->ni + ES_CTRL),
 		readl(rx->ni + 0x6850), readl(rx->ni + 0x6328 + EQ_ID * 4),
 		readl(rx->ni + CPU_READY), readl(rx->ni + 0x659c),
 		readl(rx->ni + EPP_WRITE), readl(rx->ni + EPP_READ),
 		rx->last_address, rx->last_size, rx->last_header[0], rx->last_header[1],
-		readl(rx->ni + 0x1060), readl(rx->ni + 0xa1dc), readl(rx->ni + 0x67d8),
+		readl(rx->ni + 0x1060), monitor_selector, readl(rx->ni + 0xa1dc), readl(rx->ni + 0x67d8),
 		readl(rx->ni + 0x67ec), readl(rx->ni + 0x6818), drop_info & 15,
 		(drop_info >> 16) & 511, readl(rx->ni + 0x681c),
 		readl(rx->ni + 0x6824), readl(rx->ni + 0x2d60), readl(rx->ni + 0x2d64),

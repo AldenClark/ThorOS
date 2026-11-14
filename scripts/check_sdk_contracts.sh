@@ -25,13 +25,26 @@ for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_
 done
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/include/soc/cortina/rtl8277c_registers.h" \
     "$work/rtl8277c_registers.h"
+fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/aal_ni_l2.c" \
+    "$work/aal_ni_l2.c"
+mkdir -p "$work/bpi"
+# Separate provenance corroboration, not an additional silicon contract.
+# The manifest verifies immutable SHA256/Git blob identities after download.
+while IFS=$'\t' read -r name url; do
+    fetch "$url" "$work/bpi/$name"
+done < <(python3 "$project/scripts/check_sdk_report_sources.py" --list)
 cd "$project"
+python3 scripts/check_sdk_report_sources.py --source-root "$work/bpi" \
+    --gpl-registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_sdk_contract.py --sdk "$work/sdk"
 python3 scripts/test_fe_register_contract.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_pp_exception_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_base_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_sdk_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_hardware_recipe.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_l2_evidence.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_ni_mib_evidence.py --sdk-ni "$work/aal_ni_l2.c" \
+    --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h" \
     --sdk-qm "$work/sdk/$sdk_path/aal_l3qm.c"

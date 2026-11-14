@@ -86,7 +86,7 @@ struct rtl_fe_port {
 };
 struct rtl_fe {struct list_head ports;bool enabled;};
 struct rtl_fe_bridge {
- struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask;
+ struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask,replay_ports;
  unsigned int local_target,rule_count,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
 };
 struct switchdev_notifier_info {struct net_device *dev;};
@@ -197,7 +197,7 @@ static void topology_and_policy(void){
 static void replay_mask(void){
  struct rtl_l2_fdb_entry decoded;
  for(unsigned int port=0;port<5;port++){
-  setup(31,5);expect(FE_SWITCH_OK,5,5);sw.native_mask=plan.ports;
+  setup(31,5);expect(FE_SWITCH_OK,5,5);sw.replay_ports=plan.ports;
   u8 mac[6]={2,0,0,0,0,(u8)(port+1)};
   struct switchdev_notifier_fdb_info info={.info={.dev=&lan[port]},.added_by_user=true,.addr=mac};
   assert(!fe_switch_replay_fdb(&sw,&info));assert(sw.rule_count==!!(5&BIT(port)));
@@ -207,7 +207,7 @@ static void replay_mask(void){
   sw.rule_count=0;info.is_local=true;assert(!fe_switch_replay_fdb(&sw,&info));
   assert(sw.rule_count==1);rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==25);cases++;
  }
- setup(31,1);expect(FE_SWITCH_NO_BRIDGE,1,1);sw.native_mask=0;
+ setup(31,1);expect(FE_SWITCH_NO_BRIDGE,1,1);sw.replay_ports=0;
  u8 mac[6]={2,0,0,0,0,1};
  struct switchdev_notifier_fdb_info info={.info={.dev=&lan[0]},.added_by_user=true,.addr=mac};
  assert(!fe_switch_replay_fdb(&sw,&info) && !sw.rule_count);
