@@ -170,7 +170,8 @@ int main(void) {
 }
 '''
 assert '.ndo_get_port_parent_id = rtl_get_port_parent_id' in xram
-assert 'dev->features |= NETIF_F_NETNS_LOCAL;' in body(xram, 'rtl_register_lan')
+assert 'dev->netns_immutable = true;' in body(xram, 'rtl_register_lan')
+assert 'NETIF_F_NETNS_LOCAL' not in xram
 assert 'priv->qm.fe = priv->fe;' in body(xram, 'rtl_probe')
 assert 'rx_bypass_store(' not in xram
 assert 'DEVICE_ATTR_RO(rx_bypass)' in xram

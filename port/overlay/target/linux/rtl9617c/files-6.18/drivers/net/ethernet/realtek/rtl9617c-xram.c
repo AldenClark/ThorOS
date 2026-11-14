@@ -875,7 +875,7 @@ static int rtl_register_lan(struct rtl_xram *priv, struct device *parent,
 	dev->ethtool_ops = &rtl_ethtool_ops;
 	dev->max_mtu = ETH_DATA_LEN;
 	/* One shared FDB/NI engine cannot isolate independently moved ports. */
-	dev->features |= NETIF_F_NETNS_LOCAL;
+	dev->netns_immutable = true;
 	ether_addr_copy(mac, priv->netdev->dev_addr);
 	mac[5] += port - priv->port;
 	eth_hw_addr_set(dev, mac);

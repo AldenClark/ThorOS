@@ -29,7 +29,6 @@ shim = r'''
 typedef unsigned char u8;
 #define ETH_ALEN 6
 #define ETH_DATA_LEN 1500
-#define NETIF_F_NETNS_LOCAL (1ULL << 5)
 #define BIT(n) (1U << (n))
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
@@ -64,7 +63,7 @@ struct rtl_xram;
 struct rtl_lan {struct rtl_xram *shared;unsigned int port;};
 struct net_device {
  struct rtl_lan lan;struct phy_device *phydev;char name[16];
- void *netdev_ops,*ethtool_ops;int max_mtu;u8 dev_addr[6];unsigned long long features;
+ void *netdev_ops,*ethtool_ops;int max_mtu;u8 dev_addr[6];unsigned long netns_immutable:1;
 };
 struct tyfza1_led {void *output;int requested;struct {char *name;int max_brightness;} cdev;};
 struct rtl_xram {
@@ -125,7 +124,7 @@ static int rtl_fe_add_port(void *fe,struct net_device *d,int p,int q,int r){
 static void rtl_fe_remove_port(void *fe,struct net_device *d){fe_ports&=~BIT(d->lan.port);}
 static int register_netdevice(struct net_device *d){
  assert(rtnl_held);
- assert(d->features & NETIF_F_NETNS_LOCAL);
+ assert(d->netns_immutable);
  if(stage==8 && current_port==fail_port)return -EIO;
  assert(d->phydev);active|=BIT(d->lan.port);return 0;
 }
@@ -181,7 +180,7 @@ int main(void){
     assert(!strcmp(priv.ports[p]->name,name));
     assert(priv.ports[p]->lan.port==(unsigned int)p && priv.ports[p]->phydev==&phys[p]);
     assert(priv.ports[p]->dev_addr[5]==3+p);
-    assert(priv.ports[p]->features & NETIF_F_NETNS_LOCAL);
+    assert(priv.ports[p]->netns_immutable);
    }
   }
   if(board_ports==5 && !(expected&BIT(4)))assert(!power && !actions);
