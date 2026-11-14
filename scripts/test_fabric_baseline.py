@@ -26,18 +26,19 @@ TEST = r'''
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
-static unsigned int delays;
+static unsigned int delays, settles;
 static void usleep_range(unsigned int low, unsigned int high)
- { assert(low==10 && high==20); delays++; }
+ { if(low==1000 && high==2000)settles++;else {assert(low==10 && high==20); delays++;} }
 #include "rtl9617c-fabric.h"
 
 struct model {
  unsigned int reg[0x10000/4], original[0x10000/4];
- unsigned int writes, scans, vlan_writes, reads, pp_reads;
+ unsigned int writes, scans, vlan_writes, frame_writes, reads, pp_reads;
  unsigned int pending_reg, pending_remaining, permanent_pending;
  unsigned int drop_reg, drop_occurrence, drop_seen;
  unsigned int inherited, scan_result, scan_timeout, busy_on_scan;
- unsigned int corrupt_vlan, rollback_stuck, write_busy;
+ unsigned int corrupt_vlan, rollback_stuck, corrupt_frame, frame_rollback_stuck;
+ unsigned int oversize_rollback_stuck;
  unsigned int rx_writes[5];
 };
 static struct model m;
@@ -58,8 +59,8 @@ static unsigned int read_reg(void *ctx,unsigned int reg) {
 }
 static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
  (void)ctx;assert(!(reg&3) && reg<sizeof(m.reg));m.writes++;
- /* Read-only framing policy: no hidden UNI shrink or storage/TPID write. */
- assert(reg!=RTL_FABRIC_FRAME_LENGTH && reg!=RTL_FABRIC_STORAGE_LENGTH && !(reg>=0x1108 && reg<=0x1114));
+ /* UNI MRU is managed; storage and TPID comparators remain untouched. */
+ assert(reg!=RTL_FABRIC_STORAGE_LENGTH && !(reg>=0x1108 && reg<=0x1114));
  if(reg==RTL_L2_FDB_CONTROL ||
     (reg>=0x1c18 && reg<=RTL_L2_FDB_FILTER_WORD0) ||
     reg==RTL_L2_FDB_RETURN ||
@@ -68,9 +69,10 @@ static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
  }
  for(unsigned i=0;i<5;i++)if(reg==RTL_FABRIC_RX(i)) {
   m.rx_writes[i]++;
-  assert((value&RTL_FABRIC_RX_OVERSIZE_ALLOW)==(m.original[reg/4]&RTL_FABRIC_RX_OVERSIZE_ALLOW));
+  if(m.rx_writes[i]==2)assert(!(value&RTL_FABRIC_RX_OVERSIZE_ALLOW));
+  if(m.rx_writes[i]>=3 && m.oversize_rollback_stuck==(i+1))value&=~RTL_FABRIC_RX_OVERSIZE_ALLOW;
  }
- if(reg==m.drop_reg && ++m.drop_seen==m.drop_occurrence)return;
+ bool drop=reg==m.drop_reg && ++m.drop_seen==m.drop_occurrence;
  if(reg==RTL_L2_VLAN_MODE_CONTROL) {
   m.vlan_writes++;
   assert(m.pp_reads>=3 && m.scans);
@@ -80,7 +82,15 @@ static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
   if(m.vlan_writes==1 && m.corrupt_vlan)value^=0x10;
   if(m.vlan_writes>1 && m.rollback_stuck)value|=1;
  }
- m.reg[reg/4]=value;
+ if(reg==RTL_FABRIC_FRAME_LENGTH) {
+  m.frame_writes++;
+  assert(m.pp_reads>=3 && (m.reg[RTL_L2_FDB_CONTROL/4]&RTL_L2_FDB_LEARN_DISABLE));
+  assert(m.reg[RTL_L2_VLAN_MODE_CONTROL/4]&1U);
+  if(m.frame_writes==1)assert((value&0x3fffU)==1526U);
+  if(m.frame_writes==1 && m.corrupt_frame)value^=1U<<16;
+  if(m.frame_writes>1 && m.frame_rollback_stuck)value=0x4005f6;
+ }
+ if(!drop)m.reg[reg/4]=value;
 }
 static int indirect(void *ctx,unsigned int reg,unsigned int value) {
  (void)ctx;assert(reg==RTL_L2_FDB_ACCESS && !fdb_busy());
@@ -114,7 +124,7 @@ static struct rtl_dq_io io={&m,read_reg,write_reg,indirect};
 /*SDK_DECL*/
 
 static void setup(unsigned int seed) {
- memset(&m,0,sizeof(m));delays=0;
+ memset(&m,0,sizeof(m));delays=settles=0;
  for(unsigned i=0;i<sizeof(m.reg)/sizeof(m.reg[0]);i++)
   m.reg[i]=(i*2654435761U)^seed;
  m.reg[RTL_L2_FDB_CONTROL/4]=0x10800ff9U;
@@ -138,13 +148,15 @@ static void command_restored(const struct rtl_fabric *f) {
          m.original[(RTL_L2_FDB_FILTER_WORD0-i*4)/4]);
 }
 static void baseline_preserved(const struct rtl_fabric *f) {
- (void)f;assert(m.reg[0xa034/4]==m.original[0xa034/4]);
+ if(!f->poisoned)assert(m.reg[0xa034/4]==(f->ready ?
+  ((m.original[0xa034/4]&~0x3fffU)|1526U):m.original[0xa034/4]));
  assert(m.reg[0xa038/4]==m.original[0xa038/4]);
  for(unsigned i=0;i<4;i++)assert(m.reg[(0x1108+i*4)/4]==m.original[(0x1108+i*4)/4]);
  for(unsigned i=0;i<5;i++) {
   unsigned reg=RTL_FABRIC_RX(i)/4;
   assert((m.reg[reg]&~(RTL_FABRIC_RX_SELECTOR|RTL_FABRIC_RX_OVERSIZE_ALLOW))==(m.original[reg]&~(RTL_FABRIC_RX_SELECTOR|RTL_FABRIC_RX_OVERSIZE_ALLOW)));
-  assert((m.reg[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW)==(m.original[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW));
+  if(!f->poisoned)assert((m.reg[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW)==
+   (f->ready?0:(m.original[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW)));
  }
 }
 int main(void) {
@@ -153,9 +165,9 @@ int main(void) {
   assert(!rtl_fabric_cold_prepare(&io,&f));
   assert(f.ready && f.changed && !f.refusal && !f.poisoned);
   assert(m.reg[0x1414/4]==(m.original[0x1414/4]|1));
-  assert(m.scans==1 && m.pp_reads>=4);
-  assert(f.packet_length==0x004023f1 && (f.packet_length&0x3fffU)>=1526);
-  assert(!rtl_fabric_native_mtu_compatible(&f));
+  assert(m.scans==1 && m.pp_reads>=4 && m.frame_writes==1 && settles==1);
+  assert(f.packet_length==0x004005f6 && f.original_packet_length==0x004023f1);
+  assert(rtl_fabric_native_mtu_compatible(&f));
   command_restored(&f);baseline_preserved(&f);
   unsigned writes=m.writes,scans=m.scans;
   assert(!rtl_fabric_cold_prepare(&io,&f));assert(!rtl_fabric_check(&io,&f));
@@ -195,6 +207,12 @@ int main(void) {
   struct rtl_fabric f={};setup(0);m.busy_on_scan=1;
   assert(rtl_fabric_cold_prepare(&io,&f)==-EBUSY);
   assert(f.poisoned && !f.ready && !m.vlan_writes);cases++;
+ }
+ {
+  struct rtl_fabric f={};setup(0);m.drop_reg=RTL_L2_FDB_CONTROL;m.drop_occurrence=2;
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP);
+  assert(f.refusal && !f.poisoned && !m.scans && !m.frame_writes && !m.vlan_writes);
+  command_restored(&f);baseline_preserved(&f);cases++;
  }
  for(unsigned port=0;port<5;port++) {
   struct rtl_fabric f={};setup(port);
@@ -246,7 +264,7 @@ int main(void) {
  {
   struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=1;
   assert(!rtl_fabric_cold_prepare(&io,&f));
-  assert(f.ready && !f.changed && !m.scans && !m.vlan_writes && m.pp_reads>=3);
+  assert(f.ready && f.changed && !m.scans && !m.vlan_writes && m.pp_reads>=3);
   baseline_preserved(&f);cases++;
  }
  {
@@ -259,16 +277,18 @@ int main(void) {
   assert(rtl_fabric_cold_prepare(&io,&f)==-EBUSY);
   assert(!m.writes && f.refusal && !f.poisoned);cases++;
  }
- for(unsigned kind=0;kind<4;kind++) {
+ for(unsigned kind=0;kind<6;kind++) {
   struct rtl_fabric f={};setup(kind);
   if(kind==0)m.reg[0xa034/4]=(63U<<16)|9201;
   if(kind==1)m.reg[0xa034/4]=(64U<<16)|63;
-  if(kind==2)m.reg[0xa038/4]=9200;
-  if(kind==3)m.reg[0xa034/4]=(1023U<<16)|9201;
+  if(kind==2)m.reg[0xa038/4]=1525;
+  if(kind==3)m.reg[0xa034/4]=(128U<<16)|9201;
+  if(kind==4)m.reg[0xa038/4]=1526;
+  if(kind==5)m.reg[0xa034/4]=(64U<<16)|1522;
   memcpy(m.original,m.reg,sizeof(m.reg));
   int ret=rtl_fabric_cold_prepare(&io,&f);
-  if(kind<3)assert(ret==-EOPNOTSUPP && f.refusal && !m.writes && !f.poisoned);
-  else {assert(!ret && f.ready);baseline_preserved(&f);}
+  if(kind<4)assert(ret==-EOPNOTSUPP && f.refusal && !m.writes && !f.poisoned);
+  else {assert(!ret && f.ready && m.frame_writes==1);baseline_preserved(&f);}
   cases++;
  }
  for(unsigned size=0;size<8;size++)for(unsigned ports=0;ports<32;ports++) {
@@ -284,15 +304,51 @@ int main(void) {
   if(size==0)assert(ret==-EOPNOTSUPP);
   else assert(!ret && f.ready);
   unsigned reads=m.reads,writes=m.writes;
-  assert(rtl_fabric_native_mtu_compatible(&f)==(size>=1 && size<=3 && ports==0));
+  assert(rtl_fabric_native_mtu_compatible(&f)==(size!=0));
   assert(m.reads==reads && m.writes==writes);
+  assert(m.frame_writes==(size!=0 && maximum[size]!=1526));
   baseline_preserved(&f);cases++;
+ }
+ for(unsigned kind=0;kind<3;kind++) {
+  struct rtl_fabric f={};setup(kind);
+  if(kind==0){m.drop_reg=RTL_FABRIC_FRAME_LENGTH;m.drop_occurrence=1;}
+  if(kind==1)m.corrupt_frame=1;
+  if(kind==2){m.corrupt_frame=1;m.frame_rollback_stuck=1;}
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO && !f.ready);
+  if(kind==2)assert(f.poisoned);
+  else {assert(!f.poisoned && f.refusal);baseline_preserved(&f);command_restored(&f);}
+  assert(m.reg[0x1414/4]==m.original[0x1414/4]);cases++;
+ }
+ for(unsigned port=0;port<5;port++)for(unsigned stuck=0;stuck<2;stuck++) {
+  struct rtl_fabric f={};setup(port);
+  m.reg[RTL_FABRIC_RX(port)/4]|=RTL_FABRIC_RX_OVERSIZE_ALLOW;
+  m.original[RTL_FABRIC_RX(port)/4]=m.reg[RTL_FABRIC_RX(port)/4];
+  m.drop_reg=RTL_FABRIC_RX(port);m.drop_occurrence=2;
+  /* Force an earlier successfully-cleared override to fail restoration. */
+  if(stuck) {
+   m.reg[RTL_FABRIC_RX(0)/4]|=RTL_FABRIC_RX_OVERSIZE_ALLOW;
+   m.original[RTL_FABRIC_RX(0)/4]=m.reg[RTL_FABRIC_RX(0)/4];
+   m.oversize_rollback_stuck=1;
+  }
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO && !f.ready);
+  if(stuck)assert(f.poisoned);
+  else {assert(!f.poisoned && f.refusal);baseline_preserved(&f);command_restored(&f);}
+  cases++;
  }
  for(unsigned port=0;port<5;port++) {
   struct rtl_fabric f={};setup(port);assert(!rtl_fabric_cold_prepare(&io,&f));
   m.reg[RTL_FABRIC_RX(port)/4]^=RTL_FABRIC_RX_OVERSIZE_ALLOW;
   unsigned writes=m.writes;assert(rtl_fabric_check(&io,&f)==-EIO);
+  assert(!rtl_fabric_native_mtu_compatible(&f));
   assert(m.writes==writes);cases++;
+ }
+ for(unsigned size=0;size<6;size++) {
+  const unsigned int maximum[]={1518,1522,1525,1526,1527,9201};
+  struct rtl_fabric f={};setup(size);assert(!rtl_fabric_cold_prepare(&io,&f));
+  struct rtl_fabric altered=f;altered.packet_length=(64U<<16)|maximum[size];
+  unsigned writes=m.writes,reads=m.reads;
+  assert(rtl_fabric_native_mtu_compatible(&altered)==(maximum[size]==1526));
+  assert(m.writes==writes && m.reads==reads);cases++;
  }
  {
   struct rtl_fabric f={};setup(0);assert(!rtl_fabric_native_mtu_compatible(&f));
@@ -300,8 +356,18 @@ int main(void) {
   assert(!rtl_fabric_cold_prepare(&io,&f));f.poisoned=1;
   assert(!rtl_fabric_native_mtu_compatible(&f));cases++;
  }
+ /* Reserved bits and an already-managed baseline are retained exactly. */
+ {
+  struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=1;
+  m.reg[0xa034/4]=0x804005f6;m.reg[0x1c00/4]|=RTL_L2_FDB_LEARN_DISABLE;
+  for(unsigned port=0;port<5;port++)m.reg[RTL_FABRIC_RX(port)/4]=RTL_FABRIC_RX_CPU;
+  memcpy(m.original,m.reg,sizeof(m.reg));
+  assert(!rtl_fabric_cold_prepare(&io,&f) && f.ready && !f.changed);
+  assert(!m.frame_writes && !m.vlan_writes && !settles);
+  baseline_preserved(&f);cases++;
+ }
  /*SDK_RUN*/
- printf("{\"cases\":%u,\"hardware_timing_verified\":false,\"framing_tpids_or_storage_written\":false}\n",cases);
+ printf("{\"cases\":%u,\"hardware_timing_verified\":false,\"managed_uni_max_frame\":1526,\"tpids_or_storage_written\":false}\n",cases);
  return 0;
 }
 '''
@@ -320,14 +386,18 @@ def main():
         "missing_mode_readback": production.replace(
             "ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,\n\t\t\tfabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);",
             "ret = 0;"),
-        "shrinking_legacy_frame_budget": production.replace(
-            "fabric->packet_length = fabric->original_packet_length;",
-            "fabric->packet_length = (fabric->original_packet_length & ~0x3fffU) | 1522U;\n\tio->write(io->context, RTL_FABRIC_FRAME_LENGTH, fabric->packet_length);"),
-        "discarding_legacy_oversize_policy": production.replace(
-            "(value & ~RTL_FABRIC_RX_SELECTOR) | RTL_FABRIC_RX_CPU);",
-            "((value & ~RTL_FABRIC_RX_SELECTOR) | RTL_FABRIC_RX_CPU) & ~RTL_FABRIC_RX_OVERSIZE_ALLOW);", 1),
+        "old_1522_frame_budget": production.replace(
+            "#define RTL_FABRIC_NATIVE_MAX_FRAME RTL_NI_FRAME_WIRE_BYTES", "#define RTL_FABRIC_NATIVE_MAX_FRAME 1522U", 1),
+        "missing_frame_programming": production.replace(
+            "if (fabric->packet_length != fabric->original_packet_length)", "if (0)", 1),
+        "oversize_override_left_enabled": production.replace(
+            "io->write(io->context, reg, value & ~RTL_FABRIC_RX_OVERSIZE_ALLOW);",
+            "io->write(io->context, reg, value);", 1),
+        "missing_frame_rollback": production.replace("if (frame_written) {", "if (0) {", 1),
+        "missing_oversize_rollback": production.replace(
+            "if (!(oversize_written & (1U << i)))", "if (1)", 1),
         "false_native_mtu_compatibility": production.replace(
-            "maximum > RTL_FABRIC_NATIVE_MAX_FRAME", "maximum > 16383U", 1),
+            "maximum == RTL_FABRIC_NATIVE_MAX_FRAME", "maximum <= RTL_FABRIC_NATIVE_MAX_FRAME", 1),
         "warm_rewrites_baseline": production.replace(
             "return rtl_fabric_check(io, fabric);", "{ fabric->ready = 0; return rtl_fabric_cold_prepare(io, fabric); }", 1),
     }
@@ -336,10 +406,13 @@ def main():
         "missing_initial_drain": "m.pp_reads>=3",
         "inherited_fdb_ignored": "rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP",
         "old_narrow_scan_filter": "(m.reg[0x1c28/4]&63U)==0",
-        "missing_mode_readback": "rtl_fabric_cold_prepare(&io,&f)==-EIO",
-        "shrinking_legacy_frame_budget": "reg!=RTL_FABRIC_FRAME_LENGTH",
-        "discarding_legacy_oversize_policy": "(value&RTL_FABRIC_RX_OVERSIZE_ALLOW)==(m.original[reg/4]&RTL_FABRIC_RX_OVERSIZE_ALLOW)",
-        "false_native_mtu_compatibility": "rtl_fabric_native_mtu_compatible(&f)==(size>=1 && size<=3 && ports==0)",
+        "missing_mode_readback": "m.reg[RTL_L2_VLAN_MODE_CONTROL/4]&1U",
+        "old_1522_frame_budget": "(value&0x3fffU)==1526U",
+        "missing_frame_programming": "m.frame_writes==1 && settles==1",
+        "oversize_override_left_enabled": "!(value&RTL_FABRIC_RX_OVERSIZE_ALLOW)",
+        "missing_frame_rollback": "m.reg[0xa034/4]",
+        "missing_oversize_rollback": "f.poisoned",
+        "false_native_mtu_compatibility": "rtl_fabric_native_mtu_compatible(&altered)==(maximum[size]==1526)",
         "warm_rewrites_baseline": "m.writes==writes && m.scans==scans",
     }
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -361,7 +434,7 @@ static void sdk_oracle(void) {
  L2FE_PLC_VLAN_MODE_CTRL_t vlan={.wrd=2};vlan.bf.l2e_glb_vlan_mode=1;assert(vlan.wrd==3);
  NI_HV_GLB_PKT_LEN_CFG_t length={.wrd=0x004023f1};
  assert(length.bf.min_pkt_size==64 && length.bf.max_pkt_size==9201);
- length.bf.max_pkt_size=1522;assert(length.wrd==0x004005f2);
+ length.bf.max_pkt_size=1526;assert(length.wrd==0x004005f6);
  NI_HV_GLB_PKT_STOR_LEN_CFG_t storage={.wrd=0x2454};assert(storage.bf.max_stor_pkt_len==9300);
  NI_HV_PT_RX_CNTRL_CFG_t rx={.wrd=0};rx.bf.ovr_drop_dis=1;assert(rx.wrd==(1U<<5));
 }

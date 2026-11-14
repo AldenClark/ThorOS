@@ -39,6 +39,7 @@ jobs:
           retention-days: 14
           path: |
             artifacts/l2-*.json
+            artifacts/fabric-*.json
             artifacts/ni-mib-evidence.json
 
   sdk-contracts:
@@ -50,6 +51,14 @@ jobs:
           persist-credentials: false
       - name: Verify encodings and provenance against pinned public vendor sources
         run: bash scripts/check_sdk_contracts.sh
+      - name: Upload pinned fabric SDK evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rtl9617c-fabric-sdk-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: artifacts/fabric-*.json
 
   kernel-objects:
     runs-on: ubuntu-24.04

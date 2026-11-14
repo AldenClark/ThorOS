@@ -175,7 +175,7 @@ static void reset(void)
  model.reg[RTL_L2_FDB_CONTROL/4] = BIT(31) | BIT(22) | BIT(25) | BIT(29) | 0xff9;
  model.reg[0x1c04/4] = (3830U << 19) | 300U;
  model.reg[0x1414/4] = 3;
- model.reg[0xa034/4] = (64U << 16) | 1522;
+ model.reg[0xa034/4] = (64U << 16) | 1526;
  model.reg[0x1410/4] = 0xa5000046;
  model.reg[0x1408/4] = 0x02000210;
  model.reg[0x140c/4] = 0x08100810;
@@ -331,7 +331,13 @@ static void guards(void)
  assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
  for(unsigned int i=0;i<4;i++)assert(model.reg[(0x1108+i*4)/4]==original.reg[(0x1108+i*4)/4]);
  restored(); cases++;
- reset();model.reg[0xa034/4]=(64U<<16)|1523;
+ for(unsigned int maximum=1522; maximum<=9201; maximum++) {
+  if(maximum==1526)continue;
+  reset();model.reg[0xa034/4]=(64U<<16)|maximum;
+  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+  assert(!strcmp(fe_switch_hw_reason_name(&hw),"native-mtu-baseline"));cases++;
+ }
+ reset();model.reg[0xa034/4]=(65U<<16)|1526;
  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"native-mtu-baseline"));cases++;
  reset();model.reg[FE_LAN_RX_CTRL(1)/4]|=BIT(5);
@@ -524,6 +530,10 @@ def main():
         compiler = os.environ.get("CC", "cc")
         production = HEADER.read_text()
         mutations = {
+            "old_1522_envelope": production.replace(
+                "!= RTL_NI_FRAME_WIRE_BYTES", "!= 1522", 1),
+            "unbounded_jumbo_envelope": production.replace(
+                "!= RTL_NI_FRAME_WIRE_BYTES", "> 9201", 1),
             "missing_svl_guard": production.replace(
                 "!(hw->observed.vlan_mode & RTL_L2_VLAN_MODE_SVL)", "false", 1),
             "outside_learning_left_enabled": production.replace(
@@ -533,7 +543,7 @@ def main():
             "discard_builtin_tpid_matches": production.replace(
                 "RTL_L2_ILPB_C_TPID_MATCH, FE_SW_TPID_ALL", "RTL_L2_ILPB_C_TPID_MATCH, 1", 1),
             "old_false_tpid_veto": production.replace(
-                "/* SDK aal_ni_l2.h defines", "if (hw->observed.tpid[0] == 0x8100) return -EOPNOTSUPP;\n\t/* SDK aal_ni_l2.h defines", 1),
+                "/* Cold fabric owns", "if (hw->observed.tpid[0] == 0x8100) return -EOPNOTSUPP;\n\t/* Cold fabric owns", 1),
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -553,7 +563,7 @@ def main():
                 evidence = json.loads(result.stdout)
             else:
                 assert result.returncode and "Assertion" in result.stderr, (name, result.stderr)
-        print("Recipe self-check: rejected missing SVL/learning/route gates and TPID builtin/false-veto faults")
+        print("Recipe self-check: rejected wrong MRU, missing SVL/learning/route gates and TPID builtin/false-veto faults")
     evidence.update({"production_sha256": hashlib.sha256(HEADER.read_bytes()).hexdigest(),
                      "actual_sdk_registers_verified": sdk_verified,
                      "mutations_rejected": list(mutations),

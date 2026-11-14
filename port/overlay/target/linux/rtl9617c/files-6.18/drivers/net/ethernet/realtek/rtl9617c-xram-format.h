@@ -2,6 +2,8 @@
 #ifndef RTL9617C_XRAM_FORMAT_H
 #define RTL9617C_XRAM_FORMAT_H
 
+#include "rtl9617c-frame.h"
+
 #define RTL_XRAM_RX_END 0x300
 #define RTL_XRAM_TX_START 0x300
 #define RTL_XRAM_TX_END 0x400

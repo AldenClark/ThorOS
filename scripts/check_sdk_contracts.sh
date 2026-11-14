@@ -20,16 +20,20 @@ for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_
             aal_l2_classification.c include/aal_l2_classification.h include/aal_arb.h \
             include/aal_l2_qos.h include/aal_l2_vlan.h \
             include/aal_l3_cls.h include/aal_l3fe.h include/aal_l3_specpkt.h \
-            include/aal_l2_specpkt.h aal_l2_specpkt.c; do
+            include/aal_l2_specpkt.h aal_l2_specpkt.c include/aal_ni_l2.h; do
     fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/$file" \
         "$work/sdk/$sdk_path/$file"
 done
 fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/${sdk_path%/*}/cortina-api/vlan.c" \
     "$work/sdk/${sdk_path%/*}/cortina-api/vlan.c"
+fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/${sdk_path%/*}/cortina-api/eth_port.c" \
+    "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c"
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/include/soc/cortina/rtl8277c_registers.h" \
     "$work/rtl8277c_registers.h"
 fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/aal_ni_l2.c" \
     "$work/aal_ni_l2.c"
+fetch "https://raw.githubusercontent.com/BPI-SINOVOIP/BPI-RT2/c24c6c03c6466cfb1b9e4eacadab8225a457a771/rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/core/rtk_fc_acl.c" \
+    "$work/rtk_fc_acl.c"
 mkdir -p "$work/bpi"
 # Separate provenance corroboration, not an additional silicon contract.
 # The manifest verifies immutable SHA256/Git blob identities after download.
@@ -47,6 +51,10 @@ python3 scripts/test_fe_pp_exception_contract.py --sdk "$work/sdk" --registers "
 python3 scripts/test_fe_base_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_sdk_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_hardware_recipe.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_fabric_sdk_framing.py --sdk-ni "$work/aal_ni_l2.c" \
+    --sdk-ni-header "$work/sdk/$sdk_path/include/aal_ni_l2.h" \
+    --sdk-eth "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c" \
+    --fc-acl "$work/rtk_fc_acl.c" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_evidence.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_ni_mib_evidence.py --sdk-ni "$work/aal_ni_l2.c" \
     --registers "$work/rtl8277c_registers.h"

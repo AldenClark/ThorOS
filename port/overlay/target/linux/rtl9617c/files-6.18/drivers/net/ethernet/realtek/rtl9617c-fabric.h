@@ -4,6 +4,7 @@
 
 #include <linux/delay.h>
 #include "rtl9617c-l2-table.h"
+#include "rtl9617c-frame.h"
 
 /* Cold provider handoff only: no Linux LAN or FE DMA base is published,
  * all PON RX modes are gated by the PON owner, and its PDC FIFO is empty.
@@ -16,7 +17,7 @@
 #define RTL_FABRIC_RX_CPU ((1U << 28) | (16U << 16))
 #define RTL_FABRIC_FRAME_LENGTH 0xa034U
 #define RTL_FABRIC_STORAGE_LENGTH 0xa038U
-#define RTL_FABRIC_NATIVE_MAX_FRAME 1522U
+#define RTL_FABRIC_NATIVE_MAX_FRAME RTL_NI_FRAME_WIRE_BYTES
 #define RTL_FABRIC_RX_OVERSIZE_ALLOW (1U << 5)
 
 struct rtl_fabric {
@@ -67,31 +68,24 @@ static inline int rtl_fabric_check(const struct rtl_dq_io *io,
 				       fabric->tpid[i]);
 	for (i = 0; !ret && i < RTL_FABRIC_LAN_PORTS; i++)
 		ret = rtl_fabric_match(io, fabric, RTL_FABRIC_RX(i),
-			RTL_FABRIC_RX_OVERSIZE_ALLOW, fabric->original_rx[i]);
+			RTL_FABRIC_RX_OVERSIZE_ALLOW, 0);
 	fabric->error = ret;
 	return ret;
 }
 
-/* Read-only classification of the captured physical baseline, not a full
- * native-L2 admission verdict. In particular, preserving a larger envelope
- * is required for tagged software fallback; it must not be shrunk simply to
- * make this check true. The hardware recipe separately checks live state. */
+/* Classification of the managed cold baseline, not an IP/MTU ACL or a
+ * tag-aware length check. A ready owner has read back all five UNI oversize
+ * overrides disabled; warm checking verifies that contract without writes. */
 static inline int rtl_fabric_native_mtu_compatible(const struct rtl_fabric *fabric)
 {
-	unsigned int i, minimum, maximum;
+	unsigned int minimum, maximum;
 
-	if (!fabric || !fabric->ready || fabric->poisoned)
+	if (!fabric || !fabric->ready || fabric->poisoned || fabric->error)
 		return 0;
 	minimum = (fabric->packet_length >> 16) & 0x3ffU;
 	maximum = fabric->packet_length & 0x3fffU;
-	if (minimum < 64 || maximum < minimum ||
-	    maximum > RTL_FABRIC_NATIVE_MAX_FRAME ||
-	    (fabric->storage_length & 0x3fffU) < maximum)
-		return 0;
-	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++)
-		if (fabric->original_rx[i] & RTL_FABRIC_RX_OVERSIZE_ALLOW)
-			return 0;
-	return 1;
+	return minimum == 64 && maximum == RTL_FABRIC_NATIVE_MAX_FRAME &&
+		(fabric->storage_length & 0x3fffU) >= maximum;
 }
 
 static inline int rtl_fabric_pending(const struct rtl_dq_io *io)
@@ -153,7 +147,8 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 {
 	struct rtl_l2_fdb_result row;
 	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, i, minimum, maximum;
-	unsigned int vlan_written = 0;
+	unsigned int vlan_written = 0, frame_written = 0, oversize_written = 0;
+	unsigned int selector_changed = 0;
 	unsigned int lease = 0;
 	int ret, cleanup;
 
@@ -180,15 +175,16 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		fabric->tpid[i] = io->read(io->context, 0x1108U + i * 4);
 	minimum = (fabric->original_packet_length >> 16) & 0x3ffU;
 	maximum = fabric->original_packet_length & 0x3fffU;
-	if (minimum < 64 || maximum < minimum ||
-	    (fabric->storage_length & 0x3fffU) < maximum) {
+	if (minimum != 64 || maximum < minimum ||
+	    (fabric->storage_length & 0x3fffU) < RTL_FABRIC_NATIVE_MAX_FRAME) {
 		ret = -EOPNOTSUPP;
 		goto refuse;
 	}
-	/* Keep the inherited physical receive envelope, including valid tagged
-	 * CPU-fallback traffic. A fixed 1522-byte cap would discard QinQ1500
-	 * frames before software can handle them, even with native L2 off. */
-	fabric->packet_length = fabric->original_packet_length;
+	/* Coarse UNI RX envelope for MTU1500 + two VLANs + FCS. This is not
+	 * tag-aware: it intentionally does not claim exact skb/IP MTU filtering.
+	 * The independent processing/PON storage budget is never rewritten. */
+	fabric->packet_length = (fabric->original_packet_length & ~0x3fffU) |
+		RTL_FABRIC_NATIVE_MAX_FRAME;
 	/* New LAN ingress bypasses L2 throughout acquisition and afterwards.
 	 * Never restore an inherited native/FE selector as part of cleanup. */
 	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
@@ -196,6 +192,7 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		unsigned int value = io->read(io->context, reg);
 
 		fabric->original_rx[i] = value;
+		selector_changed |= (value & RTL_FABRIC_RX_SELECTOR) != RTL_FABRIC_RX_CPU;
 		io->write(io->context, reg,
 			(value & ~RTL_FABRIC_RX_SELECTOR) | RTL_FABRIC_RX_CPU);
 		ret = rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_SELECTOR,
@@ -257,20 +254,76 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		if (ret)
 			goto restore;
 	}
+	ret = rtl_l2_fdb_mode_idle(io);
+	if (ret)
+		goto restore;
+	if (rtl_fabric_pending(io)) {
+		ret = -EBUSY;
+		goto restore;
+	}
+	/* Vendor aal_ni_pkt_len_set requires settling after updating the UNI
+	 * size. This delay is not used as a pipeline or DDR retirement fence. */
+	if (fabric->packet_length != fabric->original_packet_length) {
+		frame_written = 1;
+		io->write(io->context, RTL_FABRIC_FRAME_LENGTH, fabric->packet_length);
+		usleep_range(1000, 2000);
+		ret = rtl_fabric_match(io, fabric, RTL_FABRIC_FRAME_LENGTH,
+			~0U, fabric->packet_length);
+		if (ret)
+			goto restore;
+	}
+	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
+		unsigned int reg = RTL_FABRIC_RX(i);
+		unsigned int value = io->read(io->context, reg);
+
+		if (value & RTL_FABRIC_RX_OVERSIZE_ALLOW) {
+			oversize_written |= 1U << i;
+			io->write(io->context, reg, value & ~RTL_FABRIC_RX_OVERSIZE_ALLOW);
+		}
+		ret = rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_OVERSIZE_ALLOW, 0);
+		if (ret)
+			goto restore;
+	}
+
 restore:
 	/* Rollback is allowed only with the same stopped-learning idle lease.
 	 * On ambiguous completion retain/quarantine; never reuse DATA or expose
 	 * a provider whose shared baseline has not been read back consistently. */
-	if (ret && vlan_written) {
+	if (ret && (vlan_written || frame_written || oversize_written)) {
 		cleanup = rtl_l2_fdb_mode_idle(io);
 		if (!cleanup) {
-			unsigned int value = io->read(io->context, RTL_L2_VLAN_MODE_CONTROL);
+			for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
+				unsigned int reg, value;
 
-			io->write(io->context, RTL_L2_VLAN_MODE_CONTROL,
-				(value & ~RTL_L2_VLAN_MODE_SVL) |
-				(fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL));
-			cleanup = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL,
-				~0U, fabric->original_vlan_mode);
+				if (!(oversize_written & (1U << i)))
+					continue;
+				reg = RTL_FABRIC_RX(i);
+				value = io->read(io->context, reg);
+				io->write(io->context, reg,
+					(value & ~RTL_FABRIC_RX_OVERSIZE_ALLOW) |
+					(fabric->original_rx[i] & RTL_FABRIC_RX_OVERSIZE_ALLOW));
+				if (rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_OVERSIZE_ALLOW,
+					fabric->original_rx[i]))
+					cleanup = -EIO;
+			}
+			if (frame_written) {
+				io->write(io->context, RTL_FABRIC_FRAME_LENGTH,
+					fabric->original_packet_length);
+				usleep_range(1000, 2000);
+				if (rtl_fabric_match(io, fabric, RTL_FABRIC_FRAME_LENGTH,
+					~0U, fabric->original_packet_length))
+					cleanup = -EIO;
+			}
+			if (vlan_written) {
+				unsigned int value = io->read(io->context, RTL_L2_VLAN_MODE_CONTROL);
+
+				io->write(io->context, RTL_L2_VLAN_MODE_CONTROL,
+					(value & ~RTL_L2_VLAN_MODE_SVL) |
+					(fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL));
+				if (rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL,
+					~0U, fabric->original_vlan_mode))
+					cleanup = -EIO;
+			}
 		}
 		if (cleanup)
 			fabric->poisoned = 1;
@@ -289,7 +342,8 @@ restore:
 		goto refuse;
 	fabric->vlan_mode = fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL;
 	fabric->ready = 1;
-	fabric->changed = !!vlan_written;
+	fabric->changed = !!(vlan_written || frame_written || oversize_written ||
+		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE));
 	fabric->error = 0;
 	return 0;
 refuse:

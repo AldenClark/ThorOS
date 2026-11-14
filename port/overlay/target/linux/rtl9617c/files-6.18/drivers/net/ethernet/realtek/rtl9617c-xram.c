@@ -525,7 +525,7 @@ static int rtl_poll(struct napi_struct *napi, int budget)
 		size = FIELD_GET(PKT_SIZE, status);
 		packets++;
 		if (!(status & PKT_VALID) || (status & PKT_ERRORS) ||
-		    size < ETH_HLEN + ETH_FCS_LEN || size > 1522) {
+		    size < ETH_HLEN + ETH_FCS_LEN || size > RTL_NI_FRAME_WIRE_BYTES) {
 			dev->stats.rx_errors++;
 			writel(next, priv->ni + RX_READ);
 			continue;
@@ -625,7 +625,7 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	unsigned long flags;
 	u32 crc;
 
-	if (skb->len < ETH_HLEN || skb->len > 1522) {
+	if (skb->len < ETH_HLEN || skb->len > RTL_NI_FRAME_BYTES) {
 		dev->stats.tx_dropped++;
 		dev_kfree_skb_any(skb);
 		return NETDEV_TX_OK;

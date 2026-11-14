@@ -2,6 +2,8 @@
 #ifndef RTL9617C_FE_SWITCH_HW_H
 #define RTL9617C_FE_SWITCH_HW_H
 
+#include "rtl9617c-frame.h"
+
 #include <linux/delay.h>
 
 #include "rtl9617c-l2-table.h"
@@ -591,13 +593,13 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	 * All are enabled by native_ilpb, regardless of the user comparator
 	 * values sampled above. Do not overwrite shared CMP registers or
 	 * reject the reset baseline merely because none contains 88a8. */
-	/* SDK aal_ni_l2.h defines this min/max frame unit including FCS.
-	 * Linux bridge MTU1500 permits 1518 Ethernet bytes (+4 FCS). An older
-	 * global UNI jumbo threshold must not bypass Linux's egress limit.
-	 * Read/validate only: external UNI ports may share this global setting.
-	 */
-	if (!(hw->observed.packet_length & 0x3fffU) ||
-	    (hw->observed.packet_length & 0x3fffU) > 1522 ||
+	/* Cold fabric owns a bounded UNI MRU: MTU1500 plus two VLAN tags
+	 * and FCS. GE has no proven tag-aware AUTO/oversize-only CPU trap.
+	 * Tagged frames retain the CF CPU path; ordinary untagged frames use
+	 * this physical envelope, including its small oversize allowance.
+	 * Never admit the inherited 9201-byte jumbo envelope by accident. */
+	if (((hw->observed.packet_length >> 16) & 0x3ffU) != 64 ||
+	    (hw->observed.packet_length & 0x3fffU) != RTL_NI_FRAME_WIRE_BYTES ||
 	    (hw->observed.rx_oversize_allow & ports)) {
 		hw->reason = FE_SW_HW_MTU;
 		return -EOPNOTSUPP;

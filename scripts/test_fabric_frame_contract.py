@@ -112,7 +112,7 @@ static void dev_queue_xmit(struct sk_buff *skb){skb->queued=true;}
 '''
 # Kernel header may define __always_inline through libc's feature headers.
 common = common.replace('#define __always_inline inline', '#undef __always_inline\n#define __always_inline inline')
-unit = common + '\n' + '\n'.join('#define ' + key + ' ' + str(value) for key, value in constants.items())
+unit = '#include \"rtl9617c-frame.h\"\n' + common + '\n' + '\n'.join('#define ' + key + ' ' + str(value) for key, value in constants.items())
 unit += '\n' + reduce_mtu + '\n' + forwardable + '\n' + wrapper + '\n' + untag + '\n' + bridge
 unit += '''
 static int inherited_vlan_mtu(struct net_device *dev,struct net_device *real_dev,bool explicit_mtu) {
@@ -121,7 +121,7 @@ static int inherited_vlan_mtu(struct net_device *dev,struct net_device *real_dev
 unit += r'''
 /* A receive capacity expressed in wire-byte units is a policy fixture here.
  * This test does not interpret any RTL9617C register field. */
-#define PRESERVED_RECEIVE_WIRE_BUDGET 9201
+#define MANAGED_RECEIVE_WIRE_BUDGET RTL_NI_FRAME_WIRE_BYTES
 int main(void){
  struct net_device physical={.flags=IFF_UP,.mtu=ETH_DATA_LEN,.hard_header_len=ETH_HLEN};
  struct net_device vlan1=physical,vlan2=physical;
@@ -148,9 +148,16 @@ int main(void){
   assert(__is_skb_forwardable(&physical,&skb,true));
   /* A global fixed 1522-byte wire ceiling rejects the legal QinQ case,
    * before the CPU fallback can perform the normalization above. */
-  assert(wire<=PRESERVED_RECEIVE_WIRE_BUDGET);
+  assert(wire<=MANAGED_RECEIVE_WIRE_BUDGET);
   assert((wire<=1522)==(tags<2));
  }
+ /* The managed GE MRU is deliberately coarse: untagged wire1526
+  * passes its physical envelope although the software bridge rejects it.
+  * No assertion of exact hardware/software oversize equivalence. */
+ assert(RTL_NI_FRAME_MTU==1500 && RTL_NI_FRAME_MAX_TAGS==2);
+ assert(RTL_NI_FRAME_BYTES==1522 && MANAGED_RECEIVE_WIRE_BUDGET==1526);
+ assert(1526<=MANAGED_RECEIVE_WIRE_BUDGET && 1527>MANAGED_RECEIVE_WIRE_BUDGET);
+ struct sk_buff coarse={.len=1522};assert(!__is_skb_forwardable(&physical,&coarse,true));
  struct sk_buff edge={.len=1518};assert(__is_skb_forwardable(&physical,&edge,true));
  edge.len=1519;assert(!__is_skb_forwardable(&physical,&edge,true));
  edge.gso=true;assert(__is_skb_forwardable(&physical,&edge,true));
@@ -163,19 +170,19 @@ with tempfile.TemporaryDirectory(prefix='fabric-frame-contract-') as temporary:
     temporary = Path(temporary)
     for name, text, passed in (
         ('linux_contract', unit, True),
-        ('wrong_global_1522', unit.replace('#define PRESERVED_RECEIVE_WIRE_BUDGET 9201',
-                                          '#define PRESERVED_RECEIVE_WIRE_BUDGET 1522'), False),
+        ('wrong_global_1522', unit.replace('#define MANAGED_RECEIVE_WIRE_BUDGET RTL_NI_FRAME_WIRE_BYTES',
+                                          '#define MANAGED_RECEIVE_WIRE_BUDGET 1522'), False),
     ):
         cfile,binary=temporary/(name+'.c'),temporary/name
         cfile.write_text(text)
         subprocess.run(['cc','-std=gnu11','-Wall','-Wextra','-Werror','-Wno-unused-parameter',
-                        '-O1','-g','-fsanitize=address,undefined',str(cfile),'-o',str(binary)],check=True)
+                        '-O1','-g','-fsanitize=address,undefined','-I',str(root/'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'),str(cfile),'-o',str(binary)],check=True)
         result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=10)
         if passed:
             assert result.returncode==0,result.stdout+result.stderr
             print(result.stdout,end='')
         else:
-            assert result.returncode!=0 and 'Assertion' in result.stderr and 'PRESERVED_RECEIVE_WIRE_BUDGET' in result.stderr,result.stderr
+            assert result.returncode!=0 and 'Assertion' in result.stderr and 'MANAGED_RECEIVE_WIRE_BUDGET' in result.stderr,result.stderr
             print('wrong_global_1522: rejected by QinQ wire-budget runtime assertion')
 print('Evidence scope: Linux forwarding/MTU contract and modeled wire budget only; hardware_forwarding_proven=false')
 evidence = {
@@ -187,6 +194,8 @@ evidence = {
     'wire_bytes_including_modeled_fcs': [1518,1522,1526],
     'bridge_skb_bytes_after_outer_tag_metadata': [1514,1514,1518],
     'wrong_1522_negative_control_rejected': True,
+    'managed_uni_wire_budget': 1526, 'maximum_supported_tags': 2,
+    'coarse_native_untagged_oversize_differs_from_software': True,
     'hardware_register_counting_semantics_proven': False,
     'hardware_forwarding_proven': False,
 }
