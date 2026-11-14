@@ -37,6 +37,7 @@ static void list_del(struct list_head *n){n->next->prev=n->prev;n->prev->next=n-
 struct rtl_fe_port {struct list_head list;unsigned int bindings;};
 struct rtl_fe_flow {struct list_head list;};
 struct rtl_fe {
+ struct {bool poisoned;} fabric;
  struct list_head ports,blocks,flows;
  bool shutting_down,engine_ready,dma_exposed,prepared,base_failed;
  enum rtl_fe_mode desired_mode;
@@ -94,7 +95,7 @@ int main(void){
  fe=make_owner();fe->fdb_cmd_mode_saved=BIT(31);fe->fdb_control=0x12345678;
  assert(rtl_fe_free(fe));assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
- for(unsigned int fault=0;fault<10;fault++){
+ for(unsigned int fault=0;fault<11;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
   struct rtl_fe_flow flow={};struct list_head block;
   if(fault==0)fe->fail_disable=-ETIMEDOUT;
@@ -107,6 +108,7 @@ int main(void){
   if(fault==7)fe->dma_exposed=true; /* No documented complete AXI drain. */
   if(fault==8)fe->base_failed=true; /* Partial setup cannot release shared leases. */
   if(fault==9)fe->prepared=true; /* A surviving base snapshot is still an owner. */
+  if(fault==10)fe->fabric.poisoned=true; /* A cold SCAN can outlive a failed probe. */
   assert(!rtl_fe_free(fe));
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
   assert(!dma_frees && !path_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
@@ -125,3 +127,12 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-quarantine-'
     subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                     str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)
+    # Removing the cold-owner guard must fail at the poisoned retention case.
+    broken = production.replace(' || fe->fabric.poisoned', '')
+    assert broken != production
+    (path / 'mutant.c').write_text(fixture + broken + tests)
+    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror',
+                    str(path / 'mutant.c'), '-o', str(path / 'mutant')], check=True)
+    result = subprocess.run([str(path / 'mutant')], capture_output=True, text=True)
+    assert result.returncode and '!rtl_fe_free(fe)' in result.stderr
+    print('Cold poisoned owner release mutant rejected at the retention assertion')

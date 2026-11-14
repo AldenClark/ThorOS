@@ -10,6 +10,7 @@ sdk_pin=8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0
 register_pin=5090fbcb6ba743dd7b1314811ef557bad0460147
 sdk_path=ca-network-engine/1.0-r0/ca-network-engine-1.0/aal-77c
 mkdir -p "$work/sdk/$sdk_path/include"
+mkdir -p "$work/sdk/${sdk_path%/*}/cortina-api"
 fetch() {
     curl --fail --location --silent --show-error --retry 3 \
         --connect-timeout 15 --max-time 180 "$1" --output "$2"
@@ -23,6 +24,8 @@ for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_
     fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/$file" \
         "$work/sdk/$sdk_path/$file"
 done
+fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/${sdk_path%/*}/cortina-api/vlan.c" \
+    "$work/sdk/${sdk_path%/*}/cortina-api/vlan.c"
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/include/soc/cortina/rtl8277c_registers.h" \
     "$work/rtl8277c_registers.h"
 fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/aal_ni_l2.c" \
@@ -38,6 +41,8 @@ python3 scripts/check_sdk_report_sources.py --source-root "$work/bpi" \
     --gpl-registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_sdk_contract.py --sdk "$work/sdk"
 python3 scripts/test_fe_register_contract.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_fabric_baseline.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_pon_cold_handoff.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_pp_exception_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_base_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_sdk_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"

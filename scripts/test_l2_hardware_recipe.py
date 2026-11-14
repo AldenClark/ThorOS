@@ -105,6 +105,9 @@ static void fe_write(void *context, unsigned int address, unsigned int value)
  struct model *m = ((struct rtl_fe *)context)->model;
  int t = table_at(address, false);
  assert(!(address & 3) && address < sizeof(m->reg));
+ /* User TPID comparators are shared with foreign ports/PON. The native
+  * recipe may observe but must never rewrite them to enable built-ins. */
+ assert(address < 0x1108 || address > 0x1114);
  if (t >= 0) {
   struct rtl_l2_table_layout l;
   assert(!rtl_l2_table_layout(t, &l));
@@ -248,6 +251,7 @@ static void recipe(unsigned int ports, bool l3)
   n++;
   assert(!fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][p], RTL_L2_ILPB_TOP_S_TPID_ENABLE));
   assert(fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][p], RTL_L2_ILPB_TOP_C_TPID_ENABLE));
+  assert(fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][p], RTL_L2_ILPB_C_TPID_MATCH)==15);
   assert(!fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][p], RTL_L2_ILPB_SC_IND));
   assert(!fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][p], RTL_L2_ILPB_CLASSIFIER_ENABLE));
   assert(model.rows[RTL_L2_TBL_PORT_MEMBERSHIP][p][0] ==
@@ -309,8 +313,24 @@ static void guards(void)
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"lan-source-map"));cases++;
  reset(); model.reg[0x1400/4]|=BIT(6);
  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP); cases++;
- reset(); model.reg[0x1108/4]=0x8100;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP); cases++;
+ /* Real TYFZA1 reset comparators do not include 88a8. Built-in ILPB
+  * recognition remains available and every CSR must stay unchanged. */
+ reset();
+ model.reg[0x1108/4]=model.reg[0x110c/4]=model.reg[0x1110/4]=0x8100;
+ model.reg[0x1114/4]=0x9100;
+ memcpy(&original,&model,sizeof(model));
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false));
+ for(unsigned int i=0;i<4;i++)assert(model.reg[(0x1108+i*4)/4]==original.reg[(0x1108+i*4)/4]);
+ assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
+ restored(); cases++;
+ /* Custom comparator values also remain opaque, preserved inputs. */
+ reset();
+ for(unsigned int i=0;i<4;i++)model.reg[(0x1108+i*4)/4]=0x9300+i;
+ memcpy(&original,&model,sizeof(model));
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false));
+ assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
+ for(unsigned int i=0;i<4;i++)assert(model.reg[(0x1108+i*4)/4]==original.reg[(0x1108+i*4)/4]);
+ restored(); cases++;
  reset();model.reg[0xa034/4]=(64U<<16)|1523;
  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"native-mtu-baseline"));cases++;
@@ -510,6 +530,10 @@ def main():
                 "rtl_l2_field_set(words, RTL_L2_ILPB_STP, stp & ~1U);", "/* omitted deliberately */", 1),
             "missing_reverse_route_gate": production.replace(
                 "fe_route_gate(fe);", "/* omitted deliberately */", 1),
+            "discard_builtin_tpid_matches": production.replace(
+                "RTL_L2_ILPB_C_TPID_MATCH, FE_SW_TPID_ALL", "RTL_L2_ILPB_C_TPID_MATCH, 1", 1),
+            "old_false_tpid_veto": production.replace(
+                "/* SDK aal_ni_l2.h defines", "if (hw->observed.tpid[0] == 0x8100) return -EOPNOTSUPP;\n\t/* SDK aal_ni_l2.h defines", 1),
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -529,7 +553,7 @@ def main():
                 evidence = json.loads(result.stdout)
             else:
                 assert result.returncode and "Assertion" in result.stderr, (name, result.stderr)
-        print("Recipe self-check: rejected missing SVL, outside-learning and reverse-route gates")
+        print("Recipe self-check: rejected missing SVL/learning/route gates and TPID builtin/false-veto faults")
     evidence.update({"production_sha256": hashlib.sha256(HEADER.read_bytes()).hexdigest(),
                      "actual_sdk_registers_verified": sdk_verified,
                      "mutations_rejected": list(mutations),

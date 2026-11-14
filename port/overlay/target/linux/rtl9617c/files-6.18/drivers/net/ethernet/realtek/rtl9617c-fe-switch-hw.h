@@ -26,6 +26,12 @@
 #define FE_SW_CF_PER_PORT 5
 #define FE_SW_CF_RULES (FE_LAN_PORTS * FE_SW_CF_PER_PORT)
 #define FE_SW_FDB_OVERFLOW_RECYCLE BIT(29)
+/* aal_port.h defines ILPB match bits, not indices into CMP_S/C/O/USER:
+ * bit3=8100, bit2=9100, bit1=88a8; bit0 uses that tag class's user CSR.
+ * Keep the existing user comparator and trap every recognised C tag. */
+#define FE_SW_TPID_STANDARD (BIT(3) | BIT(2) | BIT(1))
+#define FE_SW_TPID_USER BIT(0)
+#define FE_SW_TPID_ALL (FE_SW_TPID_STANDARD | FE_SW_TPID_USER)
 
 enum fe_switch_hw_reason {
 	FE_SW_HW_OK,
@@ -357,13 +363,15 @@ static void fe_switch_hw_native_ilpb(unsigned int *words, unsigned int profile)
 	rtl_l2_field_set(words, RTL_L2_ILPB_SA_MISS_FORWARD, 1);
 	rtl_l2_field_set(words, RTL_L2_ILPB_SPECIAL_PROFILE, profile);
 	/* __aal_fdb_sc_ind_get(): top C=1/S=0 selects SC0; enabling both
-	 * does NOT. Recognise every configured TPID as C, and trap all tags.
+	 * does NOT. Recognise built-ins plus the C user comparator as C tags.
+	 * CMP_S/C/O/USER are class-specific user comparators, not four slots
+	 * replacing the built-in 8100/9100/88a8 recognition (SDK vlan.c).
 	 * ILPB.sc_ind alone is only the PVID default, not a tagged-S override.
 	 */
 	rtl_l2_field_set(words, RTL_L2_ILPB_INNER_C_TPID_ENABLE, 1);
 	rtl_l2_field_set(words, RTL_L2_ILPB_TOP_C_TPID_ENABLE, 1);
-	rtl_l2_field_set(words, RTL_L2_ILPB_C_TPID_MATCH, 15);
-	rtl_l2_field_set(words, RTL_L2_ILPB_OTHER_TPID_MATCH, 15);
+	rtl_l2_field_set(words, RTL_L2_ILPB_C_TPID_MATCH, FE_SW_TPID_ALL);
+	rtl_l2_field_set(words, RTL_L2_ILPB_OTHER_TPID_MATCH, FE_SW_TPID_ALL);
 }
 
 static void fe_switch_hw_native_elpb(unsigned int *words)
@@ -545,7 +553,7 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 {
 	struct rtl_dq_io io = fe_io(fe);
 	unsigned int words[RTL_L2_TABLE_MAX_WORDS], filter[RTL_L2_FDB_FILTER_WORDS];
-	unsigned int i, tpids = 0, field;
+	unsigned int i, field;
 	int ret;
 
 	(void)snooping; /* All multicast is trapped; Linux owns MDB/snooping. */
@@ -579,17 +587,10 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		hw->reason = FE_SW_HW_PRIORITY_KEY;
 		return -EOPNOTSUPP;
 	}
-	hw->reason = FE_SW_HW_TPID;
-	for (i = 0; i < 4; i++) {
-		unsigned int tpid = hw->observed.tpid[i] & 0xffffU;
-
-		if (tpid == 0x8100)
-			tpids |= 1;
-		if (tpid == 0x88a8)
-			tpids |= 2;
-	}
-	if (tpids != 3)
-		return -EOPNOTSUPP;
+	/* ILPB match bits1..3 select fixed 88a8/9100/8100 recognisers.
+	 * All are enabled by native_ilpb, regardless of the user comparator
+	 * values sampled above. Do not overwrite shared CMP registers or
+	 * reject the reset baseline merely because none contains 88a8. */
 	/* SDK aal_ni_l2.h defines this min/max frame unit including FCS.
 	 * Linux bridge MTU1500 permits 1518 Ethernet bytes (+4 FCS). An older
 	 * global UNI jumbo threshold must not bypass Linux's egress limit.

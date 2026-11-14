@@ -139,6 +139,24 @@ int main(void) {
   for(unsigned i=0;i<5;i++)assert(sample.lan_rx[i]==before[expected_offsets[12+i]/4]);
   sdk_oracle(&sample);
  }
+ /* Decode the exact observed IVL reset value and independent negative
+  * patterns through the production getter, without a bridge/request model.
+  * Sweep unrelated bits as well so compatibility cannot become a loose
+  * nonzero test or compare the entire control word to a magic default. */
+ for(unsigned bit=0;bit<32;bit++)for(unsigned svl=0;svl<2;svl++)
+  for(unsigned priority=0;priority<2;priority++) {
+   setup(bit);
+   registers[0x1414/4]=((1U<<bit)&~1U)|2U|svl;
+   registers[0x1400/4]=((1U<<bit)&~64U)|(priority<<6);
+   memcpy(before,registers,sizeof(before));
+   assert(rtl_fe_l2_evidence(&fe,output)>0);
+   assert(strstr(output,svl?"native_l2_svl_compatible=1 ":"native_l2_svl_compatible=0 "));
+   assert(strstr(output,priority?"native_l2_priority_key_compatible=0 ":"native_l2_priority_key_compatible=1 "));
+   assert(strstr(output,"native_l2_prerequisites_complete=0"));
+   assert(!writes && reads==17 && locks==1 && unlocks==1 && !in_spin);
+   assert(!memcmp(before,registers,sizeof(before)));
+   assert(!rtl_l2_evidence_read(&io,&sample));sdk_oracle(&sample);
+  }
  setup(42);
  assert(rtl_fe_l2_evidence(NULL,output)>0 && strstr(output,"reason=no_fe") && !reads);
  fe.lock.deny=true;assert(rtl_fe_l2_evidence(&fe,output)==-EBUSY && !reads);
@@ -162,7 +180,7 @@ int main(void) {
   assert(strstr(output,"monitor_selector=") && strstr(output,"monitor_atomic=0"));
   assert(!writes && !memcmp(before,registers,sizeof(before)));
  }
- puts("PASS: passive L2: 32 field bits, 64 live snapshots, no-FE/down/shutdown/busy; QM 32 selectors unchanged");
+ puts("PASS: passive L2: 32 field bits, 128 baseline combinations, 64 live snapshots, no-FE/down/shutdown/busy; QM 32 selectors unchanged");
 }
 '''
 
@@ -191,6 +209,10 @@ def sdk_oracle(path):
  NI_HV_MCE_CTL_REG_t m={.wrd=s->words[RTL_L2_EVIDENCE_MCE_CONTROL]};
  L2FE_ARB_ARB_CTRL_t a={.wrd=s->words[RTL_L2_EVIDENCE_ARB_CONTROL]};
  L2FE_ARB_ARB_CTRL_EXT_t e={.wrd=s->words[RTL_L2_EVIDENCE_ARB_EXT]};
+ L2FE_PLC_VLAN_MODE_CTRL_t v={.wrd=s->words[RTL_L2_EVIDENCE_VLAN_MODE]};
+ L2FE_PLC_HASH_CTRL_t h={.wrd=s->words[RTL_L2_EVIDENCE_HASH_CONTROL]};
+ assert(v.bf.l2e_glb_vlan_mode==s->native_l2_svl_compatible);
+ assert((!h.bf.use_dot1p_l2e)==s->native_l2_priority_key_compatible);
  assert(m.bf.cp_lspid_to_pol_id_en==s->mce_copy_lspid_to_pol);
  assert(m.bf.buf_flush_en==s->mce_flush_requested);
  assert(a.bf.keep_o_lspid_en_for_mc==s->arb_keep_original_lspid);
@@ -222,6 +244,10 @@ def main():
         ("production", fe, qm, header),
         ("selector_write_mutant", fe, change_once(qm,
          "u32 monitor_selector =", "writel(0x82, rx->ni + 0x105c);\n\tu32 monitor_selector ="), header),
+        ("svl_compatibility_mutant", fe, qm, change_once(header,
+         "& RTL_L2_VLAN_MODE_SVL", "& 2U")),
+        ("priority_compatibility_mutant", fe, qm, change_once(header,
+         "!(sample->words[RTL_L2_EVIDENCE_HASH_CONTROL]", "!!(sample->words[RTL_L2_EVIDENCE_HASH_CONTROL]")),
         ("mce_field_mutant", fe, qm, change_once(header, ">> 17", ">> 16")),
         ("counter_read_mutant", fe, qm, change_once(header, "0xaa60U", "0xaa70U")),
         ("table_data_read_mutant", fe, qm, change_once(header, "0xaa64U", "0xaa68U")),

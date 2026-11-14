@@ -5,6 +5,8 @@ This tests discovery, privacy, missing optional tools, timeout/error handling an
 bounded FE admission. It is not a hardware throughput or MMIO safety test.
 """
 from pathlib import Path
+import argparse
+import re
 import os
 import shutil
 import subprocess
@@ -13,6 +15,13 @@ import tempfile
 root = Path(__file__).resolve().parents[1]
 collector = root / 'scripts/observe_tyfza1_datapath.sh'
 compatibility = root / 'scripts/observe_wired_offload.sh'
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--busybox-ssh', metavar='USER@HOST',
+                    help='Also test production readers using target BusyBox awk over read-only SSH')
+parser.add_argument('--ssh-control', type=Path, help='Existing SSH ControlPath for --busybox-ssh')
+args = parser.parse_args()
+if args.ssh_control and not args.busybox_ssh:
+    parser.error('--ssh-control requires --busybox-ssh')
 
 
 def write(path, text, executable=False):
@@ -168,7 +177,10 @@ exit 0
     assert 'project_commit=' + 'a' * 40 in output and 'sources_lock_sha256=' + 'b' * 64 in output
     assert 'speed=1000 duplex=full' in output
     assert 'master_ifindex=7 brport_state=3' in output and 'bridge_vlan_filtering=0' in output
-    assert 'TYFZA1 test' in output and 'realtek,tyfza1,realtek,rtl9617c,' in output
+    assert 'model=TYFZA1 test,\n' in output
+    assert 'compatible=realtek,tyfza1,realtek,rtl9617c,\n' in output
+    assert '[uptime]\n5.00 3.00\n' in output
+    assert output.count('uptime=5.00\n') == 4
     assert output.count('boot_id=11111111-2222-3333-4444-555555555555') == 4
     assert output.count('[sample_begin]') == 2 and output.count('[sample_end]') == 2
     assert output.count('base_ready=1 dma_exposed=1 engine_poisoned=0 host_active=1 reboot_required=0') == 2
@@ -204,7 +216,7 @@ exit 0
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2
     output, _, _ = run('1', '--active-diagnostics')
     assert output.count('[dma_state]\nbusy=4 invalid=0 completion_checks=22') == 2
-    assert '42 lan1 pon0 2 6 1 1000 10 0 0' in output
+    assert '42 lan1 pon0 2 6 1 1000 10 0 0' in output, output[output.index('[fe_flow_counters]'):output.index('[l2_switch]')]
     assert '43 pon0 lan1 2 6 - - - - -' in output and '44 error=-110' in output
     assert '192.0.2.12:51000' not in output
     output, _, _ = run('1', '--active-diagnostics', '--details')
@@ -281,7 +293,7 @@ exit 0
     # No timeout applet: never silently fall back to unbounded sysfs/netlink I/O.
     limited_commands = base / 'limited-bin'
     limited_commands.mkdir()
-    for command in ('sh', 'cat', 'awk', 'uname', 'date', 'dirname'):
+    for command in ('sh', 'cat', 'awk', 'tr', 'uname', 'date', 'dirname'):
         target = shutil.which(command)
         assert target, command
         (limited_commands / command).symlink_to(target)
@@ -347,3 +359,52 @@ exit 0
 
 print('Datapath observer: passive-by-default native NI/lifecycle/topology/identity, private exclusive output, '
       'separate active/tuple opt-ins, bounded reads, missing debugfs/tools, real timeout, two snapshots and wrapper passed')
+
+if args.busybox_ssh:
+    # No remote uploads or fixture writes: feed literals through stdin to the
+    # real production readers. This detects BusyBox NUL regex/record behavior,
+    # which the host awk fixture does not emulate.
+    source = collector.read_text()
+    functions = '\n'.join(re.search(r'^' + name + r'\(\) \{.*?^\}', source,
+                                    re.M | re.S)[0]
+                          for name in ('probe', 'read_probe', 'read_board_identity', 'sample_clock'))
+    exercise = r"""
+has_timeout=1
+command -v busybox >/dev/null || exit 90
+awk --help 2>&1 | grep -q BusyBox || exit 91
+printf '5.00 3.00\n' | read_probe /dev/stdin
+printf '11111111-2222-3333-4444-555555555555\n' | read_probe /dev/stdin
+printf 'schema=1\nproject_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' | read_probe /dev/stdin
+printf 'TYFZA1 test\000' | read_board_identity /dev/stdin
+printf 'realtek,tyfza1\000realtek,rtl9617c\000' | read_board_identity /dev/stdin
+# Exercise the clock filters independently with literal values; no target
+# /proc identity is included in the regression output.
+read_probe() {
+    case "$1" in
+        /fixture/uptime) printf '5.00 3.00\n' ;;
+        /fixture/sys/kernel/random/boot_id) printf '11111111-2222-3333-4444-555555555555\n' ;;
+        *) return 99 ;;
+    esac
+}
+proc_dir=/fixture
+sample_clock sample
+"""
+    command = ['ssh']
+    if args.ssh_control:
+        command += ['-S', str(args.ssh_control)]
+    command += [args.busybox_ssh, 'sh -s']
+    expected = ('5.00 3.00\n11111111-2222-3333-4444-555555555555\n'
+                'schema=1\nproject_commit=' + 'a' * 40 + '\n'
+                'TYFZA1 test,\nrealtek,tyfza1,realtek,rtl9617c,\n'
+                '\n[sample]\nuptime=5.00\nboot_id=11111111-2222-3333-4444-555555555555\n')
+    result = subprocess.run(command, input=functions + exercise, text=True,
+                            capture_output=True, timeout=15, check=True)
+    assert result.stdout == expected, repr(result.stdout)
+    broken = functions.replace('gsub(/[^[:print:]\\t\\r]/,",")', 'gsub(/\\000/,",")')
+    assert broken != functions
+    result = subprocess.run(command, input=broken + exercise, text=True,
+                            capture_output=True, timeout=15, check=True)
+    assert result.stdout != expected, 'BusyBox negative control unexpectedly passed'
+    assert ',5,.,0,0,' in result.stdout
+    print('Target BusyBox: exact uptime/boot/build identity and NUL board records passed; '
+          'old NUL regex negative control rejected (no target writes)')

@@ -32,6 +32,7 @@
 #include "rtl9617c-fe-cache-snapshot.h"
 #include "rtl9617c-fe-observe.h"
 #include "rtl9617c-l2-evidence.h"
+#include "rtl9617c-fabric.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
@@ -167,6 +168,7 @@ struct rtl_fe {
  struct rtl_itu_paths *itu_paths;
  struct net_device *itu_netdev;
  struct rtl_fe_bridge *bridge;
+ struct rtl_fabric fabric;
  DECLARE_BITMAP(hashes,RTL_FE_HASH_ENTRIES);
  DECLARE_BITMAP(counters,FE_INTERFACES);
 };
@@ -196,6 +198,28 @@ static int fe_access(void *context,unsigned int address,unsigned int value)
 static struct rtl_dq_io fe_io(struct rtl_fe *fe)
 {
  return (struct rtl_dq_io){fe,fe_read,fe_write,fe_access};
+}
+
+int rtl_fe_fabric_cold_prepare(struct rtl_fe *fe)
+{
+ struct rtl_dq_io io;
+ int ret;
+
+ if(!fe)return -EOPNOTSUPP;
+ io=fe_io(fe);
+ mutex_lock(&fe->lock);
+ if(fe->engine_ready || fe->prepared || fe->dma_exposed || fe->shutting_down) {
+  ret=-EBUSY;
+  goto out;
+ }
+ ret=rtl_fabric_cold_prepare(&io,&fe->fabric);
+ /* A verified preflight refusal preserves the old software/routing
+  * baseline. Ambiguous writes and failed cleanup never publish NI users.
+  */
+ if(ret && fe->fabric.refusal && !fe->fabric.poisoned)ret=1;
+out:
+ mutex_unlock(&fe->lock);
+ return ret;
 }
 
 /* LPB1 (LAN connector) and LPB2 (PON connector) select one of two owned
@@ -1954,6 +1978,15 @@ static int fe_base_require_locked(struct rtl_fe *fe)
  int ret;
 
  if(fe->base_failed)return -EIO;
+ if(fe->fabric.poisoned)return -EIO;
+ if(fe->fabric.ready) {
+  struct rtl_dq_io io=fe_io(fe);
+  ret=rtl_fabric_check(&io,&fe->fabric);
+  if(ret) {
+   fe_base_quarantine_locked(fe);
+   return ret;
+  }
+ }
  if(!fe->prepared) {
   ret=fe_prepare(fe);
   if(ret) {
@@ -2160,7 +2193,7 @@ bool rtl_fe_free(struct rtl_fe *fe)
  /* This check precedes ALL ownership handoff, including the shared FDB
   * command-mode lease. An exposed/partial base may still be referenced by
   * a PON packet; do not restore a boot owner just because software is idle. */
- if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed))ret=-EBUSY;
+ if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed || fe->fabric.poisoned))ret=-EBUSY;
  if(!ret && !bound && list_empty(&fe->blocks) && list_empty(&fe->flows)) {
   struct rtl_dq_io io=fe_io(fe);
   ret=rtl_fe_window_idle(&io,0x1ca0);
@@ -2231,6 +2264,12 @@ ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
   "arb_keep_original_lspid=%u arb_mc_membership_check=%u\n",
   sample.mce_copy_lspid_to_pol,sample.mce_flush_requested,
   sample.arb_keep_original_lspid,sample.arb_mc_membership_check);
+ /* Report baseline incompatibility even without two live bridge ports.
+  * These two decoded checks are not an aggregate eligibility verdict. */
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "native_l2_svl_compatible=%u native_l2_priority_key_compatible=%u "
+  "native_l2_prerequisites_complete=0\n",
+  sample.native_l2_svl_compatible,sample.native_l2_priority_key_compatible);
  for(i=0;i<RTL_L2_EVIDENCE_LAN_PORTS;i++)
   length+=scnprintf(buffer+length,PAGE_SIZE-length,
    "hw_port=%u rx_control=0x%08x bypass=%u bypass_destination=%u\n",
@@ -2276,6 +2315,14 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "pp_rejected_register=0x%x pp_rejected_value=0x%x\n",
   fe->pp_rejected_register,fe->pp_rejected_value);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "fabric_ready=%u fabric_poisoned=%u fabric_changed=%u fabric_refusal=%u fabric_error=%d "
+  "fabric_vlan_mode=0x%x fabric_uni_frame=0x%x fabric_storage=0x%x fabric_native_mtu_compatible=%u "
+  "fabric_rejected_register=0x%x fabric_rejected_value=0x%x\n",
+  fe->fabric.ready,fe->fabric.poisoned,fe->fabric.changed,fe->fabric.refusal,fe->fabric.error,
+  fe->fabric.vlan_mode,fe->fabric.packet_length,fe->fabric.storage_length,
+  rtl_fabric_native_mtu_compatible(&fe->fabric),
+  fe->fabric.rejected_register,fe->fabric.rejected_value);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
   RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);
