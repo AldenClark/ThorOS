@@ -106,7 +106,19 @@ read_probe() {
             { if (length($0)>4096 || NR>1024 || bytes+length($0)+1>16384) {
                 print "read_truncated=16384_bytes_1024_lines_4096_line_bytes"; exit;
               }
-              bytes+=length($0)+1; gsub(/\000/,","); print; }' "$1"
+              bytes+=length($0)+1; gsub(/[^[:print:]\t\r]/,","); print; }' "$1"
+    else
+        printf 'unavailable\n'
+    fi
+}
+
+read_board_identity() {
+    # NUL regexes become empty expressions in BusyBox awk; BSD awk truncates
+    # strings at NUL. Normalize DT bytes before either awk sees the input.
+    # Both pipeline processes are independently bounded by probe; no shell
+    # child survives a timeout holding its stdout open.
+    if [ -r "$1" ]; then
+        probe tr '\000' ',' < "$1" | read_probe /dev/stdin
     else
         printf 'unavailable\n'
     fi
@@ -163,12 +175,12 @@ fe_counters() {
             for(i=1;i<=n;i++) if (!(selected[i] in column)) {
                 print "unavailable=unsupported_flow_header"; exit;
             }
-            for(i=1;i<=n;i++) printf "%s%s",i==1?"":" ",selected[i];
+            for(i=1;i<=n;i++) printf "%s%s",(i==1?"":" "),selected[i];
             printf "\n"; next;
         }
         NF==2 && $2 ~ /^error=-?[0-9]+$/ { print $1,$2; next; }
         {
-            for(i=1;i<=n;i++) printf "%s%s",i==1?"":" ",$(column[selected[i]]);
+            for(i=1;i<=n;i++) printf "%s%s",(i==1?"":" "),$(column[selected[i]]);
             printf "\n";
         }'
 }
@@ -224,12 +236,12 @@ sample_clock() {
     read_probe "$proc_dir/uptime" | awk '
         NR==1 && $1 ~ /^[0-9]+([.][0-9]+)?$/ {value=$1}
         /(probe_(failed|skipped|unavailable)|read_truncated|truncated|skipped)=/ {failed=1}
-        END {print value!="" && !failed ? value : "unavailable"}'
+        END {print (value!="" && !failed ? value : "unavailable")}'
     printf 'boot_id='
     read_probe "$proc_dir/sys/kernel/random/boot_id" | awk '
         NR==1 && $0 ~ /^[0-9a-f-]+$/ && length($0)==36 {value=$0}
         /(probe_(failed|skipped|unavailable)|read_truncated|truncated|skipped)=/ {failed=1}
-        END {print value!="" && !failed ? value : "unavailable"}'
+        END {print (value!="" && !failed ? value : "unavailable")}'
 }
 
 observation_mode=passive
@@ -264,7 +276,7 @@ fi
 printf '\n[board_identity]\n'
 for attribute in model compatible; do
     printf '%s=' "$attribute"
-    read_probe "$sys_dir/firmware/devicetree/base/$attribute"
+    read_board_identity "$sys_dir/firmware/devicetree/base/$attribute"
 done
 for attribute in family soc_id revision; do
     printf '%s=' "$attribute"

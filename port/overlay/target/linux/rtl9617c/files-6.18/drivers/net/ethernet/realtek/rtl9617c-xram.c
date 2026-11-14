@@ -173,6 +173,11 @@ struct rtl_xram {
 	spinlock_t tx_lock;
 	spinlock_t rx_lock;
 	struct mutex mib_lock;
+	struct mutex fabric_lock;
+	bool cold_handoff_required;
+	bool provider_ready;
+	bool fabric_managed;
+	int fabric_error;
 	struct delayed_work mib_work;
 	unsigned long long mib_total[5][RTL_NI_MIB_COUNTERS];
 	struct rtl_lan_mib_evidence mib_evidence[5];
@@ -852,6 +857,8 @@ static int rtl_engine_get(struct rtl_xram *priv)
 	int ret;
 
 	/* Both netdev open/stop paths are serialized by RTNL. */
+	if (priv->cold_handoff_required && !READ_ONCE(priv->provider_ready))
+		return -EPROBE_DEFER;
 	if (priv->removing)
 		return -ENODEV;
 	if (priv->engine_poisoned)
@@ -1590,6 +1597,63 @@ static const struct attribute_group *rtl_native_groups[] = {
 	NULL,
 };
 
+/* drvdata identifies an allocation, not data-plane readiness. The PON
+ * consumer completes this handoff before registering any of its interfaces.
+ * fabric_lock is never acquired from ndo_open/RTNL.
+ */
+static int rtl_ni_publish(struct rtl_xram *priv, struct device *dev)
+{
+	int ret;
+
+	if (READ_ONCE(priv->provider_ready))
+		return 0;
+	/* A port can be opened as soon as register_netdevice releases RTNL. */
+	WRITE_ONCE(priv->provider_ready, true);
+	rtl_register_lans(priv, dev);
+	ret = sysfs_create_groups(&dev->kobj, rtl_native_groups);
+	if (ret)
+		dev_warn(dev, "NI diagnostic attributes unavailable: %d\n", ret);
+	else
+		priv->native_groups_created = true;
+	schedule_delayed_work(&priv->mib_work, HZ);
+	return 0;
+}
+
+int rtl9617c_ni_cold_handoff(struct device *dev)
+{
+	struct net_device *netdev = dev_get_drvdata(dev);
+	struct rtl_xram *priv;
+	int ret = 0;
+
+	if (!netdev)
+		return -EPROBE_DEFER;
+	priv = netdev_priv(netdev);
+	mutex_lock(&priv->fabric_lock);
+	if (priv->removing || priv->engine_poisoned) {
+		ret = -EIO;
+		goto out;
+	}
+	if (READ_ONCE(priv->provider_ready))
+		goto out;
+	if (priv->cold_handoff_required) {
+		ret = rtl_fe_fabric_cold_prepare(priv->fe);
+		priv->fabric_error = ret;
+		if (ret < 0)
+			goto out;
+		priv->fabric_managed = !ret;
+		if (ret)
+			dev_warn(dev, "native L2 baseline unavailable; preserving software datapath\n");
+		else
+			/* Shared configuration is retained for this physical owner. */
+			rtl_ni_owner_expose(priv->owner);
+	}
+	ret = rtl_ni_publish(priv, dev);
+out:
+	mutex_unlock(&priv->fabric_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rtl9617c_ni_cold_handoff);
+
 static bool rtl_ni_release_dma(struct rtl_xram *priv, struct device *dev)
 {
 	bool fe_released = rtl_fe_free(priv->fe);
@@ -1662,6 +1726,9 @@ static int rtl_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->tx_lock);
 	spin_lock_init(&priv->rx_lock);
 	mutex_init(&priv->mib_lock);
+	mutex_init(&priv->fabric_lock);
+	priv->cold_handoff_required = of_property_read_bool(dev->of_node,
+						"realtek,pon-cold-handoff");
 	init_completion(&priv->lan4_ready);
 	INIT_DELAYED_WORK(&priv->mib_work, rtl_mib_work);
 	netif_napi_add(netdev, &priv->napi, rtl_poll);
@@ -1719,13 +1786,10 @@ static int rtl_probe(struct platform_device *pdev)
 		priv->qm.fe = priv->fe;
 	}
 	platform_set_drvdata(pdev, netdev);
-	rtl_register_lans(priv, dev);
-	ret = sysfs_create_groups(&dev->kobj, rtl_native_groups);
-	if (ret)
-		dev_warn(dev, "NI diagnostic attributes unavailable: %d\n", ret);
+	if (!priv->cold_handoff_required)
+		rtl_ni_publish(priv, dev);
 	else
-		priv->native_groups_created = true;
-	schedule_delayed_work(&priv->mib_work, HZ);
+		dev_info(dev, "NI provider allocated; waiting for PON cold receive handoff\n");
 	return 0;
 
 free_dma:
@@ -1750,10 +1814,12 @@ static void rtl_remove(struct platform_device *pdev)
 	unsigned int port;
 	bool release_owner;
 
+	mutex_lock(&priv->fabric_lock);
+	WRITE_ONCE(priv->removing, true);
+	WRITE_ONCE(priv->provider_ready, false);
 	if (priv->lan4_phy)
 		flush_work(&priv->lan4_work);
 	cancel_delayed_work_sync(&priv->mib_work);
-	WRITE_ONCE(priv->removing, true);
 	if (priv->native_groups_created)
 		sysfs_remove_groups(&pdev->dev.kobj, rtl_native_groups);
 	for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
@@ -1775,6 +1841,7 @@ static void rtl_remove(struct platform_device *pdev)
 	release_owner = rtl_ni_release_dma(priv, &pdev->dev);
 	netif_napi_del(&priv->napi);
 	platform_set_drvdata(pdev, NULL);
+	mutex_unlock(&priv->fabric_lock);
 	if (release_owner) {
 		rtl_ni_owner_release(priv->owner);
 		free_netdev(dev);

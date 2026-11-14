@@ -24,6 +24,9 @@ python3 scripts/test_fe_fdb_domain.py
 python3 scripts/test_fe_window_idle.py
 python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_hardware_recipe.py
+python3 scripts/test_fabric_baseline.py
+python3 scripts/test_pon_cold_handoff.py
+python3 scripts/test_ni_cold_handoff.py
 python3 scripts/test_l2_policy_races.py
 python3 scripts/test_l2_parent_id.py
 python3 scripts/test_l2_switch_lifecycle.py

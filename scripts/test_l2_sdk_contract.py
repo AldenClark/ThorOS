@@ -24,6 +24,7 @@ SDK_PIN = "8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0"
 REG_PIN = "5090fbcb6ba743dd7b1314811ef557bad0460147"
 REG_HASH = "ce5940a274a14c91e5bf3cf96e4583d2d1d086ae601eb716566dfc70d87633e0"
 SDK_FILES = {
+    "../cortina-api/vlan.c": "d819b6621f11054df8a92bb323affcbb741e90dcfad38af5bcefa0f34dc33b20",
     "include/aal_fdb.h": "e8b0cdfd5ec7a3dfea844375abacb4813d55ba063edfb678c36172b925631ae4",
     "aal_fdb.c": "b578ced837bf926a2f440b25a775e74935413a983cb8b27dbecb46ead35a8683",
     "include/aal_mcast.h": "f6dc118c698b91fed29d920ced7c84501a02d13a416316c67c58268c3a0b596d",
@@ -179,6 +180,7 @@ typedef unsigned char ca_mac_addr_t[6];
 #define CA_E_PARAM (-EINVAL)
 #define CA_E_TIMEOUT (-ETIMEDOUT)
 #define CA_IN
+#define BIT(n) (1U << (n))
 #define OFFSET(reg) ((reg)-0xf4300000U)
 '''
 
@@ -205,6 +207,14 @@ def compile_source(registers, sdk):
     source += "\n" + typedef(sdk["include/aal_fdb.h"], "aal_fdb_data0_t")
     source += "\n" + typedef(sdk["include/aal_fdb.h"], "__fdb_tbl_opcode_t")
     source += "\n" + typedef(sdk["include/aal_port.h"], "aal_stp_state_t")
+    source += "\n" + typedef(sdk["include/aal_port.h"], "aal_vlan_tpid_index_t")
+    # Compile the unchanged vendor decoder. Its bits1..3 are fixed TPIDs;
+    # only bit0 refers to the per-class user comparator. This is independent
+    # of the observed reset CSR values, which all duplicate 8100 on TYFZA1.
+    source += "\n" + function(sdk["../cortina-api/vlan.c"], "void __l2_vlan_tpid_bmp2list(")
+    native_hw = (DRIVER / "rtl9617c-fe-switch-hw.h").read_text()
+    for name in ("FE_SW_TPID_STANDARD", "FE_SW_TPID_USER", "FE_SW_TPID_ALL"):
+        source += "\n" + re.search(r"^#define " + name + r"[^\n]+", native_hw, re.M).group()
     source += "\n" + typedef(sdk["include/aal_l2_vlan.h"], "aal_l2_vlan_mode_t")
     source += "\n" + typedef(sdk["include/aal_arb.h"], "aal_ple_nonkwn_type_t")
     source += "\n" + typedef(sdk["include/aal_l3_cls.h"], "cls_fib_mod_0_t")
@@ -544,6 +554,23 @@ static void check_cf(void)
 }
 static void check_constants(void)
 {
+ assert(FE_SW_TPID_STANDARD == ((1U<<AAL_VLAN_TPID_INDEX_8100) |
+   (1U<<AAL_VLAN_TPID_INDEX_9100) | (1U<<AAL_VLAN_TPID_INDEX_88A8)));
+ assert(FE_SW_TPID_USER == (1U<<AAL_VLAN_TPID_INDEX_USER_DEFINE));
+ for(unsigned int bits=0;bits<16;bits++) {
+  ca_uint32_t list[4]={0},count=0;
+  __l2_vlan_tpid_bmp2list(bits,list,&count);
+  unsigned int expected=0;
+  for(unsigned int i=1;i<4;i++)if(bits&(1U<<i)) {
+   assert(expected<count);
+   assert(list[expected++]==(i==AAL_VLAN_TPID_INDEX_88A8?0x88a8U:
+      i==AAL_VLAN_TPID_INDEX_9100?0x9100U:0x8100U));
+  }
+  assert(count==expected);
+ }
+ ca_uint32_t list[4]={0},count=0;
+ __l2_vlan_tpid_bmp2list(FE_SW_TPID_ALL,list,&count);
+ assert(count==3 && list[0]==0x88a8 && list[1]==0x9100 && list[2]==0x8100);
  assert((int)RTL_L2_FLOOD_BROADCAST==AAL_PLE_NONKWN_TYPE_BC);
  assert((int)RTL_L2_FLOOD_UNKNOWN_UNICAST==AAL_PLE_NONKWN_TYPE_UUC);
  assert((int)RTL_L2_FLOOD_UNKNOWN_L2_MULTICAST==AAL_PLE_NONKWN_TYPE_UL2MC);
@@ -608,7 +635,7 @@ int main(void)
  check_special_priority();
  printf("Pinned RTL77C L2 SDK oracle: %u fields, %u windows, 16384 FDB vectors, "
    "48 MAC bits, 448 PONCLE keys, 128 SDK MAC-limit traces, CLS CPU-original gate, SPKTP bounds, "
-   "SCAN filters and 64-bit MC/port bitmap contracts PASS (model only)\n",
+   "fixed/user TPID bitmap decoder, SCAN filters and 64-bit MC/port bitmap contracts PASS (model only)\n",
    RTL_L2_FIELD_COUNT,RTL_L2_TBL_COUNT);
  return 0;
 }

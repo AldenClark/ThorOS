@@ -4,6 +4,13 @@
 
 / { model = "Tianyi TYFZA1 (native NI/PON bring-up)"; };
 
+&ni0 {
+	/* PON fences inherited RX before NI establishes the shared baseline
+	 * and publishes openable LAN interfaces.
+	 */
+	realtek,pon-cold-handoff;
+};
+
 &i2c0 {
 	status = "okay";
 	bosa0: optical-front-end@51 {

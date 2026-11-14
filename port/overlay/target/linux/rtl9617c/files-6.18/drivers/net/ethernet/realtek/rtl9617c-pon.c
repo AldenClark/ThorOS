@@ -7,6 +7,7 @@
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/i2c.h>
 #include <linux/etherdevice.h>
 #include <linux/module.h>
@@ -18,6 +19,7 @@
 #include "rtl9617c-pon.h"
 #include "rtl9617c-bosa.h"
 #include "rtl9617c-pon-fec.h"
+#include "rtl9617c-pon-cold.h"
 
 #define PON_EPON_MODE BIT(0)
 #define EPON_STATUS 0x0010
@@ -936,6 +938,51 @@ static const struct attribute_group rtl9617c_pon_group = {
 };
 __ATTRIBUTE_GROUPS(rtl9617c_pon);
 
+static unsigned int rtl_pon_cold_read(void *context, unsigned int reg)
+{
+	struct rtl9617c_pon *pon = context;
+
+	return readl(pon->mac + reg);
+}
+
+static void rtl_pon_cold_write(void *context, unsigned int reg, unsigned int value)
+{
+	struct rtl9617c_pon *pon = context;
+
+	writel(value, pon->mac + reg);
+}
+
+static int rtl_pon_cold_handoff(struct rtl9617c_pon *pon)
+{
+	const struct rtl_dq_io io = {
+		.context = pon, .read = rtl_pon_cold_read, .write = rtl_pon_cold_write,
+	};
+	u32 status;
+	int ret;
+
+	/* Native IRQs, interfaces and controls are not published yet. Keep the
+	 * optical transmitter inhibited while all inherited receive families
+	 * are closed, independent of the software's initial PON mode. */
+	gpiod_set_value_cansleep(pon->tx_disable, 1);
+	ret = gpiod_get_value_cansleep(pon->tx_disable);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+	ret = rtl_pon_cold_rx_gate(&io);
+	if (ret)
+		return ret;
+	/* Local PDC FIFO drain only. This is not a full NI/L3/DDR fence; NI
+	 * must complete its own cold baseline/barrier before publishing LANs.
+	 * A timeout keeps MAC RX and TX disabled and never announces handoff. */
+	ret = readl_poll_timeout(pon->mac + RTL_PON_COLD_PDC_FIFO_STATUS,
+				 status, !(status & RTL_PON_COLD_PDC_FIFO_DEPTH),
+				 1, 100000);
+	if (ret)
+		return ret;
+	return rtl9617c_ni_cold_handoff(pon->ni_dev);
+}
+
 static int rtl9617c_pon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -949,24 +996,7 @@ static int rtl9617c_pon_probe(struct platform_device *pdev)
 	pon->tx_disable = devm_gpiod_get(dev, "tx-disable", GPIOD_OUT_HIGH);
 	if (IS_ERR(pon->tx_disable))
 		return dev_err_probe(dev, PTR_ERR(pon->tx_disable), "PON TX-disable GPIO\n");
-	{
-		struct device_node *node = of_parse_phandle(dev->of_node, "realtek,optical-front-end", 0);
-		struct i2c_client *client = of_find_i2c_device_by_node(node);
 
-		of_node_put(node);
-		if (!client)
-			return -EPROBE_DEFER;
-		if (!i2c_get_clientdata(client)) {
-			put_device(&client->dev);
-			return -EPROBE_DEFER;
-		}
-		pon->bosa_dev = &client->dev;
-		if (!device_link_add(dev, pon->bosa_dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
-			put_device(&client->dev);
-			return -ENOMEM;
-		}
-		put_device(&client->dev);
-	}
 	{
 		struct device_node *node = of_parse_phandle(dev->of_node, "realtek,network-engine", 0);
 		struct platform_device *engine = of_find_device_by_node(node);
@@ -1028,6 +1058,29 @@ static int rtl9617c_pon_probe(struct platform_device *pdev)
 	pon->top_irq = devm_platform_ioremap_resource(pdev, 6);
 	if (IS_ERR(pon->top_irq))
 		return PTR_ERR(pon->top_irq);
+	ret = rtl_pon_cold_handoff(pon);
+	if (ret)
+		return dev_err_probe(dev, ret, "PON cold fabric handoff\n");
+	/* Optical front-end deferral must not withhold LAN recovery after
+	 * the receive-only cold fence and shared baseline are established. */
+	{
+		struct device_node *node = of_parse_phandle(dev->of_node, "realtek,optical-front-end", 0);
+		struct i2c_client *client = of_find_i2c_device_by_node(node);
+
+		of_node_put(node);
+		if (!client)
+			return -EPROBE_DEFER;
+		if (!i2c_get_clientdata(client)) {
+			put_device(&client->dev);
+			return -EPROBE_DEFER;
+		}
+		pon->bosa_dev = &client->dev;
+		if (!device_link_add(dev, pon->bosa_dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+			put_device(&client->dev);
+			return -ENOMEM;
+		}
+		put_device(&client->dev);
+	}
 	{
 		int irq = platform_get_irq(pdev, 0);
 		int ret;
