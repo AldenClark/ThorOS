@@ -84,3 +84,4 @@ jobs:
             artifacts/kernel-objects/objects.sha256
             artifacts/kernel-objects/config.seed
             artifacts/kernel-objects/kernel.config
+            logs/ni-kconfig-test.json
