@@ -27,6 +27,8 @@ shim = r'''
 #include <string.h>
 #include <errno.h>
 typedef unsigned char u8;
+#define EPROBE_DEFER 517
+#define READ_ONCE(p) (p)
 #define ETH_ALEN 6
 #define ETH_DATA_LEN 1500
 #define BIT(n) (1U << (n))
@@ -73,7 +75,7 @@ struct rtl_xram {
  struct device *lan4_parent;struct device_node *lan4_phy;
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
- bool phy_led_registered,qm_rx,native_groups_created;
+ bool phy_led_registered,qm_rx,native_groups_created,cold_handoff_required,provider_ready;
  int tx_lock,dma;void *fe;
 };
 static struct device_node nodes[5];
@@ -140,8 +142,8 @@ static void tyfza1_led_unregister(struct tyfza1_led *l){}
 static void *rtl_phy_led_output;
 '''
 code = shim + '\n'.join(function(n) for n in ('rtl_unregister_lan', 'rtl_sgmii_power_off', 'rtl_lan_number', 'rtl_register_lan', 'rtl_lan4_work', 'rtl_register_lans'))
-# Run the actual post-registration probe block independently of shared DMA setup.
-probe = function('rtl_probe')
+# Run the actual post-registration publication block independently of shared DMA setup.
+probe = function('rtl_ni_publish')
 services = probe[probe.index('\tret = sysfs_create_groups('):probe.index('\tschedule_delayed_work(')]
 code += r'''
 static int service_failure;
@@ -201,7 +203,7 @@ int main(void){
  printf("%u per-port fault cases, both boards, optional services and cleanup passed\n",cases);
 }
 '''
-code = code.replace('bool phy_led_registered,qm_rx,native_groups_created;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created;')
+code = code.replace('bool phy_led_registered,qm_rx,native_groups_created,cold_handoff_required,provider_ready;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created;')
 # The production code uses the device kobject only as a sysfs API argument.
 code = code.replace('struct device {struct device_node *of_node;};', 'struct device {struct device_node *of_node;int kobj;};')
 if __name__ == '__main__':

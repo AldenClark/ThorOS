@@ -56,7 +56,9 @@ struct list_head {struct rtl_fe_flow *first;};
 static bool list_empty(struct list_head *head){return !head->first;}
 static void mutex_lock(struct mutex *m){assert(!m->held);m->held=true;}
 static void mutex_unlock(struct mutex *m){assert(m->held);m->held=false;}
+struct rtl_fabric { bool ready,poisoned; int check_error; unsigned int checks; };
 struct rtl_fe {
+ struct rtl_fabric fabric;
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
@@ -137,6 +139,11 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
  return 0;
 }
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,fe_read,fe_write,fe_access};}
+/* Fabric MMIO is executed in test_fabric_baseline; this seam checks the FE
+ * admission and quarantine boundary against its result. */
+static int rtl_fabric_check(const struct rtl_dq_io *io,struct rtl_fabric *fabric) {
+ (void)io;fabric->checks++;return fabric->check_error;
+}
 static __attribute__((unused)) int fe_switch_quiesce_locked(struct rtl_fe *f){
  assert(f->lock.held);f->switch_quiesces++;return f->switch_error;
 }
@@ -381,6 +388,15 @@ int main(void) {
  for(unsigned int i=0;i<5;i++)f.lan_saved[i]=i&1?0:(25U<<16);
  mutex_lock(&f.lock);fe_lan_restore_locked(&f);mutex_unlock(&f.lock);
  for(unsigned int i=0;i<5;i++)assert((fe_read(&f,FE_LAN_RX_CTRL(i))&(BIT(28)|(63U<<16)))==(BIT(28)|(16U<<16)));
+ /* Managed baseline drift must close FE before any warm reprogramming. */
+ f=base;assert(!rtl_fe_engine_suspend(&f));f.fabric.ready=true;f.fabric.check_error=-EIO;
+ unsigned int fabric_writes=f.base_writes;
+ assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);
+ assert(f.fabric.checks==1 && f.base_writes==fabric_writes);drifts++;
+ f=cold;f.fabric.poisoned=true;
+ assert(rtl_fe_enable(&f)==-EIO && !f.prepared && !f.base_writes);failures++;
+ f=cold;f.fabric.ready=true;
+ assert(!rtl_fe_enable(&f) && f.fabric.checks==1);
  /* A cold CPU mode also takes a complete base owner without LAN admission. */
  f=cold;f.engine_ready=false;
  assert(rtl_fe_cpu_path(&f)==-EAGAIN && !f.prepared && !f.dma_exposed);

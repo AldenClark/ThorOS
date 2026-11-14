@@ -22,6 +22,10 @@ struct rtl9617c_ni_frame {
 	bool raw_payload;
 };
 
+/* Cold probe only, after the PON owner gates all inherited RX families and
+ * checks its local PDC FIFO. LANs are published after fabric readiness.
+ */
+int rtl9617c_ni_cold_handoff(struct device *dev);
 int rtl9617c_ni_report_configure(struct device *dev, unsigned int low, unsigned int high);
 u32 rtl9617c_ni_report_state(struct device *dev);
 u32 rtl9617c_ni_pon_gate(struct device *dev, u32 enabled);

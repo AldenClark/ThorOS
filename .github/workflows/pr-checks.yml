@@ -39,6 +39,7 @@ jobs:
           retention-days: 14
           path: |
             artifacts/l2-*.json
+            artifacts/fabric-*.json
             artifacts/ni-mib-evidence.json
 
   sdk-contracts:
@@ -50,6 +51,14 @@ jobs:
           persist-credentials: false
       - name: Verify encodings and provenance against pinned public vendor sources
         run: bash scripts/check_sdk_contracts.sh
+      - name: Upload pinned fabric SDK evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: rtl9617c-fabric-sdk-evidence
+          if-no-files-found: warn
+          retention-days: 14
+          path: artifacts/fabric-*.json
 
   kernel-objects:
     runs-on: ubuntu-24.04
@@ -69,6 +78,7 @@ jobs:
         run: |
           kernel_version=$(python3 -c 'import json; print(json.load(open("port/sources.lock.json"))["openwrt"]["kernel"])')
           bash scripts/check_flowtable_contracts.sh "artifacts/kernel-objects/linux-$kernel_version"
+          python3 scripts/test_fabric_frame_contract.py --kernel "artifacts/kernel-objects/linux-$kernel_version"
           python3 scripts/test_l2_bridge_eligibility.py --kernel "artifacts/kernel-objects/linux-$kernel_version"
       - name: Upload compile evidence without firmware or private inputs
         if: always()
@@ -87,3 +97,4 @@ jobs:
             artifacts/kernel-objects/config.seed
             artifacts/kernel-objects/kernel.config
             logs/ni-kconfig-test.json
+            artifacts/fabric-frame-contract.json

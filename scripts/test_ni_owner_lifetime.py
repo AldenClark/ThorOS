@@ -74,6 +74,7 @@ common = r'''
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 typedef int netdev_tx_t;
+#define EPROBE_DEFER 517
 #define __iomem
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
@@ -143,6 +144,8 @@ struct rtl_qm_rx {
 };
 struct napi_struct {bool active;};
 struct rtl_xram {
+ pthread_mutex_t fabric_lock;
+ bool cold_handoff_required,provider_ready;
  struct net_device *netdev,*ports[5];struct rtl_fe *fe;
  struct rtl_ni_owner *owner;unsigned char *ni;
  struct rtl_dma_tx dma;struct rtl_qm_rx qm;struct napi_struct napi;
@@ -290,7 +293,7 @@ int main(void){
  u32 registers[0x10000/4],dma_registers[0x2000/4];
  struct net_device dev={0};struct rtl_fe fe;
  for(unsigned mode=0;mode<4;mode++){
-  struct rtl_xram p={.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=!!(mode&1),.qm_rx=!!(mode&2),.ports={&dev,NULL,&dev,NULL,&dev},
    .dma={.registers=(void *)dma_registers,.vp=8,.memory=&dev},.qm={.memory=&dev}};
   dev.priv=&p;active_priv=&p;memset(registers,0x5a,sizeof(registers));
@@ -316,7 +319,7 @@ int main(void){
  /* Every failed cold stage keeps partial DMA exposure and prohibits retry.
   * A pre-exposure FE veto remains retryable without touching shared state. */
  for(unsigned mode=0;mode<4;mode++)for(unsigned failure=1;failure<5;failure++){
-  struct rtl_xram p={.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=!!(mode&1),.qm_rx=!!(mode&2),
    .dma={.registers=(void *)dma_registers,.vp=8},.qm={0}};
   dev.priv=&p;active_priv=&p;memset(&fe,0,sizeof(fe));reset_counts();
@@ -346,7 +349,7 @@ int main(void){
  /* An explicit zero request before, or during, sleeping cold initialization
   * must survive QM's actual final MMIO writes and final host publication. */
  for(unsigned when=0;when<2;when++){
-  struct rtl_xram p={.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.dma={.registers=(void *)dma_registers,.vp=8}};
   dev.priv=&p;active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));
   if(when)request_zero_in_qm=true;
@@ -359,7 +362,7 @@ int main(void){
  /* A temporary FE cleanup failure does not poison/reset the NI queue.
   * Retry is gated on FE's next suspend; partial FE bases reject there. */
  {
-  struct rtl_xram p={.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.dma={.registers=(void *)dma_registers,.vp=8}};
   active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));assert(!rtl_engine_get(&p));
   fail_suspend=1;rtl_engine_put(&p);assert(!p.engine_poisoned && !p.host_active && !p.napi.active);
@@ -373,7 +376,7 @@ int main(void){
   * quarantine keeps primary owner, storage and physical reprobe tombstone. */
  for(unsigned exposed=0;exposed<2;exposed++)for(unsigned retained_fe=0;retained_fe<2;retained_fe++){
   struct platform_device platform={.dev={.refs=1,.data=&dev}};
-  struct rtl_xram p={.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.irq_requested=true,.native_groups_created=true,.lan4_phy=1,
    .dma={.registers=(void *)dma_registers,.vp=8,.memory=&dev},.qm={.memory=&dev,.pon=&dev}};
   dev.priv=&p;active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));
@@ -411,7 +414,7 @@ int main(void){
  /* Actual exported TX path rejects stopped/removed/poisoned owners. */
  for(unsigned mask=0;mask<8;mask++){
   struct device parent={.data=&dev};
-  struct rtl_xram p={.host_active=!!(mask&1),.removing=!!(mask&2),.engine_poisoned=!!(mask&4)};
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.host_active=!!(mask&1),.removing=!!(mask&2),.engine_poisoned=!!(mask&4)};
   struct sk_buff skb={0};dev.priv=&p;active_priv=&p;reset_counts();
   assert(rtl9617c_ni_transmit(&parent,&dev,&skb,NULL)==NETDEV_TX_OK);
   assert(tx_frames==(mask==1) && skb.freed==(mask!=1));cases++;
@@ -420,7 +423,7 @@ int main(void){
   * removing NI must serialize and reject reopening its shared low16 gate. */
  for(unsigned mask=0;mask<8;mask++){
   struct device parent={.data=&dev};
-  struct rtl_xram p={.ni=(void *)registers,.removing=!!(mask&1),.engine_poisoned=!!(mask&2),.host_active=!!(mask&4),.qm_rx=true};
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.ni=(void *)registers,.removing=!!(mask&1),.engine_poisoned=!!(mask&2),.host_active=!!(mask&4),.qm_rx=true};
   dev.priv=&p;active_priv=&p;reset_counts();writel(0xa5a51234,p.ni+0x610c);
   assert(rtl9617c_ni_pon_gate(&parent,0xffff)==0x1234);
   assert(readl(p.ni+0x610c)==(mask==4?0xa5a5ffffU:0xa5a50000U));
