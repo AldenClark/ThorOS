@@ -58,7 +58,7 @@ struct rtl_fe {
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
- struct spinlock route_lock;bool route_gate_ready,route_admitted;
+ struct spinlock route_lock;bool route_gate_ready,route_admitted,dma_exposed;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][4][2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
  unsigned int reg[0x10000/4],mask[8],cls[1056][7],map[256],cls_keys[256];
@@ -66,7 +66,8 @@ struct rtl_fe {
  unsigned int cam[9][64][5];
  unsigned int admission_writes,cache_ready,fail_mask,fail_mask_writes,deletes,fail_delete;
  unsigned int switch_quiesces,switch_reconciles,register_writes;
- unsigned int key_reads,fail_key_read,fail_route_open;
+ unsigned int key_reads,fail_key_read,fail_route_open,fail_cpu_selector;
+ unsigned int pp_rejected_register,pp_rejected_value;
  int switch_error;
  unsigned int expected_lan[5];
 };
@@ -74,6 +75,7 @@ static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;ass
 static void fe_write(void *ctx,unsigned int reg,unsigned int value){
  struct rtl_fe *f=ctx;assert(reg<0x10000);
  f->register_writes++;
+ if(reg==0x383c)assert(f->dma_exposed);
  if(reg==0x38c4)f->cache_ready=value==0xa0000000;
  if(reg==0x351c && (value&BIT(10)) && ((value>>4)&63)==32) {
   assert(f->cache_ready && f->reg[0x3860/4]==0x020d0000);
@@ -84,6 +86,7 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
   assert(f->route_lock.held && f->prepared && f->enabled);
   if(f->fail_route_open){f->fail_route_open--;return;}
  }
+ if(reg==f->fail_cpu_selector && ((value>>10)&15)==1)return;
  if(reg==0x38c4 && value==0)assert(!(f->reg[0x351c/4]&BIT(10)));
  if(reg>=0xa5f8 && reg<=0xa838 && !((reg-0xa5f8)%0x90) && ((value>>16)&63)==25){
   f->admission_writes++;
@@ -152,6 +155,8 @@ int main(void){
  const unsigned int access[]={0x1654,0x1ca0,0x1cb4,0x3000,0x3200,0x3380,0x33b0,
   0x35c8,0x38b0,0x38e0,0x38e4,0x3910,0x3928,0x393c};
  for(unsigned int i=0;i<ARRAY_SIZE(access);i++)f.reg[access[i]/4]=0;
+ const unsigned int pp_exception[]={0x3248,0x324c,0x3314,0x3318};
+ for(unsigned int i=0;i<ARRAY_SIZE(pp_exception);i++)f.reg[pp_exception[i]/4]=0xfffffa10U;
  f.reg[0x30a4/4]=0x0001b000U;
  for(unsigned int i=0;i<5;i++)f.reg[(0xa5f8+i*0x90)/4]=f.expected_lan[i]=lan[i]=0x18100400U|(i<<24);
  for(unsigned int i=0;i<8;i++)f.mask[i]=old_mask[i]=0x55000000+i;
@@ -175,6 +180,22 @@ int main(void){
  assert(rtl_fe_disable(&f)==-ETIMEDOUT && f.desired_mode==RTL_FE_MODE_OFF);
  assert(f.register_writes==before_switch_writes && f.switch_quiesces==3);
  f.switch_error=0;
+ /* A parser override must fail before even TCAM probes, table snapshots
+  * or DMA publication. Exercise both CPU and drop allow-lists, all stage
+  * selectors, packet preservation, and reserved destination values. */
+ const unsigned int unsafe_pp[]={0,0xfffffa11U,0xfffff810U,0xfffffe10U,
+  0xfffff210U,0xffffea10U,0xfffefa10U,0xffeffa10U,0xfefffa10U,0xeffffa10U};
+ for(unsigned int side=0;side<ARRAY_SIZE(pp_exception);side++){
+  for(unsigned int bad=0;bad<ARRAY_SIZE(unsafe_pp);bad++){
+   unsigned int before_keys=f.key_reads;
+   f.reg[pp_exception[side]/4]=unsafe_pp[bad];
+   before_switch_writes=f.register_writes;
+   assert(rtl_fe_enable(&f)==-EOPNOTSUPP && !f.enabled && !f.prepared && !f.dma_exposed);
+   assert(f.register_writes==before_switch_writes && f.key_reads==before_keys);
+   assert(f.pp_rejected_register==pp_exception[side] && f.pp_rejected_value==unsafe_pp[bad]);
+  }
+  f.reg[pp_exception[side]/4]=0xfffffa10U;
+ }
  /* A foreign key of any of the four valid forms, at any TCAM index, makes
   * default-only classifier ownership unsafe. Real prepare must not write. */
  for(unsigned int index=0;index<256;index++)for(unsigned int bit=27;bit<=30;bit++){
@@ -191,8 +212,18 @@ int main(void){
  unsigned int key_reads=f.key_reads;
  assert(rtl_fe_enable(&f)==-EBUSY && f.key_reads==key_reads && f.register_writes==before_switch_writes);
  f.reg[0x3380/4]=0;
+ /* Either connector failing its CPU profile readback must prevent prepare
+  * from publishing GEM admission or claiming successful enable. */
+ for(unsigned int side=0;side<2;side++){
+  f.fail_cpu_selector=0x3418+side*12;
+  assert(rtl_fe_enable(&f)==-EIO && !f.enabled && !f.prepared && !f.route_gate_ready);
+  assert(!f.route_admitted && !f.admission_writes);
+  for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)assert(fe_read(&f,fe_registers[i])==old_regs[i]);
+ }
+ f.fail_cpu_selector=0;
  for(unsigned int cycle=0;cycle<3;cycle++){
   assert(!rtl_fe_enable(&f) && f.enabled && f.prepared);
+  assert(!f.pp_rejected_register && !f.pp_rejected_value);
   /* Table/errata preparation remains checked even though admission itself
    * now belongs to a different, generation-gated hardware owner. */
   assert(f.cache_ready && f.reg[0x383c/4]==0x03800000);
@@ -440,6 +471,7 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'PON_stream_identity_enabled_before_admission_and_restored': True,
     'two_profiles_four_result_groups_two_rows_saved_programmed_and_restored': True,
     'all_foreign_TCAM_valid_flags_rejected_without_data_writes': True,
+    'both_CPU_profile_readbacks_required_before_enable': True,
     'CPU_original_profile_stops_both_LAN_and_PON_hash_admission': True,
     'physical_LSPID_preserved': True,
     'failed_rollback_preserves_original_snapshot_on_reenable': True,

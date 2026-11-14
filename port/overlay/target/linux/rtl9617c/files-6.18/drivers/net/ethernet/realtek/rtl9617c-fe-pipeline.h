@@ -117,6 +117,47 @@ static inline int rtl_fe_classifier_keys_empty(const struct rtl_dq_io *io)
  return 0;
 }
 
+/* PP errors/over-VLAN/DDoS can replace every downstream lookup selector,
+ * independently of the LPB's atomic CPU gate. Admit only a conservative
+ * transparent CPU0/blackhole action: T0 disables LPB processing, T1..T5
+ * bypass their lookups, and PE keeps the original packet. See aal-77c
+ * aal_l3_specpkt.h:26-44 and the four generated RTL77C register unions.
+ * COS is an ordinary 3-bit queue selection; reserved bit10 must stay zero.
+ * These are semantic checks, not comparisons against assumed reset values.
+ */
+static inline int rtl_fe_pp_exception_safe(unsigned int word)
+{
+ unsigned int destination=word&63U;
+
+ return (destination==16U || destination==31U) &&
+  (word&(1U<<9)) && !(word&(1U<<10)) && (word&(1U<<11)) &&
+  (word>>12)==0xfffffU;
+}
+
+/* Read-only ownership preflight, before any profile/base/table publication.
+ * The fabric owner must serialize every writer of these shared registers;
+ * a successful snapshot cannot protect against a later foreign mutation.
+ * On rejection, optional outputs identify the first unsafe action. Outputs
+ * are unchanged on success or invalid I/O, and no MMIO write is performed.
+ */
+static inline int rtl_fe_pp_exceptions_check(const struct rtl_dq_io *io,
+ unsigned int *bad_reg,unsigned int *bad_value)
+{
+ static const unsigned int registers[]={0x3248,0x324c,0x3314,0x3318};
+ unsigned int i,value;
+
+ if(!io || !io->read)return -EINVAL;
+ for(i=0;i<sizeof(registers)/sizeof(registers[0]);i++) {
+  value=io->read(io->context,registers[i]);
+  if(!rtl_fe_pp_exception_safe(value)) {
+   if(bad_reg)*bad_reg=registers[i];
+   if(bad_value)*bad_value=value;
+   return -EOPNOTSUPP;
+  }
+ }
+ return 0;
+}
+
 /* LPB profile used by the internal LAN-to-L3 connector. No VLAN/packet
  * rewriting occurs here; classifier and flow actions decide forwarding. */
 static inline void rtl_fe_ingress_lpb(unsigned int words[3],unsigned int source,unsigned int destination)

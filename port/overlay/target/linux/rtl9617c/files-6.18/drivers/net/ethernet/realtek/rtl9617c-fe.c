@@ -133,10 +133,11 @@ struct rtl_fe {
  bool enabled, prepared, cpu_path, lan_redirected;
  /* NI stop/start must not confuse requested policy with live ASIC state. */
  bool engine_ready, shutting_down;
- bool route_gate_ready, route_admitted;
+ bool route_gate_ready, route_admitted, dma_exposed;
  enum rtl_fe_mode desired_mode;
  unsigned int fdb_cmd_mode_saved;
  unsigned int cache_target;
+ unsigned int pp_rejected_register, pp_rejected_value;
  int error;
  u64 installs, deletes, misses;
  struct rtl_fe_observe observe;
@@ -300,6 +301,15 @@ static int fe_prepare(struct rtl_fe *fe)
  unsigned long flags;
  int ret;
 
+ /* Parser/DDoS exceptions may bypass LPB and its CPU classifier profile.
+  * Do not take ownership unless every override is already keep-original
+  * CPU/drop with all route/edit stages bypassed. This is a readonly probe:
+  * an unsupported boot/PON policy remains untouched and uses software. */
+ fe->pp_rejected_register=0;
+ fe->pp_rejected_value=0;
+ ret=rtl_fe_pp_exceptions_check(&io,&fe->pp_rejected_register,
+                               &fe->pp_rejected_value);
+ if(ret)return ret;
  /* Neither a foreign valid TCAM key nor its result action may defeat the
   * CPU default used by our atomic gate. Do not clear somebody else's ACL. */
  ret=rtl_fe_classifier_keys_empty(&io);
@@ -334,6 +344,9 @@ static int fe_prepare(struct rtl_fe *fe)
  fe_write(fe,0x3218,fe_read(fe,0x3218)|BIT(15)|BIT(16));
  /* Keep GEM rewriting disabled until its classifier/default chain is ready. */
  fe_write(fe,0x351c,fe_read(fe,0x351c)&~BIT(10));
+ /* Command-window idle is not a proof that all late AXI DMA has drained.
+  * Record exposure before publishing the first hardware-visible address. */
+ fe->dma_exposed=true;
  rtl_fe_dma_tables(&io,lower_32_bits(fe->dma),(upper_32_bits(fe->dma)&255)|2);
  ret=fe_access(fe,0x393c,1);
  if(ret)return ret;
@@ -399,9 +412,10 @@ static int fe_prepare(struct rtl_fe *fe)
  }
  spin_lock_irqsave(&fe->route_lock,flags);
  fe->route_gate_ready=true;
- fe_route_select_locked(fe,1);
+ ret=fe_route_select_locked(fe,1)?0:-EIO;
  fe->route_admitted=false;
  spin_unlock_irqrestore(&fe->route_lock,flags);
+ if(ret)return ret;
  fe_write(fe,0x3400,(fe_read(fe,0x3400)&~(BIT(0)|BIT(10)))|BIT(3)|BIT(2)|BIT(19));
  fe_write(fe,0x3404,7|(25<<8)|(1<<14)|(24<<16)|(2<<22)|(3<<24));
  fe_write(fe,0x2300,fe_read(fe,0x2300)|BIT(12)|BIT(13));
@@ -2019,6 +2033,12 @@ void rtl_fe_free(struct rtl_fe *fe)
    fe_read(fe,0x1c00);
   }
  }
+ /* The public SDK does not provide a verified complete L3/AXI drain
+  * predicate. Retain an exposed allocation even after a clean software
+  * teardown. Normal stop/start reuses it; device removal requires reboot
+  * before that owner can be reclaimed. This does not make table restore
+  * itself a proven pipeline drain. */
+ if(!ret && fe->dma_exposed)ret=-EBUSY;
  fe->error=ret;
  /* Failure can leave Hash/Cache DMA using this memory. A removed callback
   * can also still own its private port until its release runs. Without a
@@ -2064,8 +2084,11 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   "engine_ready=%u requested_mode=%u shutting_down=%u\n",
   fe->engine_ready,fe->desired_mode,fe->shutting_down);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
-  "route_gate_ready=%u route_admitted=%u\n",
-  READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted));
+  "route_gate_ready=%u route_admitted=%u dma_exposed=%u\n",
+  READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted),fe->dma_exposed);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "pp_rejected_register=0x%x pp_rejected_value=0x%x\n",
+  fe->pp_rejected_register,fe->pp_rejected_value);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
   RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);

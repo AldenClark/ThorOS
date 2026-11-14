@@ -44,6 +44,7 @@ COMMON = r'''
 #include "rtl9617c-l2-format.h"
 typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define FE_LAN_PORTS 5
+#define BIT(n) (1U << (n))
 #define ETH_ALEN 6
 #define GFP_KERNEL 0
 #define system_long_wq 7
@@ -215,7 +216,7 @@ static void notifier_and_replay(void){
  event.info.dev=&foreign;fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event);assert(invalidates==1);
  event.info.dev=&ports[0];event.info.ctx=sw;
  fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event);assert(!sw->rule_count && invalidates==1);
- sw->replaying=true;
+ sw->replaying=true;sw->native_mask=31; /* The worker selects its live domain before replay. */
  assert(!fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event));
  assert(sw->rule_count==1 && !sw->replay_error && invalidates==1);
  event.info.dev=&ports[3];assert(!fe_switch_replay_fdb(sw,&event));

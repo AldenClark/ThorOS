@@ -43,6 +43,11 @@ COMMON = r'''
 #include <string.h>
 #include "rtl9617c-l2-format.h"
 typedef uint32_t u32; typedef uint64_t u64; typedef unsigned char u8;
+/* Match Linux's task accessor macro: a local variable named current must
+ * fail this host build just as it does in the real ARM64 kernel. */
+struct task_struct {unsigned int unused;};
+static inline struct task_struct *get_current(void){return NULL;}
+#define current get_current()
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
 #define HZ 100

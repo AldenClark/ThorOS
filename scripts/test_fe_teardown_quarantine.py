@@ -38,7 +38,7 @@ struct rtl_fe_port {struct list_head list;unsigned int bindings;};
 struct rtl_fe_flow {struct list_head list;};
 struct rtl_fe {
  struct list_head ports,blocks,flows;
- bool shutting_down,engine_ready;
+ bool shutting_down,engine_ready,dma_exposed;
  enum rtl_fe_mode desired_mode;
  int lock,error,fail_disable,fail_switch_stop;
  unsigned int fdb_cmd_mode_saved,fdb_control,fdb_access,limit_access;
@@ -94,7 +94,7 @@ int main(void){
  fe=make_owner();fe->fdb_cmd_mode_saved=BIT(31);fe->fdb_control=0x12345678;
  rtl_fe_free(fe);assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
- for(unsigned int fault=0;fault<7;fault++){
+ for(unsigned int fault=0;fault<8;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
   struct rtl_fe_flow flow={};struct list_head block;
   if(fault==0)fe->fail_disable=-ETIMEDOUT;
@@ -104,16 +104,18 @@ int main(void){
   if(fault==4)fe->fail_switch_stop=-ETIMEDOUT;
   if(fault==5)fe->fdb_access=BIT(31); /* An in-flight FDB command still owns CMD mode. */
   if(fault==6)fe->limit_access=BIT(31); /* A late MAC-limit command shares that mode lease. */
+  if(fault==7)fe->dma_exposed=true; /* No documented complete AXI drain. */
   rtl_fe_free(fe);
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
   assert(!dma_frees && !path_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
-  assert(!mode_writes && fe->fdb_control==0xa5123456);
+  if(fault==7)assert(mode_writes==1 && fe->fdb_control==0x25123456);
+  else assert(!mode_writes && fe->fdb_control==0xa5123456);
   assert(fe->error==(fault>=5?-EBUSY:fault==4?-ETIMEDOUT:fe->fail_disable));
   /* Test-only deallocation of deliberately quarantined model objects. Real
    * hardware owners stay allocated until a reboot/drain can be proved. */
   free(port);free(fe->memory);free(fe->itu_paths);free(fe);
  }
- puts("FE teardown: success restores only FDB CMD-mode bit; timeout, callback references, residual flows, L2-stop failure or busy FDB/MAC-limit quarantine DMA/private owners");
+ puts("FE teardown: never-exposed success restores only FDB CMD-mode bit; exposed DMA, timeout, callback references, residual flows, L2-stop failure or busy FDB/MAC-limit quarantine owners");
 }
 '''
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-quarantine-') as directory:

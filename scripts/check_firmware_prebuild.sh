@@ -29,6 +29,7 @@ python3 scripts/test_l2_switch_lifecycle.py
 python3 scripts/test_l2_switch_control.py
 python3 scripts/test_l2_switch_worker.py
 python3 scripts/test_l2_switch_fdb.py
+python3 scripts/test_l2_switch_topology.py
 python3 scripts/test_l2_bridge_eligibility.py
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py

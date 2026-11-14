@@ -369,6 +369,7 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 	struct list_head *iter;
 	struct rtl_fe_port *port;
 	unsigned int i, bit;
+	bool online;
 
 	memset(plan, 0, sizeof(*plan));
 	memset(sw->ports, 0, sizeof(sw->ports));
@@ -385,9 +386,10 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 		dev = sw->ports[i];
 		if (!dev)
 			continue;
+		online = netif_running(dev) && netif_carrier_ok(dev);
 		if (rtl9617c_switch_device_has_policy(dev))
 			plan->software_policy = true;
-		if (netif_running(dev) && netif_carrier_ok(dev) && sw->fe->enabled)
+		if (online && sw->fe->enabled)
 			sw->route_mask |= BIT(i);
 		master = netdev_master_upper_dev_get(dev);
 		if (!master || !netif_is_bridge_master(master))
@@ -395,12 +397,28 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 		if (sw->master && sw->master != master)
 			plan->multi_bridge = true;
 		sw->master = master;
-		/* Down/non-forwarding members are not silently excluded: an old
-		 * FDB row targeting such a member must not remain hardware-visible.
+		/* Offline members still identify the whole topology and every
+		 * bridge's policy. Do not hide a second bridge or foreign lower
+		 * merely because its native LAN has no carrier at this instant.
 		 */
+		plan->vlan_filtering |= br_vlan_enabled(master);
+		plan->promisc |= !!(master->flags & IFF_PROMISC);
+		if (!br_rtl9617c_l2_eligible(master))
+			plan->private_policy = true;
+		if (rtl9617c_switch_device_has_policy(master))
+			plan->software_policy = true;
+		netdev_for_each_lower_dev(master, lower, iter)
+			if (fe_switch_port_index(sw, lower) < 0)
+				plan->mixed = true;
+		/* The worker has gated, drained and removed the old hardware
+		 * domain before this snapshot. An unplugged/admin-down member is
+		 * not a policy-blocked live member; leave it out of this generation
+		 * so one connected LAN can retain its routed hardware path.
+		 */
+		if (!online)
+			continue;
 		plan->ports |= BIT(i);
-		plan->state[i] = netif_running(dev) && netif_carrier_ok(dev) ?
-			br_port_get_stp_state(dev) : BR_STATE_DISABLED;
+		plan->state[i] = br_port_get_stp_state(dev);
 		for (bit = 0; bit <= 24; bit++)
 			if (br_port_flag_is_set(dev, BIT(bit)))
 				plan->flags[i] |= BIT(bit);
@@ -409,15 +427,6 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 	}
 	if (!sw->master)
 		return plan->software_policy ? FE_SWITCH_GUARDED : FE_SWITCH_NO_BRIDGE;
-	plan->vlan_filtering = br_vlan_enabled(sw->master);
-	plan->promisc = !!(sw->master->flags & IFF_PROMISC);
-	if (!br_rtl9617c_l2_eligible(sw->master))
-		plan->private_policy = true;
-	if (rtl9617c_switch_device_has_policy(sw->master))
-		plan->software_policy = true;
-	netdev_for_each_lower_dev(sw->master, lower, iter)
-		if (fe_switch_port_index(sw, lower) < 0)
-			plan->mixed = true;
 	return fe_switch_plan_validate(plan);
 }
 
@@ -432,6 +441,12 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	int port = fe_switch_port_index(sw, info->info.dev);
 
 	if (info->vid || switchdev_fdb_is_dynamically_learned(info))
+		return 0;
+	/* A full-bridge replay includes offline members too. Their old rows
+	 * were flushed before this generation; do not recreate an output which
+	 * the snapshot deliberately excluded. Local MACs still belong to CPU.
+	 */
+	if (!info->is_local && port >= 0 && !(sw->native_mask & BIT(port)))
 		return 0;
 	if (info->locked || (!info->is_local && port < 0) ||
 	    !is_valid_ether_addr(info->addr))
@@ -819,7 +834,7 @@ static void fe_switch_scan(struct work_struct *work)
 	struct rtl_l2_fdb_result row;
 	struct rtl_l2_fdb_entry entry;
 	struct fe_switch_learned *swap;
-	unsigned int start = 0, count = 0, old, current;
+	unsigned int start = 0, count = 0, old, cursor;
 	u64 generation;
 	int ret = 0;
 
@@ -856,9 +871,9 @@ static void fe_switch_scan(struct work_struct *work)
 	    rtl9617c_switch_guard_generation(&sw->guard))
 		goto out;
 	sort(sw->next, count, sizeof(*sw->next), fe_switch_learned_compare, NULL);
-	for (current = 1; current < count; current++) {
-		if (!fe_switch_learned_compare(&sw->next[current - 1],
-					       &sw->next[current])) {
+	for (cursor = 1; cursor < count; cursor++) {
+		if (!fe_switch_learned_compare(&sw->next[cursor - 1],
+					       &sw->next[cursor])) {
 			/* A moving key observed twice is not a coherent new owner.
 			 * Retain the last complete mirror and retry after learning
 			 * settles, rather than picking an arbitrary physical slot.
@@ -871,23 +886,23 @@ static void fe_switch_scan(struct work_struct *work)
 	 * br_fdb_external_learn_del() ignores the old port and deletes by key,
 	 * so delete-after-add would erase a newly moved entry on its new port.
 	 */
-	for (old = 0, current = 0; old < sw->learned_count; old++) {
-		while (current < count && fe_switch_learned_compare(
-		       &sw->next[current], &sw->learned[old]) < 0)
-			current++;
-		if (current == count || fe_switch_learned_compare(
-		    &sw->next[current], &sw->learned[old]))
+	for (old = 0, cursor = 0; old < sw->learned_count; old++) {
+		while (cursor < count && fe_switch_learned_compare(
+		       &sw->next[cursor], &sw->learned[old]) < 0)
+			cursor++;
+		if (cursor == count || fe_switch_learned_compare(
+		    &sw->next[cursor], &sw->learned[old]))
 			fe_switch_feedback(sw, &sw->learned[old], false, 0);
 	}
-	for (current = 0; current < count; current++) {
-		ret = fe_switch_feedback(sw, &sw->next[current], true, generation);
+	for (cursor = 0; cursor < count; cursor++) {
+		ret = fe_switch_feedback(sw, &sw->next[cursor], true, generation);
 		if (ret) {
 			sw->error = ret;
 			sw->scan_errors++;
 			rtl9617c_switch_guard_invalidate(&sw->guard);
 			goto out;
 		}
-		sw->pending_count = current + 1;
+		sw->pending_count = cursor + 1;
 	}
 	swap = sw->learned;
 	sw->learned = sw->next;
