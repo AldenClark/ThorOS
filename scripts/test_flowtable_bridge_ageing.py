@@ -40,6 +40,9 @@ if args.before and "flow_offload_refresh_bridge" in offload:
         has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
         later = []
         for marker, source, name in [
+            ("try_cmpxchg(&flow->timeout", "net/netfilter/nf_flow_table_core.c", "230-flowtable-refresh-timeout-order.patch"),
+            ("NF_FLOW_INITIALIZING", "include/net/netfilter/nf_flow_table.h", "229-flowtable-initial-publication.patch"),
+            ("try_cmpxchg(&offload->flow->timeout", "net/netfilter/nf_flow_table_offload.c", "228-flowtable-stats-timeout-wrap.patch"),
             ("nf_flow_direct_mtu_valid(", "net/netfilter/nf_flow_table_core.c", "227-flowtable-direct-mtu-lifetime.patch"),
             ("route_mtu", "include/net/flow_offload.h", "226-flowtable-route-mtu.patch"),
         ]:
@@ -72,13 +75,14 @@ common = r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef uint64_t u64;
+typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef int32_t __s32;typedef uint64_t u64;typedef int64_t s64;
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(v,x) ((v)=(x))
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define time_before_eq(a,b) ((long)((a)-(b))<=0)
 #define time_after(a,b) ((long)((b)-(a))<0)
+static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return true;}*old=*p;return false;}
 #define FLOW_ACTION_HW_STATS_DELAYED 1
 #define EXPORT_SYMBOL_GPL(n)
 #define RCU_LOCKDEP_WARN(v,s) assert(!(v))
@@ -129,7 +133,7 @@ struct nf_conn {struct net *net;};
 struct flow_offload_tuple {unsigned xmit_type;struct {
  unsigned bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_dest[6];
 } out;};
-struct flow_offload {unsigned type;unsigned long flags;u64 timeout;struct nf_conn *ct;struct {struct flow_offload_tuple tuple;}tuplehash[2];};
+struct flow_offload {unsigned type;unsigned long flags;u32 timeout;struct nf_conn *ct;struct {struct flow_offload_tuple tuple;}tuplehash[2];};
 static struct net *nf_ct_net(struct nf_conn *ct){return ct->net;}
 struct nf_flowtable {unsigned flags;};
 struct flow_offload_work {struct flow_offload *flow;struct nf_flowtable *flowtable;};

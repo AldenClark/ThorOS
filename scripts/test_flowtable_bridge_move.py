@@ -52,7 +52,7 @@ enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY};
 enum ip_conntrack_dir {IP_CT_DIR_ORIGINAL,IP_CT_DIR_REPLY};
 enum {DEV_PATH_ETHERNET,DEV_PATH_DSA,DEV_PATH_VLAN,DEV_PATH_PPPOE,DEV_PATH_BRIDGE,DEV_PATH_IEEE80211};
 enum {DEV_PATH_BR_VLAN_UNTAG_HW,DEV_PATH_BR_VLAN_TAG,DEV_PATH_BR_VLAN_UNTAG,DEV_PATH_BR_VLAN_KEEP};
-enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_PENDING};
+enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_PENDING,NF_FLOW_INITIALIZING};
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define test_bit_acquire(n,p) test_bit(n,p)
@@ -201,6 +201,9 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
         has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
         later = []
         for marker, source, name in [
+            ('try_cmpxchg(&flow->timeout', 'net/netfilter/nf_flow_table_core.c', '230-flowtable-refresh-timeout-order.patch'),
+            ('NF_FLOW_INITIALIZING', 'include/net/netfilter/nf_flow_table.h', '229-flowtable-initial-publication.patch'),
+            ('try_cmpxchg(&offload->flow->timeout', 'net/netfilter/nf_flow_table_offload.c', '228-flowtable-stats-timeout-wrap.patch'),
             ('nf_flow_direct_mtu_valid(', 'net/netfilter/nf_flow_table_core.c', '227-flowtable-direct-mtu-lifetime.patch'),
             ('route_mtu', 'include/net/flow_offload.h', '226-flowtable-route-mtu.patch'),
         ]:

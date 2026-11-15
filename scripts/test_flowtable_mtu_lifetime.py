@@ -71,7 +71,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 #define rcu_dereference(p) (p)
 #define NUD_VALID 0xde
 enum {FLOW_OFFLOAD_XMIT_UNSPEC,FLOW_OFFLOAD_XMIT_NEIGH,FLOW_OFFLOAD_XMIT_DIRECT};
-enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_PENDING};
+enum {NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING,NF_FLOW_PENDING,NF_FLOW_INITIALIZING};
 enum {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY,FLOW_OFFLOAD_DIR_MAX};
 #define NF_FLOW_OFFLOAD_ROUTE 1
 struct net {struct {int sysctl_ip_fwd_use_pmtu;}ipv4;struct {struct {int ip6_rt_mtu_expires;}sysctl;}ipv6;};

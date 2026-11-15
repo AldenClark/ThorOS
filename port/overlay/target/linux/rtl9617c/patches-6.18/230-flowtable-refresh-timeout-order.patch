@@ -1,0 +1,51 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: do not regress a flow deadline on a delayed refresh
+
+A software packet can sample its deadline, lose the CPU, and later overwrite
+a newer software or hardware-stats refresh. Unsigned subtraction also treats
+an older deadline as a huge forward jump. Compare signed remaining lifetimes
+against a fresh clock for each CAS attempt, using s64 for their difference:
+a legal near-INT_MAX duration and an expired old deadline can differ by more
+than half of the u32 cycle. Keep the >HZ debounce without a packet-path lock.
+Hardware stats use the same monotonic update rule.
+
+The force caller in act_ct requests a hardware state/reply-direction refresh.
+Keep that request even when its sampled deadline no longer moves forward;
+force is not permission to overwrite a newer timeout. Reducing the timeout
+sysctl affects later extensions but does not shorten an already granted
+deadline, matching the hardware-stats path's monotonic lifetime contract.
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -380,13 +380,26 @@
+ void flow_offload_refresh(struct nf_flowtable *flow_table,
+ 			  struct flow_offload *flow, bool force)
+ {
+-	u32 timeout;
++	u32 timeout, old, now;
++	s64 advance;
+ 
+ 	timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
+-	if (force || timeout - READ_ONCE(flow->timeout) > HZ)
+-		WRITE_ONCE(flow->timeout, timeout);
+-	else
+-		return;
++	old = READ_ONCE(flow->timeout);
++	for (;;) {
++		/* A delayed packet must not lower a newer stats/packet deadline.
++		 * force still requests the act_ct hardware-state refresh below.
++		 */
++		now = nf_flowtable_time_stamp;
++		advance = (s64)(__s32)(timeout - now) - (__s32)(old - now);
++		if ((__s32)(timeout - now) <= 0 ||
++		    advance <= (force ? 0 : (__s32)HZ)) {
++			if (!force)
++				return;
++			break;
++		}
++		if (try_cmpxchg(&flow->timeout, &old, timeout))
++			break;
++	}
+ 
+ 	if (likely(!nf_flowtable_hw_offload(flow_table)) ||
+ 	    test_bit(NF_FLOW_CLOSING, &flow->flags))

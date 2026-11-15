@@ -696,7 +696,14 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	wire = rtl_xram_wire_length(skb->len);
 	memset(priv->tx_buffer, 0, ALIGN(8 + wire, 4));
-	skb_copy_bits(skb, 0, priv->tx_buffer + 8, skb->len);
+	if (skb_copy_bits(skb, 0, priv->tx_buffer + 8, skb->len)) {
+		/* A failed fragmented-skb copy may have written only a prefix.
+		 * Keep the unpublished XRAM slot and its producer unchanged. */
+		dev->stats.tx_dropped++;
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 	crc = crc32_le(~0, priv->tx_buffer + 8, wire - 4) ^ ~0;
 	put_unaligned_le32(crc, priv->tx_buffer + 8 + wire - 4);
 	offset = pointer * 8 + 4;
@@ -1012,6 +1019,19 @@ void rtl9617c_ni_close(struct device *dev, struct net_device *owner)
 	rtl_engine_put(priv);
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_close);
+
+void rtl9617c_ni_forget_tx(struct device *dev, struct net_device *owner)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	unsigned long flags;
+
+	/* Internal PON recovery traffic can outlive ndo_stop. Its final owner
+	 * withdrawal is independent of the shared LAN engine's user count. */
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	rtl_dma_tx_forget(&priv->dma, owner);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(rtl9617c_ni_forget_tx);
 
 netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 			       struct sk_buff *skb, const struct rtl9617c_ni_frame *frame)

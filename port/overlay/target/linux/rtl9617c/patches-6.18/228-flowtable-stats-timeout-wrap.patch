@@ -1,0 +1,67 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: keep hardware stats deadlines monotonic across wrap
+
+flow->timeout is a u32 jiffies deadline, even on a 64-bit kernel. A numeric
+u64 maximum can replace a future post-wrap deadline with stale pre-wrap
+hardware activity and immediately expire a live flow. INITIAL_JIFFIES makes
+the first low-32-bit wrap occur about five minutes after boot.
+
+Compare activity in the kernel's unsigned-long jiffies domain, ignore missing
+activity, and advance the u32 deadline using its existing signed modular
+ordering. Compare remaining lifetimes against a fresh clock on each CAS
+attempt, including the legal near-INT_MAX timeout and an expired old deadline.
+Retry atomically when software forwarding refreshed the flow concurrently.
+Accounting and bridge refresh still consume both original
+stats samples, without manufacturing activity for an uncounted idle flow.
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1127,7 +1127,8 @@
+ static void flow_offload_work_stats(struct flow_offload_work *offload)
+ {
+ 	struct flow_stats stats[FLOW_OFFLOAD_DIR_MAX] = {};
+-	u64 lastused;
++	unsigned long lastused, expires, now;
++	u32 timeout, updated;
+ 
+ 	flow_offload_tuple_stats(offload, FLOW_OFFLOAD_DIR_ORIGINAL, &stats[0]);
+ 	if (test_bit(NF_FLOW_HW_BIDIRECTIONAL, &offload->flow->flags))
+@@ -1139,9 +1140,35 @@
+ 	flow_offload_refresh_bridge(offload->flow, FLOW_OFFLOAD_DIR_REPLY,
+ 				    stats[1].lastused);
+ 
+-	lastused = max_t(u64, stats[0].lastused, stats[1].lastused);
+-	offload->flow->timeout = max_t(u64, offload->flow->timeout,
+-				       lastused + flow_offload_get_timeout(offload->flow));
++	/* lastused is jiffies, not a numeric sequence number: unsigned long
++	 * also preserves wrap ordering on 32-bit kernels. Zero means that the
++	 * driver supplied no activity, not a timestamp to renew from.
++	 */
++	lastused = stats[0].lastused;
++	if (!lastused ||
++	    (stats[1].lastused &&
++	     time_after((unsigned long)stats[1].lastused, lastused)))
++		lastused = stats[1].lastused;
++	if (lastused) {
++		expires = lastused + flow_offload_get_timeout(offload->flow);
++		updated = expires;
++		timeout = READ_ONCE(offload->flow->timeout);
++		for (;;) {
++			/* An idle hardware direction can coexist with long-lived
++			 * software forwarding: reject ancient full-width expiry
++			 * before truncation. Sample after reading the deadline,
++			 * including after a failed CAS, so a concurrent maximum
++			 * duration refresh cannot appear expired against old now.
++			 */
++			now = jiffies;
++			if (!time_after(expires, now) ||
++			    (__s32)(updated - (u32)now) <=
++			    (__s32)(timeout - (u32)now))
++				break;
++			if (try_cmpxchg(&offload->flow->timeout, &timeout, updated))
++				break;
++		}
++	}
+ 
+ 	if (offload->flowtable->flags & NF_FLOWTABLE_COUNTER) {
+ 		if (stats[0].pkts)

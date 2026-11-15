@@ -206,7 +206,7 @@ static void dev_consume_skb_any(struct sk_buff *skb){dev_kfree_skb_any(skb);}
 #define rcu_read_unlock() ((void)0)
 #define rcu_dereference(x) (x)
 static unsigned rtl_pointer(struct rtl_xram *p,unsigned reg){(void)p;(void)reg;assert(false);return 0;}
-static void skb_copy_bits(struct sk_buff *skb,unsigned offset,void *to,unsigned bytes){(void)skb;(void)offset;(void)to;(void)bytes;assert(false);}
+static int skb_copy_bits(struct sk_buff *skb,unsigned offset,void *to,unsigned bytes){(void)skb;(void)offset;(void)to;(void)bytes;assert(false);return 0;}
 static u32 crc32_le(u32 crc,void *buffer,unsigned bytes){(void)crc;(void)buffer;(void)bytes;assert(false);return 0;}
 static void put_unaligned_le32(u32 value,void *pointer){(void)value;(void)pointer;assert(false);}
 static u32 get_unaligned_le32(void *pointer){(void)pointer;assert(false);return 0;}

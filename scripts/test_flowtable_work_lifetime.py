@@ -39,9 +39,9 @@ common = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
-typedef int32_t __s32; typedef uint64_t u64;
+typedef int32_t __s32; typedef uint32_t u32; typedef uint64_t u64;
 enum {NF_FLOW_CLOSING,NF_FLOW_TEARDOWN,NF_FLOW_HW,NF_FLOW_HW_DYING,
- NF_FLOW_HW_DEAD,NF_FLOW_PENDING,NF_FLOW_HW_BIDIRECTIONAL};
+ NF_FLOW_HW_DEAD,NF_FLOW_PENDING,NF_FLOW_HW_BIDIRECTIONAL,NF_FLOW_INITIALIZING};
 enum {FLOW_CLS_REPLACE,FLOW_CLS_DESTROY,FLOW_CLS_STATS};
 #define BIT(n) (1UL<<(n))
 #define GFP_ATOMIC 0
@@ -49,6 +49,10 @@ enum {FLOW_CLS_REPLACE,FLOW_CLS_DESTROY,FLOW_CLS_STATS};
 #define FLOW_OFFLOAD_DIR_MAX 2
 enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY};
 #define max_t(t,a,b) ((t)(a)>(t)(b)?(t)(a):(t)(b))
+#define READ_ONCE(v) (v)
+#define jiffies fixture_jiffies()
+#define time_after(a,b) ((long)((b)-(a))<0)
+static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return true;}*old=*p;return false;}
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define INIT_WORK(p,cb) ((p)->func=(cb))
 #define NF_FLOW_TABLE_STAT_DEC_ATOMIC(n,c) ((void)(n))
@@ -61,6 +65,7 @@ struct flow_offload_work {unsigned cmd;struct nf_flowtable *flowtable;
  struct flow_offload *flow;struct work_struct work;};
 struct flow_stats {u64 pkts,bytes,lastused;};
 static unsigned now,unlinked,unsafe_unlink,adds,deletes,stats,accounted;
+static unsigned long fixture_jiffies(void){return now;}
 static bool fail_alloc,bridge_changed,late_pending,late_dying,worker_gc,worker_released;
 static struct flow_offload_work *pending,*running;
 static struct nf_flowtable *table;
@@ -202,11 +207,15 @@ int main(void){
 with tempfile.TemporaryDirectory(prefix="flow-lifetime-") as directory:
     work = Path(directory)
     names = ["net/netfilter/nf_flow_table_core.c", "net/netfilter/nf_flow_table_offload.c"]
-    for name in names:
+    copied = names + ["include/net/netfilter/nf_flow_table.h"]
+    for name in copied:
         dest = work / name
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(args.kernel / name, dest)
     if args.before:
+        if "NF_FLOW_INITIALIZING" in (work / names[0]).read_text():
+            dependent = root / "port/overlay/target/linux/rtl9617c/patches-6.18/229-flowtable-initial-publication.patch"
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(dependent)], cwd=work, check=True)
         patch = root / "port/overlay/target/linux/rtl9617c/patches-6.18/218-flowtable-work-lifetime.patch"
         subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(patch)], cwd=work, check=True)
     core, offload = [(work / name).read_text() for name in names]

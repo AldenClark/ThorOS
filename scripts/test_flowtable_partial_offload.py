@@ -48,7 +48,7 @@ common = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-typedef uint16_t __be16;typedef uint32_t u32;typedef uint64_t u64;
+typedef uint16_t __be16;typedef uint32_t u32;typedef int32_t __s32;typedef uint64_t u64;typedef int64_t s64;
 enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY,FLOW_OFFLOAD_DIR_MAX};
 enum flow_cls_command {FLOW_CLS_REPLACE,FLOW_CLS_DESTROY,FLOW_CLS_STATS};
 enum {NF_FLOW_HW,NF_FLOW_HW_BIDIRECTIONAL,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING};
@@ -69,10 +69,13 @@ enum {IPS_OFFLOAD_BIT,IPS_HW_OFFLOAD_BIT};
 #define NF_FLOWTABLE_COUNTER 1
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(v,n) ((v)=(n))
+#define time_after(a,b) ((long)((b)-(a))<0)
+static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return true;}*old=*p;return false;}
 #define likely(v) (v)
 #define max_t(t,a,b) ((t)(a)>(t)(b)?(t)(a):(t)(b))
 #define EXPORT_SYMBOL_GPL(n)
-#define nf_flowtable_time_stamp now
+#define nf_flowtable_time_stamp ((u32)fixture_jiffies())
+#define jiffies fixture_jiffies()
 struct netlink_ext_ack {int unused;};
 struct flow_stats {u64 lastused,pkts,bytes;};
 struct net_device {unsigned type,ppp_channel_generation,references;};
@@ -115,6 +118,7 @@ static void route_init(struct flow_offload *flow){
 }
 static int replies[2],allocated,destroyed,allocation_error,add_calls[2],del_calls[2],stats_calls[2];
 static u32 now;static bool fabric_authorized=true;
+static unsigned long fixture_jiffies(void){return now;}
 static bool installed[2];
 static struct nf_flow_rule rules[2];
 static int callback(int type,void *data,void *priv){

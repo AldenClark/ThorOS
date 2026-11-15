@@ -538,6 +538,10 @@ void rtl_pon_omci_remove(struct rtl9617c_pon *pon)
 {
 	rtl_pon_dying_gasp_stop(pon);
 	unregister_netdev(pon->omci_device);
+	/* Recovery workers have been stopped by the PON owner, but their last
+	 * DMA descriptors can still retain this netdev. An already-down OMCI
+	 * interface receives no second ndo_stop during unregister. */
+	rtl9617c_ni_forget_tx(pon->ni_dev, pon->omci_device);
 	free_netdev(pon->omci_device);
 	pon->omci_device = NULL;
 	crypto_free_shash(pon->omci_cmac);

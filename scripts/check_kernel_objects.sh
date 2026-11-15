@@ -205,7 +205,7 @@ python3 "$project/scripts/test_ni_kconfig.py" --kernel "$kernel" --conf "$out/sc
 for symbol in ARM64 ARCH_RTL9617C GPIO_RTL9617C PHYLIB RTL9617C_XRAM_ETH RTL9617C_PON RTL9617C_BOSA \
               NF_FLOW_TABLE NF_FLOW_TABLE_INET NFT_FLOW_OFFLOAD BRIDGE BRIDGE_VLAN_FILTERING \
               BRIDGE_IGMP_SNOOPING NET_SWITCHDEV RTL9617C_SWITCH_GUARD VLAN_8021Q NETFILTER_INGRESS \
-              SKB_EXTENSIONS NET_CLS_ACT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE \
+              SKB_EXTENSIONS NET_CLS_ACT NET_ACT_CT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE \
               PPP_FILTER PPP_MULTILINK COMPAT \
               NETFILTER_XTABLES NETFILTER_XT_TARGET_FLOWOFFLOAD; do
     grep -qx "CONFIG_${symbol}=y" "$out/.config" || {
@@ -246,6 +246,7 @@ targets=(
     net/netfilter/xt_FLOWOFFLOAD.o
     net/netfilter/core.o
     net/sched/sch_api.o
+    net/sched/act_ct.o
     net/bridge/br.o
     net/bridge/br_device.o
     net/bridge/br_fdb.o
@@ -298,7 +299,10 @@ patches = ('220-l2-switchdev-policy-gate.patch',
            '224-ppp-channel-generation.patch',
            '225-ppp-flow-policy-fence.patch',
            '226-flowtable-route-mtu.patch',
-           '227-flowtable-direct-mtu-lifetime.patch')
+           '227-flowtable-direct-mtu-lifetime.patch',
+           '228-flowtable-stats-timeout-wrap.patch',
+           '229-flowtable-initial-publication.patch',
+           '230-flowtable-refresh-timeout-order.patch')
 callers = {
     line.removeprefix('+++ b/').removesuffix('.c') + '.o'
     for patch in patches

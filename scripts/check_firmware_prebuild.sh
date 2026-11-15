@@ -28,6 +28,8 @@ python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_hardware_recipe.py
 python3 scripts/test_fabric_baseline.py
 python3 scripts/test_pon_cold_handoff.py
+python3 scripts/test_pon_probe_unwind.py --mutants
+python3 scripts/test_pon_dma_owner.py --mutants
 python3 scripts/test_ni_cold_handoff.py --mutants
 python3 scripts/test_l2_policy_races.py
 python3 scripts/test_l2_parent_id.py
@@ -48,6 +50,7 @@ python3 scripts/test_itu_cpu_path.py
 python3 scripts/test_pon_fe_stop.py
 python3 scripts/test_pon_table_staging.py
 python3 scripts/test_pon_reconfigure_guard.py
+python3 scripts/test_gpon_queue_recovery.py
 python3 scripts/test_pon_data_path.py
 python3 scripts/test_omci_compatibility.py
 python3 scripts/test_itu_pppoe_datapath.py
@@ -60,6 +63,7 @@ python3 scripts/test_qm_switch_rx.py
 python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py
 python3 scripts/test_dma_tx_fastpath.py
+python3 scripts/test_xram_tx_copy.py --mutants
 python3 scripts/test_ni_adaptive_timer.py
 python3 scripts/test_ni_timer_deadlines.py --mutants
 python3 scripts/test_rx_checksum_policy.py

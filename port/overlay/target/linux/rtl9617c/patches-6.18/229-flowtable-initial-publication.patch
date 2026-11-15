@@ -1,0 +1,101 @@
+From: Codex <codex@localhost>
+Subject: [PATCH] netfilter: fence partial flowtable publication from readers and GC
+
+Reply-first insertion keeps GC away from an incomplete hash pair, but does
+not hide that reply from packet readers. Nor does it keep GC from retiring
+the flow after original insertion but before NF_FLOW_HW is initialized.
+Such a flow can be handed to asynchronous ADD after its RCU retirement.
+
+Initialize the hardware lifetime class before either tuple is published.
+Keep lookup, GC and work admission outside the initialization interval;
+release it only after both insertions and initial conntrack refresh succeed.
+An insertion failure leaves the fence in place through caller-owned RCU
+free. Existing PENDING/DYING ownership serializes a delayed initial ADD
+against GC after successful publication.
+
+Cleanup can still mark an initializing flow for teardown. If its one-shot
+conntrack fixup ran before the initial DAY refresh, restore the normal
+timeout after that refresh. Order the DAY write before checking TEARDOWN,
+paired with teardown's fully ordered test-and-set, so concurrent cleanup
+cannot miss the new timeout while publication misses the teardown marker.
+
+Signed-off-by: Codex <codex@localhost>
+---
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -182,6 +182,7 @@
+ 	NF_FLOW_HW_DEAD,
+ 	NF_FLOW_HW_BIDIRECTIONAL,
+ 	NF_FLOW_HW_ESTABLISHED,
++	NF_FLOW_INITIALIZING,
+ };
+ 
+ enum flow_offload_type {
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -348,6 +348,12 @@
+ 	int err;
+ 
+ 	flow->timeout = nf_flowtable_time_stamp + flow_offload_get_timeout(flow);
++	/* Neither a partial tuple pair nor a half-initialized lifetime may be
++	 * observed by packet readers, asynchronous workers or GC.
++	 */
++	__set_bit(NF_FLOW_INITIALIZING, &flow->flags);
++	if (nf_flowtable_hw_offload(flow_table))
++		__set_bit(NF_FLOW_HW, &flow->flags);
+ 
+ 	err = rhashtable_insert_fast(&flow_table->rhashtable,
+ 				     &flow->tuplehash[FLOW_OFFLOAD_DIR_REPLY].node,
+@@ -368,10 +374,19 @@
+ 
+ 	nf_ct_refresh(flow->ct, NF_CT_DAY);
+ 
+-	if (nf_flowtable_hw_offload(flow_table)) {
+-		__set_bit(NF_FLOW_HW, &flow->flags);
++	/* Cleanup may have fixed up conntrack before the initial DAY refresh.
++	 * Order that write before this read, paired with teardown's fully
++	 * ordered test_and_set_bit(). A later cleanup observes the DAY write.
++	 */
++	smp_mb();
++	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
++		flow_offload_fixup_ct(flow);
++
++	/* Pair with the acquire tests in lookup, GC and work admission. */
++	smp_mb__before_atomic();
++	clear_bit(NF_FLOW_INITIALIZING, &flow->flags);
++	if (nf_flowtable_hw_offload(flow_table))
+ 		nf_flow_offload_add(flow_table, flow);
+-	}
+ 
+ 	return 0;
+ }
+@@ -511,6 +526,8 @@
+ 
+ 	dir = tuplehash->tuple.dir;
+ 	flow = container_of(tuplehash, struct flow_offload, tuplehash[dir]);
++	if (test_bit_acquire(NF_FLOW_INITIALIZING, &flow->flags))
++		return NULL;
+ 	if (test_bit(NF_FLOW_TEARDOWN, &flow->flags))
+ 		return NULL;
+ 
+@@ -746,6 +763,8 @@
+ {
+ 	bool teardown;
+ 
++	if (test_bit_acquire(NF_FLOW_INITIALIZING, &flow->flags))
++		return;
+ 	/* Worker writes are visible once PENDING is cleared. */
+ 	if (test_bit_acquire(NF_FLOW_PENDING, &flow->flags))
+ 		return;
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1213,7 +1213,8 @@
+ 		return NULL;
+ 
+ 	/* Recheck after acquiring ownership: hardware deletion is terminal. */
+-	if (test_bit(NF_FLOW_HW_DYING, &flow->flags)) {
++	if (test_bit_acquire(NF_FLOW_INITIALIZING, &flow->flags) ||
++	    test_bit(NF_FLOW_HW_DYING, &flow->flags)) {
+ 		clear_bit(NF_FLOW_PENDING, &flow->flags);
+ 		return NULL;
+ 	}

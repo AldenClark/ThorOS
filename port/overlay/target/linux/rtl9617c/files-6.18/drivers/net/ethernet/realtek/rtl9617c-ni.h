@@ -29,6 +29,9 @@ int rtl9617c_ni_pon_attach(struct device *dev, struct rtl9617c_ni_endpoint *endp
 void rtl9617c_ni_pon_detach(struct device *dev);
 int rtl9617c_ni_open(struct device *dev);
 void rtl9617c_ni_close(struct device *dev, struct net_device *owner);
+/* Stop/synchronize the owner's producers before retiring its TX references.
+ * This does not put an engine user, reset DMA, or release retained buffers. */
+void rtl9617c_ni_forget_tx(struct device *dev, struct net_device *owner);
 netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 			       struct sk_buff *skb, const struct rtl9617c_ni_frame *frame);
 int rtl9617c_ni_oam_configure(struct device *dev);

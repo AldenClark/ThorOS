@@ -258,6 +258,9 @@ with tempfile.TemporaryDirectory(prefix='flowtable-bridge-policy-') as directory
         has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
         later = []
         for marker, source, name in [
+            ('try_cmpxchg(&flow->timeout', 'net/netfilter/nf_flow_table_core.c', '230-flowtable-refresh-timeout-order.patch'),
+            ('NF_FLOW_INITIALIZING', 'include/net/netfilter/nf_flow_table.h', '229-flowtable-initial-publication.patch'),
+            ('try_cmpxchg(&offload->flow->timeout', 'net/netfilter/nf_flow_table_offload.c', '228-flowtable-stats-timeout-wrap.patch'),
             ('nf_flow_direct_mtu_valid(', 'net/netfilter/nf_flow_table_core.c', '227-flowtable-direct-mtu-lifetime.patch'),
             ('route_mtu', 'include/net/flow_offload.h', '226-flowtable-route-mtu.patch'),
         ]:
