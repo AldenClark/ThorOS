@@ -4,12 +4,10 @@
 
 / { model = "Tianyi TYFZA1 (native NI/PON bring-up)"; };
 
-&ni0 {
-	/* PON fences inherited RX before NI establishes the shared baseline
-	 * and publishes openable LAN interfaces.
-	 */
-	realtek,pon-cold-handoff;
-};
+/* Keep the production LAN recovery path independent of PON probe.
+ * Shared native-L2 cold handoff remains a board-development opt-in until
+ * its hardware reset, GPIO and retirement prerequisites are validated.
+ */
 
 &i2c0 {
 	status = "okay";

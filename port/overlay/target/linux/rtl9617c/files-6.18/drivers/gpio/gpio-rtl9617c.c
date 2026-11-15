@@ -21,11 +21,26 @@ static void rtl_gpio_update(struct rtl_gpio *gpio, unsigned int pin, unsigned in
 	writel(set ? value | mask : value & ~mask, address);
 }
 
+/* Caller holds gpio->lock across direction and data reads. */
+static int rtl_gpio_direction_locked(struct rtl_gpio *gpio, unsigned int pin)
+{
+	return readl(rtl_gpio_reg(gpio, pin, 0)) & BIT(pin % 32) ?
+		GPIO_LINE_DIRECTION_IN : GPIO_LINE_DIRECTION_OUT;
+}
+
 static int rtl_gpio_get(struct gpio_chip *chip, unsigned int pin)
 {
 	struct rtl_gpio *gpio = gpiochip_get_data(chip);
+	unsigned long flags;
+	unsigned int reg;
+	int value;
 
-	return !!(readl(rtl_gpio_reg(gpio, pin, 8)) & BIT(pin % 32));
+	spin_lock_irqsave(&gpio->lock, flags);
+	/* The SDK reads the output latch for output pins, not GPIO_IN. */
+	reg = rtl_gpio_direction_locked(gpio, pin) == GPIO_LINE_DIRECTION_IN ? 8 : 4;
+	value = !!(readl(rtl_gpio_reg(gpio, pin, reg)) & BIT(pin % 32));
+	spin_unlock_irqrestore(&gpio->lock, flags);
+	return value;
 }
 
 static int rtl_gpio_set(struct gpio_chip *chip, unsigned int pin, int value)
@@ -42,9 +57,13 @@ static int rtl_gpio_set(struct gpio_chip *chip, unsigned int pin, int value)
 static int rtl_gpio_direction(struct gpio_chip *chip, unsigned int pin)
 {
 	struct rtl_gpio *gpio = gpiochip_get_data(chip);
+	unsigned long flags;
+	int direction;
 
-	return readl(rtl_gpio_reg(gpio, pin, 0)) & BIT(pin % 32) ?
-		GPIO_LINE_DIRECTION_IN : GPIO_LINE_DIRECTION_OUT;
+	spin_lock_irqsave(&gpio->lock, flags);
+	direction = rtl_gpio_direction_locked(gpio, pin);
+	spin_unlock_irqrestore(&gpio->lock, flags);
+	return direction;
 }
 
 static int rtl_gpio_input(struct gpio_chip *chip, unsigned int pin)

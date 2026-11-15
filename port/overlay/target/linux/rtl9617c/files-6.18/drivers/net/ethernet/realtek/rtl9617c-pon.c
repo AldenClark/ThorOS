@@ -960,6 +960,14 @@ static int rtl_pon_cold_handoff(struct rtl9617c_pon *pon)
 	u32 status;
 	int ret;
 
+	/* Normal boards publish software LANs independently in NI probe.
+	 * Do not touch cross-family MAC/FIFO state merely because PON exists:
+	 * this experimental fence is valid only for an explicit board opt-in.
+	 */
+	if (!of_property_read_bool(pon->ni_dev->of_node,
+				   "realtek,pon-cold-handoff"))
+		return 0;
+
 	/* Native IRQs, interfaces and controls are not published yet. Keep the
 	 * optical transmitter inhibited while all inherited receive families
 	 * are closed, independent of the software's initial PON mode. */

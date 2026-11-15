@@ -9,6 +9,7 @@ mkdir -p artifacts logs
 
 python3 scripts/test_runtime_trim.py
 python3 scripts/test_lan_probe_isolation.py
+python3 scripts/test_gpio_readback.py
 python3 scripts/test_lan_async.py
 python3 scripts/test_qspi_poll.py
 python3 scripts/test_lan_pm_mapping.py

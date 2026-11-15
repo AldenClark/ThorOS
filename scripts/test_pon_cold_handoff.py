@@ -79,7 +79,11 @@ SHIM = r'''
 #include "rtl9617c-pon-cold.h"
 typedef uint32_t u32;
 typedef uint32_t ca_uint32_t;
-struct device {int unused;};
+struct device_node {bool cold;};
+struct device {struct device_node *of_node;};
+static bool of_property_read_bool(const struct device_node *node,const char *name) {
+ assert(!strcmp(name,"realtek,pon-cold-handoff"));return node && node->cold;
+}
 struct rtl9617c_pon {void *mac; struct device *ni_dev; void *tx_disable;};
 static unsigned regs[0x10000/4],saved[0x10000/4];
 static const unsigned offsets[]={0x088c,0x10b4,0x6114,0x4004};
@@ -146,9 +150,21 @@ static void setup(unsigned seed) {
 
 CASES = r'''
 int main(void) {
- struct device ni={};struct rtl9617c_pon pon={.mac=regs,.ni_dev=&ni};
+ struct device_node node={.cold=true};
+ struct device ni={.of_node=&node};struct rtl9617c_pon pon={.mac=regs,.ni_dev=&ni};
  unsigned cases=0;
  sdk_oracle();
+ /* Production opt-out bypasses *all* cold GPIO/MMIO/NI calls, including
+  * broken GPIO readback, a stuck FIFO or an unreadable family gate. */
+ for(unsigned fault=0;fault<4;fault++) {
+  setup(fault);node.cold=false;
+  gpio_value=fault==0?0:fault==1?-ENODEV:1;
+  fifo_stuck=true;stuck_index=0;stuck_mask=1;
+  assert(!rtl_pon_cold_handoff(&pon));
+  assert(!gpio_sets && !writes && !fifo_reads && !polls && !handoffs);
+  assert(!memcmp(regs,saved,sizeof(regs)));cases++;
+ }
+ node.cold=true;
  for(unsigned seed=0;seed<32;seed++)for(unsigned state=0;state<32;state++) {
   setup(1U<<seed);
   for(unsigned i=0;i<4;i++) {
@@ -207,6 +223,7 @@ def main():
     handoff = probe.index('ret = rtl_pon_cold_handoff(pon);')
     assert probe.index('pon->top_irq = devm_platform_ioremap_resource') < handoff
     assert handoff < probe.index('rtl_pon_mpcp_init(')
+    assert production.index('of_property_read_bool(') < production.index('gpiod_set_value_cansleep(')
     # An absent/deferred BOSA must not prevent LAN recovery after a valid
     # receive fence: optical service readiness is not fabric readiness.
     assert handoff < probe.index('"realtek,optical-front-end"')
@@ -215,6 +232,8 @@ def main():
     header = HEADER.read_text()
     variants = [
         ('production', header, production),
+        ('ignore_explicit_opt_in', header, change_once(production,
+         'if (!of_property_read_bool(', 'if (false && !of_property_read_bool(')),
         ('wrong_gpon_bit', change_once(header, '0x6114U, 1U << 1', '0x6114U, 1U << 2'), production),
         ('partial_xgpon_field', change_once(header, '0x4004U, 3U', '0x4004U, 1U'), production),
         ('reserved_bits_clobbered', change_once(header,
@@ -251,7 +270,7 @@ def main():
             else:
                 assert result.returncode and 'Assertion' in result.stderr, result
                 print('PASS: ' + name + ' rejected by runtime assertion')
-    print('PASS: probe integration orders cold handoff before IRQ/interface publication')
+    print('PASS: unflagged boards skip cold GPIO/MMIO; explicit opt-in orders the fence before IRQ/interface publication')
     if args.registers:
         print('PASS: five register addresses and RX/FIFO fields match pinned RTL8277C unions')
 

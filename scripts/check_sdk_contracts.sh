@@ -30,6 +30,8 @@ fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$
     "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c"
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/include/soc/cortina/rtl8277c_registers.h" \
     "$work/rtl8277c_registers.h"
+fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/drivers/gpio/gpio-ca77xx.c" \
+    "$work/gpio-ca77xx.c"
 fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$sdk_path/aal_ni_l2.c" \
     "$work/aal_ni_l2.c"
 fetch "https://raw.githubusercontent.com/BPI-SINOVOIP/BPI-RT2/c24c6c03c6466cfb1b9e4eacadab8225a457a771/rtk_openwrt/target/linux/realtek_bb/files-5.10/drivers/net/ethernet/realtek/rtl86900/FleetConntrackDriver/core/rtk_fc_acl.c" \
@@ -43,6 +45,7 @@ done < <(python3 "$project/scripts/check_sdk_report_sources.py" --list)
 cd "$project"
 python3 scripts/check_sdk_report_sources.py --source-root "$work/bpi" \
     --gpl-registers "$work/rtl8277c_registers.h"
+python3 scripts/test_gpio_readback.py --sdk "$work/gpio-ca77xx.c"
 python3 scripts/test_fe_sdk_contract.py --sdk "$work/sdk"
 python3 scripts/test_fe_register_contract.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fabric_baseline.py --registers "$work/rtl8277c_registers.h"
