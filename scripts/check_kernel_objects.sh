@@ -205,7 +205,9 @@ python3 "$project/scripts/test_ni_kconfig.py" --kernel "$kernel" --conf "$out/sc
 for symbol in ARM64 ARCH_RTL9617C GPIO_RTL9617C PHYLIB RTL9617C_XRAM_ETH RTL9617C_PON RTL9617C_BOSA \
               NF_FLOW_TABLE NF_FLOW_TABLE_INET NFT_FLOW_OFFLOAD BRIDGE BRIDGE_VLAN_FILTERING \
               BRIDGE_IGMP_SNOOPING NET_SWITCHDEV RTL9617C_SWITCH_GUARD VLAN_8021Q NETFILTER_INGRESS \
-              SKB_EXTENSIONS NET_CLS_ACT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE; do
+              SKB_EXTENSIONS NET_CLS_ACT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE \
+              PPP_FILTER PPP_MULTILINK COMPAT \
+              NETFILTER_XTABLES NETFILTER_XT_TARGET_FLOWOFFLOAD; do
     grep -qx "CONFIG_${symbol}=y" "$out/.config" || {
         printf 'Required compile-check feature not enabled after olddefconfig: %s\n' "$symbol" >&2
         exit 1
@@ -241,6 +243,7 @@ targets=(
     net/netfilter/nf_flow_table_xdp.o
     net/netfilter/nf_flow_table_inet.o
     net/netfilter/nft_flow_offload.o
+    net/netfilter/xt_FLOWOFFLOAD.o
     net/netfilter/core.o
     net/sched/sch_api.o
     net/bridge/br.o
@@ -285,19 +288,25 @@ targets=(
 printf '%s\n' "${targets[@]}" > "$work/compile-targets.txt"
 # Compile each changed policy-hook caller too, not just the new gate callee.
 # This coverage assertion complements compilation; it is not a policy test.
-python3 - "$target/patches-$kernel_series/220-l2-switchdev-policy-gate.patch" "${targets[@]}" <<'PY'
+python3 - "$target/patches-$kernel_series" "${targets[@]}" <<'PY'
 from pathlib import Path
 import sys
 targets = set(sys.argv[2:])
+patches = ('220-l2-switchdev-policy-gate.patch',
+           '222-flowtable-direct-route-validation.patch',
+           '223-switch-policy-noop-events.patch',
+           '224-ppp-channel-generation.patch',
+           '225-ppp-flow-policy-fence.patch')
 callers = {
     line.removeprefix('+++ b/').removesuffix('.c') + '.o'
-    for line in Path(sys.argv[1]).read_text().splitlines()
+    for patch in patches
+    for line in (Path(sys.argv[1]) / patch).read_text().splitlines()
     if line.startswith('+++ b/') and line.endswith('.c')
 }
 missing = sorted(callers - targets)
 if missing:
-    raise SystemExit('Missing real object coverage for L2 policy callers: ' + ', '.join(missing))
-print(f'Native L2 gate coverage: all {len(callers)} changed C translation units are real compile targets')
+    raise SystemExit('Missing real object coverage for policy/route callers: ' + ', '.join(missing))
+print(f'L2 policy/route coverage: all {len(callers)} changed C translation units are real compile targets')
 PY
 "${kmake[@]}" -j"$jobs" "${targets[@]}"
 for object in "${targets[@]}"; do

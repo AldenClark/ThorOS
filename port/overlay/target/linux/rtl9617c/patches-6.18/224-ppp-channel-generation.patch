@@ -1,0 +1,474 @@
+From: ThorOS maintainers
+Subject: [PATCH] ppp: fence channel handoff and retain DIRECT path generation
+
+PPP channels do not publish netdevice lower/upper adjacency, and a channel
+can change without replacing its PPP interface or route. Serialize odd/even
+path cookies under both PPP locks, close admission before publication, and
+reject stale recipes at path capture, CPU lookup, GC and the hardware owner.
+A zero cookie after wrap remains permanently ineligible. Callbacks borrow
+independently held PPP device references; no PPP lock waits for HW cleanup.
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2395,6 +2395,9 @@
+ 	struct list_head	link_watch_list;
+ 
+ 	u8 reg_state;
++	/* PPP channel writers serialize with ppp_lock(). Odd means changing;
++	 * zero is permanently invalid after wrap. Readers use the helpers below. */
++	atomic_t ppp_channel_generation;
+ 
+ 	bool dismantle;
+ 
+@@ -2587,6 +2590,23 @@
+ } ____cacheline_aligned;
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
++static inline u32 netdev_ppp_path_cookie(const struct net_device *dev)
++{
++	u32 cookie = (u32)atomic_read(&dev->ppp_channel_generation);
++
++	/* Pair the two reads around forward-path decoding with the writer's
++	 * full-barrier atomic increments before/after channel publication. */
++	smp_rmb();
++	return cookie;
++}
++
++static inline bool netdev_ppp_path_valid(const struct net_device *dev, u32 cookie)
++{
++	smp_rmb();
++	return cookie && !(cookie & 1) &&
++		cookie == (u32)atomic_read(&dev->ppp_channel_generation);
++}
++
+ /*
+  * Driver should use this to assign devlink port instance to a netdevice
+  * before it registers the netdevice. Therefore devlink_port is static
+
+--- a/Documentation/networking/net_cachelines/net_device.rst
++++ b/Documentation/networking/net_cachelines/net_device.rst
+@@ -132,6 +132,7 @@
+ struct ref_tracker_dir              refcnt_tracker
+ struct list_head                    link_watch_list
+ enum:8                              reg_state
++atomic_t                            ppp_channel_generation     read_mostly                             PPP DIRECT path cookie (control-plane writes)
+ bool                                dismantle
+ bool                                rtnl_link_initilizing
+ bool                                needs_free_netdev
+
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -4,6 +4,7 @@
+ #include <linux/kernel.h>
+ #include <linux/list.h>
+ #include <linux/netlink.h>
++#include <linux/netdevice.h>
+ #include <net/flow_dissector.h>
+ 
+ struct flow_match {
+@@ -700,7 +701,31 @@
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
+-};
++	/* NF flowtable REPLACE only: held through the driver callback. Both
++	 * directions depend on the same connection's PPP channel lifetime. */
++	struct {
++		struct net_device *dev;
++		u32 cookie;
++	} ppp_paths[2];
++};
++
++/* Call under the hardware owner's configuration mutex, before installation.
++ * A later PPP mutation synchronously closes admission; its rearm worker
++ * takes that same mutex and withdraws the old generation before reopening. */
++static inline bool flow_cls_offload_ppp_valid(const struct flow_cls_offload *cls)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(cls->ppp_paths); i++) {
++		if (!cls->ppp_paths[i].dev && !cls->ppp_paths[i].cookie)
++			continue;
++		if (!cls->ppp_paths[i].dev ||
++		    !netdev_ppp_path_valid(cls->ppp_paths[i].dev,
++					  cls->ppp_paths[i].cookie))
++			return false;
++	}
++	return true;
++}
+ 
+ enum offload_act_command  {
+ 	FLOW_ACT_REPLACE,
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -159,6 +159,7 @@
+ 			/* Keep the L3 route independently of the resolved L2 path. */
+ 			struct dst_entry *route_dst;
+ 			u32		route_cookie;
++			u32		ppp_cookie;
+ 		} out;
+ 		struct {
+ 			u32		iifidx;
+@@ -227,6 +228,7 @@
+ 			u32			bridge_ifindex, bridge_port;
+ 			u16			bridge_vid;
+ 			u32			bridge_cookie;
++			u32			ppp_cookie;
+ 			u8			h_source[ETH_ALEN];
+ 			u8			h_dest[ETH_ALEN];
+ 			u8			bridge_path:1,
+
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -5,6 +5,7 @@
+ #include <linux/netlink.h>
+ #include <linux/netfilter.h>
+ #include <linux/if_bridge.h>
++#include <linux/if_arp.h>
+ #include <linux/spinlock.h>
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+@@ -279,11 +280,20 @@
+ 	struct net_device_path_stack stack;
+ 	struct nft_forward_info info = {};
+ 	unsigned char ha[ETH_ALEN];
++	u32 ppp_cookie = 0;
+ 	int i;
+ 
++	if (dst->dev->type == ARPHRD_PPP) {
++		ppp_cookie = netdev_ppp_path_cookie(dst->dev);
++		if (!netdev_ppp_path_valid(dst->dev, ppp_cookie))
++			return -ENOENT;
++	}
+ 	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) < 0 ||
+ 	    nft_dev_path_info(&stack, &info, ha, &ft->data) < 0)
+ 		return -ENOENT;
++	/* An old path must never be stamped with a newly sampled cookie. */
++	if (ppp_cookie && !netdev_ppp_path_valid(dst->dev, ppp_cookie))
++		return -ENOENT;
+ 
+ 	if (!nft_flowtable_find_dev(info.indev, ft))
+ 		return -ENOENT;
+@@ -300,6 +310,7 @@
+ 	route->tuple[!dir].in.ingress_vlans = info.ingress_vlans;
+ 
+ 	if (info.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
++		route->tuple[dir].out.ppp_cookie = ppp_cookie;
+ 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
+ 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+ 		route->tuple[dir].out.bridge_path = info.bridge_path;
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -145,6 +145,7 @@
+ 		flow_tuple->out.route_dst = dst;
+ 		flow_tuple->out.route_cookie = flow_tuple->l3proto == NFPROTO_IPV6 ?
+ 			rt6_get_cookie(dst_rt6_info(dst)) : 0;
++		flow_tuple->out.ppp_cookie = route->tuple[dir].out.ppp_cookie;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+@@ -432,6 +433,10 @@
+ 		if (!tuple->out.route_dst ||
+ 		    !dst_check(tuple->out.route_dst, tuple->out.route_cookie))
+ 			return true;
++		if ((tuple->out.ppp_cookie || tuple->out.route_dst->dev->type == ARPHRD_PPP) &&
++		    !netdev_ppp_path_valid(tuple->out.route_dst->dev,
++					  tuple->out.ppp_cookie))
++			return true;
+ 	}
+ 	return false;
+ }
+@@ -637,8 +642,8 @@
+ /* A routed DIRECT entry caches an Ethernet destination which NEIGH would
+  * resolve on each transmission. Use the retained L3 dst to look up the
+  * actual next hop (bridge/VLAN device or gateway), not its physical port.
+- * PPP/P2P routes have no ARP/ND neighbour; their session lifetime is fenced
+- * by route/device cleanup instead. NUD_VALID includes STALE/DELAY/PROBE. */
++ * PPP channels additionally carry a cookie: a channel can change without
++ * replacing the PPP netdevice or FIB dst. NUD_VALID includes STALE/DELAY/PROBE. */
+ static bool nf_flow_direct_neigh_valid(struct flow_offload *flow, int dir)
+ {
+ 	const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
+@@ -653,6 +658,9 @@
+ 	dst = tuple->out.route_dst;
+ 	if (!dst || !dst_check(dst, tuple->out.route_cookie))
+ 		return false;
++	if ((tuple->out.ppp_cookie || dst->dev->type == ARPHRD_PPP) &&
++	    !netdev_ppp_path_valid(dst->dev, tuple->out.ppp_cookie))
++		return false;
+ 	if (dst->dev->type != ARPHRD_ETHER || dst->dev->addr_len != ETH_ALEN)
+ 		return true;
+ 
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -4,6 +4,7 @@
+ #include <linux/netfilter.h>
+ #include <linux/rhashtable.h>
+ #include <linux/netdevice.h>
++#include <linux/if_arp.h>
+ #include <linux/if_bridge.h>
+ #include <linux/ppp_defs.h>
+ #include <linux/tc_act/tc_csum.h>
+@@ -931,6 +932,58 @@
+ 	cls_flow->cookie = (unsigned long)tuple;
+ }
+ 
++static void nf_flow_offload_ppp_release(struct flow_cls_offload *cls)
++{
++	unsigned int dir;
++
++	for (dir = 0; dir < ARRAY_SIZE(cls->ppp_paths); dir++) {
++		if (cls->ppp_paths[dir].dev)
++			dev_put(cls->ppp_paths[dir].dev);
++		cls->ppp_paths[dir].dev = NULL;
++		cls->ppp_paths[dir].cookie = 0;
++	}
++}
++
++/* A held dst can replace dst->dev with blackhole_netdev during unregister.
++ * Take an independent, RCU-safe device reference for each synchronous
++ * callback; the driver must not retain these borrowed pointers. */
++static bool nf_flow_offload_ppp_prepare(struct flow_cls_offload *cls,
++					struct flow_offload *flow)
++{
++	unsigned int dir;
++	bool valid = true;
++
++	if (flow->type != NF_FLOW_OFFLOAD_ROUTE)
++		return true;
++	rcu_read_lock();
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++		struct net_device *dev;
++
++		if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT)
++			continue;
++		if (!tuple->out.route_dst) {
++			valid = false;
++			break;
++		}
++		dev = READ_ONCE(tuple->out.route_dst->dev);
++		if (!tuple->out.ppp_cookie && dev->type != ARPHRD_PPP)
++			continue;
++		if (dev->type != ARPHRD_PPP ||
++		    !netdev_ppp_path_valid(dev, tuple->out.ppp_cookie)) {
++			valid = false;
++			break;
++		}
++		dev_hold(dev);
++		cls->ppp_paths[dir].dev = dev;
++		cls->ppp_paths[dir].cookie = tuple->out.ppp_cookie;
++	}
++	rcu_read_unlock();
++	if (!valid)
++		nf_flow_offload_ppp_release(cls);
++	return valid;
++}
++
+ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 				 struct flow_offload *flow,
+ 				 struct nf_flow_rule *flow_rule,
+@@ -947,8 +1000,11 @@
+ 
+ 	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
+-	if (cmd == FLOW_CLS_REPLACE)
++	if (cmd == FLOW_CLS_REPLACE) {
+ 		cls_flow.rule = flow_rule->rule;
++		if (!nf_flow_offload_ppp_prepare(&cls_flow, flow))
++			return 0; /* Number of accepting callbacks, not an errno. */
++	}
+ 
+ 	down_read(&flowtable->flow_block_lock);
+ 	list_for_each_entry(block_cb, block_cb_list, list) {
+@@ -960,6 +1016,7 @@
+ 		i++;
+ 	}
+ 	up_read(&flowtable->flow_block_lock);
++	nf_flow_offload_ppp_release(&cls_flow);
+ 
+ 	if (cmd == FLOW_CLS_STATS)
+ 		memcpy(stats, &cls_flow.stats, sizeof(*stats));
+
+--- a/net/netfilter/xt_FLOWOFFLOAD.c
++++ b/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -10,6 +10,7 @@
+ #include <linux/netfilter.h>
+ #include <linux/netfilter/xt_FLOWOFFLOAD.h>
+ #include <linux/if_vlan.h>
++#include <linux/if_arp.h>
+ #include <net/ip.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_extend.h>
+@@ -411,11 +412,19 @@
+ 	struct net_device_path_stack stack;
+ 	struct nf_forward_info info = {};
+ 	unsigned char ha[ETH_ALEN];
++	u32 ppp_cookie = 0;
+ 	int i;
+ 
++	if (dst->dev->type == ARPHRD_PPP) {
++		ppp_cookie = netdev_ppp_path_cookie(dst->dev);
++		if (!netdev_ppp_path_valid(dst->dev, ppp_cookie))
++			return -ENOENT;
++	}
+ 	if (nf_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) < 0 ||
+ 	    nf_dev_path_info(&stack, &info, ha) < 0)
+ 		return -ENOENT;
++	if (ppp_cookie && !netdev_ppp_path_valid(dst->dev, ppp_cookie))
++		return -ENOENT;
+ 
+ 	/* The xmit path looks the output device up by index for every xmit
+ 	 * type, so it has to be set for the neighbour path as well.
+@@ -436,6 +445,7 @@
+ 	route->tuple[!dir].in.ingress_vlans = info.ingress_vlans;
+ 
+ 	if (info.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
++		route->tuple[dir].out.ppp_cookie = ppp_cookie;
+ 		memcpy(route->tuple[dir].out.h_source, info.h_source, ETH_ALEN);
+ 		memcpy(route->tuple[dir].out.h_dest, info.h_dest, ETH_ALEN);
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
+
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -26,6 +26,7 @@
+ #include <linux/list.h>
+ #include <linux/idr.h>
+ #include <linux/netdevice.h>
++#include <linux/rtl9617c-switch.h>
+ #include <linux/poll.h>
+ #include <linux/ppp_defs.h>
+ #include <linux/filter.h>
+@@ -1645,6 +1646,7 @@
+ 	dev->addr_len = 0;
+ 	dev->tx_queue_len = 3;
+ 	dev->type = ARPHRD_PPP;
++	atomic_set(&dev->ppp_channel_generation, 2);
+ 	dev->flags = IFF_POINTOPOINT | IFF_NOARP | IFF_MULTICAST;
+ 	dev->priv_destructor = ppp_dev_priv_destructor;
+ 	dev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+@@ -3032,6 +3034,58 @@
+ }
+ 
+ 
++/* All channel writers hold BOTH PPP locks. This makes begin/end pairs
++ * non-nesting even when different channels of one unit change concurrently.
++ * The gate only writes admission state/queues work; it never takes RTNL,
++ * the FE mutex or waits for hardware work while the PPP locks are held. */
++static struct net *ppp_flow_change_begin(struct ppp *ppp)
++{
++	struct net *policy;
++
++	lockdep_assert_held(&ppp->wlock);
++	lockdep_assert_held(&ppp->rlock);
++	policy = rtl9617c_switch_policy_begin(ppp->dev);
++	if (atomic_read(&ppp->dev->ppp_channel_generation))
++		atomic_inc_return(&ppp->dev->ppp_channel_generation);
++	return policy;
++}
++
++static void ppp_flow_change_end(struct ppp *ppp, struct net *policy)
++{
++	lockdep_assert_held(&ppp->wlock);
++	lockdep_assert_held(&ppp->rlock);
++	/* Zero after wrap is permanent: never authorize an old cookie again. */
++	if (atomic_read(&ppp->dev->ppp_channel_generation))
++		atomic_inc_return(&ppp->dev->ppp_channel_generation);
++	rtl9617c_switch_policy_end(policy);
++}
++
++/* chan_sem write-held by unregister. Match the documented channel.upl ->
++ * PPP locks -> channel.downl order. Gate BEFORE the first published NULL,
++ * not only later when disconnect removes the channel list entry. */
++static void ppp_channel_unpublish(struct channel *pch)
++{
++	struct net *policy = NULL;
++	struct ppp *ppp;
++	bool changing;
++
++	spin_lock(&pch->upl);
++	ppp = rcu_dereference_protected(pch->ppp, lockdep_is_held(&pch->upl));
++	if (ppp)
++		ppp_lock(ppp);
++	spin_lock_bh(&pch->downl);
++	changing = ppp && pch->chan;
++	if (changing)
++		policy = ppp_flow_change_begin(ppp);
++	WRITE_ONCE(pch->chan, NULL);
++	if (changing)
++		ppp_flow_change_end(ppp, policy);
++	spin_unlock_bh(&pch->downl);
++	if (ppp)
++		ppp_unlock(ppp);
++	spin_unlock(&pch->upl);
++}
++
+ /*
+  * Disconnect a channel from the generic layer.
+  * This must be called in process context.
+@@ -3052,9 +3106,7 @@
+ 	 * the channel's start_xmit or ioctl routine before we proceed.
+ 	 */
+ 	down_write(&pch->chan_sem);
+-	spin_lock_bh(&pch->downl);
+-	WRITE_ONCE(pch->chan, NULL);
+-	spin_unlock_bh(&pch->downl);
++	ppp_channel_unpublish(pch);
+ 	up_write(&pch->chan_sem);
+ 	ppp_disconnect_channel(pch);
+ 
+@@ -3541,6 +3593,7 @@
+ {
+ 	struct ppp *ppp;
+ 	struct ppp_net *pn;
++	struct net *policy;
+ 	int ret = -ENXIO;
+ 	int hdrlen;
+ 
+@@ -3565,6 +3618,7 @@
+ 		ret = -ENOTCONN;
+ 		goto outl;
+ 	}
++	policy = ppp_flow_change_begin(ppp);
+ 	if (pch->chan->direct_xmit)
+ 		ppp->dev->priv_flags |= IFF_NO_QUEUE;
+ 	else
+@@ -3579,6 +3633,7 @@
+ 	++ppp->n_channels;
+ 	rcu_assign_pointer(pch->ppp, ppp);
+ 	refcount_inc(&ppp->file.refcnt);
++	ppp_flow_change_end(ppp, policy);
+ 	ppp_unlock(ppp);
+ 	ret = 0;
+ 
+@@ -3596,18 +3651,24 @@
+ ppp_disconnect_channel(struct channel *pch)
+ {
+ 	struct ppp *ppp;
++	struct net *policy;
+ 	int err = -EINVAL;
+ 
+ 	spin_lock(&pch->upl);
+-	ppp = rcu_replace_pointer(pch->ppp, NULL, lockdep_is_held(&pch->upl));
+-	spin_unlock(&pch->upl);
++	ppp = rcu_dereference_protected(pch->ppp, lockdep_is_held(&pch->upl));
+ 	if (ppp) {
+ 		/* remove it from the ppp unit's list */
+ 		ppp_lock(ppp);
++		policy = ppp_flow_change_begin(ppp);
++		RCU_INIT_POINTER(pch->ppp, NULL);
+ 		list_del_rcu(&pch->clist);
+ 		if (--ppp->n_channels == 0)
+ 			wake_up_interruptible(&ppp->file.rwait);
++		ppp_flow_change_end(ppp, policy);
+ 		ppp_unlock(ppp);
++	}
++	spin_unlock(&pch->upl);
++	if (ppp) {
+ 		synchronize_net();
+ 		if (refcount_dec_and_test(&ppp->file.refcnt))
+ 			ppp_destroy_interface(ppp);
+

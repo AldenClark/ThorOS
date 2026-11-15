@@ -44,6 +44,9 @@ typedef uint8_t u8;typedef uint16_t u16,__u16,__be16;typedef uint32_t u32;
 #define NF_FLOW_OFFLOAD_ROUTE 1
 #define NFPROTO_IPV4 2
 #define NFPROTO_IPV6 10
+#define ARPHRD_PPP 512
+#define atomic_read(p) (*(p))
+#define smp_rmb() __asm__ __volatile__("" ::: "memory")
 enum flow_offload_xmit_type {FLOW_OFFLOAD_XMIT_UNSPEC,FLOW_OFFLOAD_XMIT_NEIGH,FLOW_OFFLOAD_XMIT_XFRM,FLOW_OFFLOAD_XMIT_DIRECT};
 enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY};
 enum ip_conntrack_dir {IP_CT_DIR_ORIGINAL,IP_CT_DIR_REPLY};
@@ -62,21 +65,22 @@ static bool warn_once(bool value){assert(!value);return value;}
 #define EXPORT_SYMBOL_GPL(n)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 struct net {unsigned id;};
-struct net_device {unsigned ifindex;struct net *net;u8 dev_addr[6];};
-struct dst_entry {struct net_device *dev;};
+struct net_device {unsigned ifindex,type,ppp_channel_generation;struct net *net;u8 dev_addr[6];};
+struct dst_entry {struct net_device *dev;u32 cookie;bool valid;unsigned references;};
 struct nf_conn {struct net *net;bool dying,offloaded;};
 struct flow_offload_tuple {
  unsigned dir,xmit_type,l3proto,mtu,iifidx,encap_num,in_vlan_ingress,ifidx,dst_cookie;
  unsigned bridge_path,bridge_vlan,port_vlans;
  struct {u16 id;__be16 proto;}encap[2];struct dst_entry *dst_cache;
- struct {u32 ifidx,hw_ifidx,bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_source[6],h_dest[6];}out;
+ struct {u32 ifidx,hw_ifidx,bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_source[6],h_dest[6];
+  struct dst_entry *route_dst;u32 route_cookie,ppp_cookie;}out;
 };
 struct flow_offload_tuple_rhash {struct flow_offload_tuple tuple;};
 struct flow_offload {struct nf_conn *ct;unsigned type;unsigned long flags;struct flow_offload_tuple_rhash tuplehash[2];bool hw_rules[2];};
 struct nf_flowtable {struct flow_offload_tuple_rhash *rhashtable;bool hw;};
 struct nft_flowtable {struct nf_flowtable data;};
 struct nf_flow_route {struct {struct dst_entry *dst;struct {u32 ifindex;struct {u16 id;__be16 proto;}encap[2];unsigned num_encaps,ingress_vlans;}in;
- struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_source[6],h_dest[6];unsigned bridge_path,bridge_vlan,port_vlans;}out;unsigned xmit_type;}tuple[2];};
+ struct {u32 ifindex,hw_ifindex,bridge_ifindex,bridge_port;u16 bridge_vid;u32 bridge_cookie,ppp_cookie;u8 h_source[6],h_dest[6];unsigned bridge_path,bridge_vlan,port_vlans;}out;unsigned xmit_type;}tuple[2];};
 struct net_device_path {unsigned type;struct net_device *dev;struct {unsigned vlan_mode;u16 vlan_id,vlan_proto;}bridge;struct {u16 id,proto;u8 h_dest[6];}encap;};
 struct net_device_path_stack {int num_paths;struct net_device_path path[4];};
 static struct net_device_path_stack path_stack;
@@ -113,10 +117,14 @@ static bool nft_is_valid_ether_device(const struct net_device *d){return d!=NULL
 static bool nft_flowtable_find_dev(const struct net_device *d,struct nft_flowtable *ft){(void)ft;return d!=NULL;}
 static int nft_dev_fill_forward_path(struct nf_flow_route *r,const struct dst_entry *d,const struct nf_conn *ct,unsigned dir,u8 *ha,struct net_device_path_stack *s){
  (void)r;(void)d;(void)ct;(void)dir;*s=path_stack;memset(ha,0,6);ha[5]=1;return 0;}
-static struct dst_entry *nft_route_dst_fetch(struct nf_flow_route *r,unsigned dir){return r->tuple[dir].dst;}
 static unsigned ip_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){(void)dst;(void)f;return 1500;}
 static unsigned ip6_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){return ip_dst_mtu_maybe_forward(dst,f);}
-static void dst_release(struct dst_entry *dst){(void)dst;}
+static void dst_release(struct dst_entry *dst){assert(dst && dst->references);dst->references--;}
+static struct dst_entry *dst_rt6_info(struct dst_entry *dst){return dst;}
+static u32 rt6_get_cookie(struct dst_entry *dst){return dst->cookie;}
+static struct dst_entry *dst_check(struct dst_entry *dst,u32 cookie){
+ return dst && dst->references && dst->valid && (!cookie || cookie==dst->cookie)?dst:NULL;
+}
 static unsigned flow_offload_dst_cookie(struct flow_offload_tuple *t){(void)t;return 0;}
 '''
 cases = r'''
@@ -125,7 +133,8 @@ int main(void){
  moved=hw_deletes=freed=0;
  struct net nets[2]={{0},{1}};struct nf_flowtable ft={.hw=true};
  for(unsigned n=0;n<2;n++){bridge[n]=(struct net_device){.ifindex=10,.net=&nets[n]};ports[n][0]=(struct net_device){.ifindex=2,.net=&nets[n]};ports[n][1]=(struct net_device){.ifindex=3,.net=&nets[n]};}
- struct net_device physical={.ifindex=4,.net=&nets[0]};struct dst_entry dst={&bridge[0]};
+ struct net_device physical={.ifindex=4,.net=&nets[0]};
+ struct dst_entry dst={.dev=&bridge[0],.cookie=ipv6?17:0,.valid=true,.references=1};
  /* VLAN logical port2 and physical port4 must not be confused. */
  path_stack=(struct net_device_path_stack){.num_paths=3,.path={
   {.type=DEV_PATH_BRIDGE,.dev=&bridge[0],.bridge={DEV_PATH_BR_VLAN_KEEP,7,htons(ETH_P_8021Q)}},
@@ -139,6 +148,7 @@ int main(void){
  flow.tuplehash[1].tuple.dir=1;
  flow.tuplehash[0].tuple.l3proto=ipv6?NFPROTO_IPV6:NFPROTO_IPV4;
  assert(!flow_offload_fill_route(&flow,&route,0));
+ assert(!route.tuple[0].dst); /* The real fetch transfers route ownership. */
  struct flow_offload_tuple *tuple=&flow.tuplehash[0].tuple;
 #ifdef EXPECT_BEFORE
  (void)ft;
@@ -146,6 +156,7 @@ int main(void){
  puts("Pre-fix bridge path is not captured; an FDB move cannot retire this flow.");
  return 0;
 #else
+ assert(tuple->out.route_dst==&dst && tuple->out.route_cookie==dst.cookie && dst.references==1);
  assert(tuple->out.bridge_ifidx==10 && tuple->out.bridge_port==2 && tuple->out.bridge_vid==7 && tuple->out.hw_ifidx==4);
  assert(tuple->out.bridge_cookie==((7U<<20)|BIT(16)|BIT(17)|ETH_P_8021Q));
  struct nft_forward_info invalid={};u8 ha[6]={0,0,0,0,0,1};
@@ -172,6 +183,7 @@ int main(void){
   assert(flow_offload_lookup(&ft,tuple) && ct.offloaded);
  }
  puts("Bridge move: IPv4/IPv6 path/VLAN capture -> software miss -> paired hardware removal -> connection released; unrelated flows retained.");
+ nft_flow_dst_release(&flow,0);assert(!dst.references);
 #endif
  }
 }
@@ -183,10 +195,28 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
         '--kernel-directory', str(root / 'sources/openwrt')], text=True).strip())
     if args.before:
         patch = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/216-flowtable-bridge-move.patch'
-        for name in re.findall(r'^\+\+\+ b/(.+)$', patch.read_text(), re.M):
+        ppp = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/224-ppp-channel-generation.patch'
+        ppp_policy = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch'
+        has_ppp = 'nf_flow_offload_ppp_prepare(' in (kernel / 'net/netfilter/nf_flow_table_offload.c').read_text()
+        has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else '') + (ppp_policy.read_text() if has_ppp_policy else '')
+        for name in sorted(set(re.findall(r'^\+\+\+ b/(.+)$', copied, re.M))):
             target = work / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        if has_ppp_policy:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(ppp_policy)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(ppp)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
+        # Later DIRECT ownership changes overlap the original bridge context.
+        # Undo the real dependent patch first, retaining the historical
+        # negative control instead of relaxing patch matching or assertions.
+        if 'nf_flow_direct_route_changed(' in (work / 'net/netfilter/nf_flow_table_core.c').read_text():
+            direct = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/222-flowtable-direct-route-validation.patch'
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(direct)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
         policy = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/219-flowtable-bridge-policy.patch'
         if 'br_flowtable_path_cookie_rcu' in (work / 'net/netfilter/nf_flow_table_core.c').read_text():
             subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(policy)],
@@ -197,10 +227,17 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
     core = (kernel / 'net/netfilter/nf_flow_table_core.c').read_text()
     path = (kernel / 'net/netfilter/nf_flow_table_path.c').read_text()
     code = common + re.search(r'struct nft_forward_info \{.*?\n\};', path, re.S)[0] + '\n'
+    if 'netdev_ppp_path_cookie(' in path:
+        netdevice = (kernel / 'include/linux/netdevice.h').read_text()
+        code += function(netdevice, 'netdev_ppp_path_cookie')
+        code += function(netdevice, 'netdev_ppp_path_valid')
     if 'static bool nft_bridge_path_matches_cookie(' in path:
         code += function(path, 'nft_bridge_path_matches_cookie')
     code += function(path, 'nft_dev_path_info') + function(path, 'nft_dev_forward_path')
-    code += function(core, 'flow_offload_fill_route')
+    code += function(core, 'nft_route_dst_fetch') + function(core, 'flow_offload_fill_route')
+    code += function(core, 'nft_flow_dst_release')
+    if 'static bool nf_flow_direct_route_changed(' in core:
+        code += function(core, 'nf_flow_direct_route_changed')
     if 'static bool nf_flow_bridge_changed(' in core:
         code += function(core, 'nf_flow_bridge_changed')
     code += function(core, 'flow_offload_lookup') + function(core, 'nf_flow_offload_gc_step') + cases

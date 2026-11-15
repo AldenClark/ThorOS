@@ -86,6 +86,7 @@ int main(void){
  assert(fe_install(&p,a,1)==-ENODEV);
  f.shutting_down=false;p.retired=true;
  assert(fe_install(&p,a,1)==-ENODEV);p.retired=false;
+ a.bridge=true;assert(fe_install(&p,a,1)==-EOPNOTSUPP);a.bridge=false;
  assert(!allocations && !mmio && !f.installs && f.flows.next==&f.flows);
  for(unsigned int i=0;i<sizeof(f.hashes)/sizeof(f.hashes[0]);i++)assert(!f.hashes[i]);
  for(unsigned int i=0;i<RTL_FE_MEMORY_BYTES/sizeof(unsigned int);i++)assert(!((unsigned int *)f.memory)[i]);

@@ -92,7 +92,7 @@ static void shared_lifetime(void){
  for(unsigned int i=0;i<4096;i++) {
   flows[i].source_mac=i%15;flows[i].pppoe=3U|((i%2?1234U:3456U)<<2);
   assert(!fe_interface_get(&fe,&flows[i]));assert(flows[i].counter<32);
-  assert(fe.table[flows[i].counter]==recipe(&flows[i]));assert(flows[i].counted==(i<32));
+  assert(fe.table[flows[i].counter]==recipe(&flows[i]));assert(flows[i].counted==(i<30));
   union sdk_eif row={.word=fe.table[flows[i].counter]};assert(row.fields.pppoe_len_control && row.fields.pppoe_set && row.fields.pppoe_vld && row.fields.mac_sa_vld && !row.fields.reserved);
   assert(row.fields.pppoe_session_id==(i%2?1234U:3456U) && row.fields.mac_sa_an_sel==i%15+1);
  }
@@ -147,9 +147,37 @@ static void failure_ownership(void){
  for(unsigned int i=1;i<31;i++)assert(!fe_interface_put(&fe,&rest[i]));
  assert(!fe.counters[0]);
 }
+static void recipe_before_accounting(void){
+ struct rtl_fe fe;init(&fe);struct rtl_fe_flow flows[64]={0},fresh[31]={0};
+ for(unsigned int i=0;i<64;i++) {
+  flows[i]=(struct rtl_fe_flow){.source_mac=0,.pppoe=3U|(1234U<<2)};
+  assert(!fe_interface_get(&fe,&flows[i]));
+  assert(flows[i].counter==flows[0].counter && flows[i].counted==(i==0));
+ }
+ /* More than32 flows with one recipe leave31 forwarding rows available. */
+ assert(fe.requests==2 && fe.counters[0]==1UL);
+ for(unsigned int i=0;i<31;i++) {
+  fresh[i]=(struct rtl_fe_flow){.source_mac=1,.pppoe=3U|((2000U+i)<<2)};
+  assert(!fe_interface_get(&fe,&fresh[i]) && fresh[i].counted);
+ }
+ assert(fe.requests==64 && fe.interfaces[0].users==64);
+ struct rtl_fe_flow excess={.source_mac=2,.pppoe=3U|(9000U<<2)};
+ assert(fe_interface_get(&fe,&excess)==-ENOSPC && !excess.interface_owned);
+ /* Releasing the sole counted owner must not restore a live shared EIF.
+  * A new owner can start a fresh MIB baseline; old users stay uncounted. */
+ assert(!fe_interface_put(&fe,&flows[0]) && fe.interfaces[0].users==63);
+ unsigned int requests=fe.requests;
+ struct rtl_fe_flow replacement={.source_mac=0,.pppoe=3U|(1234U<<2)};
+ assert(!fe_interface_get(&fe,&replacement) && replacement.counted && !flows[1].counted);
+ assert(fe.requests==requests && replacement.counter==0);
+ assert(!fe_interface_put(&fe,&replacement));
+ for(unsigned int i=1;i<64;i++)assert(!fe_interface_put(&fe,&flows[i]));
+ for(unsigned int i=0;i<31;i++)assert(!fe_interface_put(&fe,&fresh[i]));
+ assert(!fe.counters[0]);for(unsigned int i=0;i<32;i++)assert(fe.table[i]==0x50000000+i);
+}
 int main(void){
- capacity_counterexample();shared_lifetime();failure_ownership();
- puts("Native EIF: physical32-row/five-bit alias oracle;4096 flows/30 recipes;33 distinct recipes reject;busy/ambiguous write/unready sharing/restore retry passed");
+ capacity_counterexample();recipe_before_accounting();shared_lifetime();failure_ownership();
+ puts("Native EIF:32 physical recipes,64 duplicate flows preserve31 slots;4096 flows/30 recipes;exclusive MIB owner;busy/ambiguous write/unready sharing/restore retry passed");
 }
 '''
 # Compile historical functions unchanged: old negative control reaches the
@@ -176,5 +204,7 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-interface-')
     'hardware_access_address_bits': 5, 'thirty_third_recipe_preserves_live_row_zero': True,
     'busy_before_data_window_and_ambiguous_programming_retry': True,
     'unready_row_not_shared': True, 'last_owner_restore_retry': True,
+    'sixty_four_duplicate_flows_preserve_thirty_one_forwarding_recipes': True,
+    'one_counter_enabled_flow_per_recipe_no_double_accounting': True,
     'sanitizers': ['ASan', 'UBSan'], 'hardware_verified': False,
 }, indent=2) + '\n')

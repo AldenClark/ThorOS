@@ -61,6 +61,9 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     for name, value in {
         'cold_bootstrap': 'schema=1 cached=1 historical=1 requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0\n'
                           'pon_snapshot_ready=1 pon_stage=7 pon_error=0 pon_pdc_active=1 pon_gated_mask=0x4\n',
+        'fabric_sample': 'schema=1 sampled=1 seq=2 epoch=1 valid=1\n',
+        'fabric_evidence': 'schema=1 cached=1 clock=boottime global=1 hardware_reset_verified=0 te_direct_mode_verified=0\n'
+                           'contract=partial tm_te_baseline_verified=0 wan_arb_readback=0\n',
         'l2_switch': '1\n',
         'l2_evidence': 'mce_ctl=0002f0ff cp_lspid_to_pol_id_en=1\n',
         'lan_mib_evidence': 'schema=1 cached=1 clock=boottime raw=1 reset_tracking=0 l2_attribution=0 atomic_hardware_snapshot=0 read_opcode=0 counter_mode_verified=0 capture_ns=5000000000 registered_mask=0x1\n'
@@ -195,6 +198,9 @@ exit 0
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2
     assert str(debug / 'flows') not in trace and str(ni / 'qm_state') not in trace
     assert str(ni / 'dma_state') not in trace
+    assert str(ni / 'fabric_sample') not in trace
+    assert output.count('[fabric_evidence]\nschema=1 cached=1') == 2
+    assert output.count('[fabric_sample]\nskipped=active_diagnostics_not_requested') == 2
     assert output.count('[dma_state]\nskipped=active_diagnostics_not_requested') == 2
     assert trace.count('sleep 1\n') == 1
     assert 'timeout -s KILL 3 sh ' not in trace
@@ -218,7 +224,9 @@ exit 0
     output, _, _ = run('1', '--details')
     assert '192.0.2.12:51000' not in output
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2
-    output, _, _ = run('1', '--active-diagnostics')
+    output, trace, _ = run('1', '--active-diagnostics')
+    assert trace.count(str(ni / 'fabric_sample')) == 2
+    assert output.count('[fabric_sample]\nschema=1 sampled=1') == 2
     assert output.count('[dma_state]\nbusy=4 invalid=0 completion_checks=22') == 2
     assert '42 lan1 pon0 2 6 1 1000 10 0 0' in output, output[output.index('[fe_flow_counters]'):output.index('[l2_switch]')]
     assert '43 pon0 lan1 2 6 - - - - -' in output and '44 error=-110' in output

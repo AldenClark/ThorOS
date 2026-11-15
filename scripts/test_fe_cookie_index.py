@@ -43,7 +43,13 @@ common = r'''
 #include <time.h>
 #include <linux/list.h>
 #include <linux/rbtree.h>
-static unsigned long long visits, deleted, stats;
+typedef uint32_t u32;
+/* Single-threaded callback fixture: use the real PPP cookie validators, with
+ * atomic storage and barriers modeled rather than accepting all PPP paths. */
+#define atomic_read(p) (*(p))
+#define smp_rmb() __asm__ __volatile__("" ::: "memory")
+struct net_device {unsigned ppp_channel_generation;};
+static unsigned long long visits, deleted, stats, replaces;
 /* Count list-node visits without replacing the production loop itself. */
 #undef list_for_each_entry
 #define list_for_each_entry(p,h,m) for(p=list_first_entry(h,__typeof__(*p),m); \
@@ -61,21 +67,25 @@ struct rtl_fe_flow {struct list_head list,retry;struct rb_node cookie_node;
 struct rtl_fe {struct list_head flows,retries;struct rb_root cookies;bool shutting_down;
  unsigned int lock,misses;};
 struct flow_cls_offload {struct {unsigned int chain_index;}common;
- unsigned long cookie;unsigned int command;};
+ unsigned long cookie;unsigned int command;
+ struct {struct net_device *dev;u32 cookie;}ppp_paths[2];};
 enum tc_setup_type {TC_SETUP_CLSFLOWER};
 enum {FLOW_CLS_REPLACE,FLOW_CLS_DESTROY,FLOW_CLS_STATS};
 static bool fail_delete;
+static unsigned long fail_cookie;
 static void mutex_lock(unsigned int *v){assert(!*v);*v=1;}
 static void mutex_unlock(unsigned int *v){assert(*v);*v=0;}
 static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *f){
- if(fail_delete)return -ETIMEDOUT;
+ if(fail_delete && f->cookie==fail_cookie)return -ETIMEDOUT;
  rb_erase(&f->cookie_node,&fe->cookies);list_del_init(&f->retry);
  list_del_init(&f->list);deleted++;return 0;
 }
 static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *f,struct flow_cls_offload *c){
  assert(fe->lock && f->cookie==c->cookie);stats++;return 0;
 }
-static int fe_replace(struct rtl_fe_port *p,struct flow_cls_offload *c){(void)p;(void)c;return 0;}
+static int fe_replace(struct rtl_fe_port *p,struct flow_cls_offload *c){
+ assert(p->fe->lock);(void)c;replaces++;return 0;
+}
 static void fe_collect_ports(struct rtl_fe *fe){assert(fe->lock);}
 '''
 test = r'''
@@ -119,10 +129,36 @@ int main(void){
   assert(fe.retries.next==&f[17].retry && fe.retries.prev==&f[17].retry);
   assert(!fe.lock);
  }
- fe.shutting_down=false;c.command=FLOW_CLS_DESTROY;fail_delete=true;
- assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-ETIMEDOUT);
+ fe.shutting_down=false;fail_delete=true;fail_cookie=f[17].cookie;
+ c.command=FLOW_CLS_STATS;
+ assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
+ c.command=FLOW_CLS_REPLACE;
+ assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
+ /* The real admission callback validates borrowed PPP generation cookies
+  * under its owner mutex before any replacement, including refresh calls.
+  * These are header/callback checks, not a model of PPP channel writers. */
+ struct net_device ppp={.ppp_channel_generation=4};
+ unsigned long long saved_replaces=replaces;
+ c.ppp_paths[0].dev=&ppp;c.ppp_paths[0].cookie=2;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-EAGAIN);
+ c.ppp_paths[0].cookie=4;ppp.ppp_channel_generation=5;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-EAGAIN);
+ ppp.ppp_channel_generation=4;c.ppp_paths[0].dev=NULL;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port)==-EAGAIN);
+ assert(replaces==saved_replaces && !fe.lock);
+ c.ppp_paths[0].dev=&ppp;
+ assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
+ assert(replaces==saved_replaces+1 && !fe.lock);
+ c.ppp_paths[0].dev=NULL;c.ppp_paths[0].cookie=0;
+ c.command=FLOW_CLS_DESTROY;
+ assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
  assert(fe_flow(&fe,f[17].cookie)==&f[17]);assert(fe.retries.next==&f[17].retry);
- fail_delete=false;assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
+ assert(deleted==1 && !fe_flow(&fe,c.cookie));
+ struct flow_cls_offload tombstone={.cookie=f[17].cookie,.command=FLOW_CLS_STATS};
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&tombstone,&port)==-ENOENT);
+ tombstone.command=FLOW_CLS_DESTROY;
+ assert(fe_block_callback(TC_SETUP_CLSFLOWER,&tombstone,&port)==-ETIMEDOUT);
+ fail_delete=false;assert(!fe_delete(&fe,&f[17])); /* Dedicated cleanup owner. */
  assert(deleted==2 && list_empty(&fe.retries));assert(!fe_flow(&fe,c.cookie));
  /* Reuse the deleted cookie, then exercise a synthetic rekey workload. */
  f[count-1].installed=true;list_add_tail(&f[count-1].list,&fe.flows);
@@ -140,19 +176,26 @@ int main(void){
   list_add_tail(&f[j].list,&fe.flows);fe_index_flow(&fe,&f[j]);
   assert(fe_flow(&fe,key)==&f[j]);
  }
- /* Multiple queued releases must all leave the index and retry list. */
+ /* Unrelated stats must never execute queued MMIO cleanup. */
  f[3].deleting=true;f[5].deleting=true;
  list_add_tail(&f[3].retry,&fe.retries);list_add_tail(&f[5].retry,&fe.retries);
  c.cookie=f[9].cookie;c.command=FLOW_CLS_STATS;
  assert(!fe_block_callback(TC_SETUP_CLSFLOWER,&c,&port));
- assert(list_empty(&fe.retries)&&!fe_flow(&fe,f[3].cookie)&&!fe_flow(&fe,f[5].cookie));
+ assert(!list_empty(&fe.retries)&&fe_flow(&fe,f[3].cookie)&&fe_flow(&fe,f[5].cookie));
+ assert(!fe_delete(&fe,&f[3]) && !fe_delete(&fe,&f[5]));
  for(unsigned int i=0;i<count;i++)if(i!=17&&i!=3&&i!=5)fe_delete(&fe,&f[i]);
  assert(RB_EMPTY_ROOT(&fe.cookies)&&list_empty(&fe.flows));free(f);
  puts("FE indexed lookup, zero/high/reused cookies, rekey, wrong-port stats/destroy, retired/shutdown rejection and retry passed");
 }
 '''
 text = old if a.before else source
-parts = [common, function(text, 'fe_flow'), function(source, 'fe_index_flow'),
+ppp_helpers = ''
+if 'flow_cls_offload_ppp_valid(cls)' in function(text, 'fe_block_callback'):
+    ppp_helpers += function((a.kernel / 'include/linux/netdevice.h').read_text(),
+                            'netdev_ppp_path_valid')
+    ppp_helpers += function((a.kernel / 'include/net/flow_offload.h').read_text(),
+                            'flow_cls_offload_ppp_valid')
+parts = [common, ppp_helpers, function(text, 'fe_flow'), function(source, 'fe_index_flow'),
          function(text, 'fe_block_callback'), test]
 if a.emit_c:
     a.emit_c.write_text('\n'.join(parts))

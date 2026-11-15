@@ -34,10 +34,21 @@ if args.before and "flow_offload_refresh_bridge" in offload:
     patch = root / "port/overlay/target/linux/rtl9617c/patches-6.18/217-flowtable-bridge-ageing.patch"
     with tempfile.TemporaryDirectory(prefix="flowtable-ageing-before-") as directory:
         before = Path(directory)
-        for name in re.findall(r"^\+\+\+ b/(.+)$", patch.read_text(), re.M):
+        ppp = root / "port/overlay/target/linux/rtl9617c/patches-6.18/224-ppp-channel-generation.patch"
+        ppp_policy = root / "port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch"
+        has_ppp = "nf_flow_offload_ppp_prepare(" in offload
+        has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else "") + (ppp_policy.read_text() if has_ppp_policy else "")
+        for name in sorted(set(re.findall(r"^\+\+\+ b/(.+)$", copied, re.M))):
             target = before / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        if has_ppp_policy:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(ppp_policy)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(ppp)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(patch)],
                        cwd=before, check=True, stdout=subprocess.DEVNULL)
         fdb = (before / "net/bridge/br_fdb.c").read_text()

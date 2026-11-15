@@ -41,6 +41,7 @@
 #include "rtl9617c-fe.h"
 #include "rtl9617c-mib.h"
 #include "rtl9617c-pon-cold.h"
+#include "rtl9617c-tm-evidence.h"
 
 #define GLB_STATIC 0xa01c
 #define PORT_TO_CPU GENMASK(3, 0)
@@ -176,6 +177,10 @@ struct rtl_xram {
 	spinlock_t rx_lock;
 	struct mutex mib_lock;
 	struct mutex fabric_lock;
+	/* Direct TM PM reads have one owner; sysfs cache readers never consume PM. */
+	struct mutex tm_evidence_lock;
+	struct rtl_tm_evidence tm_evidence;
+	u64 tm_owner_generation; /* Before publication, then RTNL-serialized. */
 	bool cold_handoff_required;
 	bool cold_attempted;
 	bool provider_ready;
@@ -643,6 +648,9 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	if (priv->dma_tx) {
 		const struct rtl9617c_ni_frame frame = {
+			/* Legacy CPU LAN injection uses SDK HeaderA No-Drop priority.
+			 * FE actions inherit ingress policy instead; do not equate
+			 * these queue treatments or blindly promote all HW traffic. */
 			.header_high = BIT(13),
 			.header_low = (16 << 9) | (lan->port << 3) | BIT(29),
 		};
@@ -684,6 +692,7 @@ static void rtl_engine_poison(struct rtl_xram *priv)
 {
 	unsigned long flags;
 
+	priv->tm_owner_generation++;
 	/* Serialize the shared PON gate with recovery's rtl9617c_ni_pon_gate(). */
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->engine_poisoned, true);
@@ -778,6 +787,7 @@ static int rtl_engine_start(struct rtl_xram *priv)
 		return -ENODEV;
 	if (priv->engine_poisoned)
 		return -EIO;
+	priv->tm_owner_generation++;
 	/* FE owns its installed CPU profile for the same device lifetime. Gate
 	 * flows before first setup, but never restore a boot-time profile while
 	 * the PON classifier can still send packets to that profile. */
@@ -830,6 +840,7 @@ static void rtl_engine_stop(struct rtl_xram *priv)
 
 	if (!priv->host_active)
 		return;
+	priv->tm_owner_generation++;
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->host_active, false);
 	rtl_pon_host_gate(priv, false);
@@ -1576,6 +1587,109 @@ static ssize_t lan_mib_evidence_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(lan_mib_evidence);
 
+static unsigned long long rtl_tm_clock(void *context)
+{
+	(void)context;
+	return ktime_get_boottime_ns();
+}
+
+static ssize_t fabric_sample_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	const struct rtl_tm_observe_io io = {priv, rtl_mib_read, rtl_tm_clock};
+	unsigned long long seq, epoch;
+	unsigned int valid;
+	int sampled;
+
+	/* This explicitly active endpoint MAY consume clear-on-read PM values.
+	 * Never use it for passive UI polling. Trylocks avoid waiting behind
+	 * device removal or a sleeping reconfiguration. RTNL excludes the NI
+	 * lifetime transitions; the helper separately checks fabric config on
+	 * both sides of the non-atomic sample. No indirect window is touched. */
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!mutex_trylock(&priv->tm_evidence_lock)) {
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	if (READ_ONCE(priv->removing) || !priv->provider_ready ||
+	    !priv->base_ready || !priv->host_active || priv->engine_poisoned) {
+		rtl_tm_evidence_invalidate(&priv->tm_evidence);
+		mutex_unlock(&priv->tm_evidence_lock);
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	sampled = rtl_tm_evidence_capture(&io, &priv->tm_evidence,
+					priv->tm_owner_generation);
+	seq = priv->tm_evidence.seq;
+	epoch = priv->tm_evidence.epoch;
+	valid = priv->tm_evidence.valid;
+	mutex_unlock(&priv->tm_evidence_lock);
+	rtnl_unlock();
+	return sysfs_emit(buf, "schema=1 sampled=%d seq=%llu epoch=%llu valid=%u\n",
+			 sampled, seq, epoch, valid);
+}
+static DEVICE_ATTR_RO(fabric_sample);
+
+static ssize_t fabric_evidence_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	struct rtl_tm_evidence sample;
+	u64 owner_generation;
+	unsigned int i;
+	ssize_t length;
+
+	/* Cache-only: multiple readers cannot steal read-to-clear PM samples. */
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!mutex_trylock(&priv->tm_evidence_lock)) {
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	sample = priv->tm_evidence;
+	owner_generation = priv->tm_owner_generation;
+	mutex_unlock(&priv->tm_evidence_lock);
+	rtnl_unlock();
+	length = sysfs_emit(buf,
+		"schema=1 cached=1 clock=boottime global=1 atomic_hardware_snapshot=0 "
+		"hardware_reset_verified=0 te_direct_mode_verified=0 "
+		"capture_ns=%llu seq=%llu epoch=%llu owner_generation=%llu current_owner_generation=%llu "
+		"valid=%u delta_valid=%u epoch_reason=%u begin_ns=%llu end_ns=%llu\n",
+		ktime_get_boottime_ns(), sample.seq, sample.epoch,
+		sample.owner_generation, owner_generation,
+		sample.valid, sample.delta_valid, sample.epoch_reason,
+		sample.begin_ns, sample.end_ns);
+	length += sysfs_emit_at(buf, length,
+		"contract=partial tm_te_baseline_verified=0 wan_arb_readback=0 "
+		"sw_lan_nodrop=1 hw_nodrop_policy=ingress_inherited "
+		"bm_clear_on_read=%u te_mem_clear_on_read=%u l3lan_rxpfc=%#x\n",
+		sample.config[RTL_TM_CLEAR_CONTROL] >> 31,
+		(sample.config[RTL_TM_TE_PM_CONTROL] >> 5) & 1U,
+		sample.config[RTL_TM_FC_CONTROL] >> 24);
+	for (i = 0; i < RTL_TM_CONFIGS; i++)
+		length += sysfs_emit_at(buf, length, "%s=%#x%c",
+			rtl_tm_config_registers[i].name, sample.config[i],
+			i == RTL_TM_CONFIGS - 1 ? '\n' : ' ');
+	for (i = 0; i < RTL_TM_STATUSES; i++)
+		length += sysfs_emit_at(buf, length, "%s=%#x%c",
+			rtl_tm_status_registers[i].name, sample.status[i],
+			i == RTL_TM_STATUSES - 1 ? '\n' : ' ');
+	for (i = 0; i < RTL_TM_COUNTERS; i++) {
+		length += sysfs_emit_at(buf, length, "counter=%s raw=%u",
+			rtl_tm_counter_registers[i].name, sample.raw[i]);
+		if (i < RTL_TM_BM_COUNTERS)
+			length += sysfs_emit_at(buf, length, " observed=%llu mode=%s\n",
+				sample.observed[i],
+				sample.config[RTL_TM_CLEAR_CONTROL] >> 31 ? "read_clear" : "cumulative");
+		else
+			length += sysfs_emit_at(buf, length, " mode=unknown\n");
+	}
+	return length;
+}
+static DEVICE_ATTR_RO(fabric_evidence);
+
 static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_xram_state.attr,
 	&dev_attr_dma_state.attr,
@@ -1598,6 +1712,8 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_l2_evidence.attr,
 	&dev_attr_cold_bootstrap.attr,
 	&dev_attr_lan_mib_evidence.attr,
+	&dev_attr_fabric_sample.attr,
+	&dev_attr_fabric_evidence.attr,
 	NULL,
 };
 static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, int index)
@@ -1899,6 +2015,7 @@ static int rtl_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->rx_lock);
 	mutex_init(&priv->mib_lock);
 	mutex_init(&priv->fabric_lock);
+	mutex_init(&priv->tm_evidence_lock);
 	priv->cold_handoff_required =
 		of_property_read_bool(dev->of_node, "realtek,cold-fabric-bootstrap") ||
 		of_property_read_bool(dev->of_node, "realtek,pon-cold-handoff");

@@ -144,6 +144,7 @@ struct rtl_qm_rx {
 };
 struct napi_struct {bool active;};
 struct rtl_xram {
+ unsigned long long tm_owner_generation;
  pthread_mutex_t fabric_lock;
  bool cold_handoff_required,provider_ready;
  struct net_device *netdev,*ports[5];struct rtl_fe *fe;

@@ -6,6 +6,8 @@ atomic: one accepted direction can set HW_OFFLOAD while the other uses the
 software flowtable. Callback success alone is not a hardware hit counter.
 An independent driver epoch flush leaves that marker temporarily stale;
 actual software traffic refreshes REPLACE and can recover after re-admission.
+PPP preparation/release are also extracted; modeled dst/netdevice references
+check callback borrowing and failed-preparation cleanup, not real PPP locking.
 """
 from pathlib import Path
 import argparse
@@ -29,9 +31,16 @@ def function(source, name):
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--kernel', type=Path, required=True, help='Prepared kernel tree')
+parser.add_argument('--before-ppp-count', action='store_true',
+                    help='Negative control: restore the rejected-PPP errno/count regression')
 args = parser.parse_args()
 source = (args.kernel / 'net/netfilter/nf_flow_table_offload.c').read_text()
 core = (args.kernel / 'net/netfilter/nf_flow_table_core.c').read_text()
+if args.before_ppp_count:
+    source, replaced = re.subn(
+        r'(if \(!nf_flow_offload_ppp_prepare\(&cls_flow, flow\)\)\s*)return 0;[^\n]*',
+        r'\1return -EAGAIN;', source)
+    assert replaced == 1, 'negative control must change exactly the PPP count rejection'
 common = r'''
 #include <assert.h>
 #include <errno.h>
@@ -46,6 +55,12 @@ enum {NF_FLOW_HW,NF_FLOW_HW_BIDIRECTIONAL,NF_FLOW_HW_DEAD,NF_FLOW_CLOSING};
 enum {IPS_OFFLOAD_BIT,IPS_HW_OFFLOAD_BIT};
 #define ETH_P_ALL 3
 #define TC_SETUP_CLSFLOWER 1
+#define NF_FLOW_OFFLOAD_ROUTE 1
+#define FLOW_OFFLOAD_XMIT_DIRECT 3
+#define ARPHRD_PPP 512
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define atomic_read(p) (*(p))
+#define smp_rmb() __asm__ __volatile__("" ::: "memory")
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define set_bit(n,p) (*(p)|=BIT(n))
@@ -60,14 +75,18 @@ enum {IPS_OFFLOAD_BIT,IPS_HW_OFFLOAD_BIT};
 #define nf_flowtable_time_stamp now
 struct netlink_ext_ack {int unused;};
 struct flow_stats {u64 lastused,pkts,bytes;};
-struct flow_offload_tuple {unsigned dir;};
+struct net_device {unsigned type,ppp_channel_generation,references;};
+struct dst_entry {struct net_device *dev;};
+struct flow_offload_tuple {unsigned dir,xmit_type;
+ struct {struct dst_entry *route_dst;u32 ppp_cookie;}out;};
 struct flow_offload_tuple_rhash {struct flow_offload_tuple tuple;};
 struct nf_conn {unsigned long status;};
-struct flow_offload {struct nf_conn *ct;unsigned long flags;u32 timeout;struct flow_offload_tuple_rhash tuplehash[2];};
+struct flow_offload {struct nf_conn *ct;unsigned type;unsigned long flags;u32 timeout;struct flow_offload_tuple_rhash tuplehash[2];};
 struct nf_flow_rule {void *rule;};
 struct flow_cls_offload {
  struct {__be16 protocol;int prio;struct netlink_ext_ack *extack;} common;
  enum flow_cls_command command;unsigned long cookie;void *rule;struct flow_stats stats;
+ struct {struct net_device *dev;u32 cookie;}ppp_paths[2];
 };
 struct flow_block_cb {int (*cb)(int,void *,void *);void *cb_priv;struct flow_block_cb *next;};
 struct list_head {struct flow_block_cb *first;};
@@ -76,6 +95,22 @@ struct flow_offload_work {struct flow_offload *flow;struct nf_flowtable *flowtab
 #define list_for_each_entry(pos,head,member) for(pos=(head)->first;pos;pos=pos->next)
 static void down_read(int *lock){assert(!*lock);*lock=1;}
 static void up_read(int *lock){assert(*lock);*lock=0;}
+static unsigned rcu_depth,dev_holds,dev_puts;
+static void rcu_read_lock(void){rcu_depth++;}
+static void rcu_read_unlock(void){assert(rcu_depth);rcu_depth--;}
+static void dev_hold(struct net_device *dev){assert(rcu_depth && dev->references);dev->references++;dev_holds++;}
+static void dev_put(struct net_device *dev){assert(dev->references>1);dev->references--;dev_puts++;}
+static struct net_device ether={.type=1,.references=1};
+static struct dst_entry ether_route={.dev=&ether};
+static void route_init(struct flow_offload *flow){
+ flow->type=NF_FLOW_OFFLOAD_ROUTE;
+ for(unsigned dir=0;dir<2;dir++){
+  flow->tuplehash[dir].tuple.dir=dir;
+  flow->tuplehash[dir].tuple.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT;
+  flow->tuplehash[dir].tuple.out.route_dst=&ether_route;
+  flow->tuplehash[dir].tuple.out.ppp_cookie=0;
+ }
+}
 static int replies[2],allocated,destroyed,allocation_error,add_calls[2],del_calls[2],stats_calls[2];
 static u32 now;static bool fabric_authorized=true;
 static bool installed[2];
@@ -84,6 +119,8 @@ static int callback(int type,void *data,void *priv){
  struct flow_cls_offload *cls=data;(void)priv;
  const struct flow_offload_tuple *tuple=(void *)cls->cookie;unsigned dir=tuple->dir;
  assert(type==TC_SETUP_CLSFLOWER && dir<2 && cls->common.prio==7);
+ for(unsigned i=0;i<2;i++)if(cls->ppp_paths[i].dev)
+  assert(cls->command==FLOW_CLS_REPLACE && cls->ppp_paths[i].dev->references>1);
  if(cls->command==FLOW_CLS_REPLACE){
   add_calls[dir]++;if(!fabric_authorized)return -EAGAIN;
   if(replies[dir]<0)return replies[dir];
@@ -112,7 +149,10 @@ static void nf_ct_acct_add(struct nf_conn *ct,unsigned d,u64 pkts,u64 bytes){
 }
 '''
 code = common
-for name in ('nf_flow_offload_init', 'nf_flow_offload_tuple',
+code += function((args.kernel / 'include/linux/netdevice.h').read_text(),
+                 'netdev_ppp_path_valid')
+for name in ('nf_flow_offload_init', 'nf_flow_offload_ppp_release',
+             'nf_flow_offload_ppp_prepare', 'nf_flow_offload_tuple',
              'flow_offload_tuple_add', 'flow_offload_tuple_del',
              'flow_offload_rule_add', 'flow_offload_work_add', 'flow_offload_work_del',
              'flow_offload_tuple_stats', 'flow_offload_work_stats'):
@@ -133,7 +173,7 @@ int main(void){
  for(unsigned bidir=0;bidir<2;bidir++)for(unsigned accepted=0;accepted<4;accepted++){
   struct nf_conn ct={.status=BIT(IPS_OFFLOAD_BIT)};
   struct flow_offload flow={.ct=&ct,.flags=BIT(NF_FLOW_HW)|(bidir?BIT(NF_FLOW_HW_BIDIRECTIONAL):0)};
-  flow.tuplehash[1].tuple.dir=1;struct flow_offload_work work={&flow,&ft};
+  route_init(&flow);struct flow_offload_work work={&flow,&ft};
   replies[0]=accepted&1?0:-EOPNOTSUPP;replies[1]=accepted&2?0:-ENOSPC;
   allocated=destroyed=0;memset(add_calls,0,sizeof(add_calls));memset(del_calls,0,sizeof(del_calls));
   memset(installed,0,sizeof(installed));
@@ -147,8 +187,34 @@ int main(void){
   assert(!test_bit(IPS_HW_OFFLOAD_BIT,&ct.status) && test_bit(NF_FLOW_HW_DEAD,&flow.flags));
   assert(!installed[0] && !installed[1] && del_calls[0]==1 && del_calls[1]==(int)bidir);
  }
+ assert(!rcu_depth && !dev_holds && !dev_puts && ether.references==1);
+ /* Both directions prepare the actual held PPP endpoints before invoking a
+  * callback. A rejected second endpoint must drop the first borrowed ref,
+  * return zero accepting callbacks, and never fabricate the HW marker. */
+ struct net_device ppp={.type=ARPHRD_PPP,.ppp_channel_generation=2,.references=1};
+ struct dst_entry ppp_route={.dev=&ppp};
+ for(unsigned valid=0;valid<2;valid++)for(unsigned bidir=0;bidir<2;bidir++){
+  struct nf_conn ct={.status=BIT(IPS_OFFLOAD_BIT)};
+  struct flow_offload flow={.ct=&ct,.flags=BIT(NF_FLOW_HW)|(bidir?BIT(NF_FLOW_HW_BIDIRECTIONAL):0)};
+  route_init(&flow);
+  for(unsigned dir=0;dir<2;dir++){
+   flow.tuplehash[dir].tuple.out.route_dst=&ppp_route;
+   flow.tuplehash[dir].tuple.out.ppp_cookie=valid||!dir?2:3;
+  }
+  struct flow_offload_work work={&flow,&ft};
+  replies[0]=replies[1]=0;dev_holds=dev_puts=0;
+  memset(add_calls,0,sizeof(add_calls));memset(installed,0,sizeof(installed));
+  flow_offload_work_add(&work);
+  assert(test_bit(IPS_HW_OFFLOAD_BIT,&ct.status)==!!valid);
+  assert(test_bit(IPS_OFFLOAD_BIT,&ct.status));
+  assert(add_calls[0]==(int)valid && add_calls[1]==(int)(valid&&bidir));
+  assert(dev_holds==(valid?2U:1U)*(1U+bidir) && dev_holds==dev_puts);
+  assert(ppp.references==1 && !rcu_depth);
+  flow_offload_work_del(&work);
+ }
  /* Allocation failure must not fabricate the hardware marker or remove SW. */
  struct nf_conn ct={.status=BIT(IPS_OFFLOAD_BIT)};struct flow_offload flow={.ct=&ct};
+ route_init(&flow);
  struct flow_offload_work work={&flow,&ft};allocation_error=-ENOMEM;destroyed=0;
  flow_offload_work_add(&work);
  assert(ct.status==BIT(IPS_OFFLOAD_BIT) && !destroyed);
@@ -185,7 +251,7 @@ int main(void){
  clear_bit(NF_FLOW_CLOSING,&flow.flags);ft.hardware=false;now+=HZ+1;
  flow_offload_refresh(&ft,&flow,false);assert(add_calls[0]==4&&add_calls[1]==4);
  flow_offload_work_del(&work);assert(!test_bit(IPS_HW_OFFLOAD_BIT,&ct.status));
- puts("Kernel offload semantics: partial directions, SW fallback, ENOENT stale marker, vetoed refresh and post-arm active-flow recovery passed.");
+ puts("Kernel offload semantics: partial directions, real PPP prepare/release, rejected-path marker/refcounts, SW fallback, ENOENT stale marker, vetoed refresh and post-arm active-flow recovery passed.");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='flowtable-directions-') as directory:
@@ -194,4 +260,12 @@ with tempfile.TemporaryDirectory(prefix='flowtable-directions-') as directory:
     c_file.write_text(code)
     subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                     '-fsanitize=address,undefined', str(c_file), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    print(result.stdout, end='')
+    if args.before_ppp_count:
+        assert result.returncode and 'test_bit(IPS_HW_OFFLOAD_BIT,&ct.status)==!!valid' in result.stderr, result.stderr
+        print('Negative control reproduced: rejected PPP preparation incorrectly sets the HW marker when errno is accumulated as a callback count.')
+    else:
+        if result.returncode:
+            print(result.stderr, end='')
+        result.check_returncode()

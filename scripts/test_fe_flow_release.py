@@ -49,7 +49,10 @@ static void init_list(struct list_head *h){h->next=h->prev=h;}
 static void list_add_tail(struct list_head *n,struct list_head *h){n->prev=h->prev;n->next=h;h->prev->next=n;h->prev=n;}
 #define list_for_each_entry_safe(p,n,h,m) for(struct list_head *cursor=(h)->next,*next_cursor=cursor->next;cursor!=(h) && ((p)=container_of(cursor,__typeof__(*(p)),m));cursor=next_cursor,next_cursor=cursor->next)
 static void list_del(struct list_head *n){n->prev->next=n->next;n->next->prev=n->prev;}
+static void list_move_tail(struct list_head *n,struct list_head *h){list_del(n);list_add_tail(n,h);}
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
+#define list_first_entry(h,t,m) container_of((h)->next,t,m)
+#define min(a,b) ((a)<(b)?(a):(b))
 #define list_for_each_entry(p,h,m) for(struct list_head *cursor=(h)->next;cursor!=(h) && ((p)=container_of(cursor,__typeof__(*(p)),m));cursor=cursor->next)
 static void __clear_bit(unsigned int bit,unsigned long *words){words[bit/64]&=~(1UL<<(bit%64));}
 static void set_bit(unsigned int bit,unsigned long *words){words[bit/64]|=1UL<<(bit%64);}
@@ -82,12 +85,14 @@ struct rtl_fe {
  bool fail_CAM,fail_IF,fail_age,fail_age_write,fail_cache;
  unsigned int oracle_hash_index,age_withdraw_barriers;
  struct delayed_work cleanup_work;
+ unsigned int cleanup_delay;
  bool shutting_down;
  int lock;
 };
 #define system_wq 0
 #define HZ 100
-static void mod_delayed_work(int queue,struct delayed_work *work,unsigned int delay){assert(queue==0 && delay==HZ);work->queued++;}
+static void mod_delayed_work(int queue,struct delayed_work *work,unsigned int delay){assert(queue==0 && delay>=HZ && delay<=32U*HZ);work->queued++;}
+#define queue_delayed_work mod_delayed_work
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
 static unsigned int fe_read(void *context,unsigned int reg){return ((struct rtl_fe *)context)->registers[reg/4];}

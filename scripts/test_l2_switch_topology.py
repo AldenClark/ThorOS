@@ -98,6 +98,9 @@ static bool netif_running(const struct net_device *dev){return dev->running;}
 static bool netif_carrier_ok(const struct net_device *dev){return dev->carrier;}
 static struct net_device *netdev_master_upper_dev_get(struct net_device *dev){return dev->master;}
 static bool netif_is_bridge_master(const struct net_device *dev){return dev->bridge;}
+struct net {int unused;};static struct net init_net;
+static bool ppp_policy;static unsigned int ppp_policy_reads;
+static bool rtl9617c_switch_net_has_ppp_policy(struct net *net){assert(net==&init_net);ppp_policy_reads++;return ppp_policy;}
 static bool rtl9617c_switch_device_has_policy(struct net_device *dev){dev->policy_reads++;return dev->policy;}
 static bool br_vlan_enabled(struct net_device *dev){return dev->vlan;}
 static bool br_rtl9617c_l2_eligible(struct net_device *dev){dev->master_reads++;return dev->master_eligible;}
@@ -127,7 +130,7 @@ static void netdev_init(struct net_device *dev){
 }
 static void setup(u32 running,u32 carrier){
  memset(&fe,0,sizeof(fe));memset(&sw,0,sizeof(sw));init_list(&fe.ports);fe.enabled=true;
- sw.fe=&fe;sw.local_target=25;netdev_init(&foreign);
+ sw.fe=&fe;sw.local_target=25;netdev_init(&foreign);ppp_policy=false;ppp_policy_reads=0;
  for(unsigned int i=0;i<2;i++){netdev_init(&master[i]);master[i].bridge=true;}
  for(unsigned int i=0;i<5;i++){
   netdev_init(&lan[i]);lan[i].index=i;lan[i].master=&master[0];
@@ -138,7 +141,9 @@ static void setup(u32 running,u32 carrier){
  }
 }
 static void expect(enum fe_switch_reason reason,u32 active,u32 route){
- assert(fe_switch_snapshot(&sw,&plan)==reason);assert(plan.ports==active);assert(sw.route_mask==route);cases++;
+ unsigned int reads=ppp_policy_reads;
+ assert(fe_switch_snapshot(&sw,&plan)==reason);assert(plan.ports==active);assert(sw.route_mask==route);
+ assert(ppp_policy_reads==reads+1);cases++;
 }
 static void online_matrix(void){
  for(u32 running=0;running<32;running++)for(u32 carrier=0;carrier<32;carrier++){
@@ -164,6 +169,10 @@ static void topology_and_policy(void){
  setup(31,3);lan[1].bridge_flags|=BIT(16);expect(FE_SWITCH_PORT_POLICY,3,3);
  setup(31,3);lan[1].port_eligible=false;expect(FE_SWITCH_PRIVATE_POLICY,3,3);
  setup(31,1);lan[4].policy=true;expect(FE_SWITCH_GUARDED,1,1);
+ /* PPP has channels, not a netdev lower/upper edge. A namespace policy
+  * check is required once per snapshot even with no modeled adjacency. */
+ setup(31,31);ppp_policy=true;expect(FE_SWITCH_GUARDED,31,31);
+ ppp_policy=false;expect(FE_SWITCH_OK,31,31);
  /* An offline member still identifies a different bridge. Its policies,
   * and policies of the earlier master, must both be inspected. */
  setup(31,1);remove_item(&links[4].list);append(&links[4].list,&master[1].lowers);lan[4].master=&master[1];
@@ -186,7 +195,10 @@ static void topology_and_policy(void){
  setup(31,31);owners[4].retired=true;expect(FE_SWITCH_MIXED_PORTS,15,15);assert(!sw.ports[4]);
  remove_item(&links[4].list);expect(FE_SWITCH_OK,15,15);
  setup(31,31);owners[4].destination=24;remove_item(&links[4].list);expect(FE_SWITCH_OK,15,15);assert(!sw.ports[4]);
- setup(31,31);owners[4].source=7;owners[4].netdev=NULL;remove_item(&links[4].list);expect(FE_SWITCH_OK,15,15);
+ setup(31,31);owners[4].source=7;owners[4].netdev=&foreign;remove_item(&links[4].list);expect(FE_SWITCH_OK,15,15);
+ /* A registered PON owner is a real device, not a NULL placeholder. Its
+  * explicit software policy also forbids routed physical redirection. */
+ foreign.policy=true;expect(FE_SWITCH_GUARDED,15,15);
  setup(31,31);owners[4].retired=true;owners[4].netdev=NULL;remove_item(&links[4].list);expect(FE_SWITCH_OK,15,15);
  /* Routed ports need no bridge. A non-bridge upper is not a bridge. */
  setup(31,1);for(unsigned int i=0;i<5;i++)lan[i].master=NULL;
@@ -221,7 +233,8 @@ int main(void){online_matrix();topology_and_policy();replay_mask();
 declarations = re.search(r"enum fe_switch_reason \{.*?\n\};", source, re.S).group()
 declarations += "\n" + re.search(r"struct fe_switch_plan \{.*?\n\};", source, re.S).group()
 production = "\n".join(function(name) for name in (
-    "fe_switch_port_index", "fe_switch_plan_validate", "fe_switch_snapshot", "fe_switch_replay_fdb"))
+    "fe_switch_port_index", "fe_switch_route_plan_validate", "fe_switch_plan_validate",
+    "fe_switch_snapshot", "fe_switch_replay_fdb"))
 environment = os.environ.copy()
 environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
 with tempfile.TemporaryDirectory(prefix="l2-topology-") as directory:

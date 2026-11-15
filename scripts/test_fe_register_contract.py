@@ -40,6 +40,7 @@ CONFIGS = [
     "L3FE_FE_L3E_HS_CACHE_HASH_DATA1", "L3FE_AXIM2_CONFIG",
     "L2FE_L2E_FDB_DATA0", "L2FE_L2E_FDB_DATA1", "L2FE_L2E_FDB_DATA2",
     "L2FE_L2E_FDB_DATA3",
+    "L3FE_FE_L3E_HS_PROFILE0_INI", "L3FE_FE_L3E_HS_PROFILE0_TUPLE0",
 ]
 
 
@@ -75,6 +76,11 @@ static int command(void *context,unsigned int reg,unsigned int value)
 TEST = r'''
 int main(void)
 {
+ L3FE_FE_L3E_HS_PROFILE0_INI_t profile={.wrd=native_profile};
+ L3FE_FE_L3E_HS_PROFILE0_TUPLE0_t tuple={.wrd=native_tuple};
+ assert(profile.bf.tpl_num==1 && !profile.bf.default_sel_0e && !profile.bf.default_sel_0a &&
+        !profile.bf.default_sel_1e && !profile.bf.default_sel_1a);
+ assert(tuple.bf.maskptr==63 && !tuple.bf.pri && !tuple.bf.type);
  struct model m={0};
  struct rtl_dq_io io={&m,read_reg,write_reg,command};
  check_windows(&m,&io);
@@ -158,6 +164,12 @@ def main():
         raise SystemExit("Generated header SHA256 does not match the pinned silicon reference")
     header = data.decode()
     source = COMMON + "\n".join(declaration(header, name) for name in [*WINDOWS, *CONFIGS])
+    native = (DRIVER / 'rtl9617c-fe.c').read_text()
+    # Execute the literal register values emitted by fe_prepare against the
+    # independent SDK bitfield layout, not another hand-written tuple model.
+    for name, register in [('profile', '0x3700'), ('tuple', '0x3704')]:
+        value = re.search(r'fe_write\(fe,' + register + r',([0-9]+)\);', native).group(1)
+        source += f'\nstatic const unsigned int native_{name}={value};\n'
     source += "\nstatic void check_windows(struct model *m,struct rtl_dq_io *io) {\n"
     for name, field in WINDOWS.items():
         source += f"""

@@ -39,6 +39,7 @@ struct spinlock {pthread_mutex_t mutex;bool rx;};
 struct napi_struct {int unused;};
 struct rtl_qm_rx {bool stopped;};
 struct rtl_xram {bool qm_rx,dma_tx,rx_active,host_active;struct spinlock rx_lock,tx_lock;
+ unsigned long long tm_owner_generation;
  struct napi_struct napi;struct rtl_qm_rx qm;int timer,rx_irq,dma,fe,netdev;unsigned int mask;};
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t event=PTHREAD_COND_INITIALIZER;

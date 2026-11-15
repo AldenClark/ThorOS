@@ -52,6 +52,7 @@ python3 scripts/test_omci_compatibility.py
 python3 scripts/test_itu_pppoe_datapath.py
 python3 scripts/test_bridge_learning.py
 python3 scripts/test_fe_evto.py
+python3 scripts/test_fe_evto_dependencies.py
 python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_qm_rx_bounds.py
 python3 scripts/test_qm_switch_rx.py
@@ -63,7 +64,10 @@ python3 scripts/test_rx_checksum_policy.py
 python3 scripts/test_rx_shutdown.py
 python3 scripts/test_fe_interface_capacity.py
 python3 scripts/test_fe_flow_release.py
+python3 scripts/test_fe_flow_stats.py
+python3 scripts/test_fe_cleanup_isolation.py
 python3 scripts/test_release_uboot_archive.py
 python3 scripts/test_datapath_observer.py
 python3 scripts/test_datapath_summary.py
+python3 scripts/test_tm_summary.py
 python3 scripts/test_firmware_build_info.py

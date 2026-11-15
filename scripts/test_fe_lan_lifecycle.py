@@ -75,7 +75,7 @@ struct rtl_fe {
  unsigned int pp_rejected_register,pp_rejected_value;
  unsigned int base_rejected_register,base_rejected_value;
  unsigned int commands,fail_command,base_writes;
- int switch_error;
+ int switch_error;bool switch_recovery;
  unsigned int expected_lan[5];
 };
 static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;assert(reg<0x10000);return f->reg[reg/4];}
@@ -150,6 +150,7 @@ static __attribute__((unused)) int fe_switch_quiesce_locked(struct rtl_fe *f){
 static __attribute__((unused)) void fe_switch_reconcile_locked(struct rtl_fe *f){
  assert(f->lock.held);f->switch_reconciles++;
 }
+static __attribute__((unused)) bool fe_switch_needs_recovery(struct rtl_fe *f){assert(f->lock.held);return f->switch_recovery;}
 static void fe_collect_ports(struct rtl_fe *f){(void)f;}
 static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){
  assert(!f->enabled && f->flows.first==p);
@@ -256,7 +257,10 @@ int main(void) {
  assert((fe_read(&f,0x3948)&1U) && (fe_read(&f,0x3c80)&255U)==255U);
  assert((fe_read(&f,0x3940)&0xffff)==0xd0d0);
  assert(!(f.mask[6]&BIT(25)));
- for(unsigned int i=0;i<3;i++)assert(!(f.bridge_mask[i][6]&BIT(25)));
+ /* Only the routed template is active. Native L2 owns FDB, so the old
+  * empty MAC-only templates must not consume forwarding lookups. */
+ assert(fe_read(&f,0x3700)==1 && fe_read(&f,0x3704)==63);
+ assert(!memcmp(f.bridge_mask,cold.bridge_mask,sizeof(f.bridge_mask)));
  assert(fe_read(&f,0x30a4)==0x8001b000U);
  assert(f.ppp_protocol_ids[0]==1 && f.ppp_protocol_ids[1]==2);
  assert(f.cam[2][0][0]==0x18864 && f.cam[8][0][0]==0x10021 && f.cam[8][1][0]==0x10057);
@@ -272,12 +276,22 @@ int main(void) {
  /* Successful OFF is policy OFF, not a handoff to arbitrary boot profiles.
   * Ten complete CPU/HW/OFF transitions keep every exposed base table. */
  for(unsigned int cycle=0;cycle<10;cycle++){
+  unsigned int reconciles=f.switch_reconciles,writes=f.register_writes,commands=f.commands;
   assert(!rtl_fe_enable(&f) && f.enabled);
+  if(cycle==0)assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(fe_route_arm(&f) && f.route_admitted);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
+  assert(!rtl_fe_enable(&f) && f.route_admitted);
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_disable(&f) && !f.enabled && !f.cpu_path);
   assert(f.desired_mode==RTL_FE_MODE_OFF);check_base_retained(&f,&base);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
+  assert(!rtl_fe_disable(&f));
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_cpu_path(&f) && f.cpu_path);check_base_retained(&f,&base);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
   assert(!rtl_fe_cpu_path(&f));check_base_retained(&f,&base);
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_enable(&f) && f.enabled && !f.cpu_path);
   struct rtl_fe_flow second={},first={.next=&second};f.flows.first=&first;
   unsigned int deleted=f.deletes;
@@ -285,6 +299,24 @@ int main(void) {
   check_base_retained(&f,&base);
  }
  assert(!f.admission_writes);
+ /* Same-mode writes are a no-op only while healthy. A worker which failed
+  * an IO/withdrawal may no longer be queued: explicitly request recovery
+  * without pretending that merely queueing it has reopened admission. */
+ for(unsigned int mode=0;mode<=RTL_FE_MODE_HARDWARE;mode++) {
+  f=base;
+  int (*select)(struct rtl_fe*)=mode==RTL_FE_MODE_HARDWARE?rtl_fe_enable:
+   mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path:rtl_fe_disable;
+  assert(!select(&f));
+  f.switch_recovery=true;
+  unsigned int reconciles=f.switch_reconciles;
+  fe_route_gate(&f);
+  assert(!select(&f) && f.switch_reconciles==reconciles+1 && !f.route_admitted);
+  f.switch_recovery=false;reconciles=f.switch_reconciles;
+  assert(!select(&f) && f.switch_reconciles==reconciles);
+  /* A previous front-end error must likewise retain the explicit retry. */
+  f.error=-ETIMEDOUT;
+  assert(!select(&f) && !f.error && f.switch_reconciles==reconciles+1);
+ }
  /* A failed route withdrawal stays gated and retryable. It does NOT justify
   * restoring the base or claiming the requested CPU mode was completed. */
  assert(!rtl_fe_enable(&f));

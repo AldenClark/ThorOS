@@ -57,7 +57,7 @@ struct fe_switch_plan {
  * trapped, so Linux retains its MDB, router-port and per-packet decisions.
  */
 static enum fe_switch_reason
-fe_switch_plan_validate(const struct fe_switch_plan *plan)
+fe_switch_route_plan_validate(const struct fe_switch_plan *plan)
 {
 	const unsigned long allowed = BR_BPDU_GUARD | BR_ROOT_BLOCK |
 		BR_MULTICAST_FAST_LEAVE | BR_ADMIN_COST | BR_LEARNING | BR_FLOOD |
@@ -69,12 +69,6 @@ fe_switch_plan_validate(const struct fe_switch_plan *plan)
 		return FE_SWITCH_PORT_POLICY;
 	if (plan->software_policy)
 		return FE_SWITCH_GUARDED;
-	if (plan->multi_bridge)
-		return FE_SWITCH_MULTI_BRIDGE;
-	if (plan->mixed)
-		return FE_SWITCH_MIXED_PORTS;
-	if (plan->vlan_filtering)
-		return FE_SWITCH_VLAN_UNSUPPORTED;
 	if (plan->private_policy)
 		return FE_SWITCH_PRIVATE_POLICY;
 	if (plan->promisc)
@@ -87,6 +81,25 @@ fe_switch_plan_validate(const struct fe_switch_plan *plan)
 		    plan->state[port] != BR_STATE_FORWARDING)
 			return FE_SWITCH_PORT_POLICY;
 	}
+	return FE_SWITCH_OK;
+}
+
+static enum fe_switch_reason
+fe_switch_plan_validate(const struct fe_switch_plan *plan)
+{
+	enum fe_switch_reason reason = fe_switch_route_plan_validate(plan);
+
+	if (reason != FE_SWITCH_OK)
+		return reason;
+	/* These limit native autonomous switching, not an exact routed flow
+	 * already authorized by nft and its bridge/VLAN forwarding-path cookie.
+	 * All actual software/port policy vetoes above remain fail closed. */
+	if (plan->multi_bridge)
+		return FE_SWITCH_MULTI_BRIDGE;
+	if (plan->mixed)
+		return FE_SWITCH_MIXED_PORTS;
+	if (plan->vlan_filtering)
+		return FE_SWITCH_VLAN_UNSUPPORTED;
 	return hweight32(plan->ports) >= 2 ? FE_SWITCH_OK : FE_SWITCH_NO_BRIDGE;
 }
 
@@ -107,6 +120,9 @@ struct rtl_fe_bridge {
 	 * Atomic callbacks only compare them, never dereference a cached device.
 	 */
 	struct net_device *ports[FE_LAN_PORTS], *master;
+	/* Stable physical owner identities, including PON/EPON outputs 32..63.
+	 * Updated at add/remove under FE mutex, never cleared by a snapshot. */
+	struct net_device *owned_devices[64];
 	u32 offloaded, native_mask, route_mask, armed_route_mask;
 	/* Synchronous switchdev replay belongs to the pending topology, not
 	 * the published datapath. native_mask stays zero until preparation and
@@ -133,6 +149,31 @@ static void fe_switch_queue(struct rtl_fe_bridge *sw)
 		queue_work(system_long_wq, &sw->work);
 }
 
+static bool fe_switch_needs_recovery(struct rtl_fe *fe)
+{
+	const struct rtl_fe_bridge *sw = fe->bridge;
+
+	/* A repeated mode write may retry a failed transaction. Ordinary
+	 * capability/policy fallback is not an error requiring a global flush. */
+	return sw && sw->error && sw->reason != FE_SWITCH_HW_UNSUPPORTED &&
+	       sw->reason != FE_SWITCH_FOREIGN_FDB;
+}
+
+static void fe_switch_track_port_locked(struct rtl_fe *fe,
+					struct net_device *dev,
+					unsigned int destination, bool adding)
+{
+	struct rtl_fe_bridge *sw = fe->bridge;
+
+	if (!sw || destination >= ARRAY_SIZE(sw->owned_devices))
+		return;
+	if (adding)
+		WRITE_ONCE(sw->owned_devices[destination], dev);
+	else if (READ_ONCE(sw->owned_devices[destination]) == dev)
+		WRITE_ONCE(sw->owned_devices[destination], NULL);
+	rtl9617c_switch_guard_invalidate(&sw->guard);
+}
+
 static void fe_switch_gate(void *private)
 {
 	struct rtl_fe_bridge *sw = private;
@@ -146,6 +187,22 @@ static void fe_switch_gate(void *private)
 static void fe_switch_rebuild(void *private)
 {
 	fe_switch_queue(private);
+}
+
+/* Only compare identities here: the core holds its gate lock and RCU, not
+ * RTNL or the FE mutex. It also walks the caller's lower-device graph, so a
+ * bridge/VLAN upper is related without retaining borrowed upper refs.
+ * PPP channels are covered by the core's conservative namespace policy.
+ * A new port starts gated and is snapshotted before it can be admitted. */
+static bool fe_switch_owns_device(void *private, const struct net_device *dev)
+{
+	struct rtl_fe_bridge *sw = private;
+	unsigned int port;
+
+	for (port = 0; port < ARRAY_SIZE(sw->owned_devices); port++)
+		if (READ_ONCE(sw->owned_devices[port]) == dev)
+			return true;
+	return false;
 }
 
 static bool fe_switch_arm(void *private)
@@ -169,6 +226,7 @@ static const struct rtl9617c_switch_guard_ops fe_switch_guard_ops = {
 	.quiesce = fe_switch_gate,
 	.rebuild = fe_switch_rebuild,
 	.arm = fe_switch_arm,
+	.owns_device = fe_switch_owns_device,
 };
 
 static int fe_switch_port_index(struct rtl_fe_bridge *sw,
@@ -378,10 +436,15 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 	bool online;
 
 	memset(plan, 0, sizeof(*plan));
+	plan->software_policy = rtl9617c_switch_net_has_ppp_policy(&init_net);
 	memset(sw->ports, 0, sizeof(sw->ports));
 	sw->master = NULL;
 	sw->route_mask = 0;
 	list_for_each_entry(port, &sw->fe->ports, list) {
+		if (!port->retired &&
+		    port->netdev->reg_state == NETREG_REGISTERED &&
+		    rtl9617c_switch_device_has_policy(port->netdev))
+			plan->software_policy = true;
 		if (port->retired || port->source >= FE_LAN_PORTS ||
 		    port->netdev->reg_state != NETREG_REGISTERED ||
 		    port->source != port->destination)
@@ -685,7 +748,7 @@ static void fe_switch_work(struct work_struct *work)
 	 * native switching is not requested. Do not resurrect old L3 rules past
 	 * that policy merely because native-L2 eligibility failed.
 	 */
-	if (sw->reason != FE_SWITCH_OK && sw->reason != FE_SWITCH_NO_BRIDGE) {
+	if (fe_switch_route_plan_validate(&plan) != FE_SWITCH_OK) {
 		sw->route_mask = 0;
 		goto unlock;
 	}
@@ -812,8 +875,17 @@ failure:
 	rtl9617c_switch_guard_quiesce(&sw->guard);
 	ret = fe_switch_restore_locked(sw);
 	if (!ret && (sw->reason == FE_SWITCH_FOREIGN_FDB ||
-		     sw->reason == FE_SWITCH_HW_UNSUPPORTED))
-		rtl9617c_switch_guard_try_arm(&sw->guard, generation);
+		     sw->reason == FE_SWITCH_HW_UNSUPPORTED) &&
+	    !rtl9617c_switch_guard_try_arm(&sw->guard, generation)) {
+		/* A supported route-only fallback is not a successful fallback
+		 * until its gate actually arms. The same false return can mean a
+		 * newer policy epoch or an MMIO failure; keep it retryable instead
+		 * of leaving a permanent capability/conflict diagnosis which a
+		 * repeated mode write would correctly otherwise treat as a noop.
+		 */
+		ret = sw->error = -EAGAIN;
+		sw->reason = FE_SWITCH_GUARDED;
+	}
 	if (!ret && sw->reason == FE_SWITCH_FOREIGN_FDB && sw->retry_count < 8) {
 		unsigned int delay = min(60U, 5U << min(sw->retry_count, 4U));
 
@@ -1087,6 +1159,12 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
  */
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe) { return NULL; }
 static int fe_bridge_stop(struct rtl_fe_bridge *sw) { return 0; }
+static bool fe_switch_needs_recovery(struct rtl_fe *fe)
+{
+	return fe->enabled && !READ_ONCE(fe->route_admitted);
+}
+static void fe_switch_track_port_locked(struct rtl_fe *fe,
+	struct net_device *dev, unsigned int destination, bool adding) { }
 static int fe_switch_quiesce_locked(struct rtl_fe *fe)
 {
 	unsigned int port, value;

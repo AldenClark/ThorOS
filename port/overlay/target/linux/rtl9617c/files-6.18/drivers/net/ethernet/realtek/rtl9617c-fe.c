@@ -45,6 +45,9 @@ static void fe_switch_reconcile_locked(struct rtl_fe *fe);
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested);
 static bool fe_switch_requested(struct rtl_fe *fe);
 static bool fe_switch_flow_allowed(struct rtl_fe *fe);
+static bool fe_switch_needs_recovery(struct rtl_fe *fe);
+static void fe_switch_track_port_locked(struct rtl_fe *fe, struct net_device *dev,
+                                       unsigned int destination, bool adding);
 
 #define FE_INTERFACES 32
 #define FE_COUNTERS 32
@@ -136,6 +139,7 @@ struct rtl_fe {
  /* Atomic policy publication cannot wait for the sleeping table owner. */
  spinlock_t route_lock;
  struct delayed_work cleanup_work;
+ unsigned int cleanup_delay;
  struct list_head ports, flows, blocks, retries;
  struct rb_root cookies;
  void *memory;
@@ -157,7 +161,6 @@ struct rtl_fe {
  u64 installs, deletes, misses;
  struct rtl_fe_observe observe;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
- unsigned int bridge_mask_saved[3][8];
  struct rtl_fe_cam_protocol protocol_cam[3];
  unsigned char ppp_protocol_ids[2];
  unsigned int lan_saved[FE_LAN_PORTS];
@@ -368,10 +371,6 @@ static int fe_prepare(struct rtl_fe *fe)
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
  ret=rtl_fe_mask_read(&io,63,fe->mask_saved);
  if(ret)return ret;
- for(i=0;i<3;i++) {
-  ret=rtl_fe_mask_read(&io,61-2*i,fe->bridge_mask_saved[i]);
-  if(ret)return ret;
- }
  /* SDK defaults are standard TWO-row FIBs, with four result types per
   * profile. The second row contains fib_format_sel: stale data there can
   * reinterpret an otherwise correct first row. Save every owned row. */
@@ -412,18 +411,6 @@ static int fe_prepare(struct rtl_fe *fe)
  mask[3]&=~(BIT(2)|BIT(3));  /* top VID/TPID bits98..99 */
  mask[2]&=~(BIT(25)|BIT(27)); /* PPPoE session/type bits89/91 */
  ret=rtl_fe_mask_write(&io,63,mask);
- if(ret)return ret;
- rtl_fe_bridge_mask(mask);
- ret=rtl_fe_mask_write(&io,61,mask);
- if(ret)return ret;
- rtl_fe_bridge_mask(mask);
- rtl_fe_bits_set(mask,92,2,0); /* Exact learned inner DEI/PCP. */
- rtl_fe_bits_set(mask,96,2,0); /* Exact learned outer DEI/PCP. */
- ret=rtl_fe_mask_write(&io,59,mask);
- if(ret)return ret;
- rtl_fe_bits_set(mask,135,8,255); /* Wired PPPoE data retains no VIF selector. */
- rtl_fe_bits_set(mask,88,1,0); /* Match the CAM protocol encoding; LCP misses. */
- ret=rtl_fe_mask_write(&io,57,mask);
  if(ret)return ret;
  fe_write(fe,0x3500,0x11); /* Session version/type1, code0. */
  fe_write(fe,0x3504,PPP_IP|PPP_IPV6<<16);
@@ -474,10 +461,10 @@ static int fe_prepare(struct rtl_fe *fe)
  for(i=0;i<5;i++)fe_write(fe,0x394c+i*4,0);
  fe_write(fe,0x3724,RTL_FE_ACTION_GROUPS|(3U<<25));
  fe_write(fe,0x3704,63); /* IP/IPv6 five-tuple. */
- fe_write(fe,0x3708,61|BIT(8)); /* Transparent Ethernet. */
- fe_write(fe,0x370c,59|(2U<<8)); /* Learned bridge with explicit VLAN tags. */
- fe_write(fe,0x3710,57|(3U<<8)); /* Wired PPPoE data. */
- fe_write(fe,0x3700,4);
+ /* TC_SETUP_FT produces routed IP rules, including routed PPPoE, under
+  * mask63 only. Native LAN bridging owns the L2 FDB, not the retired
+  * MAC-only learner's masks61/59/57. Do not search empty legacy tuples. */
+ fe_write(fe,0x3700,1);
  fe_write(fe,0x3860,0x020d0000);
  fe_write(fe,0x3278,0x88a88100);
  fe_write(fe,0x327c,0x92009100);
@@ -543,10 +530,6 @@ static int fe_restore(struct rtl_fe *fe)
  }
  ret=rtl_fe_mask_write(&io,63,fe->mask_saved);
  if(ret)return ret;
- for(i=0;i<3;i++) {
-  ret=rtl_fe_mask_write(&io,61-2*i,fe->bridge_mask_saved[i]);
-  if(ret)return ret;
- }
  for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe_write(fe,fe_registers[i],fe->saved[i]);
  fe_read(fe,0x383c);
  fe->base_ready=false;
@@ -613,27 +596,23 @@ static int fe_interface_transfer(struct rtl_fe *fe,unsigned int index,
  if(!ret && !write)*value=fe_read(fe,0x3004);
  return ret;
 }
-/* L3 output interfaces select a source MAC; they are not flow-table slots.
- * All32 rows have independent MIBs.
- * Counted flows own one interface MIB. Further flows share its MAC selection
- * with their action counter bit clear, so they cannot pollute that flow MIB. */
+/* Forwarding recipes, not accounting, own the scarce32 EIF rows. Reuse a
+ * ready source-MAC/PPPoE recipe BEFORE consuming a new row; otherwise32
+ * identical counted flows can starve a perfectly valid second recipe.
+ * Only one flow per recipe enables its MIB. Other users keep counter_en=0
+ * and use their own hash age, never shared bytes, for lastused. */
 static int fe_interface_get(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 {
  struct rtl_fe_interface *interface;
- unsigned int index=find_first_zero_bit(fe->counters,FE_INTERFACES),i;
+ unsigned int index=FE_INTERFACES,i;
  int ret;
 
- if(index==FE_INTERFACES) {
-  for(i=0;i<FE_INTERFACES;i++)
-   if(fe->interfaces[i].users && fe->interfaces[i].ready &&
-      fe->interfaces[i].source_mac==flow->source_mac &&
-      fe->interfaces[i].pppoe==flow->pppoe &&
-      (!fe->interfaces[i].counted || index==FE_INTERFACES)) {
-    index=i;
-    if(!fe->interfaces[i].counted)break;
-   }
-  if(index==FE_INTERFACES)return -ENOSPC;
- }
+ for(i=0;i<FE_INTERFACES;i++)
+  if(fe->interfaces[i].users && fe->interfaces[i].ready &&
+     fe->interfaces[i].source_mac==flow->source_mac &&
+     fe->interfaces[i].pppoe==flow->pppoe) {index=i;break;}
+ if(index==FE_INTERFACES)index=find_first_zero_bit(fe->counters,FE_INTERFACES);
+ if(index==FE_INTERFACES)return -ENOSPC;
  interface=&fe->interfaces[index];
  if(!interface->users) {
   ret=fe_interface_transfer(fe,index,&interface->saved,false);
@@ -664,6 +643,7 @@ static int fe_interface_put(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 
  if(flow->counter>=FE_INTERFACES)return -ERANGE;
  interface=&fe->interfaces[flow->counter];
+ if(!interface->users)return -EINVAL;
  if(interface->users==1) {
   interface->ready=false;
   ret=fe_interface_transfer(fe,flow->counter,&interface->saved,true);
@@ -1219,18 +1199,36 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 retry:
  /* Keep the cookie reserved until every hardware owner is released. */
  if(list_empty(&flow->retry))list_add_tail(&flow->retry,&fe->retries);
- if(!fe->shutting_down)mod_delayed_work(system_wq,&fe->cleanup_work,HZ);
+ /* Repeated failed callbacks must not postpone an already queued retry. */
+ if(!fe->shutting_down)queue_delayed_work(system_wq,&fe->cleanup_work,
+  fe->cleanup_delay?fe->cleanup_delay:HZ);
  return ret;
 }
 static void fe_cleanup_work(struct work_struct *work)
 {
  struct rtl_fe *fe=container_of(to_delayed_work(work),struct rtl_fe,cleanup_work);
- struct rtl_fe_flow *flow,*next;
+ struct rtl_fe_flow *flow;
+ unsigned int budget=8;
+ int ret;
 
  mutex_lock(&fe->lock);
  if(fe->shutting_down)goto unlock;
- list_for_each_entry_safe(flow,next,&fe->retries,retry)
-  fe_delete(fe,flow);
+ /* A timed-out owner reserves its own resources, not every future flow
+  * callback. Limit the lock-held batch; rotate a failed owner so another
+  * release gets a turn. Never recycle its hash/EIF/CAM before withdrawal. */
+ while(budget-- && !list_empty(&fe->retries)) {
+  flow=list_first_entry(&fe->retries,struct rtl_fe_flow,retry);
+  ret=fe_delete(fe,flow);
+  if(ret) {
+   list_move_tail(&flow->retry,&fe->retries);
+   fe->cleanup_delay=fe->cleanup_delay?min(fe->cleanup_delay*2,32U*HZ):HZ;
+   break;
+  }
+  fe->cleanup_delay=HZ;
+ }
+ if(!list_empty(&fe->retries))
+  mod_delayed_work(system_wq,&fe->cleanup_work,fe->cleanup_delay?fe->cleanup_delay:HZ);
+ else fe->cleanup_delay=0;
  fe_collect_ports(fe);
 unlock:
  mutex_unlock(&fe->lock);
@@ -1263,6 +1261,8 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  int ret;
 
  if(port->retired || fe->shutting_down)return -ENODEV;
+ /* No producer owns the old bridge hash templates. Native L2 uses FDB. */
+ if(data.bridge)return -EOPNOTSUPP;
  if(!fe->engine_ready || !fe->enabled || !fe_switch_flow_allowed(fe) ||
     !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
@@ -1365,9 +1365,19 @@ static int fe_replace(struct rtl_fe_port *port,struct flow_cls_offload *cls)
 {
  struct rtl_fe_rule data={};
  struct rtl_fe_observe *observe=&port->fe->observe;
+ struct rtl_fe_flow *existing;
  int ret;
 
  observe->replace_requests++;
+ /* A refresh carries the same immutable tuple cookie. Configuration
+  * transactions retire existing owners before permitting new admission.
+  * Do this lookup before EVTO equivalence enumeration or table MMIO. */
+ existing=fe_flow(port->fe,cls->cookie);
+ if(existing) {
+  ret=existing->deleting?-EBUSY:-EEXIST;
+  rtl_fe_observe_install(observe,ret);
+  return ret;
+ }
  ret=fe_parse(port,cls,&data);
  if(ret) {
   rtl_fe_observe_parse(observe,data.reject_reason);
@@ -1415,19 +1425,20 @@ static int fe_block_callback(enum tc_setup_type type,void *data,void *private)
  struct rtl_fe_port *port=private;
  struct rtl_fe *fe=port->fe;
  struct flow_cls_offload *cls=data;
- struct rtl_fe_flow *flow,*next;
+ struct rtl_fe_flow *flow;
  int ret;
 
  if(type!=TC_SETUP_CLSFLOWER || cls->common.chain_index)return -EOPNOTSUPP;
  mutex_lock(&fe->lock);
  if(fe->shutting_down){ret=-ENODEV;goto unlock;}
- list_for_each_entry_safe(flow,next,&fe->retries,retry) {
-  ret=fe_delete(fe,flow);
-  if(ret)goto unlock;
- }
  flow=fe_flow(fe,cls->cookie);
  switch(cls->command) {
  case FLOW_CLS_REPLACE:
+  /* PPP may replace its channel without a FIB or ifindex change. Check
+   * the captured path under the same mutex as install and gate rearm. A
+   * concurrent later mutation closes ingress before channel publication;
+   * the rearm worker cannot flush/reopen until this callback releases it. */
+  if(!flow_cls_offload_ppp_valid(cls)){ret=-EAGAIN;break;}
   ret=port->retired?-ENODEV:fe_replace(port,cls);
   break;
  case FLOW_CLS_DESTROY:
@@ -1435,7 +1446,7 @@ static int fe_block_callback(enum tc_setup_type type,void *data,void *private)
   break;
  case FLOW_CLS_STATS:
   ret=port->retired?-ENODEV:
-      flow && flow->input==port?fe_stats(fe,flow,cls):-ENOENT;
+      flow && flow->input==port && !flow->deleting?fe_stats(fe,flow,cls):-ENOENT;
   break;
  default:ret=-EOPNOTSUPP;
  }
@@ -1750,6 +1761,7 @@ int rtl_fe_add_port(struct rtl_fe *fe,struct net_device *netdev,unsigned int sou
  mutex_lock(&fe->lock);
  if(fe->shutting_down){mutex_unlock(&fe->lock);kfree(port);return -ENODEV;}
  list_add_tail(&port->list,&fe->ports);
+ fe_switch_track_port_locked(fe,netdev,destination,true);
  netdev->hw_features|=NETIF_F_HW_TC;
  netdev->features|=NETIF_F_HW_TC;
  fe_switch_reconcile_locked(fe);
@@ -1813,6 +1825,7 @@ void rtl_fe_remove_port(struct rtl_fe *fe,struct net_device *netdev)
  }
  port=fe_port(fe,netdev);
  if(port) {
+  fe_switch_track_port_locked(fe,netdev,port->destination,false);
   port->retired=true;
   if(!fe->shutting_down)list_for_each_entry_safe(flow,next,&fe->flows,list)
    if(flow->input==port || flow->output==port) {
@@ -1928,7 +1941,9 @@ static int fe_base_check_locked(struct rtl_fe *fe)
  for(i=0;i<ARRAY_SIZE(high);i++)
   if(!fe_base_match(fe,high[i],255,address_high) ||
      !fe_base_match(fe,low[i],~127U,lower_32_bits(fe->dma)+offset[i]))return -EIO;
- if(!fe_base_match(fe,0x3848,7,4) || !fe_base_match(fe,0x3854,7,1) ||
+ if(!fe_base_match(fe,0x3700,0x00ffffffU,1) ||
+    !fe_base_match(fe,0x3704,0x173fU,63) ||
+    !fe_base_match(fe,0x3848,7,4) || !fe_base_match(fe,0x3854,7,1) ||
     !fe_base_match(fe,0x38c4,0xfc000000U,0xa0000000U) ||
     !fe_base_match(fe,0x2300,BIT(12)|BIT(13),BIT(12)|BIT(13)) ||
     !fe_base_match(fe,0x2394,0x00ff00ffU,0x000600ffU) ||
@@ -2085,17 +2100,25 @@ static int fe_cpu_path_locked(struct rtl_fe *fe)
 int rtl_fe_enable(struct rtl_fe *fe)
 {
  int ret;
+ bool changed=true;
 
  if(!fe)return -EOPNOTSUPP;
  mutex_lock(&fe->lock);
  if(fe->shutting_down)ret=-ENODEV;
  else if(!fe->engine_ready)ret=-EAGAIN;
+ else if(fe->enabled && fe->desired_mode==RTL_FE_MODE_HARDWARE &&
+         !fe->error && !fe_switch_needs_recovery(fe)) {
+  /* The live fabric worker owns any pending policy reconciliation. An
+   * identical healthy sysfs/config write must not gate all routes again.
+   * A failed worker is different: preserve explicit same-mode recovery. */
+  ret=0;changed=false;
+ }
  else {
   ret=fe_enable_locked(fe);
   if(!ret)fe->desired_mode=RTL_FE_MODE_HARDWARE;
  }
  fe->error=ret;
- fe_switch_reconcile_locked(fe);
+ if(changed)fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -2103,17 +2126,20 @@ int rtl_fe_enable(struct rtl_fe *fe)
 int rtl_fe_cpu_path(struct rtl_fe *fe)
 {
  int ret;
+ bool changed=true;
 
  if(!fe)return -EOPNOTSUPP;
  mutex_lock(&fe->lock);
  if(fe->shutting_down)ret=-ENODEV;
  else if(!fe->engine_ready)ret=-EAGAIN;
+ else if(fe->cpu_path && fe->desired_mode==RTL_FE_MODE_CPU &&
+         !fe->error && !fe_switch_needs_recovery(fe)) {ret=0;changed=false;}
  else {
   ret=fe_cpu_path_locked(fe);
   if(!ret)fe->desired_mode=RTL_FE_MODE_CPU;
  }
  fe->error=ret;
- fe_switch_reconcile_locked(fe);
+ if(changed)fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -2121,13 +2147,18 @@ int rtl_fe_cpu_path(struct rtl_fe *fe)
 int rtl_fe_disable(struct rtl_fe *fe)
 {
  int ret;
+ bool changed=true;
 
  if(!fe)return 0;
  mutex_lock(&fe->lock);
- ret=fe->shutting_down?-ENODEV:fe_disable_locked(fe);
+ if(fe->shutting_down)ret=-ENODEV;
+ else if(fe->desired_mode==RTL_FE_MODE_OFF && !fe->enabled && !fe->cpu_path &&
+         !fe->lan_redirected && !fe->error && !fe_switch_needs_recovery(fe) &&
+         list_empty(&fe->flows)) {ret=0;changed=false;}
+ else ret=fe_disable_locked(fe);
  if(!ret)fe->desired_mode=RTL_FE_MODE_OFF;
  fe->error=ret;
- fe_switch_reconcile_locked(fe);
+ if(changed)fe_switch_reconcile_locked(fe);
  mutex_unlock(&fe->lock);
  return ret;
 }
@@ -2296,6 +2327,7 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  struct rtl_fe_flow *flow;
  unsigned int flows=0,counted=0,bridged=0,learned=0;
  unsigned int lan_cpu=0,lan_route=0,lan_l2=0,i;
+ unsigned int recipes=0,retries=0,lan_pon=0,pon_lan=0,lan_lan=0;
 
  if(!fe)return sysfs_emit(buffer,"available=0\n");
  mutex_lock(&fe->lock);
@@ -2303,7 +2335,14 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   flows++;
   counted+=flow->counted;
   bridged+=flow->bridge;learned+=flow->learned;
+  if(!flow->deleting) {
+   if(flow->input->source<FE_LAN_PORTS && flow->output->source==7)lan_pon++;
+   if(flow->input->source==7 && flow->output->source<FE_LAN_PORTS)pon_lan++;
+   if(flow->input->source<FE_LAN_PORTS && flow->output->source<FE_LAN_PORTS)lan_lan++;
+  }
  }
+ list_for_each_entry(flow,&fe->retries,retry)retries++;
+ for(i=0;i<FE_INTERFACES;i++)if(fe->interfaces[i].users)recipes++;
  if(fe->engine_ready && !fe->shutting_down)for(i=0;i<FE_LAN_PORTS;i++) {
   unsigned int control=fe_read(fe,FE_LAN_RX_CTRL(i));
   if(!(control&BIT(28)))lan_l2|=BIT(i);
@@ -2313,6 +2352,13 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u cpu_path=%u\n",
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
   FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned,fe->cpu_path);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "eif_rows_used=%u eif_recipe_sharing=1 accounting=one_flow_per_recipe retry_flows=%u cleanup_backoff_ms=%u "
+  "lan_pon_rules=%u pon_lan_rules=%u lan_lan_route_rules=%u rule_counts_are_hits=0\n",
+  recipes,retries,jiffies_to_msecs(fe->cleanup_delay),lan_pon,pon_lan,lan_lan);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "route_hash_templates_config=1 wan_arb_pdpid_config=12 sdk_wan_arb_pdpid=10 "
+  "wan_arb_board_contract_verified=0 programming_metadata_is_readback=0\n");
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "engine_ready=%u requested_mode=%u shutting_down=%u\n",
   fe->engine_ready,fe->desired_mode,fe->shutting_down);

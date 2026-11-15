@@ -19,6 +19,7 @@ for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_
             include/aal_fdb.h aal_fdb.c include/aal_mcast.h include/aal_port.h \
             aal_l2_classification.c include/aal_l2_classification.h include/aal_arb.h \
             include/aal_l2_qos.h include/aal_l2_vlan.h \
+            aal_l2_tm.c aal_l2_te.c include/aal_l2_tm.h \
             include/aal_l3_cls.h include/aal_l3fe.h include/aal_l3_specpkt.h \
             include/aal_l2_specpkt.h aal_l2_specpkt.c include/aal_ni_l2.h \
             aal_pon.c aal_gpon.c aal_psds.c aal_epon_mac.c aal_xgpon.c; do
@@ -63,6 +64,8 @@ python3 scripts/test_fabric_sdk_framing.py --sdk-ni "$work/aal_ni_l2.c" \
 python3 scripts/test_l2_evidence.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_ni_mib_evidence.py --sdk-ni "$work/aal_ni_l2.c" \
     --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_tm_evidence.py --registers "$work/rtl8277c_registers.h" \
+    --sdk-root "$work/sdk/$sdk_path"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h" \
     --sdk-qm "$work/sdk/$sdk_path/aal_l3qm.c"
