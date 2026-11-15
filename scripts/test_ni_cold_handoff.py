@@ -20,6 +20,18 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--mutants', action='store_true')
 args = parser.parse_args()
 
+# Follow the actual production image include graph, not only the bring-up DTS.
+# The kernel-object job independently compiles and inspects both resulting DTBs.
+dts_root=root/'port/overlay/target/linux/rtl9617c/dts'
+def production_sources(name,seen=None):
+    seen=set() if seen is None else seen
+    if name in seen:return ''
+    seen.add(name);text=(dts_root/name).read_text()
+    return text+'\n'+''.join(production_sources(child,seen)
+        for child in re.findall(r'^#include "([^"]+)"',text,re.M))
+for name in ('rtl9617c-tyfza1-ubi.dts','rtl9617c-tyfza1-ubi-2p5g.dts'):
+    assert not re.search(r'^\s*realtek,pon-cold-handoff\s*;',production_sources(name),re.M),name
+
 
 def function(text, name):
     match = re.search(r'(?m)^(?:static\s+)?(?:inline\s+)?[\w *]+\b' + name +
@@ -189,7 +201,9 @@ int main(void){
  struct rtl_xram p;unsigned cases=0;
  assert(rtl9617c_ni_cold_handoff(&platform.dev)==-EPROBE_DEFER);cases++;
  /* DT-off boards publish normally; a flagged board remains completely private. */
- init(&p,false);assert(p.provider_ready && registrations==1 && opens==1 && !baselines);done(&p);cases++;
+ init(&p,false);assert(p.provider_ready && registrations==1 && opens==1 && !baselines);
+ baseline_result=-EIO;assert(!rtl9617c_ni_cold_handoff(&platform.dev));
+ assert(!baselines && registrations==1 && opens==1 && !owner.exposed);done(&p);cases++;
  init(&p,true);assert(rtl_engine_get(&p)==-EPROBE_DEFER && !opens);done(&p);cases++;
  for(int status=-2;status<=1;status++){
   init(&p,true);baseline_result=status;int ret=rtl9617c_ni_cold_handoff(&platform.dev);
@@ -272,4 +286,4 @@ with tempfile.TemporaryDirectory(prefix='ni-cold-handoff-') as directory:
         else:
             assert result.returncode!=0 and 'Assertion' in result.stderr,(name,result.stderr)
             print(name+': detected by runtime oracle')
-print('NI/PON production order checked: DT flag gates LAN publication; PON RX handoff precedes IRQ and OAM/OMCI publication')
+print('Production UBI boards have no cold opt-in and publish LAN without PON; experimental opt-in retains fail-closed ordering')

@@ -18,7 +18,7 @@ usage() {
         '  flex bison bc libssl-dev libelf-dev pkg-config python3 perl git curl patch xz-utils' \
         'CROSS_COMPILE may select another ARM64 GCC prefix. This script never installs tools.' \
         'The config merges the production generic/target seeds with kernel-objects.config.' \
-        'Passing proves object compilation, not a final vmlinux link, firmware boot or throughput.'
+        'Passing proves object/production-DTB compilation, not firmware boot or throughput.'
 }
 
 project=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd -P)
@@ -176,6 +176,10 @@ for kind in backport pending hack; do
     apply_directory "$directory"
 done
 apply_directory "$target/patches-$kernel_series"
+# OpenWrt's target DTS directory is outside files-6.18. Build the production
+# include chain, not just leaf .c files, against this same locked source tree.
+mkdir -p "$kernel/arch/arm64/boot/dts/realtek"
+cp -a "$target/dts/." "$kernel/arch/arm64/boot/dts/realtek/"
 
 out="$work/objects"
 mkdir -p "$out"
@@ -187,7 +191,7 @@ perl "$openwrt/scripts/kconfig.pl" + + "$generic_config" "$target/config-$kernel
     "$project/scripts/kernel-objects.config" > "$out/.config"
 cp "$out/.config" "$work/config.seed"
 if (( prepare_only )); then
-    printf 'status=prepared_only\ncompiled=0\n' > "$work/result.txt"
+    printf 'status=prepared_only\ncompiled=0\ncompiled_dtbs=0\n' > "$work/result.txt"
     printf 'PREPARED ONLY: all locked source patches applied; no objects compiled.\n'
     exit 0
 fi
@@ -198,7 +202,7 @@ export KBUILD_BUILD_TIMESTAMP='1970-01-01 00:00:00 +0000'
 kmake=(make -C "$kernel" O="$out" ARCH=arm64 CROSS_COMPILE="$cross")
 "${kmake[@]}" olddefconfig
 python3 "$project/scripts/test_ni_kconfig.py" --kernel "$kernel" --conf "$out/scripts/kconfig/conf"
-for symbol in ARM64 ARCH_RTL9617C PHYLIB RTL9617C_XRAM_ETH RTL9617C_PON RTL9617C_BOSA \
+for symbol in ARM64 ARCH_RTL9617C GPIO_RTL9617C PHYLIB RTL9617C_XRAM_ETH RTL9617C_PON RTL9617C_BOSA \
               NF_FLOW_TABLE NF_FLOW_TABLE_INET NFT_FLOW_OFFLOAD BRIDGE BRIDGE_VLAN_FILTERING \
               BRIDGE_IGMP_SNOOPING NET_SWITCHDEV RTL9617C_SWITCH_GUARD VLAN_8021Q NETFILTER_INGRESS \
               SKB_EXTENSIONS NET_CLS_ACT NET_SCHED NET_XGRESS BPF_SYSCALL PPP PPPOE; do
@@ -212,6 +216,7 @@ done
 # Keep the production built-in code paths and compile the actual translation
 # units, including VLAN/PPPoE forwarding helpers (not just vlan.c/pppoe.c).
 targets=(
+    drivers/gpio/gpio-rtl9617c.o
     drivers/net/ethernet/realtek/rtl9617c-xram.o
     drivers/net/ethernet/realtek/rtl9617c-dma.o
     drivers/net/ethernet/realtek/rtl9617c-qm.o
@@ -302,7 +307,19 @@ for object in "${targets[@]}"; do
     }
     sha256sum "$out/$object" >> "$work/objects.sha256"
 done
+# Explicit targets compile both shipping variants without linking firmware.
+dtbs=(realtek/rtl9617c-tyfza1-ubi.dtb realtek/rtl9617c-tyfza1-ubi-2p5g.dtb)
+printf '%s\n' "${dtbs[@]}" > "$work/dtb-targets.txt"
+"${kmake[@]}" -j"$jobs" "${dtbs[@]}"
+dtb_files=()
+for dtb in "${dtbs[@]}"; do
+    dtb_file="$out/arch/arm64/boot/dts/$dtb"
+    [[ -s "$dtb_file" ]] || { echo "Missing compiled production DTB: $dtb_file" >&2; exit 1; }
+    sha256sum "$dtb_file" >> "$work/dtbs.sha256"
+    dtb_files+=("$dtb_file")
+done
+python3 "$project/scripts/test_boot_dtb.py" --output "$work/boot-dtb-evidence.json" "${dtb_files[@]}"
 cp "$out/.config" "$work/kernel.config"
-printf 'status=compiled\ncompiled_objects=%s\nkernel=%s\nopenwrt_commit=%s\n' \
-    "${#targets[@]}" "$kernel_version" "$openwrt_commit" > "$work/result.txt"
-printf 'PASS: %s real ARM64 kernel objects compiled. No firmware linked, booted or published.\n' "${#targets[@]}"
+printf 'status=compiled\ncompiled_objects=%s\ncompiled_dtbs=%s\nkernel=%s\nopenwrt_commit=%s\n' \
+    "${#targets[@]}" "${#dtbs[@]}" "$kernel_version" "$openwrt_commit" > "$work/result.txt"
+printf 'PASS: %s real ARM64 kernel objects and %s production DTBs compiled. No firmware linked, booted or published.\n' "${#targets[@]}" "${#dtbs[@]}"
