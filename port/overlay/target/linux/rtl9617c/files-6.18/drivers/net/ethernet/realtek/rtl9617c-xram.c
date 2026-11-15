@@ -15,6 +15,7 @@
 #include <linux/hrtimer.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/ioport.h>
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
@@ -39,6 +40,7 @@
 #include "rtl9617c-ni.h"
 #include "rtl9617c-fe.h"
 #include "rtl9617c-mib.h"
+#include "rtl9617c-pon-cold.h"
 
 #define GLB_STATIC 0xa01c
 #define PORT_TO_CPU GENMASK(3, 0)
@@ -175,9 +177,11 @@ struct rtl_xram {
 	struct mutex mib_lock;
 	struct mutex fabric_lock;
 	bool cold_handoff_required;
+	bool cold_attempted;
 	bool provider_ready;
 	bool fabric_managed;
 	int fabric_error;
+	struct rtl_pon_cold_state pon_cold;
 	struct delayed_work mib_work;
 	unsigned long long mib_total[5][RTL_NI_MIB_COUNTERS];
 	struct rtl_lan_mib_evidence mib_evidence[5];
@@ -857,7 +861,7 @@ static int rtl_engine_get(struct rtl_xram *priv)
 	int ret;
 
 	/* Both netdev open/stop paths are serialized by RTNL. */
-	if (priv->cold_handoff_required && !READ_ONCE(priv->provider_ready))
+	if (!READ_ONCE(priv->provider_ready))
 		return -EPROBE_DEFER;
 	if (priv->removing)
 		return -ENODEV;
@@ -1230,6 +1234,11 @@ static void rtl_register_lans(struct rtl_xram *priv, struct device *parent)
 	}
 	if (!priv->lan4_phy)
 		complete_all(&priv->lan4_ready);
+	/* drvdata is already visible to other NI consumers.  Publish readiness
+	 * only after this RTNL-protected batch has queued NI4 or completed its
+	 * barrier: an earlier PON open must not hold RTNL while waiting for work
+	 * that this registration path has not yet been able to queue. */
+	WRITE_ONCE(priv->provider_ready, true);
 	rtnl_unlock();
 }
 
@@ -1489,6 +1498,27 @@ static ssize_t l2_evidence_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(l2_evidence);
 
+static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *attr,
+				   char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	const struct rtl_pon_cold_state *cold = &priv->pon_cold;
+
+	/* Historical cold result, immutable before sysfs publication. Never
+	 * remap PON registers or retry a transaction from a diagnostic read.
+	 * In particular snapshot_ready does NOT say live PON RX is still shut. */
+	return sysfs_emit(buf,
+		"schema=1 cached=1 historical=1 requested=%u attempted=%u managed=%u result=%d provider_ready=%u engine_poisoned=%u\n"
+		"pon_snapshot_ready=%u pon_stage=%u pon_error=%d pon_pdc_active=%u pon_gated_mask=0x%x pon_fifo=0x%x pon_fifo_polls=%u "
+		"pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n",
+		priv->cold_handoff_required, priv->cold_attempted, priv->fabric_managed,
+		priv->fabric_error, READ_ONCE(priv->provider_ready), READ_ONCE(priv->engine_poisoned),
+		cold->ready, cold->stage, cold->error, cold->pdc_active, cold->gated_mask,
+		cold->fifo_status, cold->fifo_polls, cold->control, cold->epon_control,
+		cold->gpon_control, cold->refused_register, cold->refused_value);
+}
+static DEVICE_ATTR_RO(cold_bootstrap);
+
 static ssize_t lan_mib_evidence_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
 {
@@ -1566,6 +1596,7 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_l2_switch.attr,
 	&dev_attr_l2_state.attr,
 	&dev_attr_l2_evidence.attr,
+	&dev_attr_cold_bootstrap.attr,
 	&dev_attr_lan_mib_evidence.attr,
 	NULL,
 };
@@ -1597,18 +1628,194 @@ static const struct attribute_group *rtl_native_groups[] = {
 	NULL,
 };
 
-/* drvdata identifies an allocation, not data-plane readiness. The PON
- * consumer completes this handoff before registering any of its interfaces.
+/* This temporary register lease is entirely inside NI probe, before either
+ * drvdata or a netdev is published. PON's normal driver requires NI drvdata
+ * before mapping its MAC/global registers and therefore cannot race this
+ * lease (its earlier TX-disable GPIO acquisition is a separate resource).
+ * Release every mapping AND resource
+ * reservation before the consumer may bind; these are not lifetime aliases
+ * of the PON driver's own devm mappings. No GPIO, BOSA, optical IRQ, firmware
+ * service, PON device binding or phandle dependency is needed to boot LAN.
+ */
+struct rtl_ni_cold_maps {
+	const struct resource *resource[4];
+	void __iomem *base[4];
+	bool claimed[4];
+};
+
+static void rtl_ni_cold_unmap(struct rtl_ni_cold_maps *maps)
+{
+	int i;
+
+	for (i = ARRAY_SIZE(maps->base) - 1; i >= 0; i--) {
+		if (maps->base[i])
+			iounmap(maps->base[i]);
+		if (maps->claimed[i])
+			release_mem_region(maps->resource[i]->start,
+					   resource_size(maps->resource[i]));
+		maps->base[i] = NULL;
+		maps->claimed[i] = false;
+	}
+}
+
+static int rtl_ni_cold_map(struct platform_device *pdev,
+			 struct rtl_ni_cold_maps *maps)
+{
+	static const char * const names[] = {
+		"pon-cold-mac", "pon-cold-control", "pon-cold-epon", "pon-cold-gpon",
+	};
+	static const resource_size_t sizes[] = { 0xc000, 4, 4, 4 };
+	static const resource_size_t starts[] = {
+		0x4f5500000ULL, 0x4f4320094ULL, 0x4f4320074ULL, 0x4f432007cULL,
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		const struct resource *resource = platform_get_resource_byname(pdev,
+							IORESOURCE_MEM, names[i]);
+
+		if (!resource || resource_size(resource) != sizes[i] ||
+		    resource->start != starts[i]) {
+			ret = -ENODEV;
+			goto fail;
+		}
+		maps->resource[i] = resource;
+		if (!request_mem_region(resource->start, resource_size(resource),
+					"rtl9617c-cold-fabric")) {
+			ret = -EBUSY;
+			goto fail;
+		}
+		maps->claimed[i] = true;
+		maps->base[i] = ioremap(resource->start, resource_size(resource));
+		if (!maps->base[i]) {
+			ret = -ENOMEM;
+			goto fail;
+		}
+	}
+	return 0;
+fail:
+	rtl_ni_cold_unmap(maps);
+	return ret;
+}
+
+static unsigned int rtl_ni_cold_read(void *context, unsigned int reg)
+{
+	struct rtl_ni_cold_maps *maps = context;
+
+	/* The global register IDs are the SDK's low-32-bit address namespace;
+	 * DT supplies the complete (above-4-GiB) physical resource addresses. */
+	switch (reg) {
+	case 0xf4320094U: return readl(maps->base[1]);
+	case 0xf4320074U: return readl(maps->base[2]);
+	case 0xf432007cU: return readl(maps->base[3]);
+	default:
+		if (WARN_ON_ONCE(reg >= 0xc000 || (reg & 3)))
+			return ~0U;
+		return readl(maps->base[0] + reg);
+	}
+}
+
+static void rtl_ni_cold_write(void *context, unsigned int reg, unsigned int value)
+{
+	struct rtl_ni_cold_maps *maps = context;
+
+	/* This owner never changes global resets/muxes, laser GPIOs or TX policy. */
+	if (WARN_ON_ONCE(reg >= 0xc000 || (reg & 3)))
+		return;
+	writel(value, maps->base[0] + reg);
+}
+
+/* One bounded, local cold transaction. A clean preflight refusal retains
+ * software LAN availability. An ambiguous shared write is a different state:
+ * retain the owner and do not claim a usable NIC. Neither result waits for a
+ * future PON probe, and no runtime/reprobe callback may replay cold writes.
  * fabric_lock is never acquired from ndo_open/RTNL.
  */
+static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *pdev)
+{
+	struct rtl_ni_cold_maps maps = {};
+	const struct rtl_dq_io io = {
+		.context = &maps, .read = rtl_ni_cold_read, .write = rtl_ni_cold_write,
+	};
+	struct device *dev = &pdev->dev;
+	int ret = 0;
+
+	mutex_lock(&priv->fabric_lock);
+	if (priv->removing || priv->engine_poisoned) {
+		ret = -EIO;
+		goto out;
+	}
+	if (priv->cold_attempted)
+		goto out;
+	if (READ_ONCE(priv->provider_ready) || priv->base_ready || priv->engine_users) {
+		ret = -EBUSY;
+		goto out;
+	}
+	priv->cold_attempted = true;
+	if (!priv->cold_handoff_required)
+		goto out;
+	if (!priv->fe) {
+		priv->fabric_error = -EOPNOTSUPP;
+		goto fallback;
+	}
+	ret = rtl_ni_cold_map(pdev, &maps);
+	if (ret) {
+		priv->fabric_error = ret;
+		goto fallback;
+	}
+	ret = rtl_pon_cold_quiesce(&io, &priv->pon_cold);
+	if (ret) {
+		/* No SVL/MRU/table write was attempted. Closed PON MAC admission
+		 * stays closed until its normal owner initializes it. */
+		priv->fabric_error = ret;
+		rtl_ni_cold_unmap(&maps);
+		goto fallback;
+	}
+	ret = rtl_fe_fabric_cold_prepare(priv->fe);
+	priv->fabric_error = ret;
+	if (ret < 0)
+		goto quarantine;
+	if (!ret) {
+		/* The endpoint gates and family selection must remain stable for
+		 * the entire shared transaction, not just its first empty sample. */
+		ret = rtl_pon_cold_verify(&io, &priv->pon_cold);
+		if (ret) {
+			priv->fabric_error = ret;
+			rtl_fe_fabric_cold_abort(priv->fe, ret);
+			goto quarantine;
+		}
+		priv->fabric_managed = true;
+		rtl_ni_owner_expose(priv->owner);
+	}
+	rtl_ni_cold_unmap(&maps);
+	if (!priv->fabric_managed)
+		goto fallback;
+	dev_info(dev, "local cold fabric ready: SVL, UNI MRU=%u; LAN publication independent of PON probe\n",
+		 RTL_NI_FRAME_WIRE_BYTES);
+	goto out;
+quarantine:
+	rtl_ni_cold_unmap(&maps);
+	rtl_ni_owner_expose(priv->owner);
+	rtl_engine_poison(priv);
+	dev_err(dev, "cold fabric write/verification failed: %d; owner quarantined, reboot required\n", ret);
+	goto out;
+fallback:
+	dev_warn(dev, "local cold fabric refused: %d (PON stage=%u reg=%08x value=%08x); publishing software LANs\n",
+		 priv->fabric_error, priv->pon_cold.stage,
+		 priv->pon_cold.refused_register, priv->pon_cold.refused_value);
+	ret = 0;
+out:
+	mutex_unlock(&priv->fabric_lock);
+	return ret;
+}
+
 static int rtl_ni_publish(struct rtl_xram *priv, struct device *dev)
 {
 	int ret;
 
 	if (READ_ONCE(priv->provider_ready))
 		return 0;
-	/* A port can be opened as soon as register_netdevice releases RTNL. */
-	WRITE_ONCE(priv->provider_ready, true);
 	rtl_register_lans(priv, dev);
 	ret = sysfs_create_groups(&dev->kobj, rtl_native_groups);
 	if (ret)
@@ -1618,41 +1825,6 @@ static int rtl_ni_publish(struct rtl_xram *priv, struct device *dev)
 	schedule_delayed_work(&priv->mib_work, HZ);
 	return 0;
 }
-
-int rtl9617c_ni_cold_handoff(struct device *dev)
-{
-	struct net_device *netdev = dev_get_drvdata(dev);
-	struct rtl_xram *priv;
-	int ret = 0;
-
-	if (!netdev)
-		return -EPROBE_DEFER;
-	priv = netdev_priv(netdev);
-	mutex_lock(&priv->fabric_lock);
-	if (priv->removing || priv->engine_poisoned) {
-		ret = -EIO;
-		goto out;
-	}
-	if (READ_ONCE(priv->provider_ready))
-		goto out;
-	if (priv->cold_handoff_required) {
-		ret = rtl_fe_fabric_cold_prepare(priv->fe);
-		priv->fabric_error = ret;
-		if (ret < 0)
-			goto out;
-		priv->fabric_managed = !ret;
-		if (ret)
-			dev_warn(dev, "native L2 baseline unavailable; preserving software datapath\n");
-		else
-			/* Shared configuration is retained for this physical owner. */
-			rtl_ni_owner_expose(priv->owner);
-	}
-	ret = rtl_ni_publish(priv, dev);
-out:
-	mutex_unlock(&priv->fabric_lock);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(rtl9617c_ni_cold_handoff);
 
 static bool rtl_ni_release_dma(struct rtl_xram *priv, struct device *dev)
 {
@@ -1727,8 +1899,9 @@ static int rtl_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->rx_lock);
 	mutex_init(&priv->mib_lock);
 	mutex_init(&priv->fabric_lock);
-	priv->cold_handoff_required = of_property_read_bool(dev->of_node,
-						"realtek,pon-cold-handoff");
+	priv->cold_handoff_required =
+		of_property_read_bool(dev->of_node, "realtek,cold-fabric-bootstrap") ||
+		of_property_read_bool(dev->of_node, "realtek,pon-cold-handoff");
 	init_completion(&priv->lan4_ready);
 	INIT_DELAYED_WORK(&priv->mib_work, rtl_mib_work);
 	netif_napi_add(netdev, &priv->napi, rtl_poll);
@@ -1785,11 +1958,13 @@ static int rtl_probe(struct platform_device *pdev)
 		if(IS_ERR(priv->fe)){ret=PTR_ERR(priv->fe);priv->fe=NULL;goto free_dma;}
 		priv->qm.fe = priv->fe;
 	}
+	ret = rtl_ni_cold_bootstrap(priv, pdev);
+	if (ret)
+		goto free_dma;
+	/* PON's consumer must not see drvdata until the temporary cold MMIO
+	 * leases have been released and the shared transaction has completed. */
 	platform_set_drvdata(pdev, netdev);
-	if (!priv->cold_handoff_required)
-		rtl_ni_publish(priv, dev);
-	else
-		dev_info(dev, "NI provider allocated; waiting for PON cold receive handoff\n");
+	rtl_ni_publish(priv, dev);
 	return 0;
 
 free_dma:

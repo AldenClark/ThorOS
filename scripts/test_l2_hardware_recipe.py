@@ -43,13 +43,13 @@ struct model {
  unsigned int rows[RTL_L2_TBL_COUNT][RTL_L2_VLAN_IDS][RTL_L2_TABLE_MAX_WORDS];
  unsigned int commands, writes, fail, pending_address, pending_request;
  unsigned int pending_words[RTL_L2_TABLE_MAX_WORDS];
- unsigned int delays, clear_after, pending_reads, native_writes, tx_writes;
+ unsigned int delays, settles, clear_after, pending_reads, native_writes, tx_writes;
  unsigned int route_gates, route_arms, rx_writes;
  bool pending, table_seen_idle[RTL_L2_TBL_COUNT], active, route_closed, arm_failure;
 };
 static struct model model, original;
 struct rtl_fe { struct model *model; bool enabled, prepared; };
-static unsigned int cases, fault_cases;
+static unsigned int cases, fault_cases, cold_cases;
 
 static int table_at(unsigned int address, bool access)
 {
@@ -69,6 +69,15 @@ static void complete(struct model *m)
  int t = table_at(m->pending_address, true);
  unsigned int index = m->pending_request & ~(BIT(31) | BIT(30));
  assert(m->pending);
+ if(m->pending_address==RTL_L2_FDB_ACCESS) {
+  assert((m->pending_request&255U)==RTL_L2_FDB_SCAN);
+  assert(((m->pending_request>>8)&8191U)==0);
+  assert((m->reg[RTL_L2_FDB_CONTROL/4]&(BIT(31)|BIT(22)))==(BIT(31)|BIT(22)));
+  /* The integrated cold path models an empty inherited FDB. Nonempty,
+   * ambiguous and rollback cases are exercised by test_fabric_baseline. */
+  m->reg[RTL_L2_FDB_RETURN/4]=RTL_L2_FDB_STATUS_MISS;
+  m->reg[m->pending_address/4]=0;m->pending=false;return;
+ }
  if(m->pending_address==RTL_L2_FDB_LIMIT_ACCESS) {
   assert(!(m->reg[RTL_L2_FDB_CONTROL/4]&BIT(31)));
   assert(m->reg[RTL_L2_FDB_CONTROL/4]&BIT(22));
@@ -136,7 +145,8 @@ static int command(void *context, unsigned int address, unsigned int request)
  struct rtl_l2_table_layout l;
  int t = table_at(address, true);
  assert(!m->pending && !(m->reg[address/4] & BIT(31)));
- if(address!=RTL_L2_FDB_LIMIT_ACCESS) {
+ if(address==RTL_L2_FDB_ACCESS) {l.words=RTL_L2_FDB_WORDS;l.data0=RTL_L2_FDB_DATA0;}
+ else if(address!=RTL_L2_FDB_LIMIT_ACCESS) {
   assert(t >= 0 && m->table_seen_idle[t] && !rtl_l2_table_layout(t, &l));
  } else {l.words=1;l.data0=RTL_L2_FDB_LIMIT_DATA;}
  assert(request & BIT(31));
@@ -151,7 +161,7 @@ static int command(void *context, unsigned int address, unsigned int request)
 static struct rtl_dq_io fe_io(struct rtl_fe *fe)
  { return (struct rtl_dq_io){fe,fe_read,fe_write,command}; }
 static void usleep_range(unsigned int low, unsigned int high)
- { assert(low == 10 && high == 20); model.delays++; }
+ { if(low==1000 && high==2000)model.settles++;else {assert(low==10 && high==20); model.delays++;} }
 static void fe_route_gate(struct rtl_fe *fe) {
  fe->model->route_closed=true;fe->model->route_gates++;
 }
@@ -163,6 +173,7 @@ static bool fe_route_arm(struct rtl_fe *fe) {
  fe->model->route_closed=false;return true;
 }
 #include "rtl9617c-fe-switch-hw.h"
+#include "rtl9617c-fabric.h"
 
 static struct rtl_fe fe = { .model = &model };
 static struct rtl_fe_switch_hw hw;
@@ -287,6 +298,51 @@ static void recipe(unsigned int ports, bool l3)
  assert(!fe_switch_hw_drain(&fe, &hw));
  assert(!fe_switch_hw_restore(&fe, &hw)); restored(); cases++;
  (void)words;
+}
+
+/* Connect the real cold transaction to the real native hardware recipe.
+ * Neither ready=1 nor a compatible MRU alone proves that native admission
+ * is reachable: exercise prepare/arm/withdraw using exactly its output.
+ * The rest of the NI/bridge ownership prerequisites remain modeled here;
+ * test_ni_cold_handoff separately executes real probe/open publication. */
+static void cold_to_native(unsigned int ports, bool l3)
+{
+ struct rtl_fabric fabric={0};
+ struct rtl_dq_io io=fe_io(&fe);
+
+ reset();
+ model.reg[0x1414/4]=2;model.reg[0xa034/4]=0x004023f1;
+ model.reg[0xa038/4]=9300;
+ model.reg[0x1108/4]=model.reg[0x110c/4]=model.reg[0x1110/4]=0x8100;
+ model.reg[0x1114/4]=0x9100;
+ for(unsigned p=0;p<5;p++) {
+  model.reg[RTL_FABRIC_RX_MAC(p)/4]=0x1101;
+  model.reg[FE_LAN_RX_CTRL(p)/4]|=BIT(5);
+ }
+ assert(!rtl_fabric_cold_prepare(&io,&fabric));
+ assert(fabric.ready && fabric.changed && fabric.cold_rx_gated==31);
+ assert(rtl_fabric_native_mtu_compatible(&fabric) && model.settles==1);
+ assert(model.reg[0x1414/4]==3 && model.reg[0xa034/4]==0x004005f6);
+ for(unsigned p=0;p<5;p++) {
+  assert(!(model.reg[RTL_FABRIC_RX_MAC(p)/4]&1));
+  assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(5)));
+  /* The NI owner opens RX only after its own DMA/QM start; native recipe
+   * does not own or reopen the physical MAC receive-enable bit. */
+  if(ports&BIT(p))model.reg[RTL_FABRIC_RX_MAC(p)/4]|=1;
+ }
+ memcpy(&original,&model,sizeof(model));
+ fe.enabled=fe.prepared=l3;
+ assert(!fe_switch_hw_prepare(&fe,&hw,ports,300,false));
+ assert(hw.prepared && hw.drained && hw.globals_owned);
+ assert(fe_switch_hw_arm(&fe,&hw,ports,0));
+ for(unsigned p=0;p<5;p++)
+  assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28))==!!(ports&BIT(p)));
+ assert(!rtl_fabric_check(&io,&fabric));
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();
+ assert(!rtl_fabric_check(&io,&fabric));
+ assert(model.reg[0x1414/4]==3 && model.reg[0xa034/4]==0x004005f6);
+ cold_cases++;
 }
 
 static void guards(void)
@@ -418,9 +474,10 @@ static void faults(void)
 int main(void)
 {
  for(unsigned int ports=1;ports<32;ports++) { recipe(ports,false); recipe(ports,true); }
+ for(unsigned int ports=1;ports<32;ports++) { cold_to_native(ports,false); cold_to_native(ports,true); }
  guards(); faults();
  /*SDK_RUN*/
- printf("{\"recipe_cases\":%u,\"fault_cases\":%u,\"hardware_verified\":false}\n",cases,fault_cases);
+ printf("{\"recipe_cases\":%u,\"fault_cases\":%u,\"cold_to_native_cases\":%u,\"hardware_verified\":false}\n",cases,fault_cases,cold_cases);
  return 0;
 }
 '''
@@ -565,6 +622,7 @@ def main():
                 assert result.returncode and "Assertion" in result.stderr, (name, result.stderr)
         print("Recipe self-check: rejected wrong MRU, missing SVL/learning/route gates and TPID builtin/false-veto faults")
     evidence.update({"production_sha256": hashlib.sha256(HEADER.read_bytes()).hexdigest(),
+                     "fabric_sha256": hashlib.sha256((DRIVERS / "rtl9617c-fabric.h").read_bytes()).hexdigest(),
                      "actual_sdk_registers_verified": sdk_verified,
                      "mutations_rejected": list(mutations),
                      "sanitizers": ["address", "undefined"],

@@ -308,7 +308,7 @@ snapshot() {
     fe_state=$(read_probe "$fe_state_file")
     printf '%s\n' "$fe_state"
     fe_counters
-    for attribute in l2_switch l2_evidence lan_mib_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
+    for attribute in cold_bootstrap l2_switch l2_evidence lan_mib_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
         printf '\n[%s]\n' "$attribute"
         if [ -n "$ni_dir" ]; then
             read_probe "$ni_dir/$attribute"

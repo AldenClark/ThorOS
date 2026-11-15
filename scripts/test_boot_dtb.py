@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Validate compiled production DTBs using a dependency-free FDT decoder.
 
-This checks the binary DTB, including inherited status. It proves neither boot
-success nor GPIO/PON hardware behavior. Each real input also gets an in-memory
-negative control restoring the unverified cold-handoff property.
+This checks the binary DTB, including inherited status and the NI-owned cold
+bootstrap resources. It proves neither boot success nor PON hardware behavior.
+Every real input also gets in-memory negative controls which disable the cold
+bootstrap or give it an incorrect resource. A software-only opt-out is not a
+successful production configuration.
 """
 import argparse
 import hashlib
@@ -13,7 +15,14 @@ import struct
 
 NI_PATH = '/soc/ethernet@4f4300000'
 NI_COMPATIBLE = 'realtek,rtl9617c-xram-eth'
-COLD_FLAG = 'realtek,pon-cold-handoff'
+COLD_FLAG = 'realtek,cold-fabric-bootstrap'
+LEGACY_COLD_FLAG = 'realtek,pon-cold-handoff'
+COLD_RESOURCES = {
+    'pon-cold-mac': (0x4f5500000, 0xc000),
+    'pon-cold-control': (0x4f4320094, 4),
+    'pon-cold-epon': (0x4f4320074, 4),
+    'pon-cold-gpon': (0x4f432007c, 4),
+}
 
 
 class DtbError(ValueError):
@@ -51,7 +60,7 @@ def decode(blob):
         if address == size == 0:
             break
     require(all(reserve_end <= start or end <= off_reserve for start,end in ranges), 'reserve map overlaps block')
-    nodes,close_offsets = {},{}
+    nodes,close_offsets,property_offsets = {},{},{}
     stack=[]
     cursor,end = off_struct,off_struct+size_struct
     finished=False
@@ -80,6 +89,7 @@ def decode(blob):
             require(cursor+length <= end and name not in nodes[stack[-1]], 'truncated/duplicate property')
             nodes[stack[-1]][name]=blob[cursor:cursor+length]
             cursor=(cursor+length+3)&~3
+            property_offsets[(stack[-1],name)]=(token_start-off_struct,cursor-off_struct)
         elif token==4:
             continue
         elif token==9:
@@ -90,7 +100,7 @@ def decode(blob):
         else:
             raise DtbError(f'unknown FDT token {token}')
     require(finished, 'missing FDT END token')
-    return {'nodes':nodes, 'close_offsets':close_offsets, 'header':header,
+    return {'nodes':nodes, 'close_offsets':close_offsets, 'property_offsets':property_offsets, 'header':header,
             'reserve':blob[off_reserve:reserve_end],
             'structure':blob[off_struct:off_struct+size_struct],
             'strings':blob[off_strings:off_strings+size_strings]}
@@ -114,22 +124,40 @@ def validate(blob):
         value=nodes[path].get('status')
         statuses[path]='absent (enabled)' if value is None else string_list(value)[0]
         require(value is None or string_list(value) in (['okay'],['ok']), f'NI/ancestor disabled: {path}')
-    # Presence, including an empty boolean property, is sufficient for OF
-    # opt-in. A textual zero value would still be a production regression.
-    require(COLD_FLAG not in nodes[NI_PATH], 'unverified cold-handoff flag present on production NI')
+    # The corrected cold transaction is owned by NI before it publishes LANs,
+    # not by a later PON probe. Both shipping boards must actually opt in.
+    props=nodes[NI_PATH]
+    require(COLD_FLAG in props and props[COLD_FLAG]==b'', 'NI-owned cold bootstrap missing or not boolean')
+    parent=nodes['/soc']
+    require(parent.get('#address-cells')==struct.pack('>I',2) and
+            parent.get('#size-cells')==struct.pack('>I',2), 'unexpected NI parent address/size cells')
+    require('reg' in props and 'reg-names' in props, 'NI cold resources missing')
+    names=string_list(props['reg-names'])
+    require(len(set(names))==len(names), 'duplicate NI resource name')
+    require(len(props['reg'])==16*len(names), 'NI resource/name count mismatch')
+    resources={name:struct.unpack_from('>QQ',props['reg'],16*index)
+               for index,name in enumerate(names)}
+    for name,expected in COLD_RESOURCES.items():
+        require(resources.get(name)==expected, f'NI cold resource mismatch: {name}')
     return {'ni_path':NI_PATH, 'ni_enabled':True, 'statuses':statuses,
-            'cold_handoff_property_present':False,
+            'cold_bootstrap_property_present':True,
+            'legacy_cold_handoff_property_present':LEGACY_COLD_FLAG in props,
+            'cold_resources':{name:{'address':hex(address),'size':size}
+                              for name,(address,size) in resources.items() if name in COLD_RESOURCES},
             'model':string_list(nodes['/']['model'])[0] if 'model' in nodes['/'] else None}
 
 
-def with_old_flag(blob):
+def replace_property(blob, name, value):
     tree=decode(blob)
     require(NI_PATH in tree['close_offsets'], 'negative control missing NI')
     strings=tree['strings']
-    prop=struct.pack('>III',3,0,len(strings))
-    at=tree['close_offsets'][NI_PATH]
-    body=tree['structure'][:at]+prop+tree['structure'][at:]
-    strings+=COLD_FLAG.encode()+b'\0'
+    bounds=tree['property_offsets'].get((NI_PATH,name))
+    start,end=bounds if bounds else (tree['close_offsets'][NI_PATH],)*2
+    prop=b''
+    if value is not None:
+        prop=struct.pack('>III',3,len(value),len(strings))+value+b'\0'*((-len(value))%4)
+        strings+=name.encode()+b'\0'
+    body=tree['structure'][:start]+prop+tree['structure'][end:]
     reserve=tree['reserve']
     off_struct=40+len(reserve)
     off_strings=off_struct+len(body)
@@ -138,32 +166,58 @@ def with_old_flag(blob):
     return header+reserve+body+strings
 
 
-def reject_old_flag(blob):
-    mutant=with_old_flag(blob)
-    try:
-        validate(mutant)
-    except DtbError as error:
-        require('cold-handoff flag present' in str(error), f'negative control failed for wrong reason: {error}')
-    else:
-        raise DtbError('old cold-handoff negative control accepted')
+def negative_controls(blob):
+    props=decode(blob)['nodes'][NI_PATH]
+    names=string_list(props['reg-names'])
+    index=names.index('pon-cold-mac')
+    malformed=bytearray(props['reg'])
+    struct.pack_into('>Q',malformed,index*16+8,4)
+    wrong_address=bytearray(props['reg'])
+    struct.pack_into('>Q',wrong_address,index*16,0x4f5500004)
+    controls=(
+        ('cold_policy_removed',replace_property(blob,COLD_FLAG,None),'cold bootstrap missing'),
+        ('cold_policy_nonboolean',replace_property(blob,COLD_FLAG,b'\0\0\0\0'),'cold bootstrap missing'),
+        ('mac_resource_truncated',replace_property(blob,'reg',bytes(malformed)),'resource mismatch: pon-cold-mac'),
+        ('mac_resource_moved',replace_property(blob,'reg',bytes(wrong_address)),'resource mismatch: pon-cold-mac'),
+        ('cold_resource_unnamed',replace_property(blob,'reg-names',
+            props['reg-names'].replace(b'pon-cold-mac\0',b'pon-cold-bad\0')),'resource mismatch: pon-cold-mac'),
+    )
+    for label,mutant,expected in controls:
+        try:
+            validate(mutant)
+        except DtbError as error:
+            require(expected in str(error), f'{label} failed for wrong reason: {error}')
+        else:
+            raise DtbError(f'{label} negative control accepted')
+    # Keeping the old boolean for compatibility must not recreate a supplier
+    # dependency: the local policy/resources remain mandatory in this oracle.
+    validate(replace_property(blob,LEGACY_COLD_FLAG,b''))
+    return [label for label,_,_ in controls]
 
 
 def self_test():
     # A small binary fixture exercises decoding and the same semantic oracle.
     # Production proof still requires actual build outputs passed on the CLI.
-    strings=b'compatible\0status\0'
+    strings=bytearray()
     def begin(name):
         value=struct.pack('>I',1)+name.encode()+b'\0'
         return value+b'\0'*((-len(value))%4)
-    def prop(offset,value):
+    def prop(name,value):
+        offset=len(strings)
+        strings.extend(name.encode()+b'\0')
         return struct.pack('>III',3,len(value),offset)+value+b'\0'*((-len(value))%4)
-    body=begin('')+begin('soc')+begin('ethernet@4f4300000')
-    body+=prop(0,NI_COMPATIBLE.encode()+b'\0')+prop(11,b'okay\0')
+    body=begin('')+begin('soc')
+    body+=prop('#address-cells',struct.pack('>I',2))+prop('#size-cells',struct.pack('>I',2))
+    body+=begin('ethernet@4f4300000')
+    body+=prop('compatible',NI_COMPATIBLE.encode()+b'\0')+prop('status',b'okay\0')
+    body+=prop(COLD_FLAG,b'')
+    body+=prop('reg-names',b''.join(name.encode()+b'\0' for name in COLD_RESOURCES))
+    body+=prop('reg',b''.join(struct.pack('>QQ',*value) for value in COLD_RESOURCES.values()))
     body+=struct.pack('>4I',2,2,2,9)
     blob=struct.pack('>10I',0xd00dfeed,56+len(body)+len(strings),56,56+len(body),40,17,16,0,len(strings),len(body))
-    blob+=bytes(16)+body+strings
+    blob+=bytes(16)+body+bytes(strings)
     validate(blob)
-    reject_old_flag(blob)
+    negative_controls(blob)
     disabled=blob.replace(b'okay\0',b'fail\0',1)
     try:
         validate(disabled)
@@ -194,13 +248,13 @@ def main():
     for path in args.dtbs:
         blob=path.read_bytes()
         record=validate(blob)
-        reject_old_flag(blob)
+        rejected=negative_controls(blob)
         record.update({'file':str(path),'sha256':hashlib.sha256(blob).hexdigest(),
-                       'old_cold_flag_negative_control_rejected':True})
+                       'negative_controls_rejected':rejected})
         evidence.append(record)
-        print(f'{path.name}: native NI enabled; production cold-handoff opt-in absent; old-flag negative control rejected')
+        print(f'{path.name}: native NI enabled; local cold bootstrap/resources present; opt-out/resource negative controls rejected')
     if args.output:
-        args.output.write_text(json.dumps({'schema':1,'compiled_dtbs':len(evidence),'dtbs':evidence,
+        args.output.write_text(json.dumps({'schema':2,'compiled_dtbs':len(evidence),'dtbs':evidence,
                                           'boot_success_proven':False,'hardware_forwarding_proven':False},indent=2)+'\n')
     print(f'Boot DTB oracle: {len(evidence)} compiled inputs validated; binary-fixture controls passed; boot_success_proven=false')
 

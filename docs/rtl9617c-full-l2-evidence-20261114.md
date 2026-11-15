@@ -45,7 +45,7 @@ NE/aal-77c/include/aal_port.h
 
 ## 共享基线后续修正
 
-后续冷交接实现见 [原生 L2 管理与实机边界](rtl9617c-native-l2-20261114.md)。NI 延迟注册 LAN，PON 先关闭全部 RX 家族，再完成共享 SVL 的空 FDB 预检和读回。TPID 的“必须在四个 CMP CSR 中看到 88a8”不是硬件要求：真实 SDK 位图自带该标准值，本轮已删除错误拒绝并保留比较寄存器。
+后续冷交接实现见 [原生 L2 管理与实机边界](rtl9617c-native-l2-20261114.md) 和 [2026-11-15 冷交接整改](rtl9617c-cold-bootstrap-20261115.md)。NI 在本地 probe、发布 LAN 之前独立门控实际已释放的 PON RX 家族及五口 UNI MAC RX，再完成共享 SVL 的空 FDB 预检和读回；不再等待完整 PON probe，也不无条件读写处于 reset 的其他家族。TPID 的“必须在四个 CMP CSR 中看到 88a8”不是硬件要求：真实 SDK 位图自带该标准值，本轮已删除错误拒绝并保留比较寄存器。
 
 UNI 接收 MRU 与软件出口 MTU 必须分别描述。固定 1522 会破坏 QinQ1500 CPU 回退；进一步核证后 cold owner 将受管 UNI 上限规范为 1526（含 FCS），保持独立存储预算与 PON 配置，标签报文走 CPU。该有界 MRU 允许少量超长未标记帧的软件/硬件差异，限定最多双 VLAN，不宣称严格逐帧 MTU 等价。规范化后可进入原生 L2 准入；实际 ASIC 边界和 active 状态仍需候选固件实测，见原生 L2 文档。
 

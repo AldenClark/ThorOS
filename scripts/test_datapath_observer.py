@@ -59,6 +59,8 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     write(pon / 'identity', 'PRIVATE_PON_IDENTITY\n')
     write(ni / 'fe', 'WRONG_NI_FE_PATH\n')
     for name, value in {
+        'cold_bootstrap': 'schema=1 cached=1 historical=1 requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0\n'
+                          'pon_snapshot_ready=1 pon_stage=7 pon_error=0 pon_pdc_active=1 pon_gated_mask=0x4\n',
         'l2_switch': '1\n',
         'l2_evidence': 'mce_ctl=0002f0ff cp_lspid_to_pol_id_en=1\n',
         'lan_mib_evidence': 'schema=1 cached=1 clock=boottime raw=1 reset_tracking=0 l2_attribution=0 atomic_hardware_snapshot=0 read_opcode=0 counter_mode_verified=0 capture_ns=5000000000 registered_mask=0x1\n'
@@ -186,6 +188,8 @@ exit 0
     assert output.count('base_ready=1 dma_exposed=1 engine_poisoned=0 host_active=1 reboot_required=0') == 2
     assert output.count('cp_lspid_to_pol_id_en=1') == 2
     assert output.count('[lan_mib_evidence]\nschema=1 cached=1') == 2 and 'dev_port=0' in output
+    assert output.count('[cold_bootstrap]\nschema=1 cached=1 historical=1') == 2
+    assert 'requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0' in output
     assert output.count('[flowtable]') == 2
     assert '198.51.100.7' not in output and '192.0.2.12' not in output and ':51000' not in output
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2
