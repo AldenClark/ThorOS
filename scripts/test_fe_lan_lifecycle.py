@@ -76,12 +76,24 @@ struct rtl_fe {
  unsigned int pp_rejected_register,pp_rejected_value;
  unsigned int base_rejected_register,base_rejected_value;
  unsigned int commands,fail_command,base_writes;
+ unsigned int bus_fault_register,bus_fault_nth,bus_fault_reads,bus_fault_writes;
+ bool bus_fault_seen;
  int switch_error;bool switch_recovery;
  unsigned int expected_lan[5];
 };
-static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;assert(reg<0x10000);return f->reg[reg/4];}
+static unsigned int fe_read(void *ctx,unsigned int reg){
+ struct rtl_fe *f=ctx;assert(reg<0x10000);
+ if(reg==f->bus_fault_register && ++f->bus_fault_reads==f->bus_fault_nth) {
+  f->bus_fault_seen=true;return ~0U;
+ }
+ return f->reg[reg/4];
+}
 static void fe_write(void *ctx,unsigned int reg,unsigned int value){
  struct rtl_fe *f=ctx;assert(reg<0x10000);
+ if(reg==f->bus_fault_register) {
+  assert(!f->bus_fault_seen); /* A failed RMW read must never be staged. */
+  f->bus_fault_writes++;
+ }
  f->register_writes++;
  if(reg!=0x3418 && reg!=0x3424 &&
     !(reg>=0xa5f8 && reg<=0xa838 && !((reg-0xa5f8)%0x90)))f->base_writes++;
@@ -253,6 +265,7 @@ int main(void) {
  unsigned int prepare_commands=f.commands;
  base=f;
  assert(f.enabled && f.base_ready && f.dma_exposed);
+ assert(!(fe_read(&f,0x2394)&BIT(15)) && !(fe_read(&f,0x23a0)&BIT(15)));
  assert(f.cache_ready && fe_read(&f,0x383c)==0x03800000);
  assert((fe_read(&f,0x3944)&0x80000001U)==0x80000001U);
  assert((fe_read(&f,0x3948)&1U) && (fe_read(&f,0x3c80)&255U)==255U);
@@ -274,6 +287,29 @@ int main(void) {
   assert(((f.cls[r][5]>>22)&3)==(p?3:0));
   for(unsigned int word=0;word<7;word++)assert(!f.cls[r+1][word]);
  }
+ /* Reject failed control snapshots without acquiring ownership; later
+  * RMW/readback faults retain and quarantine the already-exposed base. */
+ const unsigned int cold_bus_fault[]={0x2300,0xa1e0,0x30a4};
+ for(unsigned int n=0;n<ARRAY_SIZE(cold_bus_fault);n++)for(unsigned int nth=1;nth<=3;nth++) {
+  f=cold;f.bus_fault_register=cold_bus_fault[n];f.bus_fault_nth=nth;
+  assert(rtl_fe_enable(&f)==-EIO && f.bus_fault_seen);
+  assert(f.base_rejected_register==cold_bus_fault[n] && f.base_rejected_value==~0U);
+  if(nth==1) {
+   assert(!f.prepared && !f.dma_exposed && !f.base_failed && !f.base_writes);
+   f.bus_fault_register=0;f.bus_fault_seen=false;
+   assert(!rtl_fe_enable(&f));check_cpu_gate(&f);
+  } else {
+   assert(f.bus_fault_writes==(nth==3));check_poisoned(&f);
+  }
+  failures++;
+ }
+ /* Data and mask snapshots may legitimately be all ones. */
+ f=cold;f.reg[0x370c/4]=~0U;f.mask[0]=~0U;
+ assert(!rtl_fe_enable(&f));check_cpu_gate(&f);
+ assert(f.mask_saved[0]==~0U);
+ for(unsigned int i=0;i<ARRAY_SIZE(fe_registers);i++)
+  if(fe_registers[i]==0x370c)assert(f.saved[i]==~0U);
+ f=base;
  /* Successful OFF is policy OFF, not a handoff to arbitrary boot profiles.
   * Ten complete CPU/HW/OFF transitions keep every exposed base table. */
  for(unsigned int cycle=0;cycle<10;cycle++){
@@ -380,7 +416,7 @@ int main(void) {
   * padding and LPB HI[31:30] read noise cannot falsely poison a warm owner. */
  assert(!rtl_fe_engine_suspend(&f));
  f.reg[0x2300/4]^=BIT(8)|BIT(20);f.reg[0xa1e0/4]^=BIT(16);
- f.reg[0x2394/4]^=BIT(8)|BIT(15)|BIT(28);f.reg[0x23a0/4]^=BIT(8)|BIT(15)|BIT(28);
+ f.reg[0x2394/4]^=BIT(8)|BIT(28);f.reg[0x23a0/4]^=BIT(8)|BIT(28);
  const unsigned int high[]={0x3838,0x3840,0x384c,0x3858};
  const unsigned int low[]={0x383c,0x3844,0x3850,0x385c};
  for(unsigned int i=0;i<4;i++){f.reg[high[i]/4]^=0xa5000000U;f.reg[low[i]/4]^=127;}
@@ -395,6 +431,34 @@ int main(void) {
   for(unsigned int row=0;row<2;row++)for(unsigned int word=0;word<7;word++)
    f.cls[rows[p][type]+row][word]|=~cls_valid[row][word];
  assert(!rtl_fe_engine_resume(&f) && !f.base_failed && f.base_ready);
+ /* flush_en[15] is a live discard command, not reserved read noise.
+  * Both owned connector schedulers were initialized with flush disabled.
+  * No normal NI/FE mode transition owns an outstanding runtime flush. */
+ for(unsigned int port=12;port<=13;port++)for(unsigned int mode=0;mode<=RTL_FE_MODE_HARDWARE;mode++) {
+  f=base;
+  assert(!(mode==RTL_FE_MODE_OFF?rtl_fe_disable(&f):
+   mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path(&f):rtl_fe_enable(&f)));
+  assert(!rtl_fe_engine_suspend(&f));
+  unsigned int reg=0x2304+12*port,writes=f.base_writes;
+  f.reg[reg/4]|=BIT(15);
+  assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);
+  assert(f.base_writes==writes && f.base_rejected_register==reg);
+  assert(f.reg[reg/4]&BIT(15)); /* Warm validation never silently repairs it. */
+  drifts++;
+ }
+ /* An all-ones bus fault previously matched these expected-one masks. */
+ const unsigned int bus_fault[]={0x2300,0xa1e0,0x30a4};
+ for(unsigned int n=0;n<ARRAY_SIZE(bus_fault);n++)for(unsigned int mode=0;mode<=RTL_FE_MODE_HARDWARE;mode++) {
+  f=base;
+  assert(!(mode==RTL_FE_MODE_OFF?rtl_fe_disable(&f):
+   mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path(&f):rtl_fe_enable(&f)));
+  assert(!rtl_fe_engine_suspend(&f));
+  unsigned int writes=f.base_writes;
+  f.reg[bus_fault[n]/4]=~0U;
+  assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);
+  assert(f.base_writes==writes && f.base_rejected_register==bus_fault[n]);
+  assert(f.base_rejected_value==~0U);drifts++;
+ }
  /* Every preparation command may time out. Read-only failures remain
   * retryable; once publication begins, ALL partial states are poisoned,
   * including late failures in post-program readback rather than only writes. */
@@ -516,6 +580,11 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'partial_exposed_prepare_is_permanently_quarantined': True,
     'readonly_preflight_failure_is_not_poisoned': True,
     'warm_reopen_does_not_reset_cache_tables_or_DMA_bases': True,
+    'OAM_and_L3_LAN_flush_commands_reject_warm_reopen_in_all_modes': True,
+    'expected_one_masks_never_validate_all_ones_bus_faults': True,
+    'cold_control_snapshot_faults_acquire_no_base_or_DMA_owner': True,
+    'cold_control_RMW_faults_never_stage_invalid_register_values': True,
+    'all_ones_mask_and_data_snapshots_remain_valid': True,
     'shared_and_reserved_readback_bits_ignored': True,
     'full_L3_AXI_drain_verified': False,
     'per_flow_slot_retirement_verified': False,

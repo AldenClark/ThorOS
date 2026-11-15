@@ -60,7 +60,12 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     write(ni / 'fe', 'WRONG_NI_FE_PATH\n')
     for name, value in {
         'cold_bootstrap': 'schema=1 cached=1 historical=1 requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0\n'
-                          'pon_snapshot_ready=1 pon_stage=7 pon_error=0 pon_pdc_active=1 pon_gated_mask=0x4\n',
+                          'pon_snapshot_ready=1 pon_stage=7 pon_error=0 pon_pdc_active=1 pon_gated_mask=0x4\n'
+                          'pon_gate_written_mask=0x4 pon_gate_sampled_mask=0x4 pon_gate_polls=5 pon_gate_stable=3\n'
+                          'pon_gate0_before=0x00000000 pon_gate0_requested=0x00000000 pon_gate0_readback=0x00000000\n'
+                          'pon_gate1_before=0x00000000 pon_gate1_requested=0x00000000 pon_gate1_readback=0x00000000\n'
+                          'pon_gate2_before=0x00000002 pon_gate2_requested=0x00000000 pon_gate2_readback=0x00000000\n'
+                          'pon_gate3_before=0x00000000 pon_gate3_requested=0x00000000 pon_gate3_readback=0x00000000\n',
         'fabric_sample': 'schema=1 sampled=1 seq=2 epoch=1 valid=1\n',
         'fabric_evidence': 'schema=1 cached=1 clock=boottime global=1 hardware_reset_verified=0 te_direct_mode_verified=0\n'
                            'contract=partial tm_te_baseline_verified=0 wan_arb_readback=0\n',
@@ -193,6 +198,9 @@ exit 0
     assert output.count('[lan_mib_evidence]\nschema=1 cached=1') == 2 and 'dev_port=0' in output
     assert output.count('[cold_bootstrap]\nschema=1 cached=1 historical=1') == 2
     assert 'requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0' in output
+    assert output.count('pon_gate_written_mask=0x4 pon_gate_sampled_mask=0x4 pon_gate_polls=5 pon_gate_stable=3') == 2
+    assert output.count('pon_gate2_before=0x00000002 pon_gate2_requested=0x00000000 pon_gate2_readback=0x00000000') == 2
+    assert output.count('pon_gate3_readback=0x00000000') == 2
     assert output.count('[flowtable]') == 2
     assert '198.51.100.7' not in output and '192.0.2.12' not in output and ':51000' not in output
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2

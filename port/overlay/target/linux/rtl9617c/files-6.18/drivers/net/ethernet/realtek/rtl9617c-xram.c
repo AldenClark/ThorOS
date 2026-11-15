@@ -42,6 +42,8 @@
 #include "rtl9617c-mib.h"
 #include "rtl9617c-pon-cold.h"
 #include "rtl9617c-tm-evidence.h"
+#include "rtl9617c-l2qm.h"
+#include "rtl9617c-l2-es.h"
 
 #define GLB_STATIC 0xa01c
 #define PORT_TO_CPU GENMASK(3, 0)
@@ -746,8 +748,12 @@ static void rtl_engine_poison(struct rtl_xram *priv)
 static int rtl_engine_prepare(struct rtl_xram *priv)
 {
 	struct net_device *dev = priv->netdev;
+	const struct rtl_l2qm_io l2qm = {priv, rtl_mib_read, rtl_mib_write};
+	const struct rtl_dq_io es = {
+		.context = priv, .read = rtl_mib_read, .write = rtl_mib_write,
+	};
 	unsigned long flags;
-	unsigned int port;
+	unsigned int port, es_ports = BIT(15);
 	u32 config;
 	int ret;
 
@@ -771,20 +777,29 @@ static int rtl_engine_prepare(struct rtl_xram *priv)
 	}
 	if (priv->dma_tx) {
 		/* The bootloader's XRAM path leaves the normal LAN scheduler off. */
-		/* Original aal_l2_qm_init: EQ1 has4K64-byte pages, with29 pages
-		 * reserved per port so one full frame survives shared-pool pressure. */
-		writel(BIT(31) | (4U << 16) | (29U << 20), priv->ni + 0x2208);
-		rtl_update(priv, 0x2218, GENMASK(14, 0), 29);
-		writel(0x08008021, priv->ni + 0x2210);
+		/* Establish the complete private/shared allocation, including both
+		 * port-selector banks, before enabling any owned scheduler or DMA. */
+		ret = rtl_l2qm_prepare(&l2qm);
+		if (ret)
+			return ret;
 		/* Port15 uses scheduler instance14. Leaving it stopped
 		 * holds VOQ120..127 buffers until every LAN/PON data path runs out. */
-		rtl_update(priv, 0x2304 + 12 * 14, 0xff, 0xff);
-		rtl_update(priv, 0x2300, BIT(31) | BIT(15), BIT(31) | BIT(15));
 		for (port = 0; port < ARRAY_SIZE(priv->ports); port++)
-			if (priv->ports[port]) {
-				rtl_update(priv, 0x2300, BIT(31) | BIT(port), BIT(31) | BIT(port));
-				rtl_update(priv, 0x2304 + 12 * port, 0xff, 0xff);
-			}
+			if (priv->ports[port])
+				es_ports |= BIT(port);
+		ret = rtl_l2_es_cold_prepare(&es, es_ports);
+		if (ret)
+			return ret;
+		/* A failed initial read must never be reflected into enables for
+		 * foreign schedulers, even if the later readback would reject it. */
+		config = readl(priv->ni + 0x2300);
+		if (config == ~0U)
+			return -EIO;
+		writel(config | BIT(31) | es_ports, priv->ni + 0x2300);
+		config = readl(priv->ni + 0x2300);
+		if (config == ~0U ||
+		    (config & (BIT(31) | es_ports)) != (BIT(31) | es_ports))
+			return -EIO;
 		ret = rtl_dma_tx_start(&priv->dma);
 		if (ret)
 			return ret;
@@ -1058,22 +1073,16 @@ EXPORT_SYMBOL_GPL(rtl9617c_ni_transmit);
 int rtl9617c_ni_oam_configure(struct device *dev)
 {
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
-	static const unsigned int index[] = {15, 0x8f, 0x4f, 0xcf};
-	u32 status;
-	unsigned int i;
-	int ret;
 
-	/* aal_port: NI7 ninth queue (LDPID15) enters the OAM physical port12. */
-	for (i = 0; i < ARRAY_SIZE(index); i++) {
-		writel(12, priv->ni + 0x1658);
-		writel(BIT(31) | BIT(30) | index[i], priv->ni + 0x1654);
-		ret = readl_poll_timeout(priv->ni + 0x1654, status, !(status & BIT(31)), 1, 100000);
-		if (ret)
-			return ret;
-	}
-	writel(0xff | (6 << 16), priv->ni + 0x2304 + 12 * 12);
-	rtl_update(priv, 0x2300, BIT(12), BIT(12));
-	return 0;
+	/* Called under RTNL after rtl9617c_ni_open(), outside the PON lock.
+	 * Do not hold tx_lock across the sleeping FE table owner. */
+	if (READ_ONCE(priv->removing))
+		return -ENODEV;
+	if (READ_ONCE(priv->engine_poisoned))
+		return -EIO;
+	if (!READ_ONCE(priv->host_active))
+		return -EAGAIN;
+	return rtl_fe_oam_configure(priv->fe);
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_oam_configure);
 
@@ -1577,12 +1586,23 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 	return sysfs_emit(buf,
 		"schema=1 cached=1 historical=1 requested=%u attempted=%u managed=%u result=%d provider_ready=%u engine_poisoned=%u\n"
 		"pon_snapshot_ready=%u pon_stage=%u pon_error=%d pon_pdc_active=%u pon_gated_mask=0x%x pon_fifo=0x%x pon_fifo_polls=%u "
-		"pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n",
+		"pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n"
+		"pon_gate_written_mask=0x%x pon_gate_sampled_mask=0x%x pon_gate_polls=%u pon_gate_stable=%u\n"
+		"pon_gate0_before=0x%08x pon_gate0_requested=0x%08x pon_gate0_readback=0x%08x\n"
+		"pon_gate1_before=0x%08x pon_gate1_requested=0x%08x pon_gate1_readback=0x%08x\n"
+		"pon_gate2_before=0x%08x pon_gate2_requested=0x%08x pon_gate2_readback=0x%08x\n"
+		"pon_gate3_before=0x%08x pon_gate3_requested=0x%08x pon_gate3_readback=0x%08x\n",
 		priv->cold_handoff_required, priv->cold_attempted, priv->fabric_managed,
 		priv->fabric_error, READ_ONCE(priv->provider_ready), READ_ONCE(priv->engine_poisoned),
 		cold->ready, cold->stage, cold->error, cold->pdc_active, cold->gated_mask,
 		cold->fifo_status, cold->fifo_polls, cold->control, cold->epon_control,
-		cold->gpon_control, cold->refused_register, cold->refused_value);
+		cold->gpon_control, cold->refused_register, cold->refused_value,
+		cold->gate_written_mask, cold->gate_sampled_mask, cold->gate_polls,
+		cold->gate_stable,
+		cold->gate_before[0], cold->gate_requested[0], cold->gate_readback[0],
+		cold->gate_before[1], cold->gate_requested[1], cold->gate_readback[1],
+		cold->gate_before[2], cold->gate_requested[2], cold->gate_readback[2],
+		cold->gate_before[3], cold->gate_requested[3], cold->gate_readback[3]);
 }
 static DEVICE_ATTR_RO(cold_bootstrap);
 

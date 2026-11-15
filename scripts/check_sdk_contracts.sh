@@ -19,7 +19,7 @@ for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_
             include/aal_fdb.h aal_fdb.c include/aal_mcast.h include/aal_port.h \
             aal_l2_classification.c include/aal_l2_classification.h include/aal_arb.h \
             include/aal_l2_qos.h include/aal_l2_vlan.h \
-            aal_l2_tm.c aal_l2_te.c include/aal_l2_tm.h \
+            aal_l2_tm.c aal_l2_te.c aal_l2_qm.c include/aal_l2_tm.h include/aal_l2_qm.h \
             include/aal_l3_cls.h include/aal_l3fe.h include/aal_l3_specpkt.h \
             include/aal_l2_specpkt.h aal_l2_specpkt.c include/aal_ni_l2.h \
             aal_pon.c aal_gpon.c aal_psds.c aal_epon_mac.c aal_xgpon.c; do
@@ -30,6 +30,8 @@ fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/$
     "$work/sdk/${sdk_path%/*}/cortina-api/vlan.c"
 fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/${sdk_path%/*}/cortina-api/eth_port.c" \
     "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c"
+fetch "https://raw.githubusercontent.com/jameywine/ca-network-drivers/$sdk_pin/ca-scfg/1.0-r0/ca-scfg-1.0/config/scfg-77c.txt" \
+    "$work/scfg-77c.txt"
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/include/soc/cortina/rtl8277c_registers.h" \
     "$work/rtl8277c_registers.h"
 fetch "https://raw.githubusercontent.com/jameywine/GPL-for-GP3000/$register_pin/linux-5.10.x/drivers/gpio/gpio-ca77xx.c" \
@@ -66,6 +68,10 @@ python3 scripts/test_l2_evidence.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_ni_mib_evidence.py --sdk-ni "$work/aal_ni_l2.c" \
     --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_tm_evidence.py --registers "$work/rtl8277c_registers.h" \
+    --sdk-root "$work/sdk/$sdk_path"
+python3 scripts/test_l2qm_baseline.py --registers "$work/rtl8277c_registers.h" \
+    --sdk-root "$work/sdk/$sdk_path" --startup "$work/scfg-77c.txt"
+python3 scripts/test_l2_es_cold.py --registers "$work/rtl8277c_registers.h" \
     --sdk-root "$work/sdk/$sdk_path"
 python3 scripts/test_pon_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h"
 python3 scripts/test_qm_sdk_registers.py --sdk-header "$work/rtl8277c_registers.h" \

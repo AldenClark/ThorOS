@@ -38,6 +38,7 @@ def function(text, name):
 
 
 names = ('rtl_ni_owner_claim', 'rtl_ni_owner_expose', 'rtl_ni_owner_release',
+         'rtl_mib_read', 'rtl_mib_write',
          'rtl_pon_host_gate',
          'rtl_engine_poison', 'rtl_engine_prepare', 'rtl_engine_start',
          'rtl_engine_stop', 'rtl_engine_get', 'rtl_engine_put',
@@ -72,6 +73,8 @@ common = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include "rtl9617c-l2qm.h"
+#include "rtl9617c-l2-es.h"
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 typedef int netdev_tx_t;
@@ -482,7 +485,8 @@ with tempfile.TemporaryDirectory(prefix='ni-owner-lifetime-') as directory:
         cfile.write_text(unit)
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                         '-Wno-misleading-indentation', '-O1', '-g', '-pthread',
-                        '-fsanitize=address,undefined', str(cfile), '-o', str(binary)], check=True)
+                        '-fsanitize=address,undefined', '-I', str(driver),
+                        str(cfile), '-o', str(binary)], check=True)
         run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20)
         if expected:
             print(run.stdout + run.stderr, end='')

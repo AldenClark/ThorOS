@@ -17,7 +17,9 @@ from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024
 MAX_COUNTER = (1 << 64) - 1
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
-TOKEN = re.compile(r"(?<!\S)([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]+)")
+# An empty value still occupies its key: a truncated duplicate must not make
+# a preceding, apparently valid field win silently.
+TOKEN = re.compile(r"(?<!\S)([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]*)")
 LIFECYCLE = ("base_ready", "dma_exposed", "engine_poisoned", "host_active", "reboot_required")
 MIB_COUNTERS = ("rx_bytes", "tx_bytes", "rx_uc", "rx_mc", "rx_bc", "tx_uc", "tx_mc", "tx_bc")
 MAX_MIB_AGE_NS = 3_000_000_000
@@ -29,10 +31,24 @@ TM_CONFIGS = ('tm_clear_control', 'bm_control', 'buffer_config', 'eq_config', 'p
 TM_STATUSES = ('tm_init', 'te_pm_init', 'fc_status', 'es_ready', 'es_pending0', 'es_pending1',
                'es_pending2', 'es_pending3', 'es_ok0', 'es_ok1', 'es_ok2', 'es_ok3',
                'es_port_ok', 'es_arb', 'buffer_free')
+# Additive schema-1 extension: older captures remain usable with their smaller
+# observation set. A partial extension is corruption, not an old firmware.
+TM_BUFFER_CONFIGS = ('eq_weight', 'fe_backpressure', 'private_profile1',
+                     'private_profile2', 'private_profile3', 'private_select0', 'private_select1')
+TM_BUFFER_STATUSES = ('private_empty_ports', 'eq_free', *(f'cos{i}_bufcnt' for i in range(8)))
 TM_BM_COUNTERS = ('bm_rx', 'bm_tx', 'bm_sb_drop', 'bm_hdr_drop', 'bm_te_drop',
                   'bm_err_drop', 'bm_nobuf_drop')
 TM_TE_COUNTERS = ('te_pol_drop', 'te_tail_drop', 'te_wred_y_drop', 'te_wred_g_drop')
 FAILURE_MARKER = re.compile(r"(?:probe_(?:failed|skipped|unavailable)|read_truncated|truncated|skipped)=")
+L2_HW_REASONS = ('ok', 'requires-existing-svl', 'priority-fdb-key', 'tpid-profile',
+                 'cpu-egress-edit', 'queue-baseline', 'lan-source-map', 'foreign-source-alias',
+                 'aging-timebase', 'foreign-classifier', 'foreign-learning', 'special-profile-capacity',
+                 'mac-limit-io', 'table-io', 'shared-command-busy', 'pipeline-drain-timeout',
+                 'native-mtu-baseline', 'control-packet-classification')
+COLD_STAGES = ('none', 'global_snapshot', 'select_family', 'write_receive_gates',
+               'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready')
+COLD_GATES = ((0x088c, 1, 'EPON_1G'), (0x10b4, 1 << 7, 'EPON_10G'),
+              (0x6114, 1 << 1, 'GPON'), (0x4004, 3, 'XGPON'))
 
 
 def fields(lines):
@@ -81,6 +97,13 @@ def register(value):
         return None
     result = int(value, 16 if value.startswith("0x") else 10)
     return result if result <= 0xFFFFFFFF else None
+
+
+def signed32(value):
+    if not isinstance(value, str) or not re.fullmatch(r'-?[0-9]{1,10}', value):
+        return None
+    result = int(value)
+    return result if -(1 << 31) <= result < (1 << 31) else None
 
 
 def uptime(value):
@@ -184,6 +207,115 @@ def select_state(snapshot, name, keys):
         value = raw.get(key)
         if isinstance(value, str) and re.fullmatch(r"(?:-?[0-9]{1,20}|0x[0-9a-fA-F]{1,16})", value):
             result[key] = value
+    return result
+
+
+def select_fe_state(snapshot, keys):
+    result = select_state(snapshot, 'fe', keys)
+    lines = snapshot.get('fe', [])
+    if faulty(lines):
+        return result
+    raw = fields(lines)
+    if 'l2_hw_reason_name' not in raw:
+        return result
+    reason = number(raw.get('l2_hw_reason'))
+    expected = L2_HW_REASONS[reason] if reason is not None and reason < len(L2_HW_REASONS) else None
+    # Do not echo arbitrary probe strings, addresses, or mismatched enum labels.
+    result['l2_hw_reason_name_valid'] = expected is not None and raw.get('l2_hw_reason_name') == expected
+    if result['l2_hw_reason_name_valid']:
+        result['l2_hw_reason_name'] = expected
+    return result
+
+
+def cold_sample(snapshot):
+    """Decode a historical probe record; never infer a live gate or L2 hit.
+
+    provider_ready/engine_poisoned are current flags accompanying the cached
+    record. A valid record is not proof of a new power cycle, nor proof that
+    a gate remains shut after the normal PON owner reopens it.
+    """
+    lines = snapshot.get('cold_bootstrap', [])
+    invalid = lambda reason: {'valid': False, 'historical': True, 'reason': reason}
+    if not lines or faulty(lines):
+        return invalid('cold_record_missing_or_incomplete')
+    raw = fields(lines)
+    if any(raw.get(key) != '1' for key in ('schema', 'cached', 'historical')):
+        return invalid('unsupported_cold_record_schema')
+    bools = ('requested', 'attempted', 'managed', 'provider_ready', 'engine_poisoned',
+             'pon_snapshot_ready', 'pon_pdc_active')
+    registers = ('pon_gated_mask', 'pon_fifo', 'pon_control', 'pon_epon_control',
+                 'pon_gpon_control', 'pon_refused_register', 'pon_refused_value')
+    record = {key: number(raw.get(key)) for key in (*bools, 'pon_stage', 'pon_fifo_polls')}
+    record.update({key: register(raw.get(key)) for key in registers})
+    record.update({key: signed32(raw.get(key)) for key in ('result', 'pon_error')})
+    if (any(value is None for value in record.values()) or
+            any(record[key] > 1 for key in bools) or record['pon_stage'] >= len(COLD_STAGES) or
+            record['pon_gated_mask'] > 15 or record['pon_fifo_polls'] > 0xffffffff):
+        return invalid('cold_record_missing_or_invalid_value')
+    if ((record['pon_snapshot_ready'] and (record['pon_stage'] != 7 or record['pon_error'])) or
+            (record['pon_gated_mask'] and not record['pon_pdc_active']) or
+            (record['managed'] and (not record['requested'] or not record['attempted'] or
+                                   record['result'] or not record['pon_snapshot_ready']))):
+        return invalid('cold_record_inconsistent_state')
+
+    gate_fields = tuple(f'pon_gate{i}_{part}' for i in range(4)
+                        for part in ('before', 'requested', 'readback'))
+    gate_masks = ('pon_gate_written_mask', 'pon_gate_sampled_mask')
+    gate_counts = ('pon_gate_polls', 'pon_gate_stable')
+    extension = None
+    if any(key in raw for key in (*gate_fields, *gate_masks, *gate_counts)):
+        extension = {key: register(raw.get(key)) for key in (*gate_fields, *gate_masks)}
+        extension.update({key: number(raw.get(key)) for key in gate_counts})
+        if (any(value is None for value in extension.values()) or
+                any(extension[key] > 0xffffffff for key in gate_counts)):
+            return invalid('cold_gate_extension_partial_or_invalid')
+        selected = record['pon_gated_mask']
+        sampled, written = (extension[key] for key in ('pon_gate_sampled_mask', 'pon_gate_written_mask'))
+        if (sampled & ~selected or written & ~sampled or
+                extension['pon_gate_stable'] > min(3, extension['pon_gate_polls'])):
+            return invalid('cold_gate_extension_inconsistent')
+        for i, (_, mask, _) in enumerate(COLD_GATES):
+            before = extension[f'pon_gate{i}_before']
+            requested = extension[f'pon_gate{i}_requested']
+            readback = extension[f'pon_gate{i}_readback']
+            if ((not sampled & (1 << i) and (before or requested or readback)) or
+                    (sampled & (1 << i) and before != 0xffffffff and requested != (before & ~mask))):
+                return invalid('cold_gate_extension_inconsistent')
+            if written & (1 << i) and (before == 0xffffffff or not (before & mask) or
+                    requested != (before & ~mask)):
+                return invalid('cold_gate_extension_inconsistent')
+            if (record['pon_snapshot_ready'] and selected & (1 << i) and
+                    (before == 0xffffffff or extension[f'pon_gate{i}_readback'] & mask or
+                     bool(written & (1 << i)) != bool(before & mask))):
+                return invalid('cold_gate_extension_inconsistent')
+        if record['pon_snapshot_ready'] and (sampled != selected or
+                extension['pon_gate_stable'] != (3 if selected else 0) or
+                (not selected and extension['pon_gate_polls'])):
+            return invalid('cold_gate_extension_inconsistent')
+
+    if record['managed']:
+        diagnosis = 'cold_baseline_prepared_not_runtime_L2_proof'
+    elif not record['requested']:
+        diagnosis = 'cold_handoff_not_requested'
+    elif not record['attempted']:
+        diagnosis = 'cold_handoff_not_attempted'
+    elif record['pon_error'] and record['pon_stage'] == 4 and not record['pon_fifo_polls']:
+        diagnosis = 'receive_gate_readback_refused_before_FIFO'
+    elif record['pon_error']:
+        diagnosis = 'PON_quiesce_or_reverification_refused'
+    else:
+        diagnosis = 'fabric_or_resource_preparation_not_managed'
+    result = {'valid': True, 'historical': True, 'power_cycle_proven': False,
+              'live_RX_state_proven': False, 'runtime_native_L2_proven': False,
+              'reason': diagnosis, 'stage_name': COLD_STAGES[record['pon_stage']],
+              'record': record, 'gate_extension_present': extension is not None}
+    if extension is not None:
+        result['gate_observations'] = extension
+    if record['pon_error']:
+        for address, mask, family in COLD_GATES:
+            if record['pon_refused_register'] == address:
+                result['refused_receive_gate'] = {'family': family, 'register': address, 'mask': mask,
+                                                  'last_gate_bits': record['pon_refused_value'] & mask}
     return result
 
 
@@ -313,7 +445,9 @@ def tm_sample(snapshot, active):
         return None, 'fabric_cache_missing_or_incomplete'
     if active and faulty(snapshot.get('fabric_sample', [])):
         return None, 'last_fabric_capture_failed_old_cache_not_reused'
-    header = fields(lines[:1])
+    # Header and register metadata share one namespace. A later duplicate
+    # valid/schema/epoch flag (including an empty one) invalidates the record.
+    header = fields([line for line in lines if not line.startswith('counter=')])
     expected = {'schema': '1', 'cached': '1', 'clock': 'boottime', 'global': '1',
                 'atomic_hardware_snapshot': '0', 'hardware_reset_verified': '0',
                 'te_direct_mode_verified': '0', 'valid': '1'}
@@ -343,7 +477,7 @@ def tm_sample(snapshot, active):
     end = uptime(fields(snapshot.get('sample_end', [])).get('uptime'))
     if begin is None or end is None or not begin * 1_000_000_000 <= timing['capture_ns'] < (end + Decimal('0.01')) * 1_000_000_000:
         return None, 'fabric_capture_outside_snapshot_clock_window'
-    metadata = fields([line for line in lines[1:] if not line.startswith('counter=')])
+    metadata = header
     if (metadata.get('contract') != 'partial' or metadata.get('tm_te_baseline_verified') != '0' or
             metadata.get('wan_arb_readback') != '0'):
         return None, 'unsupported_fabric_contract'
@@ -351,6 +485,12 @@ def tm_sample(snapshot, active):
     status = {key: register(metadata.get(key)) for key in TM_STATUSES}
     if any(value is None for value in (*configuration.values(), *status.values())):
         return None, 'fabric_register_snapshot_missing_or_invalid'
+    if any(key in metadata for key in (*TM_BUFFER_CONFIGS, *TM_BUFFER_STATUSES)):
+        extension = {key: register(metadata.get(key)) for key in (*TM_BUFFER_CONFIGS, *TM_BUFFER_STATUSES)}
+        if any(value is None for value in extension.values()):
+            return None, 'fabric_buffer_extension_partial_or_invalid'
+        configuration.update({key: extension[key] for key in TM_BUFFER_CONFIGS})
+        status.update({key: extension[key] for key in TM_BUFFER_STATUSES})
     clear = configuration['tm_clear_control'] >> 31
     if metadata.get('bm_clear_on_read') != str(clear):
         return None, 'fabric_counter_mode_mismatch'
@@ -362,6 +502,8 @@ def tm_sample(snapshot, active):
         name = row.get('counter')
         if name not in TM_BM_COUNTERS + TM_TE_COUNTERS or name in counters:
             return None, 'fabric_counter_duplicate_or_unknown'
+        if any(key in header or key not in ('counter', 'raw', 'observed', 'mode') for key in row):
+            return None, 'fabric_counter_shadows_metadata'
         raw = number(row.get('raw'))
         mode = ('read_clear' if clear else 'cumulative') if name in TM_BM_COUNTERS else 'unknown'
         if raw is None or raw > 0xffffffff or row.get('mode') != mode:
@@ -431,9 +573,11 @@ def summarize(text):
                         "Linux netdev and QM CPU counters describe host traffic, not ASIC LAN MIBs.",
                         "Two non-atomic observations cannot exclude intervening resets or policy ABA.",
                         "FE rows are not differenced without a stable per-flow/counter generation.",
-                        "MAC raw observations have unverified counter mode; no MAC delta or rate is calculated."],
-              "states": {}, "qm_cpu": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {}}
-    fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_error", "l2_ports",
+                        "MAC raw observations have unverified counter mode; no MAC delta or rate is calculated.",
+                        "Cold-bootstrap records are historical, not proof of a new power cycle or current RX gates."],
+              "states": {}, "qm_cpu": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
+              "cold_bootstrap_history": {}}
+    fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "lan_admission_valid", "lan_cpu_mask",
                "lan_route_mask", "lan_native_l2_mask", "base_ready", "base_failed",
                "full_l3_drain_verified", "route_gate_ready", "route_admitted",
@@ -443,8 +587,9 @@ def summarize(text):
                "sdk_wan_arb_pdpid", "wan_arb_board_contract_verified",
                "programming_metadata_is_readback")
     for which, snapshot in snapshots.items():
-        result["states"][which] = {"fe": select_state(snapshot, "fe", fe_keys),
+        result["states"][which] = {"fe": select_fe_state(snapshot, fe_keys),
                                     "ni": select_state(snapshot, "xram_state", LIFECYCLE)}
+        result['cold_bootstrap_history'][which] = cold_sample(snapshot)
     if not window["valid"]:
         result["qm_cpu"] = {"valid": False, "reason": "invalid_clock_window"}
         result["netdev_host"] = {"valid": False, "reason": "invalid_clock_window"}

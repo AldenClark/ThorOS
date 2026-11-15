@@ -27,6 +27,9 @@ enum rtl_tm_config_index {
 	RTL_TM_NI_INTERNAL, RTL_TM_NI_DEMUX0, RTL_TM_NI_DEMUX1,
 	RTL_TM_NI_DEMUX2, RTL_TM_NI_DEMUX3, RTL_TM_NI_DEEP0, RTL_TM_NI_DEEP1,
 	RTL_TM_NI_DEEP2, RTL_TM_NI_DEEP3, RTL_TM_LPB_MAP,
+	RTL_TM_EQ_WEIGHT, RTL_TM_FE_BACKPRESSURE,
+	RTL_TM_PRIVATE_PROFILE1, RTL_TM_PRIVATE_PROFILE2, RTL_TM_PRIVATE_PROFILE3,
+	RTL_TM_PRIVATE_SELECT0, RTL_TM_PRIVATE_SELECT1,
 	RTL_TM_CONFIGS
 };
 
@@ -48,6 +51,13 @@ static const struct rtl_tm_register rtl_tm_config_registers[] = {
 	{"ni_deep0", 0xa1f0}, {"ni_deep1", 0xa1ec},
 	{"ni_deep2", 0xa1e8}, {"ni_deep3", 0xa1e4},
 	{"lpb_map", 0x3404},
+	/* Admission depends on the selected private profile, not just profile0.
+	 * Inherited/externally changed selectors or pool weights must not leave
+	 * apparently comparable BM samples in the same observed epoch. */
+	{"eq_weight", 0x220c}, {"fe_backpressure", 0x2214},
+	{"private_profile1", 0x221c}, {"private_profile2", 0x2220},
+	{"private_profile3", 0x2224},
+	{"private_select0", 0x2228}, {"private_select1", 0x222c},
 };
 
 static const struct rtl_tm_register rtl_tm_status_registers[] = {
@@ -57,6 +67,15 @@ static const struct rtl_tm_register rtl_tm_status_registers[] = {
 	{"es_ok0", 0x23e4}, {"es_ok1", 0x23e8}, {"es_ok2", 0x23ec},
 	{"es_ok3", 0x23f0}, {"es_port_ok", 0x23f4}, {"es_arb", 0x23f8},
 	{"buffer_free", 0x2234},
+	/* aal_l2_qm's direct getters: raw instantaneous allocation/status, not
+	 * packet/drop counters. No ACCESS selector and no PM clear-on-read bit
+	 * is involved. A sampled empty/private mask or CoS buffer use does not
+	 * identify the source of the global BM drop counter. */
+	{"private_empty_ports", 0x2230}, {"eq_free", 0x2260},
+	{"cos0_bufcnt", 0x2238}, {"cos1_bufcnt", 0x223c},
+	{"cos2_bufcnt", 0x2240}, {"cos3_bufcnt", 0x2244},
+	{"cos4_bufcnt", 0x2248}, {"cos5_bufcnt", 0x224c},
+	{"cos6_bufcnt", 0x2250}, {"cos7_bufcnt", 0x2254},
 };
 #define RTL_TM_STATUSES (sizeof(rtl_tm_status_registers) / sizeof(rtl_tm_status_registers[0]))
 

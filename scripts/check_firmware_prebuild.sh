@@ -24,8 +24,11 @@ python3 scripts/test_fe_destination_timeout.py
 python3 scripts/test_fe_destination_status.py
 python3 scripts/test_fe_fdb_domain.py
 python3 scripts/test_fe_window_idle.py
+python3 scripts/test_ni_oam_owner.py
 python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_hardware_recipe.py
+python3 scripts/test_l2qm_baseline.py
+python3 scripts/test_l2_es_cold.py
 python3 scripts/test_fabric_baseline.py
 python3 scripts/test_pon_cold_handoff.py
 python3 scripts/test_pon_probe_unwind.py --mutants

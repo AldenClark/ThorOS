@@ -242,6 +242,68 @@ void rtl_fe_fabric_cold_abort(struct rtl_fe *fe, int error)
  mutex_unlock(&fe->lock);
 }
 
+int rtl_fe_oam_configure(struct rtl_fe *fe)
+{
+ static const unsigned int index[]={15,0x8f,0x4f,0xcf};
+ struct rtl_dq_io io;
+ unsigned int i,value;
+ int ret=0;
+
+ if(!fe)return -EOPNOTSUPP;
+ io=fe_io(fe);
+ /* RTNL serializes NI opens, not FE cleanup or verification. The OAM
+  * maps use the same PDPID ACCESS/DATA window as the L3 connectors and
+  * therefore must use its FE owner too. Never acquire a PON lock here. */
+ mutex_lock(&fe->lock);
+ if(fe->shutting_down) {ret=-ENODEV;goto out;}
+ if(fe->base_failed || fe->fabric.poisoned) {ret=-EIO;goto out;}
+ if(!fe->engine_ready) {ret=-EAGAIN;goto out;}
+
+ /* aal_port: NI7's ninth queue (LDPID15) targets OAM physical port12.
+  * Verify all four side/deep-queue banks, including when L3 is OFF and
+  * no FE base snapshot exists. A healthy reopen only reads the maps.
+  * A timeout does not cancel the command: do not stage, roll back or
+  * retry while the shared hardware window remains busy. */
+ for(i=0;i<ARRAY_SIZE(index);i++) {
+  ret=rtl_fe_window_idle(&io,0x1654);
+  if(ret)goto out;
+  ret=fe_access(fe,0x1654,BIT(31)|index[i]);
+  if(ret)goto out;
+  value=fe_read(fe,0x1658);
+  if(value==~0U) {ret=-EIO;goto out;}
+  if((value&15)==12)continue;
+  ret=rtl_fe_window_idle(&io,0x1654);
+  if(ret)goto out;
+  fe_write(fe,0x1658,(value&~15U)|12);
+  ret=fe_access(fe,0x1654,BIT(31)|BIT(30)|index[i]);
+  if(ret)goto out;
+  ret=fe_access(fe,0x1654,BIT(31)|index[i]);
+  if(ret)goto out;
+  value=fe_read(fe,0x1658);
+  if(value==~0U || (value&15)!=12) {ret=-EIO;goto out;}
+ }
+
+ /* NI owns scheduler12. Clear an inherited flush command as the original
+  * OAM setup did; retaining flush_en would silently discard control
+  * traffic. Do not issue a flush or alter other ports/reserved fields. */
+ value=fe_read(fe,0x2394);
+ if(value==~0U) {ret=-EIO;goto out;}
+ if((value&0x00ff80ffU)!=0x000600ffU)
+  fe_write(fe,0x2394,(value&~0x00ff80ffU)|0x000600ffU);
+ value=fe_read(fe,0x2394);
+ if(value==~0U || (value&0x00ff80ffU)!=0x000600ffU) {
+  ret=-EIO;goto out;
+ }
+ value=fe_read(fe,0x2300);
+ if(value==~0U) {ret=-EIO;goto out;}
+ if(!(value&BIT(12)))fe_write(fe,0x2300,value|BIT(12));
+ value=fe_read(fe,0x2300);
+ if(value==~0U || !(value&BIT(12)))ret=-EIO;
+out:
+ mutex_unlock(&fe->lock);
+ return ret;
+}
+
 /* LPB1 (LAN connector) and LPB2 (PON connector) select one of two owned
  * classifier profiles. Profile1 has the SDK keep-original CPU action for
  * EVERY default result type; profile0 alone may enter the routing hash.
@@ -365,7 +427,7 @@ static void fe_collect_ports(struct rtl_fe *fe)
 static int fe_prepare(struct rtl_fe *fe)
 {
  struct rtl_dq_io io=fe_io(fe);
- unsigned int mask[8],cls[7],zero[7]={0},lpb[3],i,side,type,row;
+ unsigned int mask[8],cls[7],zero[7]={0},lpb[3],i,side,type,row,value;
  unsigned long flags;
  int ret;
 
@@ -382,7 +444,17 @@ static int fe_prepare(struct rtl_fe *fe)
   * CPU default used by our atomic gate. Do not clear somebody else's ACL. */
  ret=rtl_fe_classifier_keys_empty(&io);
  if(ret)return ret;
- for(i=0;i<ARRAY_SIZE(fe_registers);i++)fe->saved[i]=fe_read(fe,fe_registers[i]);
+ for(i=0;i<ARRAY_SIZE(fe_registers);i++) {
+  fe->saved[i]=fe_read(fe,fe_registers[i]);
+  /* These are control words, not arbitrary mask/hash payloads. Refuse
+   * an inaccessible control bank before claiming a writable snapshot. */
+  if((fe_registers[i]==0x30a4 || fe_registers[i]==0x2300 ||
+      fe_registers[i]==0xa1e0) && fe->saved[i]==~0U) {
+   fe->base_rejected_register=fe_registers[i];
+   fe->base_rejected_value=fe->saved[i];
+   return -EIO;
+  }
+ }
  for(i=0;i<FE_LAN_PORTS;i++)fe->lan_saved[i]=fe_read(fe,FE_LAN_RX_CTRL(i));
  ret=rtl_fe_mask_read(&io,63,fe->mask_saved);
  if(ret)return ret;
@@ -429,7 +501,11 @@ static int fe_prepare(struct rtl_fe *fe)
  if(ret)return ret;
  fe_write(fe,0x3500,0x11); /* Session version/type1, code0. */
  fe_write(fe,0x3504,PPP_IP|PPP_IPV6<<16);
- fe_write(fe,0x30a4,fe_read(fe,0x30a4)|BIT(31)); /* PON stream from HeaderA into HeaderI. */
+ /* Check each fresh RMW read too: a valid early snapshot is not proof
+  * that the control bank remains accessible while installation runs. */
+ value=fe_read(fe,0x30a4);
+ if(value==~0U) {fe->base_rejected_register=0x30a4;fe->base_rejected_value=value;return -EIO;}
+ fe_write(fe,0x30a4,value|BIT(31)); /* PON stream from HeaderA into HeaderI. */
  fe_write(fe,0x351c,(fe_read(fe,0x351c)&~(0x3fU<<4|0x3fU<<16|7U<<24))|BIT(31)|BIT(12)|32U<<4|16U<<16);
  /* TX MIB differences use unsigned wrap, including the32-bit packet count. */
  fe_write(fe,0x3508,fe_read(fe,0x3508)|0x1f00);
@@ -471,7 +547,9 @@ static int fe_prepare(struct rtl_fe *fe)
  if(ret)return ret;
  fe_write(fe,0x3400,(fe_read(fe,0x3400)&~(BIT(0)|BIT(10)))|BIT(3)|BIT(2)|BIT(19));
  fe_write(fe,0x3404,7|(25<<8)|(1<<14)|(24<<16)|(2<<22)|(3<<24));
- fe_write(fe,0x2300,fe_read(fe,0x2300)|BIT(12)|BIT(13));
+ value=fe_read(fe,0x2300);
+ if(value==~0U) {fe->base_rejected_register=0x2300;fe->base_rejected_value=value;return -EIO;}
+ fe_write(fe,0x2300,value|BIT(12)|BIT(13));
  fe_write(fe,0x2304+12*12,0xff|(6<<16));
  fe_write(fe,0x2304+13*12,0xff|(6<<16));
  for(i=0;i<5;i++)fe_write(fe,0x394c+i*4,0);
@@ -494,7 +572,9 @@ static int fe_prepare(struct rtl_fe *fe)
  /* The Linux rule already selected the physical LAN output. A second
   * L2 lookup would override it with the indexed DA entry's forwarding port.
   * NI demux3 enters L2TM directly; only LAN0..4's selectors change. */
- fe_write(fe,0xa1e0,fe_read(fe,0xa1e0)|0x3ff);
+ value=fe_read(fe,0xa1e0);
+ if(value==~0U) {fe->base_rejected_register=0xa1e0;fe->base_rejected_value=value;return -EIO;}
+ fe_write(fe,0xa1e0,value|0x3ff);
  rtl_fe_cache_start(&io);
  fe_write(fe,0x351c,fe_read(fe,0x351c)|BIT(10));
  fe->base_ready=true;
@@ -1985,7 +2065,8 @@ static bool fe_base_match(struct rtl_fe *fe,unsigned int reg,
 {
  unsigned int value=fe_read(fe,reg);
 
- if((value&mask)==(expected&mask))return true;
+ /* Expected-one fields alone do not validate an inaccessible MMIO bank. */
+ if(value!=~0U && (value&mask)==(expected&mask))return true;
  fe->base_rejected_register=reg;
  fe->base_rejected_value=value;
  return false;
@@ -2030,8 +2111,8 @@ static int fe_base_check_locked(struct rtl_fe *fe)
     !fe_base_match(fe,0x3848,7,4) || !fe_base_match(fe,0x3854,7,1) ||
     !fe_base_match(fe,0x38c4,0xfc000000U,0xa0000000U) ||
     !fe_base_match(fe,0x2300,BIT(12)|BIT(13),BIT(12)|BIT(13)) ||
-    !fe_base_match(fe,0x2394,0x00ff00ffU,0x000600ffU) ||
-    !fe_base_match(fe,0x23a0,0x00ff00ffU,0x000600ffU) ||
+    !fe_base_match(fe,0x2394,0x00ff80ffU,0x000600ffU) ||
+    !fe_base_match(fe,0x23a0,0x00ff80ffU,0x000600ffU) ||
     !fe_base_match(fe,0xa1e0,0x3ff,0x3ff) ||
     !fe_base_match(fe,0x3400,BIT(0)|BIT(2)|BIT(3)|BIT(10)|BIT(19),
                    BIT(2)|BIT(3)|BIT(19)) ||

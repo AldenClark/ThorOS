@@ -18,6 +18,7 @@
 #include "rtl9617c-qm.h"
 #include "rtl9617c-fe.h"
 #include "rtl9617c-rx-checksum.h"
+#include "rtl9617c-l2qm.h"
 
 #define EQ_ID 4
 #define EQ_CFG (0x61e8 + EQ_ID * 20)
@@ -451,7 +452,7 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		ret = rtl_qm_window_idle(rx, 0x2db4);
 		if (ret)
 			return ret;
-		writel(0x8e308000, ni + 0x2db8);
+		writel(RTL_L2QM_PORT_FREE_CREDIT, ni + 0x2db8);
 		ret = rtl_qm_indirect(rx, 0x2db4, BIT(31) | BIT(30) | i);
 		if (ret)
 			return ret;

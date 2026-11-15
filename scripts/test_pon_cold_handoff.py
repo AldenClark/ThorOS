@@ -5,7 +5,10 @@
 The model rejects every access to a held-reset or unselected MAC and to a
 held-reset PDC FIFO. Optional generated-register and GPL source pins check
 the actual vendor field layouts and reset polarity; this is not a hardware
-clock, bus-response, optical, or DDR-retirement proof.
+clock, bus-response, optical, or DDR-retirement proof. Delayed gate visibility
+models a completed MMIO request whose device-side admission acknowledgement
+has not settled yet, not a host posted write that readl() should flush. It is
+a software robustness oracle, not evidence that this is the board's cause.
 
 --sdk-directory accepts a pinned ca-network-drivers checkout root or its
 ca-network-engine/1.0-r0/ca-network-engine-1.0/aal-77c directory.
@@ -16,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import signal
 import subprocess
 import sys
 import tempfile
@@ -163,8 +167,9 @@ SHIM = r'''
 #include <string.h>
 typedef uint32_t ca_uint32_t;
 static unsigned waits;
+static void device_settle(void);
 static void usleep_range(unsigned low,unsigned high) {
- assert(low==100 && high==200);waits++;
+ assert(low==100 && high==200);waits++;device_settle();
 }
 #include "rtl9617c-pon-cold.h"
 static unsigned regs[0xc000/4],saved[0xc000/4],global[3],initial[3],global_reads[3];
@@ -172,20 +177,44 @@ static const unsigned offsets[]={0x088c,0x10b4,0x6114,0x4004};
 static const unsigned masks[]={1U,1U<<7,1U<<1,3U};
 static const unsigned global_regs[]={0xf4320094U,0xf4320074U,0xf432007cU};
 static unsigned allowed,mac_reads,writes,fifo_reads,busy_left,stuck_index,stuck_mask;
-static unsigned drift_index,drift_on_read,drift_mask;
+static unsigned drift_index,drift_on_read,drift_mask,drift_on_wait;
+static unsigned drift_mac_index,drift_mac_read;
+static unsigned gate_reads[4],gate_writes[4],gate_delay[4],gate_due[4],gate_requested[4];
+static unsigned gate_pending,gate_waits,ones_index,ones_on_read,fifo_ones_on_read;
+static unsigned flicker_index,change_index,change_wait,change_mask;
+static int observed_snapshot_drift;
 static int expected_error,fifo_stuck,fifo_flicker,verify_busy;
+static void device_settle(void) {
+ if(drift_index<3 && waits==drift_on_wait)global[drift_index]^=drift_mask;
+ if(fifo_reads)return;
+ gate_waits++;
+ for(unsigned i=0;i<4;i++)if((gate_pending&(1U<<i)) && gate_waits>=gate_due[i]) {
+  /* The non-gate register fields were written synchronously. Only the
+   * device's gate acknowledgement changes after the configured interval. */
+  regs[offsets[i]/4]=(regs[offsets[i]/4]&~masks[i])|(gate_requested[i]&masks[i]);
+  gate_pending&=~(1U<<i);
+ }
+ if(flicker_index<4) {
+  if(gate_waits==1)regs[offsets[flicker_index]/4]|=masks[flicker_index];
+  if(gate_waits==2)regs[offsets[flicker_index]/4]&=~masks[flicker_index];
+ }
+ if(change_index<4 && gate_waits==change_wait)regs[offsets[change_index]/4]^=change_mask;
+}
 static unsigned read_reg(void *ctx,unsigned reg) {
  (void)ctx;
  for(unsigned i=0;i<3;i++)if(reg==global_regs[i]) {
   global_reads[i]++;
   if(drift_index==i && global_reads[i]==drift_on_read)global[i]^=drift_mask;
+  if(global[i]!=initial[i])observed_snapshot_drift=1;
   return global[i];
  }
  /* Reject access to every held-reset PDC or unsupported/ambiguous mode. */
- assert((initial[0]&0x200) && !expected_error);
+ assert((initial[0]&0x200) && !expected_error && !observed_snapshot_drift);
+ assert(!memcmp(global,initial,sizeof(global)));
  if(reg==0x9010) {
   for(unsigned i=0;i<4;i++)if(allowed&(1U<<i))assert(!(regs[offsets[i]/4]&masks[i]));
   fifo_reads++;
+  if(fifo_reads==fifo_ones_on_read)return ~0U;
   if(fifo_stuck || (verify_busy && fifo_reads>=4))return 0xc001;
   if(busy_left){busy_left--;return 0xc001;}
   if(fifo_flicker && fifo_reads==3)return 0xc001;
@@ -193,7 +222,10 @@ static unsigned read_reg(void *ctx,unsigned reg) {
  }
  for(unsigned i=0;i<4;i++)if(reg==offsets[i]) {
   /* This is an access fault, not a benign zero-filled inactive register. */
-  assert(allowed&(1U<<i));mac_reads++;return regs[reg/4];
+  assert(allowed&(1U<<i));mac_reads++;gate_reads[i]++;
+  if(i==ones_index && gate_reads[i]==ones_on_read)return ~0U;
+  if(i==drift_mac_index && gate_reads[i]==drift_mac_read)global[drift_index]^=drift_mask;
+  return regs[reg/4];
  }
  assert(!"unexpected register read");return 0;
 }
@@ -201,11 +233,15 @@ static void write_reg(void *ctx,unsigned reg,unsigned value) {
  (void)ctx;unsigned i;
  for(i=0;i<4;i++)if(reg==offsets[i])break;
  /* GLOBAL, TX, reset and unrelated registers must NEVER be written. */
- assert(i<4 && (allowed&(1U<<i)));
+ assert(i<4 && (allowed&(1U<<i)) && !observed_snapshot_drift);
+ assert(!memcmp(global,initial,sizeof(global)));
  assert(regs[reg/4]!=~0U);
  assert((value&~masks[i])==(saved[reg/4]&~masks[i]));
  assert(!(value&masks[i]));
- regs[reg/4]=value;writes++;
+ writes++;gate_writes[i]++;gate_requested[i]=value;
+ assert(gate_writes[i]==1); /* Settling is a read-only wait, never replay. */
+ if(gate_delay[i]) { gate_pending|=1U<<i;gate_due[i]=gate_waits+gate_delay[i]; }
+ else regs[reg/4]=value;
  if(i==stuck_index)regs[reg/4]|=stuck_mask;
 }
 static const struct rtl_dq_io io={.read=read_reg,.write=write_reg};
@@ -216,8 +252,14 @@ static void setup(unsigned control,unsigned epon,unsigned gpon,unsigned seed) {
  for(unsigned i=0;i<4;i++)regs[offsets[i]/4]|=masks[i];
  memcpy(saved,regs,sizeof(regs));
  writes=mac_reads=fifo_reads=busy_left=waits=0;allowed=0;expected_error=0;
+ memset(gate_reads,0,sizeof(gate_reads));memset(gate_writes,0,sizeof(gate_writes));
+ memset(gate_delay,0,sizeof(gate_delay));memset(gate_due,0,sizeof(gate_due));
+ memset(gate_requested,0,sizeof(gate_requested));gate_pending=gate_waits=0;
+ ones_index=flicker_index=change_index=4;ones_on_read=fifo_ones_on_read=0;
+ change_wait=change_mask=0;observed_snapshot_drift=0;
  fifo_stuck=fifo_flicker=verify_busy=0;stuck_index=4;stuck_mask=0;
- drift_index=3;drift_on_read=0;drift_mask=0;
+ drift_index=3;drift_on_read=drift_on_wait=0;drift_mask=0;
+ drift_mac_index=4;drift_mac_read=0;
  if(!(control&0x200))return;
  /* Independent contract oracle: raw numeric SDK fields, not driver macros. */
  if(control&1) {
@@ -245,6 +287,15 @@ static void valid_case(struct rtl_pon_cold_state *state) {
  assert(state->ready && state->stage==RTL_PON_COLD_READY && !state->error);
  assert(state->control==initial[0] && state->epon_control==initial[1] && state->gpon_control==initial[2]);
  assert(state->gated_mask==allowed);
+ assert(state->gate_sampled_mask==allowed && state->gate_written_mask==allowed);
+ assert(state->gate_polls==(allowed?RTL_PON_COLD_GATE_STABLE:0));
+ assert(state->gate_stable==(allowed?RTL_PON_COLD_GATE_STABLE:0));
+ for(unsigned i=0;i<4;i++) {
+  assert(state->gate_before[i]==((allowed&(1U<<i))?saved[offsets[i]/4]:0));
+  assert(state->gate_requested[i]==((allowed&(1U<<i))?(saved[offsets[i]/4]&~masks[i]):0));
+  assert(state->gate_readback[i]==state->gate_requested[i]);
+  assert(gate_writes[i]==!!(allowed&(1U<<i)));
+ }
  assert(state->pdc_active==!!(initial[0]&0x200));
  assert(state->fifo_polls==fifo_reads);
  if(!state->pdc_active)assert(!mac_reads && !writes && !fifo_reads && !waits);
@@ -260,6 +311,18 @@ CASES = r'''
 int main(void) {
  struct rtl_pon_cold_state state={0};unsigned cases=0;
  sdk_oracle();
+ /* Synthetic XG admission word with unrelated fields 0xa0. The
+  * backend deliberately acknowledges the ONE completed request after two
+  * sleep intervals. This is an admissible robustness case, not a claim
+  * that the physical failure was caused by asynchronous acknowledgement. */
+ setup(0x30e,0x30000,0x305,0);
+ regs[0x4004/4]=saved[0x4004/4]=0xa2;gate_delay[3]=2;
+ assert(!rtl_pon_cold_quiesce(&io,&state));
+ assert(state.ready && state.gated_mask==8 && state.gate_written_mask==8);
+ assert(state.gate_sampled_mask==8 && state.gate_before[3]==0xa2);
+ assert(state.gate_requested[3]==0xa0 && state.gate_readback[3]==0xa0);
+ assert(state.gate_polls==5 && state.gate_stable==3 && gate_waits==4);
+ assert(gate_writes[3]==1 && writes==1 && fifo_reads==4);cases++;
  /* Every mux, PDC, parent/child reset, AE hint and ignored high-bit state.
   * Inactive-family register access aborts the process immediately. */
  for(unsigned mode=0;mode<2;mode++)for(unsigned pdc=0;pdc<2;pdc++)
@@ -286,16 +349,72 @@ int main(void) {
  for(unsigned n=0;n<sizeof(recipes)/sizeof(recipes[0]);n++)for(unsigned bit=0;bit<32;bit++) {
   setup(recipes[n][0],recipes[n][1],recipes[n][2],1U<<bit);
   busy_left=n;valid_case(&state);
-  if(initial[0]&0x200)assert(fifo_reads==n+5 && waits==n+2);
+  if(initial[0]&0x200)assert(fifo_reads==n+5 && waits==n+2+(allowed?2:0));
   cases++;
+ }
+ /* All SDK gate families, including simultaneous released children. Vary
+  * acknowledgement latency independently; every sweep must close ALL
+  * selected gates and may not access the opposite held-reset family. */
+ const unsigned delays[]={0,1,2,7,31,RTL_PON_COLD_GATE_POLLS-RTL_PON_COLD_GATE_STABLE};
+ for(unsigned target=0;target<4;target++)
+ for(unsigned both=0;both<2;both++)
+ for(unsigned delay=0;delay<sizeof(delays)/sizeof(delays[0]);delay++) {
+  unsigned ep=target<2?(both?0xf:(1U|(4U<<target))):0;
+  unsigned gp=target>=2?(both?7:(1U|(2U<<(target-2)))):0;
+  setup(target<2?0x30f:0x30e,ep,gp,0x19283746);
+  gate_delay[target]=delays[delay];
+  assert(!rtl_pon_cold_quiesce(&io,&state));
+  assert(state.ready && state.gate_polls==delays[delay]+RTL_PON_COLD_GATE_STABLE);
+  assert(state.gate_stable==RTL_PON_COLD_GATE_STABLE && fifo_reads==4);
+  assert(state.gate_written_mask==allowed && state.gate_sampled_mask==allowed);
+  unchanged_except_gates();cases++;
+ }
+ /* Last-budget closure with too few consecutive samples still times out,
+  * even though its last value is zero; no premature FIFO/fabric access. */
+ for(unsigned target=0;target<4;target++)for(unsigned late=1;late<=3;late++) {
+  setup(target<2?0x30f:0x30e,0xf,7,0);
+  gate_delay[target]=RTL_PON_COLD_GATE_POLLS-RTL_PON_COLD_GATE_STABLE+late;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-ETIMEDOUT);
+  assert(!state.ready && state.stage==RTL_PON_COLD_READBACK && !fifo_reads);
+  assert(state.gate_polls==RTL_PON_COLD_GATE_POLLS && gate_waits==RTL_PON_COLD_GATE_POLLS-1);
+  assert(state.gate_stable==RTL_PON_COLD_GATE_STABLE-late);
+  assert(gate_writes[target]==1 && state.gate_written_mask==allowed);cases++;
+ }
+ /* A gate reopening between samples restarts the stable window. */
+ for(unsigned target=0;target<4;target++) {
+  setup(target<2?0x30f:0x30e,0xf,7,0);flicker_index=target;
+  assert(!rtl_pon_cold_quiesce(&io,&state));
+  assert(state.gate_polls==5 && gate_waits==4 && state.gate_stable==3);
+  assert(gate_writes[target]==1);unchanged_except_gates();cases++;
+ }
+ /* Already-disabled gates need observation, not gratuitous writes. */
+ for(unsigned target=0;target<4;target++) {
+  setup(target<2?0x30f:0x30e,0xf,7,0);
+  regs[offsets[target]/4]&=~masks[target];saved[offsets[target]/4]=regs[offsets[target]/4];
+  assert(!rtl_pon_cold_quiesce(&io,&state));
+  assert(state.gate_sampled_mask==allowed && state.gate_written_mask==(allowed&~(1U<<target)));
+  assert(!gate_writes[target] && state.gate_before[target]==state.gate_requested[target]);
+  unchanged_except_gates();cases++;
+ }
+ /* Hardware may update unrelated fields during settling. The read-only
+  * poll must retain that update and never replay the old full register. */
+ for(unsigned target=0;target<4;target++)for(unsigned bit=0;bit<32;bit++)
+ if(!(masks[target]&(1U<<bit))) {
+  setup(target<2?0x30f:0x30e,0xf,7,0x12345678);
+  gate_delay[target]=2;change_index=target;change_wait=1;change_mask=1U<<bit;
+  assert(!rtl_pon_cold_quiesce(&io,&state));
+  unsigned expected=(saved[offsets[target]/4]&~masks[target])^change_mask;
+  assert(regs[offsets[target]/4]==expected && state.gate_readback[target]==expected);
+  assert(state.gate_requested[target]==(saved[offsets[target]/4]&~masks[target]));
+  assert(gate_writes[target]==1 && state.gate_polls==5);cases++;
  }
  /* Stable-empty sampling must restart after a transient busy sample. */
  setup(0x30e,0x30000,3,0);fifo_flicker=1;
  assert(!rtl_pon_cold_quiesce(&io,&state));
- assert(fifo_reads==7 && waits==5);cases++;
+ assert(fifo_reads==7 && waits==7);cases++;
  setup(0x30f,0x300ef,0x300,0);fifo_stuck=1;
  assert(rtl_pon_cold_quiesce(&io,&state)==-ETIMEDOUT);
- assert(fifo_reads==RTL_PON_COLD_FIFO_POLLS && waits==RTL_PON_COLD_FIFO_POLLS);
+ assert(fifo_reads==RTL_PON_COLD_FIFO_POLLS && waits==RTL_PON_COLD_FIFO_POLLS+2);
  assert(!state.ready && state.stage==RTL_PON_COLD_FIFO && state.refused_register==0x9010);
  unchanged_except_gates();cases++;
  /* An immediately reoccupied FIFO may not pass the final verify. */
@@ -305,9 +424,13 @@ int main(void) {
  for(unsigned target=0;target<4;target++)for(unsigned bit=0;bit<32;bit++)if(masks[target]&(1U<<bit)) {
   setup(target<2?0x30f:0x30e,0x300ef,0x307,0);
   stuck_index=target;stuck_mask=1U<<bit;
-  assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
+  assert(rtl_pon_cold_quiesce(&io,&state)==-ETIMEDOUT);
   assert(!state.ready && state.stage==RTL_PON_COLD_READBACK && !fifo_reads);
-  assert(state.refused_register==offsets[target] && (state.refused_value&stuck_mask));cases++;
+  assert(state.refused_register==offsets[target] && (state.refused_value&stuck_mask));
+  assert(state.gate_polls==RTL_PON_COLD_GATE_POLLS && !state.gate_stable);
+  assert(gate_waits==RTL_PON_COLD_GATE_POLLS-1 && gate_writes[target]==1);
+  unsigned before=writes;
+  assert(rtl_pon_cold_verify(&io,&state)==-ETIMEDOUT && writes==before);cases++;
  }
  /* All-ones MAC read fails before writing that missing register window. */
  for(unsigned target=0;target<4;target++) {
@@ -315,7 +438,29 @@ int main(void) {
   regs[offsets[target]/4]=~0U;saved[offsets[target]/4]=~0U;
   assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
   assert(!state.ready && state.stage==RTL_PON_COLD_GATE && !fifo_reads);
-  assert(regs[offsets[target]/4]==~0U && state.refused_register==offsets[target]);cases++;
+  assert(regs[offsets[target]/4]==~0U && state.refused_register==offsets[target]);
+  assert(state.gate_sampled_mask&(1U<<target));
+  assert(!(state.gate_written_mask&(1U<<target)) && !gate_writes[target]);
+  assert(state.gate_before[target]==~0U && state.gate_readback[target]==~0U);cases++;
+ }
+ /* Losing a register window after an apparently successful gate clear
+  * is an I/O failure, never a reason to wait 1000 times or rewrite it. */
+ const unsigned loss_reads[]={2,3,5};
+ for(unsigned target=0;target<4;target++)for(unsigned loss=0;loss<3;loss++) {
+  setup(target<2?0x30f:0x30e,0xf,7,0);
+  ones_index=target;ones_on_read=loss_reads[loss];
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
+  assert(!state.ready && state.refused_register==offsets[target] && state.refused_value==~0U);
+  assert(state.gate_readback[target]==~0U && gate_reads[target]==loss_reads[loss]);
+  assert(state.stage==(loss==2?RTL_PON_COLD_VERIFY:RTL_PON_COLD_READBACK));
+  assert(fifo_reads==(loss==2?3U:0U) && gate_writes[target]==1);cases++;
+ }
+ for(unsigned loss=1;loss<=4;loss++) {
+  setup(0x30e,0x30000,0x305,0);fifo_ones_on_read=loss;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
+  assert(!state.ready && state.refused_register==0x9010 && state.refused_value==~0U);
+  assert(state.stage==(loss==4?RTL_PON_COLD_VERIFY:RTL_PON_COLD_FIFO));
+  assert(fifo_reads==loss && state.fifo_polls==loss);cases++;
  }
  for(unsigned target=0;target<3;target++) {
   setup(0x30e,0x30000,3,0);global[target]=~0U;
@@ -323,8 +468,8 @@ int main(void) {
   assert(state.stage==RTL_PON_COLD_GLOBAL && !writes && !mac_reads && !fifo_reads);
   assert(state.refused_register==global_regs[target]);cases++;
  }
- /* Torn initial snapshots reject before MAC MMIO; later drift fails final
-  * verification. Never interpret drift as a request to reselect a family. */
+ /* Torn or pre-gate snapshots reject before MAC MMIO. Never interpret
+  * drift as a request to reselect another mode or release reset. */
  for(unsigned target=0;target<3;target++)for(unsigned bit=0;bit<32;bit++)
  for(unsigned when=2;when<=3;when++) {
   setup(0x30e,0x30000,3,0);
@@ -332,8 +477,45 @@ int main(void) {
   assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
   assert(!state.ready && state.refused_register==global_regs[target]);
   if(when==2)assert(state.stage==RTL_PON_COLD_GLOBAL && !writes && !mac_reads && !fifo_reads);
-  else assert(state.stage==RTL_PON_COLD_VERIFY && state.gated_mask==4);
+  else assert(state.stage==RTL_PON_COLD_GATE && state.gated_mask==4 && !mac_reads && !writes);
   cases++;
+ }
+ /* Drift scheduled independently of read callbacks, at gate and FIFO
+  * sleeps: every next access must check the global snapshot first. */
+ for(unsigned target=0;target<3;target++)for(unsigned bit=0;bit<32;bit++)
+ for(unsigned when=1;when<=4;when++) {
+  setup(0x30e,0x30000,0x305,0);
+  drift_index=target;drift_mask=1U<<bit;drift_on_wait=when;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+  assert(!state.ready && state.refused_register==global_regs[target]);
+  assert(state.stage==(when<=2?RTL_PON_COLD_READBACK:RTL_PON_COLD_FIFO));
+  assert(fifo_reads==(when<=2?0:when-2) && waits==when && gate_writes[3]==1);cases++;
+ }
+ /* Detect reset/mux drift caused after the first MAC sample BEFORE the
+  * one-shot write. A sampled/requested value is not evidence of a write. */
+ for(unsigned gate=0;gate<4;gate++)for(unsigned target=0;target<3;target++)
+ for(unsigned bit=0;bit<32;bit++) {
+  setup(gate<2?0x30f:0x30e,gate<2?(1U|(4U<<gate)):0,
+        gate>=2?(1U|(2U<<(gate-2))):0,0x74638291);
+  drift_index=target;drift_mask=1U<<bit;drift_mac_index=gate;drift_mac_read=1;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+  assert(!state.ready && state.stage==RTL_PON_COLD_GATE && !writes && !fifo_reads);
+  assert(state.refused_register==global_regs[target] && state.gate_sampled_mask==(1U<<gate));
+  assert(!state.gate_written_mask && state.gate_before[gate]==saved[offsets[gate]/4]);
+  assert(state.gate_readback[gate]==saved[offsets[gate]/4]);
+  assert(state.gate_requested[gate]==(saved[offsets[gate]/4]&~masks[gate]));cases++;
+ }
+ /* With two active children, revalidate between individual gate reads,
+  * including the post-fabric strict verifier and its final FIFO read. */
+ for(unsigned family=0;family<2;family++)for(unsigned child=0;child<2;child++)
+ for(unsigned when=2;when<=5;when+=3)for(unsigned target=0;target<3;target++) {
+  setup(family?0x30e:0x30f,0xf,7,0);
+  drift_index=target;drift_mask=target?1:0x201;
+  drift_mac_index=family*2+child;drift_mac_read=when;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+  assert(!state.ready && state.refused_register==global_regs[target]);
+  assert(state.stage==(when==2?RTL_PON_COLD_READBACK:RTL_PON_COLD_VERIFY));
+  assert(fifo_reads==(when==2?0U:3U));cases++;
  }
  /* Post-fabric verification rejects any reset/mux drift before MAC reads. */
  for(unsigned pdc=0;pdc<2;pdc++)for(unsigned target=0;target<3;target++)
@@ -351,8 +533,10 @@ int main(void) {
   setup(target<2?0x30f:0x30e,0x300ef,0x307,0);
   assert(!rtl_pon_cold_quiesce(&io,&state));
   regs[offsets[target]/4]|=masks[target];
+  unsigned before_writes=writes,before_waits=waits,before_polls=state.gate_polls;
   assert(rtl_pon_cold_verify(&io,&state)==-EIO);
-  assert(!state.ready && state.refused_register==offsets[target]);cases++;
+  assert(!state.ready && state.refused_register==offsets[target]);
+  assert(writes==before_writes && waits==before_waits && state.gate_polls==before_polls);cases++;
  }
  setup(0x30e,0x30000,3,0);assert(!rtl_pon_cold_quiesce(&io,&state));fifo_stuck=1;
  assert(rtl_pon_cold_verify(&io,&state)==-EBUSY && !state.ready);cases++;
@@ -370,11 +554,42 @@ int main(void) {
 }
 '''
 
+LEGACY_CASE = r'''
+int main(void) {
+ struct rtl_pon_cold_state state={0};sdk_oracle();
+ (void)unchanged_except_gates;
+ setup(0x30e,0x30000,0x305,0);
+ regs[0x4004/4]=saved[0x4004/4]=0xa2;gate_delay[3]=2;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
+ assert(!state.ready && state.stage==RTL_PON_COLD_READBACK);
+ assert(state.gated_mask==8 && state.refused_register==0x4004 && state.refused_value==0xa2);
+ assert(writes==1 && gate_writes[3]==1 && gate_reads[3]==2 && !waits && !fifo_reads);
+ /* Advance the backend, not the old helper. It would acknowledge the
+  * original write without any retry; the original helper already refused. */
+ usleep_range(100,200);usleep_range(100,200);
+ assert(regs[0x4004/4]==0xa0 && writes==1 && !fifo_reads && !state.ready);
+ puts("PASS: actual baseline helper rejects the synthetic delayed gate; the same single request settles after two modeled intervals");
+}
+'''
+
 
 def change_once(source, old, new):
     if source.count(old) != 1:
         raise ValueError('Mutation target not unique: ' + repr(old))
     return source.replace(old, new, 1)
+
+
+def change_function(source, name, old, new):
+    match = re.search(r'\b' + re.escape(name) + r'\([^;{}]*\)\s*\{', source)
+    if not match:
+        raise ValueError('Missing mutation function ' + name)
+    end = source.index('{', match.start()) + 1
+    depth = 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return (source[:match.start()] +
+            change_once(source[match.start():end], old, new) + source[end:])
 
 
 def variants(header):
@@ -394,29 +609,68 @@ def variants(header):
         ('ignore_snapshot_drift', 'if (value != state->member)', 'if (0)'),
         ('access_every_family', 'state->stage = RTL_PON_COLD_GATE;',
          'state->gated_mask = 15U;\n\tstate->stage = RTL_PON_COLD_GATE;'),
-        ('ignore_missing_mac', '\t\tif (value == ~0U)\n', '\t\tif (0)\n'),
-        ('clobber_reserved_bits', 'value & ~rtl_pon_cold_gates[i].mask);', '0);'),
+        ('clobber_reserved_bits', 'state->gate_requested[i] = value & ~rtl_pon_cold_gates[i].mask;',
+         'state->gate_requested[i] = 0;'),
+        ('accept_single_closed_gate', '#define RTL_PON_COLD_GATE_STABLE 3U',
+         '#define RTL_PON_COLD_GATE_STABLE 1U'),
         ('accept_single_empty', '#define RTL_PON_COLD_FIFO_STABLE 3U',
          '#define RTL_PON_COLD_FIFO_STABLE 1U'),
         ('ignore_fifo_timeout', 'if (i == RTL_PON_COLD_FIFO_POLLS)',
          'if (0)'),
-        ('skip_post_fabric_mac_check',
-         'if (value & rtl_pon_cold_gates[i].mask)\n\t\t\treturn rtl_pon_cold_error(state, -EIO,',
-         None),
     )
     for name, old, new in mutations:
-        if name == 'skip_post_fabric_mac_check':
-            # The first match is verify; the second is the pre-FIFO readback.
-            assert header.count(old) == 2
-            yield name, header.replace(old, 'if (0)\n\t\t\treturn rtl_pon_cold_error(state, -EIO,', 1)
-        else:
-            yield name, change_once(header, old, new)
+        yield name, change_once(header, old, new)
+    guarded_read = ('ret = rtl_pon_cold_globals_match(io, state);\n'
+                    '\t\t\tif (ret)\n\t\t\t\treturn ret;\n'
+                    '\t\t\tvalue = io->read(io->context, rtl_pon_cold_gates[i].reg);')
+    guarded_fifo = ('ret = rtl_pon_cold_globals_match(io, state);\n'
+                    '\t\tif (ret)\n\t\t\treturn ret;\n'
+                    '\t\tvalue = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);')
+    scoped = (
+        ('ignore_missing_mac', 'rtl_pon_cold_quiesce',
+         'state->gate_readback[i] = value;\n\t\tif (value == ~0U)',
+         'state->gate_readback[i] = value;\n\t\tif (0)'),
+        ('skip_post_fabric_mac_check', 'rtl_pon_cold_verify',
+         'if (value & rtl_pon_cold_gates[i].mask)', 'if (0)'),
+        ('immediate_readback_regression', 'rtl_pon_cold_wait_gates',
+         'if (value & rtl_pon_cold_gates[i].mask)\n\t\t\t\tclosed = 0;',
+         'if (value & rtl_pon_cold_gates[i].mask)\n'
+         '\t\t\t\treturn rtl_pon_cold_error(state, -EIO, rtl_pon_cold_gates[i].reg, value);'),
+        ('ignore_missing_settling_gate', 'rtl_pon_cold_wait_gates',
+         'if (value == ~0U)', 'if (0)'),
+        ('do_not_restart_gate_stability', 'rtl_pon_cold_wait_gates',
+         'closed ? state->gate_stable + 1 : 0',
+         'closed ? state->gate_stable + 1 : state->gate_stable'),
+        ('replay_gate_write_during_wait', 'rtl_pon_cold_wait_gates',
+         'state->gate_readback[i] = value;',
+         'io->write(io->context, rtl_pon_cold_gates[i].reg, state->gate_requested[i]);\n'
+         '\t\t\tstate->gate_readback[i] = value;'),
+        ('skip_settling_global_guards', 'rtl_pon_cold_wait_gates',
+         guarded_read, 'ret = 0; (void)ret;\n\t\t\tvalue = io->read(io->context, rtl_pon_cold_gates[i].reg);'),
+        ('skip_prewrite_global_guard', 'rtl_pon_cold_quiesce',
+         'ret = rtl_pon_cold_globals_match(io, state);\n\t\t\tif (ret)\n\t\t\t\treturn ret;\n'
+         '\t\t\tio->write(io->context, rtl_pon_cold_gates[i].reg,',
+         'io->write(io->context, rtl_pon_cold_gates[i].reg,'),
+        ('skip_fifo_global_guards', 'rtl_pon_cold_quiesce',
+         guarded_fifo, 'value = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);'),
+        ('skip_verify_fifo_global_guard', 'rtl_pon_cold_verify',
+         guarded_fifo, 'value = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);'),
+        ('ignore_missing_fifo', 'rtl_pon_cold_quiesce',
+         'state->fifo_polls++;\n\t\tif (value == ~0U)',
+         'state->fifo_polls++;\n\t\tif (0)'),
+        ('ignore_missing_verify_fifo', 'rtl_pon_cold_verify',
+         'state->fifo_polls++;\n\t\tif (value == ~0U)',
+         'state->fifo_polls++;\n\t\tif (0)'),
+    )
+    for name, symbol, old, new in scoped:
+        yield name, change_function(header, symbol, old, new)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--registers', type=Path)
     parser.add_argument('--sdk-directory', type=Path)
+    parser.add_argument('--baseline-git', help='Also run the actual old header from this local git revision on the two-interval oracle')
     args = parser.parse_args()
     sdk_sources(args.sdk_directory)
     oracle = sdk_oracle(args.registers)
@@ -428,29 +682,46 @@ def main():
         if sys.platform == 'darwin':
             (compat / 'linux').mkdir(parents=True)
             (compat / 'linux/errno.h').write_text('#include <errno.h>\n')
-        for name, header in variants(HEADER.read_text()):
+        units = [(name, header, SHIM + oracle + CASES) for name, header in variants(HEADER.read_text())]
+        if args.baseline_git:
+            old = subprocess.run(['git', 'show', args.baseline_git + ':' + str(HEADER.relative_to(ROOT))],
+                                 cwd=ROOT, text=True, capture_output=True, check=True).stdout
+            units.insert(0, ('baseline', old, SHIM.split('static void valid_case(', 1)[0] + oracle + LEGACY_CASE))
+        for name, header, unit in units:
             target = directory / name
             target.mkdir()
             (target / HEADER.name).write_text(header)
             source, binary = target / 'test.c', target / 'test'
-            source.write_text(SHIM + oracle + CASES)
+            source.write_text(unit)
             build = subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-O1', '-g',
                                     '-Wall', '-Wextra', '-Werror',
+                                    '-fsanitize=address,undefined', '-fno-sanitize-recover=all',
+                                    '-fno-omit-frame-pointer',
+                                    *([] if sys.platform == 'darwin' else ['-no-pie']),
                                     '-I', str(compat), '-I', str(target), '-I', str(DRIVER),
                                     str(source), '-o', str(binary)],
                                    capture_output=True, text=True)
             if build.returncode:
                 raise SystemExit(f'{name}: compile failed\n' + build.stdout + build.stderr)
-            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=45)
-            if name == 'production':
+            run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=45,
+                                 env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0',
+                                      'UBSAN_OPTIONS': 'halt_on_error=1'})
+            if name in ('production', 'baseline'):
                 if run.returncode:
                     raise SystemExit(run.stdout + run.stderr)
                 print(run.stdout, end='')
             else:
                 if run.returncode == 0:
                     raise SystemExit(f'SURVIVED: {name}')
+                # An instrumentation crash, UB or timeout is a broken test,
+                # not proof that the intended safety mutant was detected.
+                if (run.returncode != -signal.SIGABRT or 'assert' not in run.stderr.lower() or
+                        'AddressSanitizer' in run.stderr or 'runtime error:' in run.stderr):
+                    raise SystemExit(f'{name}: not rejected by a runtime assertion\n' + run.stderr)
+                if name == 'immediate_readback_regression' and '!rtl_pon_cold_quiesce(&io,&state)' not in run.stderr:
+                    raise SystemExit('Old readback did not fail the intended delayed-acknowledgement assertion\n' + run.stderr)
                 mutants += 1
-    print(f'PASS: rejected {mutants} cold-handoff safety mutants')
+    print(f'PASS: rejected {mutants} cold-handoff safety mutants by runtime assertions; ASan/UBSan enabled')
 
 
 if __name__ == '__main__':

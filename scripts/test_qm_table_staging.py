@@ -133,6 +133,11 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='qm-staging-', dir=root / 'artifacts') as temp:
     path = Path(temp)
     (path / 'rtl9617c-qm-deepq.h').write_text(read('rtl9617c-qm-deepq.h'))
+    # Keep --revision self-contained: older code used the literal credit
+    # word and did not yet have this allocation-contract header.
+    if 'RTL_L2QM_PORT_FREE_CREDIT' in production:
+        (path / 'rtl9617c-l2qm.h').write_text(read('rtl9617c-l2qm.h'))
+        fixture = '#include "rtl9617c-l2qm.h"\n' + fixture
     c, exe = path / 'test.c', path / 'test'
     c.write_text(fixture + production + cases)
     subprocess.run(['cc', '-O1', '-g', '-Wall', '-Wextra', '-Werror',

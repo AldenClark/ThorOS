@@ -4,6 +4,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,7 +24,7 @@ topology = ('dev=lan1 ifindex=3 iflink=3 mtu=1500 operstate=up carrier=1 speed=1
 
 def capture(*, after_boot=boot, times=('10.00', '11.00', '21.00', '22.00'),
             q_before='9007199254740993', q_after='9007199254741193',
-            ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None):
+            ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None, cold=None):
     result = 'schema=tyfza1-datapath-v3 mode=passive interval_seconds=10 details=0 active_diagnostics=0\n'
     for index, which in enumerate(('before', 'after') if after else ('before',)):
         identity = boot if index == 0 else after_boot
@@ -38,6 +39,8 @@ l2_requested=1 l2_active=1 l2_bum_hardware=0 l2_vlan_hardware=0 lan_admission_va
 PRIVATE_TUPLE=192.0.2.1:1234
 [xram_state]
 {state if index == 0 else ni_after}
+[cold_bootstrap]
+{cold[index] if cold else 'unavailable'}
 [qm_voqs]
 cpu_bytes={q_before if index == 0 else q_after} cpu_packets={20 + index} ring_errors=0 buffer_errors=0 budget_hits={index}
 [lan_mib_evidence]
@@ -54,7 +57,6 @@ boot_id={identity}
     if missing:
         # Preserve the section so parser has to reject absent content rather
         # than relying on a schema/version rejection.
-        import re
         result = re.sub(rf'\[{missing}\]\n[^\[]*', f'[{missing}]\nunavailable\n', result)
     return result + extra
 
@@ -72,6 +74,119 @@ assert result['hardware_forwarding_proven'] is False
 assert result['states']['after']['fe']['l2_active'] == '1'
 serialized = json.dumps(result)
 assert '192.0.2.1' not in serialized and '198.51.100.1' not in serialized and 'PRIVATE' not in serialized
+
+# Match the real driver's numeric enum/name table, not a separately invented
+# textual l2_reason (the generic l2_reason itself remains numeric).
+switch_hw = (root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-fe-switch-hw.h').read_text()
+names = re.search(r'static const char \* const names\[\] = \{(.*?)\};', switch_hw, re.S).group(1)
+assert tuple(re.findall(r'"([^"]+)"', names)) == module.L2_HW_REASONS
+for code, name in enumerate(module.L2_HW_REASONS):
+    text = capture().replace('l2_requested=1', f'l2_hw_reason={code} l2_hw_reason_name={name} l2_requested=1')
+    parsed = module.summarize(text)['states']['after']['fe']
+    assert parsed['l2_hw_reason_name_valid'] and parsed['l2_hw_reason_name'] == name
+    assert parsed['l2_hw_reason'] == str(code)
+for reason, name in (('0', 'requires-existing-svl'), ('99', 'ok'), ('-1', 'ok'), ('1', 'PRIVATE_192.0.2.1')):
+    text = capture().replace('l2_requested=1', f'l2_hw_reason={reason} l2_hw_reason_name={name} l2_requested=1')
+    parsed = module.summarize(text)['states']['after']['fe']
+    assert not parsed['l2_hw_reason_name_valid'] and 'l2_hw_reason_name' not in parsed
+    assert 'PRIVATE_' not in json.dumps(parsed)
+text = capture().replace('l2_requested=1', 'l2_hw_reason=1 l2_hw_reason_name=requires-existing-svl l2_hw_reason_name=ok l2_requested=1')
+assert not module.summarize(text)['states']['after']['fe']['l2_hw_reason_name_valid']
+
+# Synthetic XGPON readback records with deliberately chosen unrelated bits.
+# Parser coverage only: these are not device captures or a physical power cycle.
+cold_old = ('schema=1 cached=1 historical=1 requested=1 attempted=1 managed=0 result=-5 '
+            'provider_ready=1 engine_poisoned=0\n'
+            'pon_snapshot_ready=0 pon_stage=4 pon_error=-5 pon_pdc_active=1 pon_gated_mask=0x8 '
+            'pon_fifo=0x0 pon_fifo_polls=0 pon_control=0x200 pon_epon_control=0x0 '
+            'pon_gpon_control=0x5 pon_refused_register=0x4004 pon_refused_value=0xa2\n')
+cold_extension = ('pon_gate_written_mask=0x8 pon_gate_sampled_mask=0x8 pon_gate_polls=1000 pon_gate_stable=0\n' +
+                  ''.join(f'pon_gate{i}_before=0x{0xa2 if i == 3 else 0:x} '
+                          f'pon_gate{i}_requested=0x{0xa0 if i == 3 else 0:x} '
+                          f'pon_gate{i}_readback=0x{0xa2 if i == 3 else 0:x}\n' for i in range(4)))
+cold_new = cold_old.replace('result=-5', 'result=-110').replace('pon_error=-5', 'pon_error=-110') + cold_extension
+for cold in (cold_old, cold_new):
+    full = module.summarize(capture(cold=(cold, cold)))
+    record = full['cold_bootstrap_history']['after']
+    assert record['valid'] and record['historical']
+    assert record['reason'] == 'receive_gate_readback_refused_before_FIFO'
+    assert record['stage_name'] == 'receive_gate_readback'
+    assert record['refused_receive_gate'] == {'family': 'XGPON', 'register': 0x4004, 'mask': 3, 'last_gate_bits': 2}
+    assert not record['power_cycle_proven'] and not record['live_RX_state_proven'] and not record['runtime_native_L2_proven']
+    assert not full['hardware_forwarding_proven']
+    assert record['gate_extension_present'] == (cold == cold_new)
+    # Historical decoding remains possible even when rates across boots cannot.
+    crossed = module.summarize(capture(cold=(cold, cold), after_boot=other_boot))
+    assert not crossed['clock_window']['valid'] and crossed['cold_bootstrap_history']['before']['valid']
+
+cold_ok = (cold_old.replace('managed=0', 'managed=1').replace('result=-5', 'result=0')
+           .replace('pon_snapshot_ready=0', 'pon_snapshot_ready=1').replace('pon_stage=4', 'pon_stage=7')
+           .replace('pon_error=-5', 'pon_error=0').replace('pon_fifo_polls=0', 'pon_fifo_polls=5')
+           .replace('pon_refused_register=0x4004', 'pon_refused_register=0x0').replace('pon_refused_value=0xa2', 'pon_refused_value=0x0') +
+           cold_extension.replace('pon_gate_polls=1000', 'pon_gate_polls=5').replace('pon_gate_stable=0', 'pon_gate_stable=3')
+           .replace('pon_gate3_readback=0xa2', 'pon_gate3_readback=0xa0'))
+record = module.summarize(capture(cold=(cold_ok, cold_ok)))['cold_bootstrap_history']['after']
+assert record['valid'] and record['reason'] == 'cold_baseline_prepared_not_runtime_L2_proof'
+assert not record['runtime_native_L2_proven'] and 'refused_receive_gate' not in record
+# The producer records attempted=1 even for an unrequested legacy DT. Do not
+# turn that legitimate no-op into an error or infer any baseline was prepared.
+cold_legacy = ('schema=1 cached=1 historical=1 requested=0 attempted=1 managed=0 result=0 '
+               'provider_ready=1 engine_poisoned=0 pon_snapshot_ready=0 pon_stage=0 pon_error=0 '
+               'pon_pdc_active=0 pon_gated_mask=0 pon_fifo=0 pon_fifo_polls=0 pon_control=0 '
+               'pon_epon_control=0 pon_gpon_control=0 pon_refused_register=0 pon_refused_value=0')
+assert module.cold_sample({'cold_bootstrap': [cold_legacy]})['reason'] == 'cold_handoff_not_requested'
+for old, new, reason in (
+    ('schema=1', 'schema=2', 'unsupported_cold_record_schema'),
+    ('pon_stage=4', 'pon_stage=8', 'cold_record_missing_or_invalid_value'),
+    ('result=-5', 'result=-2147483649', 'cold_record_missing_or_invalid_value'),
+    ('pon_refused_value=0xa2', 'pon_refused_value=0x100000000', 'cold_record_missing_or_invalid_value'),
+    ('requested=1', 'requested=2', 'cold_record_missing_or_invalid_value'),
+    ('managed=0', 'managed=1', 'cold_record_inconsistent_state'),
+    ('pon_snapshot_ready=0', 'pon_snapshot_ready=1', 'cold_record_inconsistent_state'),
+    ('pon_stage=4', 'pon_stage=4 pon_stage=4', 'cold_record_missing_or_invalid_value'),
+):
+    record = module.cold_sample({'cold_bootstrap': cold_old.replace(old, new).splitlines()})
+    assert not record['valid'] and record['reason'] == reason, record
+for old, new in (('pon_gate3_requested=0xa0', 'pon_gate3_requested=0xa2'),
+                  ('pon_gate_sampled_mask=0x8', 'pon_gate_sampled_mask=0x4'),
+                  ('pon_gate_written_mask=0x8', 'pon_gate_written_mask=0x1'),
+                  ('pon_gate_stable=0', 'pon_gate_stable=4')):
+    record = module.cold_sample({'cold_bootstrap': cold_new.replace(old, new).splitlines()})
+    assert not record['valid'] and record['reason'] == 'cold_gate_extension_inconsistent', record
+for old, new in (('pon_gate3_readback=0xa0', 'pon_gate3_readback=0xa2'),
+                  ('pon_gate_sampled_mask=0x8', 'pon_gate_sampled_mask=0x0'),
+                  ('pon_gate_written_mask=0x8', 'pon_gate_written_mask=0x0'),
+                  ('pon_gate_stable=3', 'pon_gate_stable=0')):
+    record = module.cold_sample({'cold_bootstrap': cold_ok.replace(old, new).splitlines()})
+    assert not record['valid'] and record['reason'] == 'cold_gate_extension_inconsistent', record
+closed_at_entry = (cold_ok.replace('pon_gate_written_mask=0x8', 'pon_gate_written_mask=0x0')
+                  .replace('pon_gate3_before=0xa2', 'pon_gate3_before=0xa0'))
+assert module.cold_sample({'cold_bootstrap': closed_at_entry.splitlines()})['valid']
+pdc_in_reset = (cold_ok.replace('pon_pdc_active=1', 'pon_pdc_active=0').replace('pon_gated_mask=0x8', 'pon_gated_mask=0x0')
+                .replace('pon_gate_written_mask=0x8', 'pon_gate_written_mask=0x0').replace('pon_gate_sampled_mask=0x8', 'pon_gate_sampled_mask=0x0')
+                .replace('pon_gate_polls=5', 'pon_gate_polls=0').replace('pon_gate_stable=3', 'pon_gate_stable=0')
+                .replace('pon_control=0x200', 'pon_control=0x0').replace('pon_fifo_polls=5', 'pon_fifo_polls=0')
+                .replace('pon_gate3_before=0xa2', 'pon_gate3_before=0x0')
+                .replace('pon_gate3_requested=0xa0', 'pon_gate3_requested=0x0')
+                .replace('pon_gate3_readback=0xa0', 'pon_gate3_readback=0x0'))
+assert module.cold_sample({'cold_bootstrap': pdc_in_reset.splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': pdc_in_reset.replace('pon_gate3_before=0x0', 'pon_gate3_before=0xa2').splitlines()})['valid']
+reopened = cold_ok.replace('managed=1', 'managed=0').replace('result=0', 'result=-5').replace('pon_error=0', 'pon_error=-5')
+reopened = reopened.replace('pon_snapshot_ready=1', 'pon_snapshot_ready=0').replace('pon_stage=7', 'pon_stage=6')
+reopened = reopened.replace('pon_gate3_readback=0xa0', 'pon_gate3_readback=0xa2')
+assert module.cold_sample({'cold_bootstrap': reopened.splitlines()})['valid']  # stable=3 is historical, not final success
+for extension in ('pon_gate_polls=1', cold_extension.replace('pon_gate3_readback=0xa2', ''),
+                  cold_extension + 'pon_gate_polls=1000', cold_extension + 'pon_gate3_readback=',
+                  cold_extension.replace('pon_gate_polls=1000', 'pon_gate_polls=4294967296')):
+    record = module.cold_sample({'cold_bootstrap': (cold_old + extension).splitlines()})
+    assert not record['valid'] and record['reason'] == 'cold_gate_extension_partial_or_invalid'
+for marker in ('probe_failed=awk', 'read_truncated=16384_bytes', 'truncated=max_lines'):
+    assert not module.cold_sample({'cold_bootstrap': [cold_old + marker]})['valid']
+assert not module.summarize(capture())['cold_bootstrap_history']['after']['valid']
+assert 'PRIVATE_' not in json.dumps(module.cold_sample({'cold_bootstrap': [cold_old + ' PRIVATE_ADDRESS=192.0.2.1']}))
+for suffix in ('requested=', 'pon_error=', 'schema=', 'pon_stage='):
+    assert not module.cold_sample({'cold_bootstrap': (cold_old + suffix).splitlines()})['valid']
+assert module.fields(['value=1 value=']) == {'value': None}
 
 for reason, text in (
     ('boot_changed', capture(after_boot=other_boot)),
@@ -236,4 +351,5 @@ with tempfile.TemporaryDirectory(prefix='datapath-summary-') as temporary:
         assert run.returncode == 2 and 'Invalid capture:' in run.stderr and not run.stdout
 
 print('Datapath summary: exact host/QM deltas, quantized clock bounds, cached MAC raw-only evidence, '
+      'historical cold failure/gate evidence, FE hardware-reason enum, '
       'mode/boot/reset/wrap/link/policy/lifecycle/partial refusal, privacy, bounded parser and CLI passed')
