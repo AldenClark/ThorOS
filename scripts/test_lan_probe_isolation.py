@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Execute production LAN registration with failures at each per-port stage."""
+"""Execute production LAN registration and NI4/first-open RTNL interleavings.
+
+The PHY/device APIs are instrumented boundaries. The actual LAN worker,
+registration and engine_get code runs with real pthread RTNL/completion locks,
+including failure paths; hardware link training is not emulated.
+"""
 from pathlib import Path
 import re
 import subprocess
@@ -26,6 +31,7 @@ shim = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <pthread.h>
 typedef unsigned char u8;
 #define EPROBE_DEFER 517
 #define READ_ONCE(p) (p)
@@ -52,11 +58,27 @@ struct completion {unsigned int done;};
 static struct work_struct *pending_work;
 static inline bool schedule_work(struct work_struct *w){pending_work=w;return true;}
 static inline void flush_work(struct work_struct *w){if(pending_work==w){pending_work=NULL;w->func(w);}}
-static int rtnl_held;
-static void rtnl_lock(void){assert(!rtnl_held);rtnl_held=1;}
-static void rtnl_unlock(void){assert(rtnl_held);rtnl_held=0;}
-#define init_completion(c) ((c)->done=0)
-#define complete_all(c) ((c)->done=~0U)
+static pthread_mutex_t rtnl_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t completion_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t completion_cond=PTHREAD_COND_INITIALIZER;
+static _Thread_local int rtnl_held;
+static bool open_waiting;
+static void rtnl_lock(void){assert(!rtnl_held);assert(!pthread_mutex_lock(&rtnl_mutex));rtnl_held=1;}
+static void rtnl_unlock(void){assert(rtnl_held);rtnl_held=0;assert(!pthread_mutex_unlock(&rtnl_mutex));}
+static void init_completion(struct completion *c){
+ assert(!pthread_mutex_lock(&completion_mutex));c->done=0;open_waiting=false;
+ assert(!pthread_mutex_unlock(&completion_mutex));
+}
+static void complete_all(struct completion *c){
+ assert(!pthread_mutex_lock(&completion_mutex));c->done=~0U;
+ assert(!pthread_cond_broadcast(&completion_cond));assert(!pthread_mutex_unlock(&completion_mutex));
+}
+static void wait_for_completion(struct completion *c){
+ assert(rtnl_held);assert(!pthread_mutex_lock(&completion_mutex));
+ open_waiting=true;assert(!pthread_cond_broadcast(&completion_cond));
+ while(!c->done)assert(!pthread_cond_wait(&completion_cond,&completion_mutex));
+ assert(!pthread_mutex_unlock(&completion_mutex));
+}
 struct device_node {unsigned int port;};
 struct device {struct device_node *of_node;};
 struct phy {int dummy;};
@@ -75,7 +97,9 @@ struct rtl_xram {
  struct device *lan4_parent;struct device_node *lan4_phy;
  struct {struct net_device *lan[5];} qm;
  struct phy *sgmii;struct tyfza1_led phy_led;
- bool phy_led_registered,qm_rx,native_groups_created,cold_handoff_required,provider_ready;
+ bool phy_led_registered,qm_rx,dma_tx,native_groups_created,cold_handoff_required,provider_ready;
+ bool removing,engine_poisoned;
+ unsigned int engine_users;
  int tx_lock,dma;void *fe;
 };
 static struct device_node nodes[5];
@@ -140,8 +164,14 @@ static void synchronize_net(void){}
 static int tyfza1_led_register(struct device *d,struct tyfza1_led *l,void *n){return stage==9?-EIO:0;}
 static void tyfza1_led_unregister(struct tyfza1_led *l){}
 static void *rtl_phy_led_output;
+static unsigned int engine_starts;
+static int rtl_engine_start(struct rtl_xram *priv){
+ assert(rtnl_held && priv->lan4_ready.done);
+ assert(priv->provider_ready && !priv->removing && !priv->engine_poisoned);
+ engine_starts++;return 0;
+}
 '''
-code = shim + '\n'.join(function(n) for n in ('rtl_unregister_lan', 'rtl_sgmii_power_off', 'rtl_lan_number', 'rtl_register_lan', 'rtl_lan4_work', 'rtl_register_lans'))
+code = shim + '\n'.join(function(n) for n in ('rtl_unregister_lan', 'rtl_sgmii_power_off', 'rtl_lan_number', 'rtl_register_lan', 'rtl_lan4_work', 'rtl_register_lans', 'rtl_engine_get'))
 # Run the actual post-registration publication block independently of shared DMA setup.
 probe = function('rtl_ni_publish')
 services = probe[probe.index('\tret = sysfs_create_groups('):probe.index('\tschedule_delayed_work(')]
@@ -151,6 +181,15 @@ static int sysfs_create_groups(void *d,void *g){return service_failure==1?-EIO:0
 static void *rtl_native_groups;
 static void services(struct rtl_xram *priv,struct device *dev){int ret;
 '''+services+r'''
+}
+static void *open_thread(void *context){
+ struct rtl_xram *priv=context;
+ rtnl_lock();int ret=rtl_engine_get(priv);rtnl_unlock();
+ return (void *)(intptr_t)ret;
+}
+static void *worker_thread(void *context){
+ struct rtl_xram *priv=context;
+ priv->lan4_work.func(&priv->lan4_work);return NULL;
 }
 int main(void){
  unsigned int cases=0;
@@ -200,17 +239,43 @@ int main(void){
   assert(!active && !fe_ports && !allocated && !priv.registered_ports);
   cases++;
  }
- printf("%u per-port fault cases, both boards, optional services and cleanup passed\n",cases);
+ /* A real first ndo_open owns RTNL while waiting for NI4. The production
+  * worker must complete before taking that same lock for registration. */
+ for(unsigned int index=0;index<4;index++){
+  const int failures[]={0,1,5,8};
+  struct net_device primary={.dev_addr={0,0x50,0xc2,1,2,3}};
+  struct rtl_xram priv={.netdev=&primary,.qm_rx=true};
+  struct device parent={0};pthread_t opener,worker;void *result;
+  board_ports=5;fail_port=4;stage=failures[index];engine_starts=0;
+  active=removed=fe_ports=allocated=power=actions=node_refs=s3_requests=0;
+  for(int p=0;p<5;p++)nodes[p].port=p;
+  init_completion(&priv.lan4_ready);rtl_register_lans(&priv,&parent);
+  assert(pending_work==&priv.lan4_work && !priv.lan4_ready.done);
+  assert(!pthread_create(&opener,NULL,open_thread,&priv));
+  assert(!pthread_mutex_lock(&completion_mutex));
+  while(!open_waiting)assert(!pthread_cond_wait(&completion_cond,&completion_mutex));
+  assert(!pthread_mutex_unlock(&completion_mutex));
+  pending_work=NULL;
+  assert(!pthread_create(&worker,NULL,worker_thread,&priv));
+  assert(!pthread_join(opener,&result) && !pthread_join(worker,NULL));
+  assert(!result && engine_starts==1 && priv.engine_users==1);
+  unsigned int expected=stage?7U:23U;
+  assert(active==expected && priv.registered_ports==expected && fe_ports==expected);
+  assert(priv.lan4_ready.done && !node_refs);
+  for(int p=0;p<5;p++)rtl_unregister_lan(&priv,p);
+  assert(!active && !fe_ports && !allocated && !priv.registered_ports);
+  cases++;
+ }
+ printf("%u LAN cases, including 4 real NI4/first-open RTNL interleavings, passed\n",cases);
 }
 '''
-code = code.replace('bool phy_led_registered,qm_rx,native_groups_created,cold_handoff_required,provider_ready;', 'bool phy_led_registered,qm_rx,dma_tx,native_groups_created;')
 # The production code uses the device kobject only as a sysfs API argument.
 code = code.replace('struct device {struct device_node *of_node;};', 'struct device {struct device_node *of_node;int kobj;};')
 if __name__ == '__main__':
     with tempfile.TemporaryDirectory(prefix='lan-isolation-') as directory:
         path = Path(directory)
         (path / 'test.c').write_text(code)
-        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
+        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-pthread',
                         '-Wno-unused-parameter', '-Wno-sign-compare',
                         str(path / 'test.c'), '-o', str(path / 'test')], check=True)
-        subprocess.run([str(path / 'test')], check=True)
+        subprocess.run([str(path / 'test')], check=True, timeout=30)

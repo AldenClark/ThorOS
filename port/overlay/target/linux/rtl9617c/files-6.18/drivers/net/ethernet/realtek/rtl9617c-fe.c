@@ -222,6 +222,18 @@ out:
  return ret;
 }
 
+/* The NI owner lost its external ingress fence after shared cold writes.
+ * Do not let a later open accept the apparently valid SVL/MRU snapshot. */
+void rtl_fe_fabric_cold_abort(struct rtl_fe *fe, int error)
+{
+ if(!fe)return;
+ mutex_lock(&fe->lock);
+ fe->fabric.ready=0;
+ fe->fabric.poisoned=1;
+ fe->fabric.error=error?error:-EIO;
+ mutex_unlock(&fe->lock);
+}
+
 /* LPB1 (LAN connector) and LPB2 (PON connector) select one of two owned
  * classifier profiles. Profile1 has the SDK keep-original CPU action for
  * EVERY default result type; profile0 alone may enter the routing hash.
@@ -2323,6 +2335,9 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   fe->fabric.vlan_mode,fe->fabric.packet_length,fe->fabric.storage_length,
   rtl_fabric_native_mtu_compatible(&fe->fabric),
   fe->fabric.rejected_register,fe->fabric.rejected_value);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "fabric_cold_rx_gated=0x%x fabric_inherited_fdb_present=%u fabric_inherited_fdb_index=%u\n",
+  fe->fabric.cold_rx_gated,fe->fabric.inherited_fdb_present,fe->fabric.inherited_fdb_index);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
   RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);

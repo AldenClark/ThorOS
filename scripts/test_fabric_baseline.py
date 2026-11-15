@@ -38,8 +38,9 @@ struct model {
  unsigned int drop_reg, drop_occurrence, drop_seen;
  unsigned int inherited, scan_result, scan_timeout, busy_on_scan;
  unsigned int corrupt_vlan, rollback_stuck, corrupt_frame, frame_rollback_stuck;
- unsigned int oversize_rollback_stuck;
- unsigned int rx_writes[5];
+ unsigned int oversize_rollback_stuck, pending_after_vlan, corrupt_learning_stop;
+ unsigned int live_rx, live_rx_reads, corrupt_mac_gate;
+ unsigned int rx_writes[5], mac_rx_writes[5];
 };
 static struct model m;
 static unsigned int cases;
@@ -48,9 +49,25 @@ static bool fdb_busy(void) {
  return (m.reg[RTL_L2_FDB_ACCESS/4] |
          m.reg[RTL_L2_FDB_LIMIT_ACCESS/4]) & RTL_L2_ACCESS_BUSY;
 }
+static bool mac_rx_enabled(void) {
+ for(unsigned i=0;i<5;i++)
+  if(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)return true;
+ return false;
+}
+static void assert_mac_rx_gated(void) {
+ for(unsigned i=0;i<5;i++)
+  assert(!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE));
+}
 static unsigned int read_reg(void *ctx,unsigned int reg) {
  (void)ctx;assert(!(reg&3) && reg<sizeof(m.reg));m.reads++;
- if(reg==0x11c0)m.pp_reads++;
+ if(reg==0x11c0) {
+  m.pp_reads++;
+  /* A bypassed frame still has HeaderA/PP state. CPU16 cannot drain
+   * through an as-yet unstarted QM: real RX, not destination selection,
+   * is the cold receive fence. This is deliberately independent of the
+   * production helper's cold_rx_gated bookkeeping. */
+  if(m.live_rx && mac_rx_enabled()){m.live_rx_reads++;return 1U;}
+ }
  if(reg==m.pending_reg && (m.pending_remaining || m.permanent_pending)) {
   if(m.pending_remaining)m.pending_remaining--;
   return reg==0x11c0?1U:2U;
@@ -65,24 +82,44 @@ static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
     (reg>=0x1c18 && reg<=RTL_L2_FDB_FILTER_WORD0) ||
     reg==RTL_L2_FDB_RETURN ||
     (reg<=RTL_L2_FDB_DATA0 && reg>RTL_L2_FDB_DATA0-RTL_L2_FDB_WORDS*4)) {
-  assert(!fdb_busy());
+  assert(!fdb_busy());assert_mac_rx_gated();
+ }
+ for(unsigned i=0;i<5;i++) {
+  assert(reg!=0xa5d4U+0x90U*i); /* TX must remain able to drain. */
+  if(reg==RTL_FABRIC_RX_MAC(i)) {
+   m.mac_rx_writes[i]++;
+   assert(!(value&RTL_FABRIC_RX_MAC_ENABLE)); /* Only ndo_open may reopen. */
+   if(m.corrupt_mac_gate==i+1)value=m.original[reg/4]^4U;
+  }
  }
  for(unsigned i=0;i<5;i++)if(reg==RTL_FABRIC_RX(i)) {
+  assert_mac_rx_gated();
   m.rx_writes[i]++;
   if(m.rx_writes[i]==2)assert(!(value&RTL_FABRIC_RX_OVERSIZE_ALLOW));
   if(m.rx_writes[i]>=3 && m.oversize_rollback_stuck==(i+1))value&=~RTL_FABRIC_RX_OVERSIZE_ALLOW;
  }
  bool drop=reg==m.drop_reg && ++m.drop_seen==m.drop_occurrence;
+ if(reg==RTL_L2_FDB_CONTROL && m.corrupt_learning_stop &&
+    (value&RTL_L2_FDB_LEARN_DISABLE)) {
+  value=(value&~RTL_L2_FDB_LEARN_DISABLE)^4U;
+ }
  if(reg==RTL_L2_VLAN_MODE_CONTROL) {
+  assert_mac_rx_gated();
   m.vlan_writes++;
   assert(m.pp_reads>=3 && m.scans);
   assert(m.reg[RTL_L2_FDB_CONTROL/4]&RTL_L2_FDB_LEARN_DISABLE);
   for(unsigned int i=0;i<5;i++)
    assert((m.reg[RTL_FABRIC_RX(i)/4]&RTL_FABRIC_RX_SELECTOR)==RTL_FABRIC_RX_CPU);
   if(m.vlan_writes==1 && m.corrupt_vlan)value^=0x10;
+  if(m.vlan_writes==1 && m.pending_after_vlan) {
+   m.pending_reg=0x11c0;m.pending_remaining=7;
+   m.permanent_pending=m.pending_after_vlan==2;
+  }
+  if(m.vlan_writes>1)assert(!m.pending_remaining && !m.permanent_pending);
   if(m.vlan_writes>1 && m.rollback_stuck)value|=1;
  }
  if(reg==RTL_FABRIC_FRAME_LENGTH) {
+  assert_mac_rx_gated();
   m.frame_writes++;
   assert(m.pp_reads>=3 && (m.reg[RTL_L2_FDB_CONTROL/4]&RTL_L2_FDB_LEARN_DISABLE));
   assert(m.reg[RTL_L2_VLAN_MODE_CONTROL/4]&1U);
@@ -94,6 +131,7 @@ static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
 }
 static int indirect(void *ctx,unsigned int reg,unsigned int value) {
  (void)ctx;assert(reg==RTL_L2_FDB_ACCESS && !fdb_busy());
+ assert_mac_rx_gated();
  assert((value&255U)==RTL_L2_FDB_SCAN);
  assert((value>>8 & 8191U)==0);
  assert(m.reg[RTL_L2_FDB_CONTROL/4]&RTL_L2_FDB_LEARN_DISABLE);
@@ -135,6 +173,8 @@ static void setup(unsigned int seed) {
  m.reg[0xa034/4]=0x004023f1;m.reg[0xa038/4]=0x2454;
  m.reg[0x1108/4]=m.reg[0x110c/4]=m.reg[0x1110/4]=0x8100;
  m.reg[0x1114/4]=0x9100;
+ for(unsigned i=0;i<5;i++)m.reg[RTL_FABRIC_RX_MAC(i)/4]|=RTL_FABRIC_RX_MAC_ENABLE;
+ m.live_rx=1;
  /* Deliberately narrow inherited SCAN predicates. */
  m.reg[0x1c28/4]|=31;m.reg[0x1c24/4]&=~63U;m.reg[0x1c18/4]&=~0x7fffU;
  m.scan_result=RTL_L2_FDB_STATUS_MISS;
@@ -157,13 +197,26 @@ static void baseline_preserved(const struct rtl_fabric *f) {
   assert((m.reg[reg]&~(RTL_FABRIC_RX_SELECTOR|RTL_FABRIC_RX_OVERSIZE_ALLOW))==(m.original[reg]&~(RTL_FABRIC_RX_SELECTOR|RTL_FABRIC_RX_OVERSIZE_ALLOW)));
   if(!f->poisoned)assert((m.reg[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW)==
    (f->ready?0:(m.original[reg]&RTL_FABRIC_RX_OVERSIZE_ALLOW)));
+  reg=RTL_FABRIC_RX_MAC(i)/4;
+  assert((m.reg[reg]&~RTL_FABRIC_RX_MAC_ENABLE)==
+         (m.original[reg]&~RTL_FABRIC_RX_MAC_ENABLE));
+  if(f->cold_rx_gated&(1U<<i))assert(!(m.reg[reg]&RTL_FABRIC_RX_MAC_ENABLE));
  }
 }
 int main(void) {
+ {
+  /* Continuous ingress cannot be made idle merely by selecting CPU16. */
+  setup(0);assert(rtl_fabric_pending(&io));
+  for(unsigned i=0;i<5;i++)m.reg[RTL_FABRIC_RX(i)/4]=RTL_FABRIC_RX_CPU;
+  assert(rtl_fabric_pending(&io));
+  for(unsigned i=0;i<5;i++)m.reg[RTL_FABRIC_RX_MAC(i)/4]&=~RTL_FABRIC_RX_MAC_ENABLE;
+  assert(!rtl_fabric_pending(&io));assert(m.live_rx_reads==2);cases++;
+ }
  for(unsigned seed=0;seed<128;seed++) {
   struct rtl_fabric f={};setup(seed*0x10001U);
   assert(!rtl_fabric_cold_prepare(&io,&f));
   assert(f.ready && f.changed && !f.refusal && !f.poisoned);
+  assert(f.cold_rx_gated==31 && !mac_rx_enabled() && !m.live_rx_reads);
   assert(m.reg[0x1414/4]==(m.original[0x1414/4]|1));
   assert(m.scans==1 && m.pp_reads>=4 && m.frame_writes==1 && settles==1);
   assert(f.packet_length==0x004005f6 && f.original_packet_length==0x004023f1);
@@ -177,6 +230,9 @@ int main(void) {
   struct rtl_fabric f={};setup(1);m.inherited=inherited;
   assert(rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP);
   assert(!f.ready && f.refusal && !f.poisoned && !m.vlan_writes);
+  assert(f.inherited_fdb_present && f.inherited_fdb_index==4127);
+  for(unsigned i=0;i<RTL_L2_FDB_WORDS;i++)
+   assert(f.inherited_fdb_words[i]==m.reg[(RTL_L2_FDB_DATA0-i*4)/4]);
   assert(m.scans==1);command_restored(&f);baseline_preserved(&f);cases++;
  }
  for(unsigned stage=0;stage<4;stage++) {
@@ -216,6 +272,29 @@ int main(void) {
  }
  for(unsigned port=0;port<5;port++) {
   struct rtl_fabric f={};setup(port);
+  m.drop_reg=RTL_FABRIC_RX_MAC(port);m.drop_occurrence=1;
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
+  assert(!f.poisoned && f.refusal && !f.ready && !m.scans && !m.pp_reads);
+  assert(f.cold_rx_gated==((1U<<port)-1));
+  assert(f.rejected_register==RTL_FABRIC_RX_MAC(port));
+  assert(m.reg[RTL_L2_FDB_CONTROL/4]==m.original[RTL_L2_FDB_CONTROL/4]);
+  for(unsigned i=0;i<5;i++)assert(!m.rx_writes[i]);
+  baseline_preserved(&f);command_restored(&f);
+  cases++;
+ }
+ for(unsigned port=0;port<5;port++) {
+  /* An unknown MAC word is not equivalent to a completely ignored write. */
+  struct rtl_fabric f={};setup(port);m.corrupt_mac_gate=port+1;
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
+  assert(f.poisoned && !f.refusal && !f.ready && !m.scans && !m.pp_reads);
+  assert(f.cold_rx_gated==((1U<<port)-1));
+  assert(f.rejected_register==RTL_FABRIC_RX_MAC(port));
+  assert(m.reg[RTL_L2_FDB_CONTROL/4]==m.original[RTL_L2_FDB_CONTROL/4]);
+  for(unsigned i=0;i<5;i++)assert(!m.rx_writes[i]);
+  cases++;
+ }
+ for(unsigned port=0;port<5;port++) {
+  struct rtl_fabric f={};setup(port);
   m.drop_reg=RTL_FABRIC_RX(port);m.drop_occurrence=1;
   assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
   assert(f.poisoned && !f.ready && !m.scans);cases++;
@@ -228,9 +307,30 @@ int main(void) {
   if(kind==3){m.corrupt_vlan=1;m.rollback_stuck=1;}
   assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
   assert(!f.ready);
-  if(kind==2){assert(!f.poisoned && f.refusal);command_restored(&f);}
+  if(kind==1 || kind==2){assert(!f.poisoned && f.refusal);command_restored(&f);}
   else assert(f.poisoned);
   baseline_preserved(&f);cases++;
+ }
+ {
+  /* A failed stop-learning write is recoverable ONLY if the old control
+   * remains exact. A partial corruption is not an ignored write. */
+  struct rtl_fabric f={};setup(0);m.corrupt_learning_stop=1;
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
+  assert(f.poisoned && !f.refusal && !f.ready && !m.scans);cases++;
+ }
+ for(unsigned permanent=0;permanent<2;permanent++) {
+  struct rtl_fabric f={};setup(0);m.pending_after_vlan=permanent+1;
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EBUSY);
+  assert(!f.ready && !m.frame_writes && f.cold_rx_gated==31);
+  if(permanent) {
+   assert(f.poisoned && !f.refusal && m.vlan_writes==1);
+   assert(m.reg[RTL_L2_FDB_CONTROL/4]&RTL_L2_FDB_LEARN_DISABLE);
+  } else {
+   assert(!f.poisoned && f.refusal && m.vlan_writes==2);
+   assert(m.reg[RTL_L2_VLAN_MODE_CONTROL/4]==m.original[RTL_L2_VLAN_MODE_CONTROL/4]);
+   command_restored(&f);
+  }
+  cases++;
  }
  for(unsigned index=0;index<RTL_L2_FDB_FILTER_WORDS;index++) {
   struct rtl_fabric f={};setup(index);m.drop_reg=RTL_L2_FDB_FILTER_WORD0-index*4;
@@ -360,7 +460,10 @@ int main(void) {
  {
   struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=1;
   m.reg[0xa034/4]=0x804005f6;m.reg[0x1c00/4]|=RTL_L2_FDB_LEARN_DISABLE;
-  for(unsigned port=0;port<5;port++)m.reg[RTL_FABRIC_RX(port)/4]=RTL_FABRIC_RX_CPU;
+  for(unsigned port=0;port<5;port++) {
+   m.reg[RTL_FABRIC_RX(port)/4]=RTL_FABRIC_RX_CPU;
+   m.reg[RTL_FABRIC_RX_MAC(port)/4]&=~RTL_FABRIC_RX_MAC_ENABLE;
+  }
   memcpy(m.original,m.reg,sizeof(m.reg));
   assert(!rtl_fabric_cold_prepare(&io,&f) && f.ready && !f.changed);
   assert(!m.frame_writes && !m.vlan_writes && !settles);
@@ -378,10 +481,25 @@ def main():
     parser.add_argument("--registers", type=Path, help="Pinned independent RTL8277C register unions")
     args = parser.parse_args()
     production = HEADER.read_text()
+    mac_gate = re.search(r"\tfor \(i = 0; i < RTL_FABRIC_LAN_PORTS; i\+\+\) \{\n"
+                         r"\t\tunsigned int reg = RTL_FABRIC_RX_MAC\(i\);.*?"
+                         r"\t\tfabric->cold_rx_gated \|= 1U << i;\n\t\}", production, re.S)
+    assert mac_gate
     mutants = {
+        "bypass_is_not_mac_rx_gate": production.replace(mac_gate.group(), "/* RX gate omitted */", 1),
+        "missing_mac_rx_readback": production.replace(
+            "ret = rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_MAC_ENABLE, 0);", "ret = 0;", 1),
+        "ignored_mac_gate_poisoned": production.replace(
+            "if (io->read(io->context, reg) == fabric->original_mac_rx[i])", "if (0)", 1),
+        "unknown_mac_gate_swallowed": production.replace(
+            "if (io->read(io->context, reg) == fabric->original_mac_rx[i])", "if (1)", 1),
+        "ignored_learning_stop_poisoned": production.replace(
+            "lease = 0;\n\t\t\tgoto refuse;", "goto restore;", 1),
+        "rollback_without_drain": production.replace("cleanup = rtl_fabric_drain(io);", "cleanup = 0;", 1),
         "missing_initial_drain": production.replace("ret = rtl_fabric_drain(io);", "ret = 0;"),
         "inherited_fdb_ignored": production.replace(
-            "if (ret > 0)\n\t\t\tret = -EOPNOTSUPP;", "if (ret > 0)\n\t\t\tret = 0;", 1),
+            "fabric->inherited_fdb_words[i] = row.words[i];\n\t\t\tret = -EOPNOTSUPP;",
+            "fabric->inherited_fdb_words[i] = row.words[i];\n\t\t\tret = 0;", 1),
         "old_narrow_scan_filter": production.replace("rtl_l2_fdb_scan_filter(filter);", "/* deliberately omitted */"),
         "missing_mode_readback": production.replace(
             "ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,\n\t\t\tfabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);",
@@ -403,6 +521,12 @@ def main():
     }
     assert all(text != production for text in mutants.values())
     expected_assertions = {
+        "bypass_is_not_mac_rx_gate": "!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)",
+        "missing_mac_rx_readback": "!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)",
+        "ignored_mac_gate_poisoned": "!f.poisoned && f.refusal && !f.ready && !m.scans && !m.pp_reads",
+        "unknown_mac_gate_swallowed": "f.poisoned && !f.refusal && !f.ready && !m.scans && !m.pp_reads",
+        "ignored_learning_stop_poisoned": "!f.poisoned && f.refusal",
+        "rollback_without_drain": "!m.pending_remaining && !m.permanent_pending",
         "missing_initial_drain": "m.pp_reads>=3",
         "inherited_fdb_ignored": "rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP",
         "old_narrow_scan_filter": "(m.reg[0x1c28/4]&63U)==0",
@@ -423,7 +547,7 @@ def main():
         assert hashlib.sha256(raw).hexdigest() == REGISTER_SHA, "Unpinned register input"
         source = raw.decode()
         names = ("L2FE_PLC_VLAN_MODE_CTRL", "NI_HV_GLB_PKT_LEN_CFG",
-                 "NI_HV_GLB_PKT_STOR_LEN_CFG", "NI_HV_PT_RX_CNTRL_CFG")
+                 "NI_HV_GLB_PKT_STOR_LEN_CFG", "NI_HV_PT_RX_CNTRL_CFG", "NI_HV_PT_RXMAC_CFG")
         unions = []
         for name in names:
             match = re.search(r"typedef volatile union \{(?:(?!typedef volatile union).)*?\} " + name + r"_t;", source, re.S)
@@ -437,6 +561,8 @@ static void sdk_oracle(void) {
  length.bf.max_pkt_size=1526;assert(length.wrd==0x004005f6);
  NI_HV_GLB_PKT_STOR_LEN_CFG_t storage={.wrd=0x2454};assert(storage.bf.max_stor_pkt_len==9300);
  NI_HV_PT_RX_CNTRL_CFG_t rx={.wrd=0};rx.bf.ovr_drop_dis=1;assert(rx.wrd==(1U<<5));
+ NI_HV_PT_RXMAC_CFG_t mac={.wrd=0};mac.bf.rx_en=1;assert(mac.wrd==RTL_FABRIC_RX_MAC_ENABLE);
+ assert(RTL_FABRIC_RX_MAC(0)==0xa5c8 && RTL_FABRIC_RX_MAC(4)==0xa808);
 }
 '''
         test = test.replace("/*SDK_DECL*/", declaration).replace("/*SDK_RUN*/", "sdk_oracle();")

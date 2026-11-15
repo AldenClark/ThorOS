@@ -4,10 +4,22 @@
 
 / { model = "Tianyi TYFZA1 (native NI/PON bring-up)"; };
 
-/* Keep the production LAN recovery path independent of PON probe.
- * Shared native-L2 cold handoff remains a board-development opt-in until
- * its hardware reset, GPIO and retirement prerequisites are validated.
- */
+/* NI owns the bounded cold transition before publishing any port. These
+ * temporary leases are released before PON can bind; no PON phandle is
+ * introduced here (PON already depends on NI). GPIO/BOSA/optical IRQ probe
+ * cannot withhold LANs. No automatic L2 admission: bridge policy remains
+ * separately requested through l2_switch after this baseline is ready. */
+&ni0 {
+	reg = <4 0xf4300000 0 0x10000>, <0 0xf4500000 0 0x2000>,
+	      <4 0xf7001000 0 0x1000>, <4 0xf432d000 0 0x1000>,
+	      <4 0xf4320098 0 4>, <4 0xf432f000 0 0x1000>,
+	      <4 0xf432e000 0 0x1000>, <4 0xf5500000 0 0xc000>,
+	      <4 0xf4320094 0 4>, <4 0xf4320074 0 4>, <4 0xf432007c 0 4>;
+	reg-names = "ni", "xram", "dma-lso", "qm-axi-reorder", "block-reset",
+		    "l3fe-axi-reorder", "dma-axi-reorder", "pon-cold-mac",
+		    "pon-cold-control", "pon-cold-epon", "pon-cold-gpon";
+	realtek,cold-fabric-bootstrap;
+};
 
 &i2c0 {
 	status = "okay";

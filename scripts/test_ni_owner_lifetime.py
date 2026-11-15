@@ -292,8 +292,15 @@ static void assert_tokens(struct rtl_xram *p){
 int main(void){
  u32 registers[0x10000/4],dma_registers[0x2000/4];
  struct net_device dev={0};struct rtl_fe fe;
+ /* Allocation is not publication, even on a non-cold bring-up board. */
+ for(unsigned required=0;required<2;required++){
+  struct rtl_xram p={.cold_handoff_required=required};
+  active_priv=&p;reset_counts();
+  assert(rtl_engine_get(&p)==-EPROBE_DEFER);
+  assert(!suspends && !writes && !waits && !p.engine_users);cases++;
+ }
  for(unsigned mode=0;mode<4;mode++){
-  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.provider_ready=true,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=!!(mode&1),.qm_rx=!!(mode&2),.ports={&dev,NULL,&dev,NULL,&dev},
    .dma={.registers=(void *)dma_registers,.vp=8,.memory=&dev},.qm={.memory=&dev}};
   dev.priv=&p;active_priv=&p;memset(registers,0x5a,sizeof(registers));
@@ -319,7 +326,7 @@ int main(void){
  /* Every failed cold stage keeps partial DMA exposure and prohibits retry.
   * A pre-exposure FE veto remains retryable without touching shared state. */
  for(unsigned mode=0;mode<4;mode++)for(unsigned failure=1;failure<5;failure++){
-  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.provider_ready=true,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=!!(mode&1),.qm_rx=!!(mode&2),
    .dma={.registers=(void *)dma_registers,.vp=8},.qm={0}};
   dev.priv=&p;active_priv=&p;memset(&fe,0,sizeof(fe));reset_counts();
@@ -349,7 +356,7 @@ int main(void){
  /* An explicit zero request before, or during, sleeping cold initialization
   * must survive QM's actual final MMIO writes and final host publication. */
  for(unsigned when=0;when<2;when++){
-  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.provider_ready=true,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.dma={.registers=(void *)dma_registers,.vp=8}};
   dev.priv=&p;active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));
   if(when)request_zero_in_qm=true;
@@ -362,7 +369,7 @@ int main(void){
  /* A temporary FE cleanup failure does not poison/reset the NI queue.
   * Retry is gated on FE's next suspend; partial FE bases reject there. */
  {
-  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.provider_ready=true,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.dma={.registers=(void *)dma_registers,.vp=8}};
   active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));assert(!rtl_engine_get(&p));
   fail_suspend=1;rtl_engine_put(&p);assert(!p.engine_poisoned && !p.host_active && !p.napi.active);
@@ -376,7 +383,7 @@ int main(void){
   * quarantine keeps primary owner, storage and physical reprobe tombstone. */
  for(unsigned exposed=0;exposed<2;exposed++)for(unsigned retained_fe=0;retained_fe<2;retained_fe++){
   struct platform_device platform={.dev={.refs=1,.data=&dev}};
-  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
+  struct rtl_xram p={.fabric_lock=PTHREAD_MUTEX_INITIALIZER,.provider_ready=true,.netdev=&dev,.fe=&fe,.owner=claim(),.ni=(void *)registers,
    .dma_tx=true,.qm_rx=true,.irq_requested=true,.native_groups_created=true,.lan4_phy=1,
    .dma={.registers=(void *)dma_registers,.vp=8,.memory=&dev},.qm={.memory=&dev,.pon=&dev}};
   dev.priv=&p;active_priv=&p;reset_counts();memset(&fe,0,sizeof(fe));

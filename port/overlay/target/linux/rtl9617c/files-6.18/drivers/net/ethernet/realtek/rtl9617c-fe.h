@@ -12,6 +12,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device, void __iomem *registers);
  * negative: unsafe/unavailable handoff, keep provider unpublished.
  */
 int rtl_fe_fabric_cold_prepare(struct rtl_fe *fe);
+void rtl_fe_fabric_cold_abort(struct rtl_fe *fe, int error);
 /* false means a quarantined owner remains; NI must retain its DMA/provider. */
 bool rtl_fe_free(struct rtl_fe *fe);
 int rtl_fe_add_port(struct rtl_fe *fe, struct net_device *netdev,

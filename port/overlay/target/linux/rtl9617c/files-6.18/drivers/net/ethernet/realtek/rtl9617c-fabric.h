@@ -6,12 +6,15 @@
 #include "rtl9617c-l2-table.h"
 #include "rtl9617c-frame.h"
 
-/* Cold provider handoff only: no Linux LAN or FE DMA base is published,
- * all PON RX modes are gated by the PON owner, and its PDC FIFO is empty.
+/* Cold provider handoff only: no Linux LAN or FE DMA base is published.
+ * NI's local bootstrap has gated the selected, released PON RX family and
+ * verified PDC empty (or PDC is held in reset); no PON probe is required.
  * The caller owns the shared FE mutex. This local L2 drain is not a fence
  * for L3/DDR resource retirement. No table is flushed or inherited row erased.
  */
 #define RTL_FABRIC_LAN_PORTS 5U
+#define RTL_FABRIC_RX_MAC(port) (0xa5c8U + 0x90U * (port))
+#define RTL_FABRIC_RX_MAC_ENABLE 1U
 #define RTL_FABRIC_RX(port) (0xa5f8U + 0x90U * (port))
 #define RTL_FABRIC_RX_SELECTOR ((1U << 28) | (63U << 16))
 #define RTL_FABRIC_RX_CPU ((1U << 28) | (16U << 16))
@@ -24,10 +27,12 @@ struct rtl_fabric {
 	unsigned int vlan_mode, packet_length, storage_length, tpid[4];
 	unsigned int original_vlan_mode, original_packet_length, saved_control;
 	unsigned int original_rx[RTL_FABRIC_LAN_PORTS];
+	unsigned int original_mac_rx[RTL_FABRIC_LAN_PORTS], cold_rx_gated;
 	unsigned int saved_filter[RTL_L2_FDB_FILTER_WORDS];
+	unsigned int inherited_fdb_index, inherited_fdb_words[RTL_L2_FDB_WORDS];
 	unsigned int rejected_register, rejected_value;
 	int error;
-	unsigned char ready, poisoned, changed, refusal;
+	unsigned char ready, poisoned, changed, refusal, inherited_fdb_present;
 };
 
 static inline int rtl_fabric_match(const struct rtl_dq_io *io,
@@ -160,6 +165,9 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		return rtl_fabric_check(io, fabric);
 	fabric->refusal = 0;
 	fabric->changed = 0;
+	fabric->cold_rx_gated = 0;
+	fabric->inherited_fdb_present = 0;
+	fabric->inherited_fdb_index = ~0U;
 	fabric->rejected_register = fabric->rejected_value = 0;
 	control = io->read(io->context, RTL_L2_FDB_CONTROL);
 	if ((control & (1U << 30)) ||
@@ -185,13 +193,43 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 	 * The independent processing/PON storage budget is never rewritten. */
 	fabric->packet_length = (fabric->original_packet_length & ~0x3fffU) |
 		RTL_FABRIC_NATIVE_MAX_FRAME;
-	/* New LAN ingress bypasses L2 throughout acquisition and afterwards.
-	 * Never restore an inherited native/FE selector as part of cleanup. */
+	/* A CPU destination is NOT a receive fence. The SDK's __ni_rx_init()
+	 * closes GE RXMAC.rx_en before configuring NI; RX_CNTRL.rxctrl_byp_en
+	 * only carries an FE-bypass/destination policy. In particular, CPU16's
+	 * QM has not been started yet: admitting frames there can backpressure
+	 * the very local pipeline that this cold transaction must drain.
+	 * Snapshot every port before the first write, close real MAC receive,
+	 * and leave TX untouched so already accepted frames can leave.
+	 * Both success and safe refusal leave RX closed for normal ndo_open.
+	 * Neither path may restore an inherited native/FE admission policy. */
+	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
+		fabric->original_mac_rx[i] = io->read(io->context, RTL_FABRIC_RX_MAC(i));
+		fabric->original_rx[i] = io->read(io->context, RTL_FABRIC_RX(i));
+	}
+	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
+		unsigned int reg = RTL_FABRIC_RX_MAC(i);
+
+		io->write(io->context, reg,
+			fabric->original_mac_rx[i] & ~RTL_FABRIC_RX_MAC_ENABLE);
+		ret = rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_MAC_ENABLE, 0);
+		if (ret) {
+			/* No selector or shared baseline has been written yet. A
+			 * completely ignored gate write is a clean native refusal,
+			 * just like the read-only preflight: software LAN startup
+			 * retains the exact inherited state of this port. Earlier
+			 * closed ports stay closed until their normal ndo_open.
+			 * Any changed/unknown word is not this recoverable case. */
+			if (io->read(io->context, reg) == fabric->original_mac_rx[i])
+				goto refuse;
+			fabric->poisoned = 1;
+			goto refuse;
+		}
+		fabric->cold_rx_gated |= 1U << i;
+	}
 	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
 		unsigned int reg = RTL_FABRIC_RX(i);
 		unsigned int value = io->read(io->context, reg);
 
-		fabric->original_rx[i] = value;
 		selector_changed |= (value & RTL_FABRIC_RX_SELECTOR) != RTL_FABRIC_RX_CPU;
 		io->write(io->context, reg,
 			(value & ~RTL_FABRIC_RX_SELECTOR) | RTL_FABRIC_RX_CPU);
@@ -212,8 +250,20 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		control | RTL_L2_FDB_LEARN_DISABLE);
 	ret = rtl_fabric_match(io, fabric, RTL_L2_FDB_CONTROL,
 		RTL_L2_FDB_LEARN_DISABLE, RTL_L2_FDB_LEARN_DISABLE);
-	if (ret)
+	if (ret) {
+		/* An ignored first write has not acquired the shared command lease.
+		 * If the original control is still exact and both windows idle,
+		 * there is nothing to restore and no ambiguous command to retire.
+		 * Requiring a stopped-learning lease to restore this unchanged state
+		 * would turn an optional native failure into a dead management LAN. */
+		if (io->read(io->context, RTL_L2_FDB_CONTROL) == control &&
+		    !((io->read(io->context, RTL_L2_FDB_ACCESS) |
+		       io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)) {
+			lease = 0;
+			goto refuse;
+		}
 		goto restore;
+	}
 	ret = rtl_fabric_drain(io);
 	if (ret)
 		goto restore;
@@ -235,8 +285,13 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		/* Every inherited valid row vetoes reinterpretation, including a
 		 * static or multicast IVL key. A complete all-valid MISS proves empty. */
 		ret = rtl_l2_fdb_scan(io, 0, &row);
-		if (ret > 0)
+		if (ret > 0) {
+			fabric->inherited_fdb_present = 1;
+			fabric->inherited_fdb_index = row.index;
+			for (i = 0; i < RTL_L2_FDB_WORDS; i++)
+				fabric->inherited_fdb_words[i] = row.words[i];
 			ret = -EOPNOTSUPP;
+		}
 		if (ret)
 			goto restore;
 		ret = rtl_l2_fdb_mode_idle(io);
@@ -291,6 +346,8 @@ restore:
 	 * a provider whose shared baseline has not been read back consistently. */
 	if (ret && (vlan_written || frame_written || oversize_written)) {
 		cleanup = rtl_l2_fdb_mode_idle(io);
+		if (!cleanup)
+			cleanup = rtl_fabric_drain(io);
 		if (!cleanup) {
 			for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++) {
 				unsigned int reg, value;
@@ -331,7 +388,7 @@ restore:
 	/* A successful shared baseline keeps learning stopped. The native
 	 * owner may later enable only its prepared ports; software-only paths
 	 * remain on CPU bypass. Failed acquisition restores inherited policy. */
-	if (lease && rtl_fabric_restore_command(io, fabric, ret ?
+	if (lease && !fabric->poisoned && rtl_fabric_restore_command(io, fabric, ret ?
 		fabric->saved_control : fabric->saved_control | RTL_L2_FDB_LEARN_DISABLE))
 		fabric->poisoned = 1;
 	if (fabric->poisoned) {
@@ -344,6 +401,8 @@ restore:
 	fabric->ready = 1;
 	fabric->changed = !!(vlan_written || frame_written || oversize_written ||
 		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE));
+	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++)
+		fabric->changed |= !!(fabric->original_mac_rx[i] & RTL_FABRIC_RX_MAC_ENABLE);
 	fabric->error = 0;
 	return 0;
 refuse:
