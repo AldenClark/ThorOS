@@ -127,12 +127,15 @@ static inline int rtl_fabric_restore_command(const struct rtl_dq_io *io,
 					    struct rtl_fabric *fabric,
 					    unsigned int control)
 {
-	unsigned int i;
+	unsigned int i, live;
+	unsigned int owned = RTL_L2_FDB_CMD_MODE | RTL_L2_FDB_LEARN_DISABLE;
 	int ret;
 
-	ret = rtl_l2_fdb_mode_idle(io);
+	ret = rtl_l2_fdb_mode_control(io, &live);
 	if (ret)
 		return ret;
+	if ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))
+		return -EIO;
 	for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++) {
 		unsigned int reg = RTL_L2_FDB_FILTER_WORD0 - i * 4;
 
@@ -142,16 +145,38 @@ static inline int rtl_fabric_restore_command(const struct rtl_dq_io *io,
 		if (ret)
 			return ret;
 	}
+	/* The SDK toggles sw_age_entry_scan to request a scan. It is live edge
+	 * state, not a setting to replay from the pre-lease snapshot. Recheck
+	 * after restoring filters and only return the CMD/learning bits owned
+	 * by this transaction; unrelated stable control drift is not repairable
+	 * by overwriting the whole register with an old value. */
+	ret = rtl_l2_fdb_mode_control(io, &live);
+	if (ret)
+		return ret;
+	if ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))
+		return -EIO;
+	control = (live & ~owned) | (control & owned);
 	io->write(io->context, RTL_L2_FDB_CONTROL, control);
-	return rtl_fabric_match(io, fabric, RTL_L2_FDB_CONTROL, ~0U,
-				 control);
+	/* A failed acquisition may restore learning enabled, so use the idle
+	 * control reader rather than demanding a stopped-learning lease here. */
+	ret = rtl_l2_fdb_control_read(io, &live);
+	if (ret)
+		return ret;
+	if ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {
+		if (!fabric->rejected_register) {
+			fabric->rejected_register = RTL_L2_FDB_CONTROL;
+			fabric->rejected_value = live;
+		}
+		return -EIO;
+	}
+	return 0;
 }
 
 static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 					 struct rtl_fabric *fabric)
 {
 	struct rtl_l2_fdb_result row;
-	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, i, minimum, maximum;
+	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, live, i, minimum, maximum;
 	unsigned int vlan_written = 0, frame_written = 0, oversize_written = 0;
 	unsigned int selector_changed = 0;
 	unsigned int lease = 0;
@@ -240,10 +265,21 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 			goto refuse;
 		}
 	}
-	fabric->saved_control = control;
 	for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++)
 		fabric->saved_filter[i] = io->read(io->context,
 			RTL_L2_FDB_FILTER_WORD0 - i * 4);
+	/* RX gating and filter snapshots may span a software age-scan toggle.
+	 * Refresh that edge before the first CTRL write, without accepting stable policy
+	 * changes or a newly busy command window as part of our old snapshot. */
+	ret = rtl_l2_fdb_control_read(io, &live);
+	if (ret)
+		goto refuse;
+	if ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {
+		ret = -EIO;
+		goto refuse;
+	}
+	control = live;
+	fabric->saved_control = control;
 	/* Claim before the first global write, so partial setup is accounted for. */
 	lease = 1;
 	io->write(io->context, RTL_L2_FDB_CONTROL,
@@ -252,13 +288,12 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		RTL_L2_FDB_LEARN_DISABLE, RTL_L2_FDB_LEARN_DISABLE);
 	if (ret) {
 		/* An ignored first write has not acquired the shared command lease.
-		 * If the original control is still exact and both windows idle,
+		 * If the original stable control and both idle windows are intact,
 		 * there is nothing to restore and no ambiguous command to retire.
 		 * Requiring a stopped-learning lease to restore this unchanged state
 		 * would turn an optional native failure into a dead management LAN. */
-		if (io->read(io->context, RTL_L2_FDB_CONTROL) == control &&
-		    !((io->read(io->context, RTL_L2_FDB_ACCESS) |
-		       io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)) {
+		cleanup = rtl_l2_fdb_control_read(io, &live);
+		if (!cleanup && !((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN)) {
 			lease = 0;
 			goto refuse;
 		}

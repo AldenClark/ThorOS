@@ -66,15 +66,17 @@ struct rtl_fe_bridge;
 struct rtl_fe {int lock; bool shutting_down,engine_ready; struct rtl_fe_bridge *bridge;};
 struct rtl_dq_io {struct rtl_fe *context;};
 struct rtl_l2_fdb_result {unsigned int raw,status,index,words[4];};
-struct rtl_fe_switch_hw {bool owned,drained; int drain_error,restore_error; unsigned int drains,restores;};
+struct rtl_fe_switch_hw {bool owned,drained; int drain_error,restore_error; unsigned int drains,restores;u32 learning_mask;};
 struct rtl9617c_switch_guard {struct rtl_fe_bridge *owner;u64 generation;unsigned int invalidations;};
 struct fe_switch_learned {u8 address[6];u8 port;};
+struct fe_switch_published {u8 address[6];u8 destination;u64 cookie;};
 '''
 
 BACKEND = r'''
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct rtl9617c_switch_guard guard;struct rtl_fe_switch_hw hw;
- struct net_device *ports[5];struct delayed_work scan_work;struct work_struct work;
+ struct net_device *ports[5],*master;struct delayed_work scan_work;struct work_struct work;
+ struct fe_switch_published *published;unsigned int published_count;
  struct fe_switch_learned *learned,*next;unsigned int learned_count,pending_count;
  unsigned int scan_start,scan_count,scan_old,scan_cursor;u64 scan_generation;
  bool scan_running,scan_complete,scan_removed;
@@ -194,6 +196,14 @@ static bool br_rtl9617c_fdb_forget(struct net_device *dev,const u8 *address){
  events[event_count]=(struct feedback){.add=false,.port=dev->port};
  memcpy(events[event_count++].mac,address,6);return true;
 }
+static bool br_rtl9617c_fdb_unoffload(const struct net_device *master,const u8 *address,
+ unsigned short vid,struct rtl9617c_switch_guard *guard,u64 cookie){
+ assert(rtnl_held && !fe.lock && master && address && !vid && guard==&sw.guard && cookie);
+ /* Static-cookie publication has its own real-worker regression. None of
+  * this dynamic scan test's rows has a published static owner. */
+ assert(!"unexpected static publication in dynamic scan fixture");
+ return false;
+}
 static void switchdev_bridge_port_unoffload(struct net_device *dev,struct rtl_fe_bridge *owner,
  struct notifier_block *atomic,struct notifier_block *blocking){
  assert(rtnl_held && !fe.lock && dev && owner==&sw && atomic==&sw.atomic_nb && blocking==&sw.blocking_nb);
@@ -218,7 +228,7 @@ static void setup(void){
  memset(&fe,0,sizeof(fe));memset(&sw,0,sizeof(sw));memset(first,0,sizeof(first));memset(second,0,sizeof(second));
  memset(rows,0,sizeof(rows));memset(used,0,sizeof(used));
  sw.fe=&fe;fe.bridge=&sw;fe.engine_ready=true;sw.requested=true;sw.guard.owner=&sw;sw.learned=first;sw.next=second;
- sw.native_mask=3;sw.active=true;sw.hw.owned=true;status_override=-1;
+ sw.native_mask=3;sw.active=true;sw.hw.owned=true;sw.hw.learning_mask=3;status_override=-1;
  scans=deletes=appends=fail_scan_at=fail_delete_at=event_count=0;
  learn_calls=fail_learn_at=epoch_on_learn=epoch_after_learn=epoch_on_forget=protected_mac=unoffloads=0;
  nanoseconds=operation_ns=last_delay=0;
@@ -495,6 +505,34 @@ static void bounded_time_and_generation(void){
   assert(!sw.scan_running && !sw.polls && sw.learned_count==1 && !sw.pending_count && !event_count);cases++;
  }
 }
+static void learning_mask_policy(void){
+ /* Programmed learning permission and the native forwarding subset must
+  * BOTH authorize a destination. A leftover dynamic row on a learning-off
+  * or CPU-only STP port must never be published back into the bridge. */
+ for(unsigned int native=1;native<32;native++)for(unsigned int learning=0;learning<32;learning++){
+  setup();sw.native_mask=native;sw.hw.learning_mask=learning;
+  unsigned int count=0;
+  for(unsigned int port=0;port<5;port++){
+   put_row(port,port+1,port,0,false);
+   if((native&learning)&BIT(port))count++;
+  }
+  finish_scan();
+  assert(sw.polls==1 && sw.learned_count==count && event_count==count && learn_calls==count);
+  for(unsigned int i=0;i<count;i++){
+   assert(events[i].add && ((native&learning)&BIT(events[i].port)));
+   assert(sw.learned[i].port==events[i].port && address_id(events[i].mac)==events[i].port+1);
+  }
+  cases++;
+ }
+ /* Withdraw an old owned mirror when its source learning is disabled,
+  * without treating the still-visible silicon row as fresh permission. */
+ setup();put_row(0,1,0,0,false);put_row(1,2,1,0,false);finish_scan();
+ assert(sw.learned_count==2 && learn_calls==2);
+ event_count=0;learn_calls=0;sw.hw.learning_mask=1;finish_scan();
+ assert(sw.learned_count==1 && sw.learned[0].port==0 && learn_calls==1);
+ assert(event_count==2 && !events[0].add && events[0].port==1 && address_id(events[0].mac)==2);
+ assert(events[1].add && events[1].port==0 && address_id(events[1].mac)==1);cases++;
+}
 static void batch_fault_matrix(void){
  const unsigned int positions[]={1,64,65,128,129,130};
  for(unsigned int i=0;i<sizeof(positions)/sizeof(positions[0]);i++){
@@ -514,7 +552,7 @@ static void batch_fault_matrix(void){
   cases++;
  }
 }
-int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();batch_fault_matrix();
+int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();learning_mask_policy();batch_fault_matrix();
  printf("Native switch production FDB: %u rollback/status/batched-scan scenarios; full 4128-row capacity, timed slices, generation/rebuild restart, partial feedback ownership and MAC moves passed (max %u boundary operations/slice)\n",cases,max_slice_operations);
  return 0;}
 '''
@@ -527,6 +565,10 @@ functions = "\n".join(function(name) for name in [
     "fe_switch_feedback", "fe_switch_unoffload", "fe_switch_learned_compare", "fe_switch_scan",
 ])
 mutants = {
+    "scan_ignores_learning_mask": functions.replace(
+        "sw->native_mask & sw->hw.learning_mask", "sw->native_mask", 1),
+    "scan_ignores_native_subset": functions.replace(
+        "sw->native_mask & sw->hw.learning_mask", "sw->hw.learning_mask", 1),
     "unbounded_mmio_batch": functions.replace(
         "\treturn operations >= FE_SWITCH_SCAN_BUDGET ||",
         "\treturn false ||", 1),
@@ -585,11 +627,11 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-fdb-") as directory:
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if result.returncode != -6 or "Assertion" not in result.stderr:
                 raise SystemExit(f"{name}: expected a contract assertion, got {result.returncode}: {result.stderr}")
-            print(f"Runtime regression mutant rejected: {name}")
+            print(f"Runtime regression mutant rejected: {name}", flush=True)
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-fdb.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),
-    "scope": "production FDB domain/restore/bounded-scan orchestration with hardware-command fault injection, 4128-row full capacity, timed slices, epoch/rebuild interruption and feedback ownership",
+    "scope": "production FDB domain/restore/bounded-scan orchestration with hardware-command fault injection, 4128-row full capacity, 992 native/learning-mask combinations, timed slices, epoch/rebuild interruption and feedback ownership",
     "runtime_mutants_rejected": list(mutants),
     "hardware_verified": False,
 }, indent=2) + "\n")

@@ -33,11 +33,18 @@ struct l2_mmio_model {
 	unsigned int fdb_status, fdb_index, fdb_reply[RTL_L2_FDB_WORDS];
 	unsigned int fdb_effects;
 	bool complete_busy_fdb, complete_enable_learning;
+	unsigned int control_reads, control_writes;
+	unsigned int ignore_control_write_at, corrupt_control_write_at, corrupt_control_value;
+	unsigned int corrupt_control_read_at, corrupt_control_read_value;
+	unsigned int complete_control_xor, after_limit_data_control_xor;
+	bool complete_control_override;
+	unsigned int complete_control_value;
 };
 
 static void l2_model_trace_reset(struct l2_mmio_model *model)
 {
 	model->event_count = model->reads = model->writes = model->commands = 0;
+	model->control_reads = model->control_writes = 0;
 	memset(model->checked_idle, 0, sizeof(model->checked_idle));
 }
 
@@ -73,6 +80,9 @@ static unsigned int l2_model_read(void *context, unsigned int address)
 
 	assert(!(address & 3) && address < sizeof(model->registers));
 	value = model->registers[address / 4];
+	if (address == RTL_L2_FDB_CONTROL &&
+	    ++model->control_reads == model->corrupt_control_read_at)
+		value = model->corrupt_control_read_value;
 	for (table = 0; table < RTL_L2_TBL_COUNT; table++) {
 		const struct rtl_l2_table_layout *layout = &model->layouts[table];
 
@@ -86,8 +96,10 @@ static unsigned int l2_model_read(void *context, unsigned int address)
 		model->checked_idle[RTL_L2_TBL_COUNT] = !(value & RTL_L2_ACCESS_BUSY);
 	if (address == RTL_L2_FDB_LIMIT_ACCESS)
 		model->checked_idle[RTL_L2_TBL_COUNT + 1] = !(value & RTL_L2_ACCESS_BUSY);
-	if (address == RTL_L2_FDB_LIMIT_DATA)
+	if (address == RTL_L2_FDB_LIMIT_DATA) {
 		assert(!(model->registers[RTL_L2_FDB_LIMIT_ACCESS / 4] & RTL_L2_ACCESS_BUSY));
+		model->registers[RTL_L2_FDB_CONTROL / 4] ^= model->after_limit_data_control_xor;
+	}
 	if ((address <= RTL_L2_FDB_DATA0 && address > RTL_L2_FDB_DATA0 - 16) ||
 	    address == RTL_L2_FDB_RETURN)
 		assert(!(model->registers[RTL_L2_FDB_ACCESS / 4] & RTL_L2_ACCESS_BUSY));
@@ -123,9 +135,10 @@ static void l2_model_write(void *context, unsigned int address, unsigned int val
 		assert(!(model->registers[RTL_L2_FDB_ACCESS / 4] & RTL_L2_ACCESS_BUSY));
 		assert(!(model->registers[RTL_L2_FDB_LIMIT_ACCESS / 4] & RTL_L2_ACCESS_BUSY));
 		assert(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_LEARN_DISABLE);
-		if (address == RTL_L2_FDB_CONTROL)
+		if (address == RTL_L2_FDB_CONTROL) {
 			assert(!((value ^ model->registers[address / 4]) & ~RTL_L2_FDB_CMD_MODE));
-		else
+			assert(!(value & RTL_L2_FDB_INFO_INIT));
+		} else
 			assert(!(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_CMD_MODE));
 		staging = true;
 	}
@@ -133,6 +146,13 @@ static void l2_model_write(void *context, unsigned int address, unsigned int val
 	assert(staging);
 	l2_model_event(model, L2_MODEL_WRITE, address, value);
 	model->writes++;
+	if (address == RTL_L2_FDB_CONTROL) {
+		model->control_writes++;
+		if (model->control_writes == model->ignore_control_write_at)
+			return;
+		if (model->control_writes == model->corrupt_control_write_at)
+			value = model->corrupt_control_value;
+	}
 	model->registers[address / 4] = value;
 }
 
@@ -195,6 +215,11 @@ static void l2_model_complete(struct l2_mmio_model *model)
 	} else {
 		assert(table < RTL_L2_TBL_COUNT);
 	}
+	if (address == RTL_L2_FDB_ACCESS || address == RTL_L2_FDB_LIMIT_ACCESS) {
+		model->registers[RTL_L2_FDB_CONTROL / 4] ^= model->complete_control_xor;
+		if (model->complete_control_override)
+			model->registers[RTL_L2_FDB_CONTROL / 4] = model->complete_control_value;
+	}
 	model->registers[address / 4] = 0;
 	model->pending = false;
 }
@@ -219,12 +244,16 @@ static int l2_model_command(void *context, unsigned int address, unsigned int va
 	}
 	if (address == RTL_L2_FDB_ACCESS) {
 		assert(model->checked_idle[RTL_L2_TBL_COUNT]);
+		assert(model->checked_idle[RTL_L2_TBL_COUNT + 1]);
+		assert(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_CMD_MODE);
+		assert(!(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_INFO_INIT));
 		for (word = 0; word < RTL_L2_FDB_WORDS; word++)
 			model->pending_words[word] = model->registers[(RTL_L2_FDB_DATA0 - word * 4) / 4];
 	} else if (address == RTL_L2_FDB_LIMIT_ACCESS) {
 		assert(model->checked_idle[RTL_L2_TBL_COUNT]);
 		assert(model->checked_idle[RTL_L2_TBL_COUNT + 1]);
 		assert(!(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_CMD_MODE));
+		assert(!(model->registers[RTL_L2_FDB_CONTROL / 4] & RTL_L2_FDB_INFO_INIT));
 		model->pending_words[0] = model->registers[RTL_L2_FDB_LIMIT_DATA / 4];
 	} else {
 		assert(table < RTL_L2_TBL_COUNT);

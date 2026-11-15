@@ -340,6 +340,10 @@ static bool fe_route_select_locked(struct rtl_fe *fe, unsigned int profile)
  for(i=0;i<2;i++) {
   address=0x3418+i*12;
   value=fe_read(fe,address);
+  /* An inaccessible LPB is not a valid base for preserving unrelated
+   * fields. Still try the other connector and verify both afterwards;
+   * neither a skipped write nor a failed read may authorize admission. */
+  if(value==~0U) {selected=false;continue;}
   fe_write(fe,address,(value&~(15U<<10))|(profile<<10));
  }
  for(i=0;i<2;i++)

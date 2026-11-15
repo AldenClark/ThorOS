@@ -93,6 +93,30 @@ for reason, name in (('0', 'requires-existing-svl'), ('99', 'ok'), ('-1', 'ok'),
 text = capture().replace('l2_requested=1', 'l2_hw_reason=1 l2_hw_reason_name=requires-existing-svl l2_hw_reason_name=ok l2_requested=1')
 assert not module.summarize(text)['states']['after']['fe']['l2_hw_reason_name_valid']
 
+# Policy/capacity state is diagnostic evidence, never a packet hit counter or
+# proof that all bridge capabilities are implemented. Preserve integers and
+# reject malformed/duplicate fields without echoing arbitrary payloads.
+new_state = {
+    'l2_mdb_hardware': '0', 'l2_multibridge_hardware': '0',
+    'l2_route_policy_allowed': '0', 'l2_flow_allowed': '0',
+    'l2_local_target': '16', 'l2_rx_gate_verified': '0',
+    'l2_learning_ports': '0x3', 'l2_isolated_ports': '0x2',
+    'l2_static_published': '4096', 'l2_journal_used': '201',
+    'l2_journal_capacity': '256', 'l2_journal_quarantined': '1',
+    'route_gate_verified': '0',
+}
+text = capture().replace('l2_requested=1', 'l2_requested=1 ' + ' '.join(
+    f'{key}={value}' for key, value in new_state.items()))
+parsed = module.summarize(text)
+assert {key: parsed['states']['after']['fe'][key] for key in new_state} == new_state
+assert parsed['hardware_forwarding_proven'] is False
+for key in new_state:
+    for bad in ('PRIVATE_192.0.2.1', new_state[key] + f' {key}=42'):
+        corrupted = text.replace(f'{key}={new_state[key]}', f'{key}={bad}')
+        result = module.summarize(corrupted)
+        assert key not in result['states']['after']['fe']
+        assert 'PRIVATE_' not in json.dumps(result)
+
 # Synthetic XGPON readback records with deliberately chosen unrelated bits.
 # Parser coverage only: these are not device captures or a physical power cycle.
 cold_old = ('schema=1 cached=1 historical=1 requested=1 attempted=1 managed=0 result=-5 '

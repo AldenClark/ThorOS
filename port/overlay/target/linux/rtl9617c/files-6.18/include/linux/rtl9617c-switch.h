@@ -85,6 +85,44 @@ static inline int br_rtl9617c_fdb_learn(const struct net_device *port,
 }
 #endif
 
+#if IS_REACHABLE(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
+/* RTNL held, with no driver's FE mutex held across notifications.  Publish
+ * only an already programmed static-sticky or LOCAL FDB row.  local requires
+ * port==NULL and means CPU delivery, including a port-owned LOCAL address;
+ * otherwise port must still be a member of master and match the FDB dst.
+ *
+ * cookie is returned only on success.  It identifies this exact publication,
+ * independently of the policy generation, entry address or a recycled guard
+ * pointer.  Keep the bridge device alive until cleanup; cleanup removes only
+ * this owner's mark and never deletes or reassigns an FDB entry. */
+int br_rtl9617c_fdb_offload(const struct net_device *master,
+			   const struct net_device *port,
+			   const unsigned char *addr, unsigned short vid, bool local,
+			   struct rtl9617c_switch_guard *guard, u64 generation,
+			   u64 *cookie);
+bool br_rtl9617c_fdb_unoffload(const struct net_device *master,
+			      const unsigned char *addr, unsigned short vid,
+			      struct rtl9617c_switch_guard *guard, u64 cookie);
+#else
+static inline int br_rtl9617c_fdb_offload(const struct net_device *master,
+				       const struct net_device *port,
+				       const unsigned char *addr,
+				       unsigned short vid, bool local,
+				       struct rtl9617c_switch_guard *guard,
+				       u64 generation, u64 *cookie)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool br_rtl9617c_fdb_unoffload(const struct net_device *master,
+					  const unsigned char *addr,
+					  unsigned short vid,
+					  struct rtl9617c_switch_guard *guard,
+					  u64 cookie)
+{
+	return false;
+}
+#endif
+
 #if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
 int rtl9617c_switch_guard_register(struct rtl9617c_switch_guard *guard,
 				 struct net *net,

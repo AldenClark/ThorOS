@@ -12,7 +12,7 @@ permissions:
 jobs:
   regression:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Run production-code regression tests
@@ -44,7 +44,7 @@ jobs:
 
   sdk-contracts:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -80,6 +80,7 @@ jobs:
           bash scripts/check_flowtable_contracts.sh "artifacts/kernel-objects/linux-$kernel_version"
           python3 scripts/test_fabric_frame_contract.py --kernel "artifacts/kernel-objects/linux-$kernel_version"
           python3 scripts/test_l2_bridge_eligibility.py --kernel "artifacts/kernel-objects/linux-$kernel_version"
+          python3 scripts/test_l2_static_fdb.py --kernel "artifacts/kernel-objects/linux-$kernel_version" --sanitize --mutants
       - name: Upload compile evidence without firmware or private inputs
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6

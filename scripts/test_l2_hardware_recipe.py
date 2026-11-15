@@ -45,10 +45,17 @@ struct model {
  unsigned int pending_words[RTL_L2_TABLE_MAX_WORDS];
  unsigned int delays, settles, clear_after, pending_reads, native_writes, tx_writes;
  unsigned int route_gates, route_arms, rx_writes;
+ unsigned int lpb_reads;
+ unsigned int corrupt_read_address, corrupt_read_value, corrupt_after_command;
+ unsigned int corrupt_after_writes, ignore_write_table, ignore_write_address;
+ unsigned int ignore_write_value, corrupt_trigger_value;
+ bool ignore_write_match, corrupt_wait_write, corrupt_triggered;
+ bool ignore_write, ignore_limits, reserved_read_zero;
  bool pending, table_seen_idle[RTL_L2_TBL_COUNT], active, route_closed, arm_failure;
 };
 static struct model model, original;
-struct rtl_fe { struct model *model; bool enabled, prepared; unsigned pending_withdrawals; };
+struct rtl_fe { struct model *model; bool enabled, prepared, route_gate_verified;
+ bool route_gate_ready, dma_exposed; unsigned pending_withdrawals; };
 static unsigned int cases, fault_cases, cold_cases;
 
 static int table_at(unsigned int address, bool access)
@@ -82,7 +89,9 @@ static void complete(struct model *m)
   assert(!(m->reg[RTL_L2_FDB_CONTROL/4]&BIT(31)));
   assert(m->reg[RTL_L2_FDB_CONTROL/4]&BIT(22));
   assert((index&~63U)==RTL_L2_FDB_LIMIT_SELECT);
-  if(m->pending_request&BIT(30)) m->limits[index&63]=m->pending_words[0];
+  if(m->pending_request&BIT(30)) {
+   if(!m->ignore_limits)m->limits[index&63]=m->pending_words[0];
+  }
   else m->reg[RTL_L2_FDB_LIMIT_DATA/4]=m->limits[index&63];
   m->reg[m->pending_address/4]=0;m->pending=false;return;
  }
@@ -91,8 +100,14 @@ static void complete(struct model *m)
  for (unsigned int w = 0; w < l.words; w++) {
   if (m->pending_request & BIT(30)) {
    assert(m->reg[(l.data0 - 4*w)/4] == m->pending_words[w]);
-   m->rows[t][index][w] = m->pending_words[w];
-  } else m->reg[(l.data0 - 4*w)/4] = m->rows[t][index][w];
+   if(!m->ignore_write || (unsigned int)t!=m->ignore_write_table)
+    m->rows[t][index][w] = m->pending_words[w];
+  } else {
+   unsigned int value=m->rows[t][index][w];
+   if(m->reserved_read_zero && t==RTL_L2_TBL_CF_KEY && w==2)value&=0x1f8ffU;
+   if(m->reserved_read_zero && t==RTL_L2_TBL_CF_FIB && w==2)value&=0x3ffU;
+   m->reg[(l.data0 - 4*w)/4] = value;
+  }
  }
  m->reg[m->pending_address/4] = 0;
  m->pending = false;
@@ -103,9 +118,13 @@ static unsigned int fe_read(void *context, unsigned int address)
  struct model *m = ((struct rtl_fe *)context)->model;
  int t = table_at(address, true);
  assert(!(address & 3) && address < sizeof(m->reg));
+ if(address==0x3418 || address==0x3424)m->lpb_reads++;
  if (t >= 0) m->table_seen_idle[t] = !(m->reg[address/4] & BIT(31));
  if (address == 0x1904 && m->clear_after && ++m->pending_reads >= m->clear_after)
   m->reg[address/4] = 0;
+ if(m->corrupt_read_address==address && m->commands>=m->corrupt_after_command &&
+    m->writes>=m->corrupt_after_writes && (!m->corrupt_wait_write || m->corrupt_triggered))
+  return m->corrupt_read_value;
  return m->reg[address/4];
 }
 
@@ -135,7 +154,10 @@ static void fe_write(void *context, unsigned int address, unsigned int value)
   assert(!((m->reg[RTL_L2_FDB_ACCESS/4]|m->reg[RTL_L2_FDB_LIMIT_ACCESS/4])&BIT(31)));
   assert(!(m->reg[RTL_L2_FDB_CONTROL/4]&BIT(31)) && (m->reg[RTL_L2_FDB_CONTROL/4]&BIT(22)));
  }
- m->reg[address/4] = value;
+ if(m->corrupt_wait_write && m->corrupt_read_address==address && value==m->corrupt_trigger_value)
+  m->corrupt_triggered=true;
+ if(m->ignore_write_address!=address || (m->ignore_write_match && value!=m->ignore_write_value))
+  m->reg[address/4] = value;
  m->writes++;
 }
 
@@ -164,26 +186,45 @@ static void usleep_range(unsigned int low, unsigned int high)
  { if(low==1000 && high==2000)model.settles++;else {assert(low==10 && high==20); model.delays++;} }
 static void fe_route_gate(struct rtl_fe *fe) {
  fe->model->route_closed=true;fe->model->route_gates++;
+ fe->route_gate_verified=!fe->model->arm_failure;
+ if(fe->route_gate_verified && (fe->enabled || fe->prepared || fe->route_gate_ready ||
+    fe->dma_exposed || fe->pending_withdrawals))
+  for(unsigned int i=0;i<2;i++)
+   fe->model->reg[(0x3418+i*12)/4]=(fe->model->reg[(0x3418+i*12)/4]&~(15U<<10))|BIT(10);
 }
 static bool fe_route_arm(struct rtl_fe *fe) {
- assert(fe->model->rx_writes && !(fe->model->rx_writes%5));
+ assert(fe->model->rx_writes);
  assert(fe->pending_withdrawals || (fe->enabled && fe->prepared));
  fe->model->route_arms++;
  if(fe->model->arm_failure)return false;
- if(fe->pending_withdrawals) {fe->model->route_closed=true;return true;}
- fe->model->route_closed=false;return true;
+ if(fe->pending_withdrawals) {
+  fe->model->route_closed=true;fe->route_gate_verified=true;
+  for(unsigned int i=0;i<2;i++)
+   fe->model->reg[(0x3418+i*12)/4]=(fe->model->reg[(0x3418+i*12)/4]&~(15U<<10))|BIT(10);
+  return true;
+ }
+ fe->model->route_closed=false;fe->route_gate_verified=false;
+ for(unsigned int i=0;i<2;i++)fe->model->reg[(0x3418+i*12)/4]&=~(15U<<10);
+ return true;
 }
 #include "rtl9617c-fe-switch-hw.h"
 #include "rtl9617c-fabric.h"
 
 static struct rtl_fe fe = { .model = &model };
 static struct rtl_fe_switch_hw hw;
+static struct rtl_l2_snapshot hw_rows[FE_SW_SNAPSHOTS];
+static unsigned short hw_index[7039];
 
 static void reset(void)
 {
  memset(&model, 0, sizeof(model)); memset(&hw, 0, sizeof(hw));
+ memset(hw_rows,0,sizeof(hw_rows));
+ assert(ARRAY_SIZE(hw_index)==rtl_l2_journal_index_count());
+ hw.rows=hw_rows;
+ assert(!rtl_l2_journal_init(&hw.journal,hw_index,ARRAY_SIZE(hw_index),FE_SW_SNAPSHOTS));
  model.route_closed=true;
- fe.enabled = false; fe.prepared = false; fe.pending_withdrawals = 0;
+ fe.enabled = false; fe.prepared = false; fe.pending_withdrawals = 0;fe.route_gate_verified=true;
+ fe.route_gate_ready=fe.dma_exposed=false;
  model.reg[RTL_L2_FDB_CONTROL/4] = BIT(31) | BIT(22) | BIT(25) | BIT(29) | 0xff9;
  model.reg[0x1c04/4] = (3830U << 19) | 300U;
  model.reg[0x1414/4] = 3;
@@ -242,6 +283,11 @@ static void restored(void)
  for (unsigned int i = 0; i < ARRAY_SIZE(regs); i++)
   assert(model.reg[regs[i]/4] == original.reg[regs[i]/4]);
  assert(!hw.count && !hw.globals_owned && !hw.prepared);
+ assert(hw.rows==hw_rows && hw.journal.row_index==hw_index);
+ assert(hw.journal.capacity==FE_SW_SNAPSHOTS && hw.journal.index_count==ARRAY_SIZE(hw_index));
+ assert(!hw.journal.quarantined && !hw.journal.restoring && !hw.journal.restored);
+ assert(hw.rx_gate_verified);
+ for(unsigned int i=0;i<ARRAY_SIZE(hw_index);i++)assert(!hw_index[i]);
  cpu_only();
 }
 
@@ -249,7 +295,7 @@ static void recipe(unsigned int ports, bool l3)
 {
  unsigned int words[5], expected[5], n = 0;
  reset(); fe.enabled = fe.prepared = l3;
- assert(!fe_switch_hw_prepare(&fe, &hw, ports, 123, true));
+ assert(!fe_switch_hw_prepare(&fe, &hw, ports, 123, true,true));
  assert(hw.prepared && hw.drained && hw.globals_owned && hw.special_profile == 7);
  assert(model.reg[0x1c04/4] == original.reg[0x1c04/4]); /* not before domain claim */
  assert(model.reg[0x1c00/4] & BIT(22)); cpu_only();
@@ -288,7 +334,7 @@ static void recipe(unsigned int ports, bool l3)
  }
  memcpy(expected, hw.filter, sizeof(expected)); rtl_l2_fdb_scan_filter(expected);
  for (unsigned int i = 0; i < 5; i++) assert(model.reg[(0x1c28-i*4)/4] == expected[i]);
- assert(fe_switch_hw_arm(&fe, &hw, ports, 0));
+ assert(fe_switch_hw_arm(&fe, &hw, ports, 0,true));
  assert(model.route_arms==(unsigned)l3);
  assert(model.reg[0x1c04/4] == ((3830U << 19) | 123U));
  assert(!(model.reg[0x1c00/4] & (BIT(22) | BIT(25) | BIT(29))));
@@ -333,9 +379,9 @@ static void cold_to_native(unsigned int ports, bool l3)
  }
  memcpy(&original,&model,sizeof(model));
  fe.enabled=fe.prepared=l3;
- assert(!fe_switch_hw_prepare(&fe,&hw,ports,300,false));
+ assert(!fe_switch_hw_prepare(&fe,&hw,ports,300,false,true));
  assert(hw.prepared && hw.drained && hw.globals_owned);
- assert(fe_switch_hw_arm(&fe,&hw,ports,0));
+ assert(fe_switch_hw_arm(&fe,&hw,ports,0,true));
  for(unsigned p=0;p<5;p++)
   assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28))==!!(ports&BIT(p)));
  assert(!rtl_fabric_check(&io,&fabric));
@@ -355,28 +401,28 @@ static void guards(void)
 	 model.rows[RTL_L2_TBL_CF_FIB][p][2] |= 0xfffffc00U;
 	}
 	memcpy(&original, &model, sizeof(model));
-	assert(!fe_switch_hw_prepare(&fe,&hw,31,300,false));
+	assert(!fe_switch_hw_prepare(&fe,&hw,31,300,false,true));
 	assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
 	restored(); cases++;
- reset(); assert(fe_switch_hw_prepare(&fe,&hw,32,300,false)==-EINVAL); cases++;
+ reset(); assert(fe_switch_hw_prepare(&fe,&hw,32,300,false,true)==-EINVAL); cases++;
  reset(); model.reg[0x1414/4]&=~1U;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP && !hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP && !hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"requires-existing-svl"));cases++;
  reset();model.rows[RTL_L2_TBL_IPPB][7][0]=0;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"foreign-source-alias"));cases++;
  reset();model.rows[RTL_L2_TBL_IPPB][0][0]=4;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"lan-source-map"));cases++;
  reset(); model.reg[0x1400/4]|=BIT(6);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP); cases++;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP); cases++;
  /* Real TYFZA1 reset comparators do not include 88a8. Built-in ILPB
   * recognition remains available and every CSR must stay unchanged. */
  reset();
  model.reg[0x1108/4]=model.reg[0x110c/4]=model.reg[0x1110/4]=0x8100;
  model.reg[0x1114/4]=0x9100;
  memcpy(&original,&model,sizeof(model));
- assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false));
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false,true));
  for(unsigned int i=0;i<4;i++)assert(model.reg[(0x1108+i*4)/4]==original.reg[(0x1108+i*4)/4]);
  assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
  restored(); cases++;
@@ -384,70 +430,70 @@ static void guards(void)
  reset();
  for(unsigned int i=0;i<4;i++)model.reg[(0x1108+i*4)/4]=0x9300+i;
  memcpy(&original,&model,sizeof(model));
- assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false));
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false,true));
  assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
  for(unsigned int i=0;i<4;i++)assert(model.reg[(0x1108+i*4)/4]==original.reg[(0x1108+i*4)/4]);
  restored(); cases++;
  for(unsigned int maximum=1522; maximum<=9201; maximum++) {
   if(maximum==1526)continue;
   reset();model.reg[0xa034/4]=(64U<<16)|maximum;
-  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
   assert(!strcmp(fe_switch_hw_reason_name(&hw),"native-mtu-baseline"));cases++;
  }
  reset();model.reg[0xa034/4]=(65U<<16)|1526;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"native-mtu-baseline"));cases++;
  reset();model.reg[FE_LAN_RX_CTRL(1)/4]|=BIT(5);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP&&!hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(hw.observed.rx_oversize_allow==2);cases++;
  reset(); model.rows[RTL_L2_TBL_ELPB][16][0]|=BIT(18);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP); cases++;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP); cases++;
  reset(); model.reg[0x1c04/4]=300;
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EOPNOTSUPP); cases++;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP); cases++;
  reset(); model.reg[RTL_L2_FDB_LIMIT_ACCESS/4]=BIT(31);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EBUSY&&!hw.globals_owned);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EBUSY&&!hw.globals_owned);
  assert(model.reg[0x1c00/4]==original.reg[0x1c00/4]);cpu_only();cases++;
  reset(); model.reg[0x1c00/4]&=~BIT(22);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EBUSY);
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EBUSY);
  assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
  assert(!(model.reg[0x1c00/4]&BIT(22))); cases++;
  reset(); model.reg[0x1c00/4]&=~BIT(22);
  for(unsigned int k=0;k<32;k++) model.rows[RTL_L2_TBL_SPB][32+k][0]=BIT(4);
  memcpy(&original,&model,sizeof(model));
- assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false));
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false,true));
  assert(fe_switch_hw_field(model.rows[RTL_L2_TBL_ILPB][7],RTL_L2_ILPB_STP)==3);
  assert(!fe_switch_hw_drain(&fe,&hw)); assert(!fe_switch_hw_restore(&fe,&hw));
  restored(); cases++;
  reset(); /* A foreign source wildcard must not be hidden by our traps. */
  model.rows[RTL_L2_TBL_CF_KEY][7][2]=BIT(16);
  model.rows[RTL_L2_TBL_CF_KEY][519][2]=BIT(16);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-EBUSY); cases++;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EBUSY); cases++;
  reset(); /* A profile cannot be borrowed while any outside LPID uses it. */
  for (unsigned int i=0;i<8;i++)
   rtl_l2_field_set(model.rows[RTL_L2_TBL_ILPB][16+i],RTL_L2_ILPB_SPECIAL_PROFILE,i);
- assert(fe_switch_hw_prepare(&fe,&hw,3,300,false)==-ENOSPC); cases++;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-ENOSPC); cases++;
  reset(); hw.globals_owned=true; model.reg[0x1904/4]=1;
  assert(fe_switch_hw_drain(&fe,&hw)==-ETIMEDOUT && !hw.drained); cpu_only(); cases++;
  model.clear_after=5; model.pending_reads=0;
  assert(!fe_switch_hw_drain(&fe,&hw) && hw.drained); cases++;
- reset(); assert(!fe_switch_hw_arm(&fe,&hw,1,0));
- assert(!fe_switch_hw_arm(&fe,&hw,0,1)); fe.enabled=fe.prepared=true;
- assert(!fe_switch_hw_arm(&fe,&hw,1,1)); assert(fe_switch_hw_arm(&fe,&hw,0,31));
+ reset(); assert(!fe_switch_hw_arm(&fe,&hw,1,0,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,0,1,true)); fe.enabled=fe.prepared=true;
+ assert(!fe_switch_hw_arm(&fe,&hw,1,1,true)); assert(fe_switch_hw_arm(&fe,&hw,0,31,true));
  for(unsigned int p=0;p<5;p++)
   assert((model.reg[FE_LAN_RX_CTRL(p)/4]&(BIT(28)|(63U<<16)))==(BIT(28)|(25U<<16)));
  fe_switch_hw_gate(&fe,&hw); cpu_only(); cases++;
  reset();fe.enabled=fe.prepared=true;
- assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true));model.arm_failure=true;
- assert(!fe_switch_hw_arm(&fe,&hw,3,0)&&model.route_closed);cpu_only();cases++;
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));model.arm_failure=true;
+ assert(!fe_switch_hw_arm(&fe,&hw,3,0,true)&&model.route_closed);cpu_only();cases++;
  /* The route-off mode may still have a published action whose age/cache
   * withdrawal timed out. Native L2 must demand a verified CPU gate in
   * BOTH modes; neither enabled=false nor the presence of L2 owners proves
   * the route connectors actually closed. Refusal precedes native writes. */
  for(unsigned enabled=0;enabled<2;enabled++)for(unsigned fail=0;fail<2;fail++) {
   reset();fe.enabled=enabled;fe.prepared=true;fe.pending_withdrawals=1;
-  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true));model.arm_failure=fail;
+  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));model.arm_failure=fail;
   unsigned before=model.native_writes;
-  assert(fe_switch_hw_arm(&fe,&hw,3,0)==!fail);
+  assert(fe_switch_hw_arm(&fe,&hw,3,0,true)==!fail);
   assert(model.route_arms==1 && model.route_closed);
   if(fail) {assert(model.native_writes==before);cpu_only();}
   else for(unsigned p=0;p<2;p++)assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28)));
@@ -457,13 +503,13 @@ static void guards(void)
 
 static void faults(void)
 {
- reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true));
+ reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
  unsigned int commands=model.commands;
  /* Inject at EVERY indirect command, including snapshots/read-only
   * validation. An ambiguous write completes late before retrying restore. */
  for (unsigned int at=1;at<=commands;at++) {
   reset(); model.fail=at;
-  assert(fe_switch_hw_prepare(&fe,&hw,31,300,true)==-ETIMEDOUT);
+  assert(fe_switch_hw_prepare(&fe,&hw,31,300,true,true)==-ETIMEDOUT);
   assert(model.pending && !hw.prepared); cpu_only();
   complete(&model); model.fail=0;
   assert(!fe_switch_hw_drain(&fe,&hw));
@@ -471,10 +517,12 @@ static void faults(void)
  }
  /* Every rollback write can also time out. Original snapshots survive
   * partial restores; a second full rollback is idempotent. */
- reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true));
- unsigned int rows=hw.count, restores=rows+5;
+ reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
+ unsigned int rows=hw.count, start=model.commands;
+ assert(!fe_switch_hw_restore(&fe,&hw));
+ unsigned int restores=model.commands-start;
  for (unsigned int at=1;at<=restores;at++) {
-  reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true));
+  reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
   assert(!fe_switch_hw_drain(&fe,&hw));
   model.fail=model.commands+at;
   assert(fe_switch_hw_restore(&fe,&hw)==-ETIMEDOUT);
@@ -485,12 +533,257 @@ static void faults(void)
  }
 }
 
+static void rollback_fixture(void)
+{
+ reset();fe.enabled=fe.prepared=true;
+ assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(!fe_switch_hw_drain(&fe,&hw));
+}
+
+static void retained_retry(unsigned int count, unsigned int limits)
+{
+ assert(hw.count==count && hw.globals_owned && hw.limits_owned==limits);
+ assert(hw.journal.quarantined && !hw.port_policy_ready);
+ assert(hw.rows==hw_rows && hw.journal.row_index==hw_index);
+ for(unsigned int i=0;i<hw.count;i++) {
+  unsigned int slot;
+  assert(hw.rows[i].valid && !rtl_l2_journal_slot(&hw.journal,hw.rows[i].table,hw.rows[i].index,&slot));
+  assert(hw_index[slot]==i+1);
+ }
+ unsigned int writes=model.writes;
+ assert(fe_switch_hw_prepare(&fe,&hw,31,300,true,true)==-EALREADY);
+ assert(!fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,0,31,true));
+ assert(model.writes==writes);cpu_only();
+ model.ignore_write=false;model.ignore_limits=false;model.ignore_write_address=0;
+ model.corrupt_read_address=0;
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+}
+
+static void readback_faults(void)
+{
+ static const unsigned int tables[]={RTL_L2_TBL_ILPB,RTL_L2_TBL_ELPB,RTL_L2_TBL_SPB,
+  RTL_L2_TBL_PORT_MEMBERSHIP,RTL_L2_TBL_DFT_FWD,RTL_L2_TBL_CF_FIB,RTL_L2_TBL_CF_KEY};
+ static const unsigned int regs[]={0x1c28,0x1c24,0x1c20,0x1c1c,0x1c18,
+  0x1410,0x1408,0x140c,0x1c04,0xa1e0,0x1c00};
+ static const unsigned int masks[]={~0U,~0U,~0U,~0U,~0U,0x7fU,BIT(29),
+  0x7ffU|(0x7ffU<<16),0x7ffffU,0x3ffU,FE_SW_FDB_OWNED_CONTROL};
+ for(unsigned int t=0;t<ARRAY_SIZE(tables);t++) {
+  reset();model.ignore_write=true;model.ignore_write_table=tables[t];
+  assert(fe_switch_hw_prepare(&fe,&hw,31,123,true,true)==-EIO);
+  assert(hw.globals_owned && hw.journal.quarantined && !hw.prepared);
+  model.ignore_write=false;assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  rollback_fixture();unsigned int count=hw.count,limits=hw.limits_owned;
+  model.ignore_write=true;model.ignore_write_table=tables[t];
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  retained_retry(count,limits);
+  rollback_fixture();count=hw.count;limits=hw.limits_owned;
+  struct rtl_l2_table_layout layout;assert(!rtl_l2_table_layout(tables[t],&layout));
+  const struct rtl_l2_snapshot *last=NULL;
+  for(unsigned int i=0;i<hw.count;i++)if(hw.rows[i].table==tables[t])last=&hw.rows[i];
+  assert(last);model.corrupt_read_address=layout.data0;
+  model.corrupt_read_value=last->words[0]^2U;
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  retained_retry(count,limits);
+ }
+ reset();model.ignore_limits=true;
+ assert(fe_switch_hw_prepare(&fe,&hw,31,123,true,true)==-EIO);
+ assert(hw.limits_owned==1 && hw.journal.quarantined);
+ model.ignore_limits=false;assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ rollback_fixture();unsigned int count=hw.count,limits=hw.limits_owned;
+ model.ignore_limits=true;assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+ retained_retry(count,limits);
+ rollback_fixture();count=hw.count;limits=hw.limits_owned;
+ model.corrupt_read_address=RTL_L2_FDB_LIMIT_DATA;model.corrupt_read_value=0x123;
+ assert(fe_switch_hw_restore(&fe,&hw)==-EIO);retained_retry(count,limits);
+ for(unsigned int r=0;r<ARRAY_SIZE(regs);r++) {
+  rollback_fixture();count=hw.count;limits=hw.limits_owned;
+  /* Some unchanged scan comparison words still belong to the command
+   * lease. A disturbed word must be repaired, not silently relinquished. */
+  if(!((model.reg[regs[r]/4]^original.reg[regs[r]/4])&masks[r]))
+   model.reg[regs[r]/4]^=masks[r]&-masks[r];
+  model.ignore_write_address=regs[r];model.ignore_write_match=true;
+  model.ignore_write_value=original.reg[regs[r]/4];
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);retained_retry(count,limits);
+  rollback_fixture();count=hw.count;limits=hw.limits_owned;
+  model.corrupt_read_address=regs[r];model.corrupt_read_value=~0U;
+  model.corrupt_wait_write=true;model.corrupt_trigger_value=original.reg[regs[r]/4];
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);retained_retry(count,limits);
+ }
+ /* Persistent controls restored under owned masks must not overwrite a
+  * different owner's unrelated update, even on a rollback retry. */
+ rollback_fixture();
+ for(unsigned int r=5;r<ARRAY_SIZE(regs);r++) {
+  unsigned int foreign=~masks[r]&~FE_SW_FDB_COMMAND_BITS;
+  unsigned int bit=foreign&-foreign;
+  assert(bit);model.reg[regs[r]/4]^=bit;original.reg[regs[r]/4]^=bit;
+ }
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
+ /* A failed first snapshot owns an indirect window despite count zero. */
+ reset();hw.journal.quarantined=1;
+ model.reg[0x11e4/4]=BIT(31);
+ assert(fe_switch_hw_prepare(&fe,&hw,31,300,true,true)==-EALREADY);
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(fe_switch_hw_restore(&fe,&hw)==-EBUSY && hw.journal.quarantined);
+ model.reg[0x11e4/4]=0;
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ /* FIFO initialization has no supported inherited-state contract. */
+ {
+  reset();model.reg[0x1c00/4]|=BIT(30);
+  assert(fe_switch_hw_prepare(&fe,&hw,31,300,true,true)==-EBUSY && !hw.globals_owned);
+  rollback_fixture();model.reg[0x1c00/4]|=BIT(30);
+  assert(fe_switch_hw_restore(&fe,&hw)==-EBUSY && hw.globals_owned);
+  model.reg[0x1c00/4]&=~BIT(30);
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ }
+ /* SDK software-age request is a toggle, NOT a high-level busy flag.
+  * Both stable values work; rollback must preserve a newer live toggle
+  * instead of replaying the value captured before native preparation. */
+ for(unsigned int level=0;level<2;level++) {
+  reset();model.reg[0x1c00/4]|=level<<12;original.reg[0x1c00/4]|=level<<12;
+  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  model.reg[0x1c00/4]^=BIT(12);original.reg[0x1c00/4]^=BIT(12);
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
+ }
+ /* Journal readback ignores only genuine reserved TCAM bits, while the
+  * model leaves all defined key/action bits and the full mask observable. */
+ reset();model.reserved_read_zero=true;
+ for(unsigned int p=0;p<5;p++) {
+  model.rows[RTL_L2_TBL_CF_KEY][p][2]&=0x1f8ffU;
+  model.rows[RTL_L2_TBL_CF_KEY][p+512][2]&=0x1f8ffU;
+ }
+ memcpy(&original,&model,sizeof(model));
+ assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
+}
+
+static void admission_faults(void)
+{
+ for(unsigned int p=0;p<5;p++) {
+  unsigned int address=FE_LAN_RX_CTRL(p);
+  /* Empty counters cannot justify rewriting tables if a selector refused
+   * the close write. This is deliberately NOT asserted as CPU-only. */
+  reset();fe.enabled=fe.prepared=true;
+  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(!hw.rx_gate_verified);
+  unsigned int count=hw.count,commands=model.commands;
+  model.ignore_write_address=address;
+  assert(fe_switch_hw_drain(&fe,&hw)==-EIO);
+  assert(!hw.rx_gate_verified && !hw.drained && hw.count==count);
+  assert(!(model.reg[address/4]&BIT(28)) && model.commands==commands);
+  assert(fe_switch_hw_restore(&fe,&hw)==-EBUSY && hw.globals_owned && hw.count==count);
+  model.ignore_write_address=0;
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  /* A previously closed selector can drift before rollback. A recorded
+   * proof alone must not allow even the first indirect restore command. */
+  rollback_fixture();count=hw.count;commands=model.commands;
+  assert(hw.rx_gate_verified);model.reg[address/4]&=~BIT(28);
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  assert(!hw.rx_gate_verified && !hw.drained && hw.journal.quarantined);
+  assert(hw.globals_owned && hw.count==count && model.commands==commands);
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  /* A bad final readback after every row/global was restored still must
+   * retain the complete journal and allocation for a healthy retry. */
+  rollback_fixture();count=hw.count;
+  model.corrupt_read_address=address;model.corrupt_read_value=16U<<16;
+  model.corrupt_after_command=model.commands+2*hw.count+10;
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  retained_retry(count,31);
+  reset();model.reg[address/4]&=~BIT(28);model.ignore_write_address=address;
+  assert(fe_switch_hw_prepare(&fe,&hw,31,123,true,true)==-EIO);
+  assert(!hw.globals_owned && !hw.count && !hw.prepared && !hw.rx_gate_verified);
+  assert(!model.commands && hw.reason==FE_SW_HW_ADMISSION);
+  model.ignore_write_address=0;
+  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  for(unsigned int corrupt=0;corrupt<2;corrupt++) {
+   reset();fe.enabled=fe.prepared=true;
+   assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+   count=hw.count;unsigned int value=model.reg[address/4];
+   if(corrupt) {model.corrupt_read_address=address;model.corrupt_read_value=~0U;}
+   else model.ignore_write_address=address;
+   assert(!fe_switch_hw_arm(&fe,&hw,31,0,true));
+   assert(hw.globals_owned && hw.count==count && !hw.port_policy_ready);
+   assert(hw.reason==FE_SW_HW_ADMISSION && model.reg[address/4]==value);
+   assert(hw.rx_gate_verified==!corrupt);
+   model.ignore_write_address=0;model.corrupt_read_address=0;
+   assert(!fe_switch_hw_drain(&fe,&hw));
+   assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  }
+ }
+ for(unsigned int connector=0;connector<2;connector++)for(unsigned int bad=0;bad<2;bad++) {
+  rollback_fixture();unsigned int address=0x3418+connector*12;
+  unsigned int value=model.reg[address/4],count=hw.count,commands=model.commands;
+  assert(fe.route_gate_verified);
+  model.reg[address/4]=bad?~0U:value&~(15U<<10);
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  assert(hw.globals_owned && hw.count==count && hw.journal.quarantined);
+  assert(!hw.drained && model.commands==commands);
+  model.reg[address/4]=value;
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+  rollback_fixture();count=hw.count;
+  model.corrupt_read_address=address;model.corrupt_read_value=bad?~0U:0;
+  model.corrupt_after_command=model.commands+2*hw.count+10;
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  retained_retry(count,31);
+ }
+ /* Disabling the administrative flag is not disposal of prepared or DMA
+  * exposure. Exercise each independent reason to require the L3 gate. */
+ for(unsigned int exposure=0;exposure<5;exposure++) {
+  reset();
+  if(exposure==0)fe.route_gate_ready=true;
+  if(exposure==1)fe.prepared=true;
+  if(exposure==2)fe.dma_exposed=true;
+  if(exposure==3)fe.enabled=true;
+  if(exposure==4)fe.pending_withdrawals=1;
+  model.arm_failure=true;
+  assert(fe_switch_hw_prepare(&fe,&hw,31,123,true,true)==-EIO);
+  assert(!hw.globals_owned && !hw.count && !model.commands);
+  rollback_fixture();fe.enabled=fe.prepared=false;
+  if(exposure==0)fe.route_gate_ready=true;
+  if(exposure==1)fe.prepared=true;
+  if(exposure==2)fe.dma_exposed=true;
+  if(exposure==3)fe.enabled=true;
+  if(exposure==4)fe.pending_withdrawals=1;
+  unsigned int commands=model.commands,count=hw.count;
+  model.arm_failure=true;
+  assert(fe_switch_hw_drain(&fe,&hw)==-EIO && !hw.drained);
+  assert(hw.count==count && hw.globals_owned && model.commands==commands);
+  model.arm_failure=false;
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  fe.route_gate_verified=false;commands=model.commands;
+  assert(fe_switch_hw_restore(&fe,&hw)==-EIO);
+  assert(hw.count==count && hw.globals_owned && model.commands==commands);
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ }
+ /* A never-prepared native-only engine has no L3 gate dependency. */
+ reset();model.arm_failure=true;
+ assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();
+ assert(!model.lpb_reads);cases++;
+}
+
 /*SDK_ORACLE*/
 int main(void)
 {
  for(unsigned int ports=1;ports<32;ports++) { recipe(ports,false); recipe(ports,true); }
  for(unsigned int ports=1;ports<32;ports++) { cold_to_native(ports,false); cold_to_native(ports,true); }
- guards(); faults();
+ guards(); faults();readback_faults();admission_faults();
  /*SDK_RUN*/
  printf("{\"recipe_cases\":%u,\"fault_cases\":%u,\"cold_to_native_cases\":%u,\"hardware_verified\":false}\n",cases,fault_cases,cold_cases);
  return 0;
@@ -509,7 +802,7 @@ static bool sdk_cf_match(unsigned int id, const unsigned int packet[3])
 }
 static void sdk_oracle(void)
 {
- reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true));
+ reset(); assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
  for(unsigned int p=0;p<5;p++) {
   const unsigned int *w=model.rows[RTL_L2_TBL_ILPB][p];
   L2FE_PP_ILPB_DATA0_t a={.wrd=w[0]};
@@ -536,7 +829,7 @@ static void sdk_oracle(void)
  L2FE_PLC_LRN_FWD_CTRL_1_t exceptions={.wrd=model.reg[0x140c/4]};
  assert(exceptions.bf.sa_limit_excd_fwd_ctrl==1 && exceptions.bf.sa_limit_excd_ldpid==16);
  assert(exceptions.bf.sa_hash_cllsn_fwd_ctrl==1 && exceptions.bf.sa_hash_cllsn_ldpid==16);
- assert(fe_switch_hw_arm(&fe,&hw,31,0));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
  L2FE_L2E_CTRL_t control={.wrd=model.reg[0x1c00/4]};
  assert(!control.bf.lrn_dis && control.bf.lrn_mode==1 && control.bf.cpu_opt_mode);
  assert(!control.bf.hash_collision_overwrite && !control.bf.ovfl_entries_rcyc_en);
@@ -573,6 +866,20 @@ static void sdk_oracle(void)
 '''
 
 
+def without_table_verification(production, table):
+    """Negative control keeps the real snapshot but omits one table readback."""
+    needle = "\treturn rtl_l2_journal_replace(&hw->journal, &io, hw->rows, &hw->count,"
+    insertion = """\tif (table == TABLE) {
+\t\tstruct rtl_l2_snapshot *snapshot;
+\t\tint ret = rtl_l2_journal_snapshot(&hw->journal, &io, hw->rows, &hw->count,
+\t\t\t\t\t\t table, index, &snapshot);
+\t\treturn ret ? ret : rtl_l2_table_write(&io, table, index, words);
+\t}
+""".replace("TABLE", table)
+    assert needle in production
+    return production.replace(needle, insertion + needle, 1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--registers", type=Path)
@@ -598,6 +905,7 @@ def main():
         build = Path(temporary)
         (build / "linux").mkdir()
         (build / "linux/delay.h").write_text("/* host delay stub is in the fixture */\n")
+        (build / "linux/string.h").write_text("#include <string.h>\n")
         (build / "test.c").write_text(source)
         compiler = os.environ.get("CC", "cc")
         production = HEADER.read_text()
@@ -618,6 +926,26 @@ def main():
                 "/* Cold fabric owns", "if (hw->observed.tpid[0] == 0x8100) return -EOPNOTSUPP;\n\t/* Cold fabric owns", 1),
             "disabled_pending_route_skips_gate": production.replace(
                 "if (withdrawing && !fe_route_arm(fe))", "if (withdrawing && fe->enabled && !fe_route_arm(fe))", 1),
+            "global_restore_not_verified": production.replace(
+                "if ((mask != ~0U && actual == ~0U) || ((actual ^ value) & mask))",
+                "if ((actual ^ value) & 0U)", 1),
+            "limit_restore_not_verified": production.replace(
+                "return (actual ^ expected) & RTL_L2_FDB_LIMIT_MAX ? -EIO : 0;",
+                "return 0;", 1),
+            "journal_allocations_forgotten": production.replace(
+                "hw->rows = rows;", "hw->rows = NULL; (void)rows;", 1),
+            "membership_write_not_verified": without_table_verification(production, "RTL_L2_TBL_PORT_MEMBERSHIP"),
+            "rx_gate_not_verified": production.replace(
+                "if (!fe_switch_hw_rx_check(fe, 0, 0))", "if (false)", 1),
+            "rollback_uses_stale_rx_gate": production.replace(
+                "|| !fe_switch_hw_rx_check(fe, 0, 0) ||", "||", 1),
+            "arm_selector_write_not_verified": production.replace(
+                "if (!fe_switch_hw_rx_check(fe, native, route))", "if (false)", 1),
+            "disabled_route_exposure_ignored": production.replace(
+                "READ_ONCE(fe->route_gate_ready) || READ_ONCE(fe->prepared) ||\n\t      READ_ONCE(fe->dma_exposed) || ",
+                "", 1),
+            "stale_l3_gate_latch": production.replace(
+                "if (value == ~0U || ((value >> 10) & 15U) != 1U)", "if (value & 0U)", 1),
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -628,8 +956,7 @@ def main():
                             "-fno-omit-frame-pointer", "-no-pie", "-I", str(build),
                             "-I", str(DRIVERS), str(build / "test.c"),
                             "-o", str(build / "test")], check=True)
-            result = subprocess.run([str(build / "test")], text=True, capture_output=True,
-                                    env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+            result = subprocess.run([str(build / "test")], text=True, capture_output=True)
             if name == "production":
                 if result.returncode:
                     raise AssertionError(result.stderr)

@@ -7,6 +7,8 @@
 #include <linux/delay.h>
 
 #include "rtl9617c-l2-table.h"
+#include "rtl9617c-l2-resources.h"
+#include "rtl9617c-l2-port-policy.h"
 
 /* Native LAN admission and its reversible L2 resources have one owner.
  * The policy compiler holds fe->lock for prepare/drain/restore. The core
@@ -28,6 +30,15 @@
 #define FE_SW_CF_PER_PORT 5
 #define FE_SW_CF_RULES (FE_LAN_PORTS * FE_SW_CF_PER_PORT)
 #define FE_SW_FDB_OVERFLOW_RECYCLE BIT(29)
+/* SDK toggles CTRL bit12 to request a software aging scan; either steady
+ * value is legal and restoring an old value could issue a new scan. Bit30
+ * names FIFO initialization but lacks a proven completion contract: refuse
+ * it while high. Neither bit is owned/replayed by this native transaction. */
+#define FE_SW_FDB_COMMAND_BITS (BIT(12) | BIT(30))
+#define FE_SW_FDB_INIT BIT(30)
+#define FE_SW_FDB_OWNED_CONTROL (RTL_L2_FDB_CMD_MODE | RTL_L2_FDB_LEARN_DISABLE | \
+	RTL_L2_FDB_LEARN_MODE_MASK | RTL_L2_FDB_COLLISION_OVERWRITE | \
+	FE_SW_FDB_OVERFLOW_RECYCLE | BIT(11) | 0x7f8U | BIT(2) | BIT(0))
 /* aal_port.h defines ILPB match bits, not indices into CMP_S/C/O/USER:
  * bit3=8100, bit2=9100, bit1=88a8; bit0 uses that tag class's user CSR.
  * Keep the existing user comparator and trap every recognised C tag. */
@@ -54,6 +65,10 @@ enum fe_switch_hw_reason {
 	FE_SW_HW_DRAIN,
 	FE_SW_HW_MTU,
 	FE_SW_HW_CONTROL_PACKETS,
+	FE_SW_HW_PORT_POLICY,
+	FE_SW_HW_ISOLATION,
+	FE_SW_HW_REDIRECT,
+	FE_SW_HW_ADMISSION,
 };
 
 struct fe_switch_hw_observed {
@@ -63,7 +78,8 @@ struct fe_switch_hw_observed {
 };
 
 struct rtl_fe_switch_hw {
-	struct rtl_l2_snapshot rows[FE_SW_SNAPSHOTS];
+	struct rtl_l2_snapshot *rows;
+	struct rtl_l2_journal journal;
 	unsigned int count, ports, special_profile;
 	unsigned int cf[FE_SW_CF_RULES], cf_count;
 	unsigned int control, aging, requested_aging, learning;
@@ -72,9 +88,12 @@ struct rtl_fe_switch_hw {
 	unsigned int limits[FE_LAN_PORTS], limits_owned;
 	unsigned int filter[RTL_L2_FDB_FILTER_WORDS];
 	unsigned int run_control;
+	unsigned int learning_mask, isolated_mask, local_target;
 	enum fe_switch_hw_reason reason;
 	struct fe_switch_hw_observed observed;
-	bool globals_owned, prepared, drained;
+	bool globals_owned, prepared, drained, port_policy_ready;
+	bool route_policy_allowed;
+	bool rx_gate_verified;
 };
 
 static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
@@ -86,6 +105,8 @@ static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
 		"foreign-learning", "special-profile-capacity", "mac-limit-io",
 		"table-io", "shared-command-busy", "pipeline-drain-timeout",
 		"native-mtu-baseline", "control-packet-classification",
+		"port-policy-transaction", "isolation-baseline", "redirect-baseline",
+		"admission-readback",
 	};
 
 	return (unsigned int)hw->reason < ARRAY_SIZE(names) ? names[hw->reason] : "unknown";
@@ -95,20 +116,72 @@ static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
  * policy veto. Clearing a destination's TX enable is neither a proven GE
  * FIFO flush nor a safe way to restore the software fallback afterwards.
  */
+static bool fe_switch_hw_rx_check(struct rtl_fe *fe, unsigned int native,
+				   unsigned int route)
+{
+	unsigned int port, expected, value;
+	bool verified = true;
+
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		expected = FE_SW_RX_CPU;
+		if (native & BIT(port))
+			expected &= ~FE_SW_RX_BYPASS;
+		else if (route & BIT(port))
+			expected = FE_SW_RX_BYPASS | (25U << 16);
+		value = fe_read(fe, FE_LAN_RX_CTRL(port));
+		if (value == ~0U ||
+		    (value & (FE_SW_RX_DEST_MASK | FE_SW_RX_BYPASS)) != expected)
+			verified = false;
+	}
+	return verified;
+}
+
+static bool fe_switch_hw_route_closed(struct rtl_fe *fe)
+{
+	unsigned int i, value;
+
+	/* Disable clears enabled before deleting cached flows. Admission proof
+	 * must outlive that administrative flag, until all prepared/DMA/route
+	 * exposure and retained withdrawals have actually disappeared. */
+	if (!(READ_ONCE(fe->route_gate_ready) || READ_ONCE(fe->prepared) ||
+	      READ_ONCE(fe->dma_exposed) || READ_ONCE(fe->enabled) ||
+	      READ_ONCE(fe->pending_withdrawals)))
+		return true;
+	if (!READ_ONCE(fe->route_gate_verified))
+		return false;
+	/* The latch records the last gate operation, not future MMIO state.
+	 * Recheck both L3 connectors without touching a cold foreign engine. */
+	for (i = 0; i < 2; i++) {
+		value = fe_read(fe, 0x3418 + i * 12);
+		if (value == ~0U || ((value >> 10) & 15U) != 1U)
+			return false;
+	}
+	return true;
+}
+
 static void fe_switch_hw_gate(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 {
 	unsigned int port, value;
+	bool verified = true;
 
 	/* This also closes PON -> L3 -> LAN old-flow admission. LAN selectors
 	 * alone cannot guard an ingress physically coming from the PON. */
 	fe_route_gate(fe);
+	WRITE_ONCE(hw->rx_gate_verified, false);
 	for (port = 0; port < FE_LAN_PORTS; port++) {
 		value = fe_read(fe, FE_LAN_RX_CTRL(port));
+		if (value == ~0U) {
+			verified = false;
+			continue;
+		}
 		value = (value & ~FE_SW_RX_DEST_MASK) | FE_SW_RX_CPU;
 		fe_write(fe, FE_LAN_RX_CTRL(port), value);
 	}
-	/* Flush posted admission writes before the core publishes new policy. */
-	fe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));
+	/* A posted read alone is not proof the selector accepted the write.
+	 * Check every owned port, even if one earlier RMW read was invalid. */
+	if (!fe_switch_hw_rx_check(fe, 0, 0))
+		verified = false;
+	WRITE_ONCE(hw->rx_gate_verified, verified);
 	WRITE_ONCE(hw->drained, false);
 }
 
@@ -131,8 +204,13 @@ static int fe_switch_hw_drain(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	int ret;
 
 	fe_switch_hw_gate(fe, hw);
-	if (!hw->globals_owned && !hw->count)
+	if (!hw->globals_owned && !hw->count && !hw->limits_owned && !hw->journal.quarantined &&
+	    !hw->journal.restoring)
 		return 0;
+	if (!READ_ONCE(hw->rx_gate_verified) || !fe_switch_hw_route_closed(fe)) {
+		hw->reason = FE_SW_HW_ADMISSION;
+		return -EIO;
+	}
 	if ((fe_read(fe, RTL_L2_FDB_ACCESS) |
 	     fe_read(fe, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY) {
 		hw->reason = FE_SW_HW_BUSY;
@@ -140,9 +218,13 @@ static int fe_switch_hw_drain(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	}
 	if (hw->globals_owned) {
 		control = fe_read(fe, RTL_L2_FDB_CONTROL);
+		if (control == ~0U || (control & FE_SW_FDB_INIT))
+			return -EBUSY;
 		fe_write(fe, RTL_L2_FDB_CONTROL,
 			 control | RTL_L2_FDB_LEARN_DISABLE);
-		fe_read(fe, RTL_L2_FDB_CONTROL);
+		control = fe_read(fe, RTL_L2_FDB_CONTROL);
+		if (control == ~0U || !(control & RTL_L2_FDB_LEARN_DISABLE))
+			return -EIO;
 	}
 	/* Do not substitute a fixed sleep or return success on timeout. Three
 	 * empty observations cover the independently sampled stage counters.
@@ -155,7 +237,7 @@ static int fe_switch_hw_drain(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 				/* A late limit transaction may have retained mode0.
 				 * Recover only our owned, idle, learning-stopped lease,
 				 * before the bridge uses SCAN to delete its own rows. */
-				ret = rtl_l2_fdb_command_mode(&io);
+				ret = hw->globals_owned ? rtl_l2_fdb_command_mode(&io) : 0;
 				if (ret)
 					return ret;
 				WRITE_ONCE(hw->drained, true);
@@ -174,12 +256,10 @@ static struct rtl_l2_snapshot *
 fe_switch_hw_snapshot_find(struct rtl_fe_switch_hw *hw,
 			  enum rtl_l2_table table, unsigned int index)
 {
-	unsigned int i;
+	struct rtl_l2_snapshot *snapshot;
 
-	for (i = 0; i < hw->count; i++)
-		if (hw->rows[i].table == table && hw->rows[i].index == index)
-			return &hw->rows[i];
-	return NULL;
+	return rtl_l2_journal_find(&hw->journal, hw->rows, hw->count,
+				   table, index, &snapshot) ? NULL : snapshot;
 }
 
 static int fe_switch_hw_snapshot(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
@@ -187,34 +267,19 @@ static int fe_switch_hw_snapshot(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 				struct rtl_l2_snapshot **snapshot)
 {
 	struct rtl_dq_io io = fe_io(fe);
-	struct rtl_l2_snapshot *row;
-	int ret;
 
-	row = fe_switch_hw_snapshot_find(hw, table, index);
-	if (!row) {
-		if (hw->count == FE_SW_SNAPSHOTS)
-			return -ENOSPC;
-		row = &hw->rows[hw->count];
-		ret = rtl_l2_snapshot_take(&io, row, table, index);
-		if (ret)
-			return ret;
-		hw->count++;
-	}
-	*snapshot = row;
-	return 0;
+	return rtl_l2_journal_snapshot(&hw->journal, &io, hw->rows, &hw->count,
+				       table, index, snapshot);
 }
 
 static int fe_switch_hw_replace(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			       enum rtl_l2_table table, unsigned int index,
 			       const unsigned int *words)
 {
-	struct rtl_l2_snapshot *snapshot;
 	struct rtl_dq_io io = fe_io(fe);
-	int ret = fe_switch_hw_snapshot(fe, hw, table, index, &snapshot);
 
-	if (ret)
-		return ret;
-	return rtl_l2_table_write(&io, table, index, words);
+	return rtl_l2_journal_replace(&hw->journal, &io, hw->rows, &hw->count,
+				      table, index, words);
 }
 
 static unsigned int fe_switch_hw_field(const unsigned int *words,
@@ -291,7 +356,6 @@ static int fe_switch_hw_cf_claim(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 
 static int fe_switch_hw_cf_install(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 {
-	struct rtl_dq_io io = fe_io(fe);
 	struct rtl_l2_snapshot *xrow, *yrow, *frow;
 	unsigned int x[3], y[3], fib[3], port, kind, id, slot = 0;
 	int ret;
@@ -321,11 +385,11 @@ static int fe_switch_hw_cf_install(struct rtl_fe *fe, struct rtl_fe_switch_hw *h
 			rtl_l2_cf_destination(fib, 16);
 			/* Ingress is closed and drained. Program the action before the
 			 * replacement valid keys; retain originals on any timeout. */
-			ret = rtl_l2_table_write(&io, RTL_L2_TBL_CF_FIB, id, fib);
+			ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_FIB, id, fib);
 			if (!ret)
-				ret = rtl_l2_table_write(&io, RTL_L2_TBL_CF_KEY, id, x);
+				ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_KEY, id, x);
 			if (!ret)
-				ret = rtl_l2_table_write(&io, RTL_L2_TBL_CF_KEY,
+				ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_KEY,
 							id + RTL_L2_CF_ENTRIES, y);
 			if (ret)
 				return ret;
@@ -412,7 +476,8 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	struct rtl_l2_snapshot *snapshot;
 	unsigned int words[RTL_L2_TABLE_MAX_WORDS], used = 0, profile;
 	unsigned int no_learning = 0;
-	unsigned int port, type, stp, i, target = fe->enabled && fe->prepared ? 25 : 16;
+	unsigned int port, type, stp, i;
+	unsigned int target = hw->route_policy_allowed && fe->enabled && fe->prepared ? 25 : 16;
 	int ret;
 
 	hw->reason = FE_SW_HW_LEARNING;
@@ -464,6 +529,7 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	}
 	hw->reason = FE_SW_HW_TABLE;
 	hw->special_profile = --profile;
+	hw->local_target = target;
 	for (type = 0; type < RTL_L2_SPB_PACKET_TYPES; type++) {
 		ret = fe_switch_hw_snapshot(fe, hw, RTL_L2_TBL_SPB,
 					   profile * RTL_L2_SPB_PACKET_TYPES + type, &snapshot);
@@ -479,7 +545,7 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 			rtl_l2_field_set(words, RTL_L2_SPB_SPECIAL_FORWARD, 1);
 			rtl_l2_field_set(words, RTL_L2_SPB_DESTINATION, type == 12 ? target : 16);
 		}
-		ret = rtl_l2_table_write(&io, RTL_L2_TBL_SPB,
+		ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_SPB,
 					 profile * RTL_L2_SPB_PACKET_TYPES + type, words);
 		if (ret)
 			return ret;
@@ -492,7 +558,7 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 			return ret;
 		memcpy(words, snapshot->words, sizeof(words));
 		fe_switch_hw_native_ilpb(words, profile);
-		ret = rtl_l2_table_write(&io, RTL_L2_TBL_ILPB, port, words);
+		ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_ILPB, port, words);
 		if (ret)
 			return ret;
 		ret = fe_switch_hw_snapshot(fe, hw, RTL_L2_TBL_ELPB, port, &snapshot);
@@ -500,7 +566,7 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 			return ret;
 		memcpy(words, snapshot->words, sizeof(words));
 		fe_switch_hw_native_elpb(words);
-		ret = rtl_l2_table_write(&io, RTL_L2_TBL_ELPB, port, words);
+		ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_ELPB, port, words);
 		if (ret)
 			return ret;
 		/* aal_port_mmshp_check_set(source, destination bitmap). Do not
@@ -525,6 +591,158 @@ static int fe_switch_hw_ports(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	return 0;
 }
 
+/* Foreign redirects may defeat an otherwise correct membership matrix.
+ * There is no documented drop-reason ID for port isolation in this SDK,
+ * so do not guess one: require all drop redirects disabled, plus the
+ * redirects of every destination this native domain can select. These
+ * shared tables and the multicast-check enable remain foreign-owned.
+ */
+static int fe_switch_hw_redirects_check(struct rtl_fe *fe,
+					struct rtl_fe_switch_hw *hw)
+{
+	struct rtl_dq_io io = fe_io(fe);
+	unsigned int words[RTL_L2_TABLE_MAX_WORDS], index;
+	unsigned int destinations = hw->ports | BIT(16) | BIT(hw->local_target);
+	int ret;
+
+	hw->reason = FE_SW_HW_REDIRECT;
+	for (index = 0; index < 32; index++) {
+		ret = rtl_l2_table_read(&io, RTL_L2_TBL_REDIR_DROP, index, words);
+		if (ret)
+			return ret;
+		if (words[0] & RTL_L2_POLICY_REDIRECT_ENABLE)
+			return -EOPNOTSUPP;
+		if (!(destinations & BIT(index)))
+			continue;
+		ret = rtl_l2_table_read(&io, RTL_L2_TBL_REDIR_LDPID, index, words);
+		if (ret)
+			return ret;
+		if (words[0] & RTL_L2_POLICY_REDIRECT_ENABLE)
+			return -EOPNOTSUPP;
+	}
+	return 0;
+}
+
+/* Apply only after prepare, while all ingress is gated and drained. The
+ * original snapshots belong to the existing native transaction; never
+ * overwrite them with an intermediate learning/isolation configuration.
+ * A failed command is not cancellation. Retain ownership and leave arm
+ * disabled until retry succeeds or the caller drains/restores everything.
+ */
+static int fe_switch_hw_port_policy(struct rtl_fe *fe,
+				    struct rtl_fe_switch_hw *hw,
+				    unsigned int learning_mask,
+				    unsigned int isolated_mask)
+{
+	struct rtl_l2_port_policy policy[FE_LAN_PORTS];
+	struct rtl_l2_snapshot *snapshot;
+	unsigned int words[RTL_L2_TABLE_MAX_WORDS];
+	unsigned int port;
+	int ret;
+
+	if (!hw->globals_owned || !READ_ONCE(hw->prepared) ||
+	    !READ_ONCE(hw->drained) || hw->journal.quarantined || hw->journal.restoring)
+		return -EBUSY;
+	WRITE_ONCE(hw->port_policy_ready, false);
+	hw->reason = FE_SW_HW_PORT_POLICY;
+	if (!hw->ports || (hw->ports & ~FE_SW_LAN_MASK) ||
+	    ((learning_mask | isolated_mask) & ~hw->ports))
+		return -EINVAL;
+	/* Validate every row's existing ownership before the first mutation. */
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(hw->ports & BIT(port)))
+			continue;
+		ret = rtl_l2_port_policy_build(hw->ports, learning_mask,
+			isolated_mask, port, hw->local_target, &policy[port]);
+		if (ret)
+			return ret;
+		snapshot = fe_switch_hw_snapshot_find(hw, RTL_L2_TBL_ILPB, port);
+		if (!snapshot || !snapshot->valid)
+			return -EIO;
+		snapshot = fe_switch_hw_snapshot_find(hw, RTL_L2_TBL_PORT_MEMBERSHIP, port);
+		if (!snapshot || !snapshot->valid)
+			return -EIO;
+	}
+	if (isolated_mask) {
+		hw->reason = FE_SW_HW_ISOLATION;
+		if (!rtl_l2_port_policy_mc_check(fe_read(fe, RTL_L2_POLICY_ARB_EXT)))
+			return -EOPNOTSUPP;
+	}
+	/* CPU traps and native known-unicast destinations need this proof even
+	 * without port isolation. A redirect on CPU16 can otherwise turn BUM,
+	 * BPDU/control or a software fallback into a foreign/PON egress. */
+	ret = fe_switch_hw_redirects_check(fe, hw);
+	if (ret)
+		return ret;
+	hw->reason = FE_SW_HW_PORT_POLICY;
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(hw->ports & BIT(port)))
+			continue;
+		snapshot = fe_switch_hw_snapshot_find(hw, RTL_L2_TBL_ILPB, port);
+		memcpy(words, snapshot->words, sizeof(words));
+		fe_switch_hw_native_ilpb(words, hw->special_profile);
+		rtl_l2_field_set(words, RTL_L2_ILPB_STP, policy[port].stp);
+		ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_ILPB, port, words);
+		if (ret)
+			return ret;
+		ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_PORT_MEMBERSHIP,
+					 port, policy[port].members);
+		if (ret)
+			return ret;
+	}
+	if (isolated_mask &&
+	    !rtl_l2_port_policy_mc_check(fe_read(fe, RTL_L2_POLICY_ARB_EXT))) {
+		hw->reason = FE_SW_HW_ISOLATION;
+		return -EOPNOTSUPP;
+	}
+	hw->learning_mask = learning_mask;
+	hw->isolated_mask = isolated_mask;
+	hw->reason = FE_SW_HW_OK;
+	WRITE_ONCE(hw->port_policy_ready, true);
+	return 0;
+}
+
+static int fe_switch_hw_limit_write(struct rtl_fe *fe, unsigned int port,
+				    unsigned int expected)
+{
+	struct rtl_dq_io io = fe_io(fe);
+	unsigned int actual;
+	int ret;
+
+	ret = rtl_l2_port_limit_write(&io, port, expected);
+	if (!ret)
+		ret = rtl_l2_port_limit_read(&io, port, &actual);
+	if (ret)
+		return ret;
+	return (actual ^ expected) & RTL_L2_FDB_LIMIT_MAX ? -EIO : 0;
+}
+
+/* All direct registers below are configuration words owned only under the
+ * specified mask. Full-width scan-filter data may legitimately be all ones;
+ * control/status words may not use a failed all-ones read as an RMW base.
+ * Readback verifies persistent fields, never self-clearing command bits. */
+static int fe_switch_hw_config_write(struct rtl_fe *fe, unsigned int address,
+				     unsigned int expected, unsigned int mask)
+{
+	unsigned int value, actual;
+
+	if (mask == ~0U) {
+		value = expected;
+	} else {
+		value = fe_read(fe, address);
+		if (value == ~0U)
+			return -EIO;
+		if (address == RTL_L2_FDB_CONTROL && (value & FE_SW_FDB_INIT))
+			return -EBUSY;
+		value = (value & ~mask) | (expected & mask);
+	}
+	fe_write(fe, address, value);
+	actual = fe_read(fe, address);
+	if ((mask != ~0U && actual == ~0U) || ((actual ^ value) & mask))
+		return -EIO;
+	return 0;
+}
+
 static int fe_switch_hw_limits(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 {
 	struct rtl_dq_io io = fe_io(fe);
@@ -541,17 +759,19 @@ static int fe_switch_hw_limits(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 		hw->limits_owned |= BIT(port);
 		/* SDK initializes 0x1fff. Zero means zero learning, not unlimited.
 		 * Never initialize the live count or flush a different domain. */
-		ret = rtl_l2_port_limit_write(&io, port,
-					     hw->limits[port] | RTL_L2_FDB_LIMIT_MAX);
-		if (ret)
+		ret = fe_switch_hw_limit_write(fe, port,
+					      hw->limits[port] | RTL_L2_FDB_LIMIT_MAX);
+		if (ret) {
+			hw->journal.quarantined = 1;
 			return ret;
+		}
 	}
 	return 0;
 }
 
 static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			       unsigned int ports, unsigned long ageing,
-			       bool snooping)
+			       bool snooping, bool route_policy_allowed)
 {
 	struct rtl_dq_io io = fe_io(fe);
 	unsigned int words[RTL_L2_TABLE_MAX_WORDS], filter[RTL_L2_FDB_FILTER_WORDS];
@@ -562,9 +782,19 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	hw->reason = FE_SW_HW_OK;
 	if (!ports || (ports & ~FE_SW_LAN_MASK) || ageing > 0x7ffffUL)
 		return -EINVAL;
-	if (hw->globals_owned || hw->count || hw->prepared)
+	if (hw->globals_owned || hw->count || hw->prepared || hw->limits_owned ||
+	    hw->journal.quarantined || hw->journal.restoring)
 		return -EALREADY;
+	if (!hw->rows || !hw->journal.row_index ||
+	    hw->journal.capacity != FE_SW_SNAPSHOTS ||
+	    hw->journal.index_count != rtl_l2_journal_index_count())
+		return -EINVAL;
+	hw->route_policy_allowed = route_policy_allowed;
 	fe_switch_hw_gate(fe, hw);
+	if (!READ_ONCE(hw->rx_gate_verified) || !fe_switch_hw_route_closed(fe)) {
+		hw->reason = FE_SW_HW_ADMISSION;
+		return -EIO;
+	}
 	memset(&hw->observed, 0, sizeof(hw->observed));
 	hw->observed.source_port = hw->observed.source_logical = ~0U;
 	hw->observed.learning_port = hw->observed.learning_profile = ~0U;
@@ -652,14 +882,20 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		return -EBUSY;
 	hw->ports = ports;
 	hw->control = fe_read(fe, RTL_L2_FDB_CONTROL);
-	if (hw->control & BIT(30))
-		return -EBUSY; /* FDB info FIFO initialization is still active. */
+	if (hw->control == ~0U)
+		return -EIO;
+	if (hw->control & FE_SW_FDB_INIT)
+		return -EBUSY; /* Unknown inherited FIFO initialization state. */
 	hw->aging = fe_read(fe, 0x1c04);
 	hw->requested_aging = (hw->aging & ~0x7ffffU) | (unsigned int)ageing;
 	hw->learning = fe_read(fe, 0x1410);
 	hw->learn_forward = fe_read(fe, 0x1408);
 	hw->learn_exception = fe_read(fe, 0x140c);
 	hw->demux = fe_read(fe, 0xa1e0) & 0x3ffU;
+	if (hw->aging == ~0U || hw->learning == ~0U ||
+	    hw->learn_forward == ~0U || hw->learn_exception == ~0U ||
+	    fe_read(fe, 0xa1e0) == ~0U)
+		return -EIO;
 	hw->reason = FE_SW_HW_TIMER;
 	if (!(hw->aging >> 19))
 		return -EOPNOTSUPP;
@@ -675,7 +911,9 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		return ret;
 	/* Own only physical LAN0..4 destination selectors. Standalone L2 does
 	 * not require an earlier L3 prepare; all PON/other-port bits survive. */
-	fe_write(fe, 0xa1e0, fe_read(fe, 0xa1e0) | 0x3ffU);
+	ret = fe_switch_hw_config_write(fe, 0xa1e0, 0x3ffU, 0x3ffU);
+	if (ret)
+		goto retained;
 	hw->run_control = (hw->control & ~(RTL_L2_FDB_LEARN_MODE_MASK |
 		RTL_L2_FDB_LEARN_DISABLE | RTL_L2_FDB_COLLISION_OVERWRITE |
 		FE_SW_FDB_OVERFLOW_RECYCLE | BIT(2) | 0x7f8U | BIT(0))) |
@@ -684,121 +922,228 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		hw->run_control |= BIT(0);
 	/* Keep the original aging policy until the owner's complete SCAN has
 	 * proved there is no foreign dynamic domain. arm applies the new time. */
-	fe_write(fe, RTL_L2_FDB_CONTROL,
+	ret = fe_switch_hw_config_write(fe, RTL_L2_FDB_CONTROL,
 		 (hw->control | RTL_L2_FDB_CMD_MODE | RTL_L2_FDB_LEARN_DISABLE) &
-		 ~(RTL_L2_FDB_COLLISION_OVERWRITE | FE_SW_FDB_OVERFLOW_RECYCLE));
+		 ~(RTL_L2_FDB_COLLISION_OVERWRITE | FE_SW_FDB_OVERFLOW_RECYCLE),
+		 FE_SW_FDB_OWNED_CONTROL);
 	/* Learn valid untagged/unknown-EtherType frames, never invalid source
 	 * addresses, loops or ingress-dropped traffic. Preserve reserved bits. */
-	fe_write(fe, 0x1410, (hw->learning & ~0x7fU) | BIT(0) | BIT(2) | BIT(6));
+	if (!ret)
+		ret = fe_switch_hw_config_write(fe, 0x1410, BIT(0) | BIT(2) | BIT(6), 0x7fU);
 	memcpy(filter, hw->filter, sizeof(filter));
 	rtl_l2_fdb_scan_filter(filter);
-	for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++)
-		fe_write(fe, RTL_L2_FDB_FILTER_WORD0 - i * 4, filter[i]);
+	for (i = 0; !ret && i < RTL_L2_FDB_FILTER_WORDS; i++)
+		ret = fe_switch_hw_config_write(fe, RTL_L2_FDB_FILTER_WORD0 - i * 4,
+						filter[i], ~0U);
+	if (ret)
+		goto retained;
 	ret = fe_switch_hw_cf_claim(fe, hw);
 	if (!ret)
 		ret = fe_switch_hw_ports(fe, hw);
+	if (!ret)
+		ret = fe_switch_hw_redirects_check(fe, hw);
 	if (!ret)
 		ret = fe_switch_hw_limits(fe, hw);
 	if (!ret) {
 		/* SDK aal_fdb_init permits forwarding on a static-SA move. A
 		 * Linux static destination FDB row is not source-port locking. */
-		fe_write(fe, 0x1408, hw->learn_forward | BIT(29));
+		ret = fe_switch_hw_config_write(fe, 0x1408, hw->learn_forward | BIT(29), BIT(29));
 		/* A full/busy FDB bucket must fall back, not inherit reset DROP.
 		 * SDK enum REDIRECT=1, CPU0 LDPID=16, COS=0. Keep all unspecified
 		 * keep-old flags; their names alone do not prove edit semantics. */
-		fe_write(fe, 0x140c,
-			 (hw->learn_exception & ~(0x7ffU | (0x7ffU << 16))) |
-			 16U | (1U << 9) | (16U << 16) | (1U << 25));
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0x140c,
+				16U | (1U << 9) | (16U << 16) | (1U << 25),
+				0x7ffU | (0x7ffU << 16));
 	}
 	if (!ret)
 		ret = fe_switch_hw_cf_install(fe, hw);
 	if (ret)
-		return ret;
+		goto retained;
 	hw->reason = FE_SW_HW_OK;
+	hw->learning_mask = ports;
+	hw->isolated_mask = 0;
+	WRITE_ONCE(hw->port_policy_ready, true);
 	WRITE_ONCE(hw->prepared, true);
 	return 0;
+
+retained:
+	hw->journal.quarantined = 1;
+	return ret;
 }
 
 static int fe_switch_hw_restore(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 {
 	struct rtl_dq_io io = fe_io(fe);
+	struct rtl_l2_snapshot *rows = hw->rows;
+	struct rtl_l2_journal journal;
 	enum fe_switch_hw_reason reason = hw->reason;
 	struct fe_switch_hw_observed observed = hw->observed;
-	unsigned int i;
+	unsigned int i, control;
 	int ret;
 
 	/* Caller has first drained and deleted only its claimed FDB domain.
 	 * SCAN filter remains ours until those deletes finish. */
-	if (!hw->globals_owned && !hw->count) {
+	if (!hw->globals_owned && !hw->count && !hw->limits_owned &&
+	    !hw->journal.quarantined && !hw->journal.restoring) {
 		WRITE_ONCE(hw->prepared, false);
+		WRITE_ONCE(hw->port_policy_ready, false);
 		return 0;
 	}
 	if (!READ_ONCE(hw->drained))
 		return -EBUSY;
+	WRITE_ONCE(hw->port_policy_ready, false);
+	/* A recorded drain is not a lease on future selector state. Recheck
+	 * closed LAN admission and the shared L3 gate before the first restore.
+	 * Never free retained rows merely because momentary occupancy is zero. */
+	if (!READ_ONCE(hw->rx_gate_verified) || !fe_switch_hw_rx_check(fe, 0, 0) ||
+	    !fe_switch_hw_route_closed(fe)) {
+		WRITE_ONCE(hw->rx_gate_verified, false);
+		WRITE_ONCE(hw->drained, false);
+		hw->reason = FE_SW_HW_ADMISSION;
+		ret = -EIO;
+		goto retained;
+	}
 	if ((fe_read(fe, RTL_L2_FDB_ACCESS) |
-	     fe_read(fe, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)
-		return -EBUSY;
+	     fe_read(fe, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY) {
+		ret = -EBUSY;
+		goto retained;
+	}
+	if (hw->globals_owned) {
+		control = fe_read(fe, RTL_L2_FDB_CONTROL);
+		if (control == ~0U) {
+			ret = -EIO;
+			goto retained;
+		}
+		if ((control & FE_SW_FDB_INIT) ||
+		    !(control & RTL_L2_FDB_LEARN_DISABLE)) {
+			ret = -EBUSY;
+			goto retained;
+		}
+	}
+	/* Retain every original until the complete rollback, including direct
+ * globals and per-port limits, has passed readback. A failed suffix cannot
+ * authorize a fresh prepare or free the already-restored prefix's owner. */
+	ret = rtl_l2_journal_restore(&hw->journal, &io, hw->rows, hw->count,
+				     READ_ONCE(hw->drained));
+	if (ret)
+		goto retained;
 	for (i = 0; i < FE_LAN_PORTS; i++) {
 		if (!(hw->limits_owned & BIT(i)))
 			continue;
-		ret = rtl_l2_port_limit_write(&io, i, hw->limits[i]);
+		ret = fe_switch_hw_limit_write(fe, i, hw->limits[i]);
 		if (ret)
-			return ret;
-	}
-	for (i = hw->count; i; i--) {
-		ret = rtl_l2_snapshot_restore(&io, &hw->rows[i - 1]);
-		if (ret)
-			return ret;
+			goto retained;
 	}
 	if (hw->globals_owned) {
-		for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++)
-			fe_write(fe, RTL_L2_FDB_FILTER_WORD0 - i * 4, hw->filter[i]);
-		fe_write(fe, 0x1410, hw->learning);
-		fe_write(fe, 0x1408, hw->learn_forward);
-		fe_write(fe, 0x140c, hw->learn_exception);
-		fe_write(fe, 0x1c04, hw->aging);
-		fe_write(fe, 0xa1e0, (fe_read(fe, 0xa1e0) & ~0x3ffU) | hw->demux);
-		fe_write(fe, RTL_L2_FDB_CONTROL, hw->control);
-		fe_read(fe, RTL_L2_FDB_CONTROL);
+		for (i = 0; !ret && i < RTL_L2_FDB_FILTER_WORDS; i++)
+			ret = fe_switch_hw_config_write(fe, RTL_L2_FDB_FILTER_WORD0 - i * 4,
+							hw->filter[i], ~0U);
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0x1410, hw->learning, 0x7fU);
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0x1408, hw->learn_forward, BIT(29));
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0x140c, hw->learn_exception,
+						0x7ffU | (0x7ffU << 16));
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0x1c04, hw->aging, 0x7ffffU);
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, 0xa1e0, hw->demux, 0x3ffU);
+		if (!ret)
+			ret = fe_switch_hw_config_write(fe, RTL_L2_FDB_CONTROL,
+						 hw->control, FE_SW_FDB_OWNED_CONTROL);
+		if (ret)
+			goto retained;
 	}
+	/* Long indirect rollbacks must not release the owner if a connector
+	 * changed after the initial closed-gate check. No selector is opened by
+	 * restoration itself; only the generation-checked arm may do that. */
+	if (!fe_switch_hw_rx_check(fe, 0, 0) || !fe_switch_hw_route_closed(fe)) {
+		WRITE_ONCE(hw->rx_gate_verified, false);
+		WRITE_ONCE(hw->drained, false);
+		hw->reason = FE_SW_HW_ADMISSION;
+		ret = -EIO;
+		goto retained;
+	}
+	ret = rtl_l2_journal_release(&hw->journal, hw->rows, &hw->count);
+	if (ret)
+		goto retained;
+	journal = hw->journal;
 	memset(hw, 0, sizeof(*hw));
+	hw->rows = rows;
+	hw->journal = journal;
+	WRITE_ONCE(hw->rx_gate_verified, true);
 	hw->reason = reason;
 	hw->observed = observed;
 	/* RX stays CPU16. Only the core's epoch-checked arm may reopen a
 	 * native/L3 route mask; restoring an old raw 25 selector is unsafe. */
 	return 0;
+
+retained:
+	hw->journal.quarantined = 1;
+	return ret;
 }
 
 static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
-			    unsigned int native, unsigned int route)
+			    unsigned int native, unsigned int route,
+			    bool route_policy_allowed)
 {
 	unsigned int port, value;
 	bool withdrawing = READ_ONCE(fe->pending_withdrawals);
 
-	if ((native | route) & ~FE_SW_LAN_MASK || (native & route) ||
+	if (hw->journal.quarantined || hw->journal.restoring ||
+	    (native | route) & ~FE_SW_LAN_MASK || (native & route) ||
 	    (native && (!READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
+			!READ_ONCE(hw->port_policy_ready) ||
+			hw->route_policy_allowed != route_policy_allowed ||
 			native != hw->ports)) ||
-	    (route && (!READ_ONCE(fe->enabled) || !READ_ONCE(fe->prepared))))
+	    (route && (!route_policy_allowed || !READ_ONCE(fe->enabled) ||
+		       !READ_ONCE(fe->prepared))))
 		return false;
+	if (native && hw->isolated_mask &&
+	    !rtl_l2_port_policy_mc_check(fe_read(fe, RTL_L2_POLICY_ARB_EXT))) {
+		hw->reason = FE_SW_HW_ISOLATION;
+		WRITE_ONCE(hw->port_policy_ready, false);
+		fe_switch_hw_gate(fe, hw);
+		return false;
+	}
 	/* Disabling routes in software is not proof that an uncertain cached
 	 * action cannot still execute. Verify the CPU-only L3 gate BEFORE any
 	 * native/RX selector opens, even after a failed disable set enabled=0.
 	 * A verified gate preserves independent LAN switching while withdrawal
 	 * retries continue. The FE mutex keeps this latch stable during arm.
 	 */
-	if (withdrawing && !fe_route_arm(fe)) {
+	if (!route_policy_allowed) {
+		/* A zero LAN route mask does not close the PON -> L3 connector.
+		 * Keep both shared L3 selectors on their verified CPU-only profile,
+		 * even when the L3 engine remains administratively enabled.
+		 */
+		fe_route_gate(fe);
+		if (!fe_switch_hw_route_closed(fe)) {
+			fe_switch_hw_gate(fe, hw);
+			return false;
+		}
+	} else if (withdrawing && !fe_route_arm(fe)) {
 		fe_switch_hw_gate(fe, hw);
 		return false;
 	}
 	if (native) {
 		/* Prepared, drained, static FDB replayed; learning is enabled only
 		 * immediately before opening native ingress. No indirect MMIO. */
-		fe_write(fe, 0x1c04, hw->requested_aging);
-		fe_write(fe, RTL_L2_FDB_CONTROL, hw->run_control);
-		fe_read(fe, RTL_L2_FDB_CONTROL);
+		if (fe_switch_hw_config_write(fe, 0x1c04, hw->requested_aging, 0x7ffffU) ||
+		    fe_switch_hw_config_write(fe, RTL_L2_FDB_CONTROL,
+					 hw->run_control, FE_SW_FDB_OWNED_CONTROL)) {
+			hw->journal.quarantined = 1;
+			WRITE_ONCE(hw->port_policy_ready, false);
+			fe_switch_hw_gate(fe, hw);
+			return false;
+		}
 	}
 	for (port = 0; port < FE_LAN_PORTS; port++) {
 		value = fe_read(fe, FE_LAN_RX_CTRL(port));
+		if (value == ~0U)
+			goto admission_failed;
 		value = (value & ~FE_SW_RX_DEST_MASK) | FE_SW_RX_CPU;
 		if (native & BIT(port))
 			value &= ~FE_SW_RX_BYPASS;
@@ -806,15 +1151,25 @@ static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			value = (value & ~FE_SW_RX_DEST_MASK) | (25U << 16);
 		fe_write(fe, FE_LAN_RX_CTRL(port), value);
 	}
-	fe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));
-	if (!withdrawing && READ_ONCE(fe->enabled) && READ_ONCE(fe->prepared)) {
+	if (!fe_switch_hw_rx_check(fe, native, route))
+		goto admission_failed;
+	if (route_policy_allowed && !withdrawing &&
+	    READ_ONCE(fe->enabled) && READ_ONCE(fe->prepared)) {
 		if (!fe_route_arm(fe)) {
 			fe_switch_hw_gate(fe, hw);
 			return false;
 		}
 	}
 	WRITE_ONCE(hw->drained, false);
+	/* This field records a closed-gate observation, never live native RX. */
+	WRITE_ONCE(hw->rx_gate_verified, false);
 	return true;
+
+admission_failed:
+	hw->reason = FE_SW_HW_ADMISSION;
+	WRITE_ONCE(hw->port_policy_ready, false);
+	fe_switch_hw_gate(fe, hw);
+	return false;
 }
 
 #endif

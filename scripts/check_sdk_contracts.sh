@@ -16,7 +16,7 @@ fetch() {
         --connect-timeout 15 --max-time 180 "$1" --output "$2"
 }
 for file in include/aal_common.h aal_common.c include/aal_hash.h aal_hash.c aal_l3qm.c \
-            include/aal_fdb.h aal_fdb.c include/aal_mcast.h include/aal_port.h \
+            include/aal_fdb.h aal_fdb.c include/aal_mcast.h include/aal_port.h aal_port.c aal_arb.c \
             aal_l2_classification.c include/aal_l2_classification.h include/aal_arb.h \
             include/aal_l2_qos.h include/aal_l2_vlan.h \
             aal_l2_tm.c aal_l2_te.c aal_l2_qm.c include/aal_l2_tm.h include/aal_l2_qm.h \
@@ -61,6 +61,8 @@ python3 scripts/test_fe_pp_exception_contract.py --sdk "$work/sdk" --registers "
 python3 scripts/test_fe_base_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_sdk_contract.py --sdk "$work/sdk" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_hardware_recipe.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_l2_port_policy.py --sdk "$work/sdk/$sdk_path" \
+    --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fabric_sdk_framing.py --sdk-ni "$work/aal_ni_l2.c" \
     --sdk-ni-header "$work/sdk/$sdk_path/include/aal_ni_l2.h" \
     --sdk-eth "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c" \

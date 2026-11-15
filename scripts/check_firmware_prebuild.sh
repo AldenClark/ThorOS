@@ -26,7 +26,9 @@ python3 scripts/test_fe_fdb_domain.py
 python3 scripts/test_fe_window_idle.py
 python3 scripts/test_ni_oam_owner.py
 python3 scripts/test_l2_table_transactions.py
+python3 scripts/test_l2_resources.py --mutants --sanitize
 python3 scripts/test_l2_hardware_recipe.py
+python3 scripts/test_l2_port_policy.py
 python3 scripts/test_l2qm_baseline.py
 python3 scripts/test_l2_es_cold.py
 python3 scripts/test_fabric_baseline.py
@@ -43,6 +45,7 @@ python3 scripts/test_l2_switch_fdb.py
 python3 scripts/test_l2_switch_topology.py
 python3 scripts/test_l2_evidence.py
 python3 scripts/test_l2_bridge_eligibility.py
+python3 scripts/test_l2_static_fdb.py --sanitize --mutants
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py
 python3 scripts/test_fe_teardown_quarantine.py

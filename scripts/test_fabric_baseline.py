@@ -41,6 +41,10 @@ struct model {
  unsigned int oversize_rollback_stuck, pending_after_vlan, corrupt_learning_stop;
  unsigned int live_rx, live_rx_reads, corrupt_mac_gate;
  unsigned int rx_writes[5], mac_rx_writes[5];
+ unsigned int control_writes, last_filter_writes, scan_toggles;
+ unsigned int toggle_at_gate, toggle_on_scan, toggle_after_control, toggle_after_filter;
+ unsigned int toggle_on_filter_read, last_filter_reads;
+ unsigned int fault_after_filter, fault_after_control;
 };
 static struct model m;
 static unsigned int cases;
@@ -58,8 +62,25 @@ static void assert_mac_rx_gated(void) {
  for(unsigned i=0;i<5;i++)
   assert(!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE));
 }
+static void toggle_scan(void) {
+ m.reg[RTL_L2_FDB_CONTROL/4]^=RTL_L2_FDB_SW_AGE_SCAN;m.scan_toggles++;
+}
+static void control_fault(unsigned int fault) {
+ switch(fault) {
+ case 0:break;
+ case 1:m.reg[RTL_L2_FDB_CONTROL/4]=~0U;break;
+ case 2:m.reg[RTL_L2_FDB_CONTROL/4]|=RTL_L2_FDB_INFO_INIT;break;
+ case 3:m.reg[RTL_L2_FDB_CONTROL/4]^=RTL_L2_FDB_LEARN_DISABLE;break;
+ case 4:m.reg[RTL_L2_FDB_CONTROL/4]^=4U;break;
+ case 5:m.reg[RTL_L2_FDB_LIMIT_ACCESS/4]=RTL_L2_ACCESS_BUSY;break;
+ case 6:m.reg[RTL_L2_FDB_CONTROL/4]^=RTL_L2_FDB_CMD_MODE;break;
+ default:assert(0);
+ }
+}
 static unsigned int read_reg(void *ctx,unsigned int reg) {
  (void)ctx;assert(!(reg&3) && reg<sizeof(m.reg));m.reads++;
+ if(reg==RTL_L2_FDB_FILTER_WORD0-(RTL_L2_FDB_FILTER_WORDS-1)*4 &&
+    ++m.last_filter_reads==1 && m.toggle_on_filter_read)toggle_scan();
  if(reg==0x11c0) {
   m.pp_reads++;
   /* A bypassed frame still has HeaderA/PP state. CPU16 cannot drain
@@ -76,6 +97,11 @@ static unsigned int read_reg(void *ctx,unsigned int reg) {
 }
 static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
  (void)ctx;assert(!(reg&3) && reg<sizeof(m.reg));m.writes++;
+ if(reg==RTL_L2_FDB_CONTROL) {
+  /* Only the independent SDK scan producer may toggle this edge. */
+  assert(!((value^m.reg[reg/4])&RTL_L2_FDB_SW_AGE_SCAN));
+  m.control_writes++;
+ }
  /* UNI MRU is managed; storage and TPID comparators remain untouched. */
  assert(reg!=RTL_FABRIC_STORAGE_LENGTH && !(reg>=0x1108 && reg<=0x1114));
  if(reg==RTL_L2_FDB_CONTROL ||
@@ -128,6 +154,16 @@ static void write_reg(void *ctx,unsigned int reg,unsigned int value) {
   if(m.frame_writes>1 && m.frame_rollback_stuck)value=0x4005f6;
  }
  if(!drop)m.reg[reg/4]=value;
+ if(reg==RTL_FABRIC_RX(4) && m.rx_writes[4]==1 && m.toggle_at_gate)toggle_scan();
+ if(reg==RTL_L2_FDB_FILTER_WORD0-(RTL_L2_FDB_FILTER_WORDS-1)*4) {
+  m.last_filter_writes++;
+  if(m.last_filter_writes==m.toggle_after_filter)toggle_scan();
+  control_fault(m.fault_after_filter);
+ }
+ if(reg==RTL_L2_FDB_CONTROL) {
+  if(m.toggle_after_control&(1U<<m.control_writes))toggle_scan();
+  control_fault(m.fault_after_control);
+ }
 }
 static int indirect(void *ctx,unsigned int reg,unsigned int value) {
  (void)ctx;assert(reg==RTL_L2_FDB_ACCESS && !fdb_busy());
@@ -156,6 +192,7 @@ static int indirect(void *ctx,unsigned int reg,unsigned int value) {
   for(unsigned i=0;i<RTL_L2_FDB_WORDS;i++)m.reg[(RTL_L2_FDB_DATA0-i*4)/4]=words[i];
  }
  if(m.busy_on_scan)m.reg[RTL_L2_FDB_LIMIT_ACCESS/4]=RTL_L2_ACCESS_BUSY;
+ if(m.toggle_on_scan)toggle_scan();
  return 0;
 }
 static struct rtl_dq_io io={&m,read_reg,write_reg,indirect};
@@ -181,7 +218,8 @@ static void setup(unsigned int seed) {
  memcpy(m.original,m.reg,sizeof(m.reg));
 }
 static void command_restored(const struct rtl_fabric *f) {
- assert(m.reg[RTL_L2_FDB_CONTROL/4]==(m.original[RTL_L2_FDB_CONTROL/4]|
+ assert(m.reg[RTL_L2_FDB_CONTROL/4]==((m.original[RTL_L2_FDB_CONTROL/4]^
+  ((m.scan_toggles&1)?RTL_L2_FDB_SW_AGE_SCAN:0))|
   (f->ready?RTL_L2_FDB_LEARN_DISABLE:0)));
  for(unsigned i=0;i<RTL_L2_FDB_FILTER_WORDS;i++)
   assert(m.reg[(RTL_L2_FDB_FILTER_WORD0-i*4)/4]==
@@ -266,9 +304,57 @@ int main(void) {
  }
  {
   struct rtl_fabric f={};setup(0);m.drop_reg=RTL_L2_FDB_CONTROL;m.drop_occurrence=2;
-  assert(rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP);
+  /* CMD readback now detects this ignored write before touching SCAN. */
+  assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
   assert(f.refusal && !f.poisoned && !m.scans && !m.frame_writes && !m.vlan_writes);
   command_restored(&f);baseline_preserved(&f);cases++;
+ }
+ for(unsigned initial=0;initial<2;initial++)for(unsigned path=0;path<5;path++)
+  for(unsigned phase=0;phase<6;phase++) {
+   if(phase==1 && path>1)continue; /* These paths never reach SCAN. */
+   if((phase==2 || phase==3) && path==3)continue; /* No lease acquired. */
+   if(phase==4 && path!=2 && path!=3)continue; /* Ignored owned write. */
+   struct rtl_fabric f={};setup(0);
+   m.reg[RTL_L2_FDB_CONTROL/4]|=initial?RTL_L2_FDB_SW_AGE_SCAN:0;
+   m.original[RTL_L2_FDB_CONTROL/4]=m.reg[RTL_L2_FDB_CONTROL/4];
+   if(path==1)m.inherited=2;
+   if(path==2 || path==3) {
+    m.drop_reg=RTL_L2_FDB_CONTROL;m.drop_occurrence=path==2?2:1;
+   }
+   if(path==4){m.pending_reg=0x11c0;m.permanent_pending=1;}
+   if(phase==0)m.toggle_at_gate=1;
+   if(phase==1)m.toggle_on_scan=1;
+   if(phase==2)m.toggle_after_filter=path<2?2:1;
+   if(phase==3)m.toggle_after_control=1U<<(path==4?2:3);
+   if(phase==4)m.toggle_after_control=1U<<m.drop_occurrence;
+   if(phase==5)m.toggle_on_filter_read=1;
+   int ret=rtl_fabric_cold_prepare(&io,&f);
+   const int expected[]={0,-EOPNOTSUPP,-EIO,-EIO,-ETIMEDOUT};
+   assert(ret==expected[path] && !f.poisoned && m.scan_toggles==1);
+   assert(f.ready==(path==0) && f.refusal==(path!=0));
+   assert(m.control_writes==(path==3?1U:(path==4?2U:3U)));
+   if(path>=2)assert(!m.scans && !m.frame_writes && !m.vlan_writes);
+   if(path==3)assert(!m.last_filter_writes);
+   command_restored(&f);baseline_preserved(&f);cases++;
+  }
+ /* The real restore helper must not hide unknown control state by replaying
+  * a saved whole word. Inject before filters, after the final filter write,
+  * and after the final CTRL write; no DATA/SCAN or baseline mutation occurs. */
+ for(unsigned phase=0;phase<3;phase++)for(unsigned fault=1;fault<=6;fault++) {
+  if(fault==6 && phase<2)continue; /* CMD is owned and intentionally restored. */
+  struct rtl_fabric f={};setup(0);
+  for(unsigned port=0;port<5;port++)m.reg[RTL_FABRIC_RX_MAC(port)/4]&=~RTL_FABRIC_RX_MAC_ENABLE;
+  for(unsigned word=0;word<RTL_L2_FDB_FILTER_WORDS;word++)
+   f.saved_filter[word]=m.original[(RTL_L2_FDB_FILTER_WORD0-word*4)/4];
+  m.reg[RTL_L2_FDB_CONTROL/4]|=RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE;
+  if(phase==0)control_fault(fault);
+  if(phase==1)m.fault_after_filter=fault;
+  if(phase==2)m.fault_after_control=fault;
+  int ret=rtl_fabric_restore_command(&io,&f,m.original[RTL_L2_FDB_CONTROL/4]);
+  int expected=fault==2?-EOPNOTSUPP:(fault==5 || (fault==3 && phase<2)?-EBUSY:-EIO);
+  assert(ret==expected);
+  assert(m.control_writes==(phase==2) && !m.scans && !m.frame_writes && !m.vlan_writes);
+  assert(m.last_filter_writes==(phase!=0));cases++;
  }
  for(unsigned port=0;port<5;port++) {
   struct rtl_fabric f={};setup(port);
@@ -518,6 +604,29 @@ def main():
             "maximum == RTL_FABRIC_NATIVE_MAX_FRAME", "maximum <= RTL_FABRIC_NATIVE_MAX_FRAME", 1),
         "warm_rewrites_baseline": production.replace(
             "return rtl_fabric_check(io, fabric);", "{ fabric->ready = 0; return rtl_fabric_cold_prepare(io, fabric); }", 1),
+        "cold_replays_saved_scan_edge": production.replace(
+            "control = (live & ~owned) | (control & owned);", "/* stale saved control */", 1),
+        "acquire_replays_pre_gate_edge": production.replace(
+            "control = live;\n\tfabric->saved_control = control;",
+            "/* stale acquisition control */\n\tfabric->saved_control = control;", 1),
+        "post_filter_lease_not_refreshed": production.replace(
+            "ret = rtl_l2_fdb_mode_control(io, &live);\n\tif (ret)\n\t\treturn ret;\n"
+            "\tif ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))\n\t\treturn -EIO;\n"
+            "\tcontrol = (live & ~owned) | (control & owned);",
+            "control = (live & ~owned) | (control & owned);", 1),
+        "harmless_readback_toggle_poisoned": production.replace(
+            "if ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {",
+            "if ((live ^ control) & ~0U) {", 1),
+        "ignored_write_toggle_poisoned": production.replace(
+            "if (!cleanup && !((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN))",
+            "if (!cleanup && live == control)", 1),
+        "unowned_control_drift_swallowed": production.replace(
+            "if ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))\n\t\treturn -EIO;",
+            "/* stable policy drift ignored */"),
+        "cold_restore_readback_ignored": production.replace(
+            "ret = rtl_l2_fdb_control_read(io, &live);\n\tif (ret)\n\t\treturn ret;\n"
+            "\tif ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {",
+            "return 0;\n\tif ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {", 1),
     }
     assert all(text != production for text in mutants.values())
     expected_assertions = {
@@ -525,7 +634,7 @@ def main():
         "missing_mac_rx_readback": "!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)",
         "ignored_mac_gate_poisoned": "!f.poisoned && f.refusal && !f.ready && !m.scans && !m.pp_reads",
         "unknown_mac_gate_swallowed": "f.poisoned && !f.refusal && !f.ready && !m.scans && !m.pp_reads",
-        "ignored_learning_stop_poisoned": "!f.poisoned && f.refusal",
+        "ignored_learning_stop_poisoned": "ret==expected[path] && !f.poisoned && m.scan_toggles==1",
         "rollback_without_drain": "!m.pending_remaining && !m.permanent_pending",
         "missing_initial_drain": "m.pp_reads>=3",
         "inherited_fdb_ignored": "rtl_fabric_cold_prepare(&io,&f)==-EOPNOTSUPP",
@@ -538,6 +647,13 @@ def main():
         "missing_oversize_rollback": "f.poisoned",
         "false_native_mtu_compatibility": "rtl_fabric_native_mtu_compatible(&altered)==(maximum[size]==1526)",
         "warm_rewrites_baseline": "m.writes==writes && m.scans==scans",
+        "cold_replays_saved_scan_edge": "!((value^m.reg[reg/4])&RTL_L2_FDB_SW_AGE_SCAN)",
+        "acquire_replays_pre_gate_edge": "!((value^m.reg[reg/4])&RTL_L2_FDB_SW_AGE_SCAN)",
+        "post_filter_lease_not_refreshed": "!((value^m.reg[reg/4])&RTL_L2_FDB_SW_AGE_SCAN)",
+        "harmless_readback_toggle_poisoned": "ret==expected[path] && !f.poisoned && m.scan_toggles==1",
+        "ignored_write_toggle_poisoned": "ret==expected[path] && !f.poisoned && m.scan_toggles==1",
+        "unowned_control_drift_swallowed": "ret==expected",
+        "cold_restore_readback_ignored": "ret==expected",
     }
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     evidence = None
@@ -547,7 +663,8 @@ def main():
         assert hashlib.sha256(raw).hexdigest() == REGISTER_SHA, "Unpinned register input"
         source = raw.decode()
         names = ("L2FE_PLC_VLAN_MODE_CTRL", "NI_HV_GLB_PKT_LEN_CFG",
-                 "NI_HV_GLB_PKT_STOR_LEN_CFG", "NI_HV_PT_RX_CNTRL_CFG", "NI_HV_PT_RXMAC_CFG")
+                 "NI_HV_GLB_PKT_STOR_LEN_CFG", "NI_HV_PT_RX_CNTRL_CFG", "NI_HV_PT_RXMAC_CFG",
+                 "L2FE_L2E_CTRL")
         unions = []
         for name in names:
             match = re.search(r"typedef volatile union \{(?:(?!typedef volatile union).)*?\} " + name + r"_t;", source, re.S)
@@ -563,6 +680,11 @@ static void sdk_oracle(void) {
  NI_HV_PT_RX_CNTRL_CFG_t rx={.wrd=0};rx.bf.ovr_drop_dis=1;assert(rx.wrd==(1U<<5));
  NI_HV_PT_RXMAC_CFG_t mac={.wrd=0};mac.bf.rx_en=1;assert(mac.wrd==RTL_FABRIC_RX_MAC_ENABLE);
  assert(RTL_FABRIC_RX_MAC(0)==0xa5c8 && RTL_FABRIC_RX_MAC(4)==0xa808);
+ L2FE_L2E_CTRL_t ctrl={.wrd=0};ctrl.bf.sw_age_entry_scan=1;
+ assert(ctrl.wrd==RTL_L2_FDB_SW_AGE_SCAN);
+ ctrl.wrd=0;ctrl.bf.cpu_opt_mode=1;assert(ctrl.wrd==RTL_L2_FDB_CMD_MODE);
+ ctrl.wrd=0;ctrl.bf.lrn_dis=1;assert(ctrl.wrd==RTL_L2_FDB_LEARN_DISABLE);
+ ctrl.wrd=0;ctrl.bf.info_ff_init=1;assert(ctrl.wrd==RTL_L2_FDB_INFO_INIT);
 }
 '''
         test = test.replace("/*SDK_DECL*/", declaration).replace("/*SDK_RUN*/", "sdk_oracle();")

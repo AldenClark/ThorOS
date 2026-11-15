@@ -44,7 +44,9 @@ L2_HW_REASONS = ('ok', 'requires-existing-svl', 'priority-fdb-key', 'tpid-profil
                  'cpu-egress-edit', 'queue-baseline', 'lan-source-map', 'foreign-source-alias',
                  'aging-timebase', 'foreign-classifier', 'foreign-learning', 'special-profile-capacity',
                  'mac-limit-io', 'table-io', 'shared-command-busy', 'pipeline-drain-timeout',
-                 'native-mtu-baseline', 'control-packet-classification')
+                 'native-mtu-baseline', 'control-packet-classification',
+                 'port-policy-transaction', 'isolation-baseline', 'redirect-baseline',
+                 'admission-readback')
 COLD_STAGES = ('none', 'global_snapshot', 'select_family', 'write_receive_gates',
                'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready')
 COLD_GATES = ((0x088c, 1, 'EPON_1G'), (0x10b4, 1 << 7, 'EPON_10G'),
@@ -578,9 +580,13 @@ def summarize(text):
               "states": {}, "qm_cpu": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
               "cold_bootstrap_history": {}}
     fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_error", "l2_ports",
-               "l2_bum_hardware", "l2_vlan_hardware", "lan_admission_valid", "lan_cpu_mask",
+               "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
+               "l2_route_policy_allowed", "l2_flow_allowed", "l2_local_target", "l2_rx_gate_verified",
+               "l2_learning_ports", "l2_isolated_ports", "l2_static_published",
+               "l2_journal_used", "l2_journal_capacity", "l2_journal_quarantined",
+               "lan_admission_valid", "lan_cpu_mask",
                "lan_route_mask", "lan_native_l2_mask", "base_ready", "base_failed",
-               "full_l3_drain_verified", "route_gate_ready", "route_admitted",
+               "full_l3_drain_verified", "route_gate_ready", "route_admitted", "route_gate_verified",
                "eif_rows_used", "retry_flows", "cleanup_backoff_ms", "lan_pon_rules",
                "pon_lan_rules", "lan_lan_route_rules", "rule_counts_are_hits",
                "route_hash_templates_config", "wan_arb_pdpid_config",

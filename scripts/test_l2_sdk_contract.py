@@ -299,6 +299,8 @@ void __aal_mac_2_fdb_data(L2FE_L2E_FDB_DATA3_t *, L2FE_L2E_FDB_DATA2_t *,
     source += "}\n" + CF_REFERENCE
     source += function(sdk["aal_l2_classification.c"], "ca_status_t __aal_l2_cf_key_write(")
     source += LIMIT_REFERENCE
+    # The pinned producer toggles this bit; it is not a high-is-busy flag.
+    assert sdk["aal_fdb.c"].count("l2e_ctrl.bf.sw_age_entry_scan ^= 0x1;") == 2
     source += function(sdk["aal_fdb.c"], "ca_status_t __aal_l2e_cpu_op_mode(")
     source += function(sdk["aal_fdb.c"], "ca_status_t __aal_port_mac_lmt(")
     source += "\n#pragma GCC diagnostic pop\n"
@@ -340,6 +342,7 @@ LIMIT_REFERENCE = r'''
 #define L2_DEBUG(...) ((void)0)
 struct limit_model {
  unsigned int control, data, rows[64], trace[16][2], count;
+ unsigned int control_xor_on_complete;
 };
 static struct limit_model limit_vendor, limit_native;
 static unsigned int limit_read(struct limit_model *m,unsigned int address)
@@ -361,6 +364,7 @@ static void limit_write(struct limit_model *m,unsigned int address,unsigned int 
   assert((access.bf.addr&~63U)==CA_AAL_L2E_LMT_ACCESS);
   if(access.bf.rbw)m->rows[access.bf.addr&63]=m->data;
   else m->data=m->rows[access.bf.addr&63];
+  m->control^=m->control_xor_on_complete;m->control_xor_on_complete=0;
  }
 }
 static unsigned int limit_native_read(void *context,unsigned int address)
@@ -408,9 +412,14 @@ static void check_limit(void)
  assert(CA_AAL_L2E_LMT_ACCESS==RTL_L2_FDB_LIMIT_SELECT);
  L2FE_L2E_PORT_MAC_CNT_LMT_DATA_t field={.wrd=~0U};
  assert(field.bf.val==RTL_L2_FDB_LIMIT_MAX);
- for(unsigned int port=0;port<64;port++)for(unsigned int write=0;write<2;write++) {
+ for(unsigned int port=0;port<64;port++)for(unsigned int write=0;write<2;write++)for(unsigned int toggle=0;toggle<4;toggle++) {
   memset(&limit_vendor,0,sizeof(limit_vendor));
-  limit_vendor.control=next_random()|RTL_L2_FDB_CMD_MODE|RTL_L2_FDB_LEARN_DISABLE;
+  limit_vendor.control=(next_random()&~RTL_L2_FDB_INFO_INIT)|RTL_L2_FDB_CMD_MODE|RTL_L2_FDB_LEARN_DISABLE;
+  /* Both stable trigger levels are supported, including a new software
+   * scan edge while the limit command completes. Do not replay old state. */
+  if(toggle&1)limit_vendor.control|=RTL_L2_FDB_SW_AGE_SCAN;
+  else limit_vendor.control&=~RTL_L2_FDB_SW_AGE_SCAN;
+  limit_vendor.control_xor_on_complete=(toggle&2)?RTL_L2_FDB_SW_AGE_SCAN:0;
   for(unsigned int i=0;i<64;i++)limit_vendor.rows[i]=next_random();
   limit_native=limit_vendor;
   struct rtl_dq_io io={.context=&limit_native,.read=limit_native_read,
@@ -604,6 +613,8 @@ static void check_constants(void)
  assert(RTL_L2_MC_FIB_ENTRIES==ARB_FIB_TBL_ENTRY_MAX && RTL_L2_MC_VECTOR_ENTRIES==MCE_INDX_TBL_ENTRY_MAX);
  L2FE_L2E_CTRL_t ctl={.wrd=RTL_L2_FDB_CMD_MODE|RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_LEARN_HW|RTL_L2_FDB_COLLISION_OVERWRITE};
  assert(ctl.bf.cpu_opt_mode==1 && ctl.bf.lrn_dis==1 && ctl.bf.lrn_mode==1 && ctl.bf.hash_collision_overwrite==1);
+ ctl.wrd=0;ctl.bf.sw_age_entry_scan=1;assert(ctl.wrd==RTL_L2_FDB_SW_AGE_SCAN);
+ ctl.wrd=0;ctl.bf.info_ff_init=1;assert(ctl.wrd==RTL_L2_FDB_INFO_INIT);
  assert(OFFSET(L2FE_L2E_CTRL)==RTL_L2_FDB_CONTROL && OFFSET(L2FE_L2E_FDB_ACCESS)==RTL_L2_FDB_ACCESS);
  assert(OFFSET(L2FE_L2E_FDB_CMD_RETURN)==RTL_L2_FDB_RETURN && OFFSET(L2FE_L2E_FDB_DATA0)==RTL_L2_FDB_DATA0);
  assert(OFFSET(L2FE_L2E_FDB_CPU_CMD_WORD0)==RTL_L2_FDB_FILTER_WORD0);
@@ -634,7 +645,7 @@ int main(void)
  check_fields();check_tables();check_fdb();check_cf();check_constants();check_limit();check_classifier_gate();
  check_special_priority();
  printf("Pinned RTL77C L2 SDK oracle: %u fields, %u windows, 16384 FDB vectors, "
-   "48 MAC bits, 448 PONCLE keys, 128 SDK MAC-limit traces, CLS CPU-original gate, SPKTP bounds, "
+   "48 MAC bits, 448 PONCLE keys, 512 SDK MAC-limit/scan-toggle traces, CLS CPU-original gate, SPKTP bounds, "
    "fixed/user TPID bitmap decoder, SCAN filters and 64-bit MC/port bitmap contracts PASS (model only)\n",
    RTL_L2_FIELD_COUNT,RTL_L2_TBL_COUNT);
  return 0;

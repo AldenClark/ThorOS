@@ -6,8 +6,10 @@
  * fully programmed snapshot may reopen the hardware path.
  *
  * This first hardware contract is deliberately explicit: a single, native
- * untagged LAN bridge, hardware-learned unicast, and CPU-only BUM/control
- * packets.  VLAN filtering and complex bridge policy use the software path.
+ * untagged LAN bridge, per-port learning/isolation, hardware unicast and
+ * CPU-only BUM/control packets. Non-forwarding STP ports remain on CPU;
+ * their control frames and software bridge state machine remain intact.
+ * VLAN filtering and complex bridge policy use the software path.
  * No skb is treated as an authorization and no CPU trap is marked forwarded.
  */
 #include <linux/if_bridge.h>
@@ -89,10 +91,29 @@ fe_switch_route_plan_validate(const struct fe_switch_plan *plan)
 static enum fe_switch_reason
 fe_switch_plan_validate(const struct fe_switch_plan *plan)
 {
-	enum fe_switch_reason reason = fe_switch_route_plan_validate(plan);
+	const unsigned long allowed = BR_BPDU_GUARD | BR_ROOT_BLOCK |
+		BR_MULTICAST_FAST_LEAVE | BR_ADMIN_COST | BR_LEARNING | BR_FLOOD |
+		BR_PROMISC | BR_LEARNING_SYNC | BR_MCAST_FLOOD | BR_BCAST_FLOOD |
+		BR_BPDU_FILTER | BR_ISOLATED;
+	unsigned int port, forwarding = 0;
 
-	if (reason != FE_SWITCH_OK)
-		return reason;
+	if (plan->ports & ~GENMASK(FE_LAN_PORTS - 1, 0))
+		return FE_SWITCH_PORT_POLICY;
+	if (plan->software_policy)
+		return FE_SWITCH_GUARDED;
+	if (plan->private_policy)
+		return FE_SWITCH_PRIVATE_POLICY;
+	if (plan->promisc)
+		return FE_SWITCH_PROMISC;
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(plan->ports & BIT(port)))
+			continue;
+		if ((plan->flags[port] & ~allowed) ||
+		    plan->state[port] > BR_STATE_BLOCKING)
+			return FE_SWITCH_PORT_POLICY;
+		if (plan->state[port] == BR_STATE_FORWARDING)
+			forwarding++;
+	}
 	/* These limit native autonomous switching, not an exact routed flow
 	 * already authorized by nft and its bridge/VLAN forwarding-path cookie.
 	 * All actual software/port policy vetoes above remain fail closed. */
@@ -102,12 +123,45 @@ fe_switch_plan_validate(const struct fe_switch_plan *plan)
 		return FE_SWITCH_MIXED_PORTS;
 	if (plan->vlan_filtering)
 		return FE_SWITCH_VLAN_UNSUPPORTED;
-	return hweight32(plan->ports) >= 2 ? FE_SWITCH_OK : FE_SWITCH_NO_BRIDGE;
+	return forwarding >= 2 ? FE_SWITCH_OK : FE_SWITCH_NO_BRIDGE;
+}
+
+/* Keep plan.ports as the complete online topology. In particular, hiding a
+ * blocked member here would make the independent route-policy check forget
+ * its restriction. Only the final native mask excludes STP-blocked ports. */
+static u32 fe_switch_forwarding_ports(const struct fe_switch_plan *plan)
+{
+	u32 ports = 0;
+	unsigned int port;
+
+	for (port = 0; port < FE_LAN_PORTS; port++)
+		if ((plan->ports & BIT(port)) &&
+		    plan->state[port] == BR_STATE_FORWARDING)
+			ports |= BIT(port);
+	return ports;
+}
+
+static u32 fe_switch_flag_ports(const struct fe_switch_plan *plan, u32 ports,
+				 unsigned long flag)
+{
+	u32 selected = 0;
+	unsigned int port;
+
+	for (port = 0; port < FE_LAN_PORTS; port++)
+		if ((ports & BIT(port)) && (plan->flags[port] & flag))
+			selected |= BIT(port);
+	return selected;
 }
 
 struct fe_switch_learned {
 	u8 address[ETH_ALEN];
 	u8 port;
+};
+
+struct fe_switch_published {
+	u8 address[ETH_ALEN];
+	u8 destination;
+	u64 cookie;
 };
 
 /* A populated 4K table must not monopolize RTNL or the shared FE mutex.
@@ -141,6 +195,10 @@ struct rtl_fe_bridge {
 	u32 replay_ports;
 	unsigned int (*rules)[RTL_L2_FDB_WORDS];
 	unsigned int rule_count, local_target, retry_count;
+	/* Separate from rules[], which domain_flush reuses. A failed publish
+	 * must still withdraw every successful prefix by its unique FDB cookie. */
+	struct fe_switch_published *published;
+	unsigned int published_count;
 	struct fe_switch_learned *learned, *next;
 	unsigned int learned_count, pending_count;
 	/* Only MACs/physical IDs survive a slice. Device pointers are always
@@ -151,7 +209,7 @@ struct rtl_fe_bridge {
 	u64 scan_generation;
 	bool scan_running, scan_complete, scan_removed;
 	bool requested, stopping, active, replaying, domain_owned, flow_allowed;
-	bool route_generation_valid;
+	bool route_generation_valid, route_policy_allowed;
 	bool netdev_registered, atomic_registered, blocking_registered;
 	int replay_error, error;
 	enum fe_switch_reason reason;
@@ -244,10 +302,12 @@ static bool fe_switch_arm(void *private)
 	    !READ_ONCE(sw->fe->engine_ready))
 		return false;
 	armed = fe_switch_hw_arm(sw->fe, &sw->hw,
-				sw->native_mask, sw->route_mask);
+				sw->native_mask, sw->route_mask,
+				sw->route_policy_allowed);
 	WRITE_ONCE(sw->active, armed && sw->native_mask);
 	WRITE_ONCE(sw->armed_route_mask, armed ? sw->route_mask : 0);
-	WRITE_ONCE(sw->flow_allowed, armed && sw->fe->enabled &&
+	WRITE_ONCE(sw->flow_allowed, armed && sw->route_policy_allowed &&
+		   sw->fe->enabled &&
 		   READ_ONCE(sw->fe->route_admitted));
 	return armed;
 }
@@ -453,7 +513,7 @@ static bool fe_switch_request_current(struct rtl_fe *fe, bool requested)
 	return !READ_ONCE(sw->active) && !sw->native_mask && !READ_ONCE(sw->offloaded) &&
 	       !sw->domain_owned && !sw->hw.globals_owned && !sw->hw.prepared &&
 	       !sw->hw.count && !READ_ONCE(sw->learned_count) &&
-	       !READ_ONCE(sw->pending_count);
+	       !READ_ONCE(sw->pending_count) && !READ_ONCE(sw->published_count);
 }
 
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested)
@@ -603,6 +663,46 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	return 0;
 }
 
+/* Stage under FE mutex before releasing it for bridge feedback. A concurrent
+ * mode-disable may restore hardware and reuse rules[] while feedback runs;
+ * it cannot overwrite this RTNL-owned, independently allocated journal. */
+static void fe_switch_static_stage(struct rtl_fe_bridge *sw)
+{
+	struct rtl_l2_fdb_entry entry;
+	unsigned int i;
+
+	for (i = 0; i < sw->rule_count; i++) {
+		rtl_l2_fdb_decode(sw->rules[i], &entry);
+		ether_addr_copy(sw->published[i].address, entry.mac);
+		sw->published[i].destination = entry.destination;
+		sw->published[i].cookie = 0;
+	}
+	WRITE_ONCE(sw->published_count, sw->rule_count);
+}
+
+/* RTNL, but not FE mutex. The bridge serializes with its FDB hash lock and
+ * the same generation gate as admission. It will not claim another owner's
+ * flag, a replaced key, a movable static entry, or a stale policy epoch. */
+static int fe_switch_static_publish(struct rtl_fe_bridge *sw, u64 generation)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < sw->published_count; i++) {
+		struct fe_switch_published *row = &sw->published[i];
+		bool local = row->destination >= FE_LAN_PORTS;
+		struct net_device *dev = local ? NULL : sw->ports[row->destination];
+
+		if (!sw->master || (!local && !dev))
+			return -ENODEV;
+		ret = br_rtl9617c_fdb_offload(sw->master, dev, row->address, 0,
+					   local, &sw->guard, generation, &row->cookie);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int fe_switch_atomic_event(struct notifier_block *nb,
 				 unsigned long event, void *pointer)
 {
@@ -698,6 +798,12 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *sw)
 {
 	unsigned int i;
 
+	for (i = 0; i < sw->published_count; i++)
+		if (sw->master && sw->published[i].cookie)
+			br_rtl9617c_fdb_unoffload(sw->master,
+				sw->published[i].address, 0, &sw->guard,
+				sw->published[i].cookie);
+	WRITE_ONCE(sw->published_count, 0);
 	for (i = 0; i < sw->learned_count; i++)
 		fe_switch_feedback(sw, &sw->learned[i], false, 0);
 	WRITE_ONCE(sw->learned_count, 0);
@@ -778,6 +884,7 @@ static void fe_switch_work(struct work_struct *work)
 	clock_t age_ticks;
 	unsigned long seconds;
 	unsigned int i;
+	u32 native_ports;
 	u64 generation;
 	int ret = 0;
 	bool native = false;
@@ -808,14 +915,21 @@ static void fe_switch_work(struct work_struct *work)
 	}
 	generation = rtl9617c_switch_guard_generation(&sw->guard);
 	sw->reason = fe_switch_snapshot(sw, &plan);
-	sw->local_target = fe->enabled && fe->prepared ? 25 : 16;
+	sw->route_policy_allowed =
+		fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK;
+	sw->local_target = sw->route_policy_allowed &&
+		fe->enabled && fe->prepared ? 25 : 16;
 	/* A bridge port may be blocked or have software-only policy even when
 	 * native switching is not requested. Do not resurrect old L3 rules past
 	 * that policy merely because native-L2 eligibility failed.
 	 */
-	if (fe_switch_route_plan_validate(&plan) != FE_SWITCH_OK) {
+	if (!sw->route_policy_allowed) {
 		sw->route_mask = 0;
-		goto unlock;
+		/* Native learning-off/isolation and a forwarding STP subset do
+		 * not authorize the L3 engine. Keep both its ingress profiles on
+		 * the verified CPU gate, including PON, while native L2 runs. */
+		if (sw->reason != FE_SWITCH_OK || !sw->requested)
+			goto unlock;
 	}
 	if (!sw->requested &&
 	    (sw->reason == FE_SWITCH_OK || sw->reason == FE_SWITCH_NO_BRIDGE))
@@ -868,9 +982,10 @@ static void fe_switch_work(struct work_struct *work)
 		goto arm;
 	}
 	seconds = age_ticks / USER_HZ;
+	native_ports = fe_switch_forwarding_ports(&plan);
 	sw->rule_count = 0;
 	sw->replay_error = 0;
-	sw->replay_ports = plan.ports;
+	sw->replay_ports = native_ports;
 	sw->replaying = true;
 	/* switchdev's replay invokes our supplied notifier synchronously with
 	 * ctx=sw. No live packet callback is permitted to append a static rule.
@@ -878,7 +993,7 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	mutex_unlock(&fe->lock);
 	for (i = 0; i < FE_LAN_PORTS; i++) {
-		if (!(plan.ports & BIT(i)))
+		if (!(native_ports & BIT(i)))
 			continue;
 		ret = switchdev_bridge_port_offload(sw->ports[i], sw->ports[i], sw,
 			&sw->atomic_nb, &sw->blocking_nb, false, NULL);
@@ -903,8 +1018,17 @@ static void fe_switch_work(struct work_struct *work)
 		ret = -EAGAIN;
 		goto failure;
 	}
-	ret = fe_switch_hw_prepare(fe, &sw->hw, plan.ports, seconds,
-				   br_multicast_enabled(sw->master));
+	ret = fe_switch_hw_prepare(fe, &sw->hw, native_ports, seconds,
+				   br_multicast_enabled(sw->master),
+				   sw->route_policy_allowed);
+	if (ret) {
+		if (ret == -EOPNOTSUPP)
+			sw->reason = FE_SWITCH_HW_UNSUPPORTED;
+		goto failure;
+	}
+	ret = fe_switch_hw_port_policy(fe, &sw->hw,
+		fe_switch_flag_ports(&plan, native_ports, BR_LEARNING),
+		fe_switch_flag_ports(&plan, native_ports, BR_ISOLATED));
 	if (ret) {
 		if (ret == -EOPNOTSUPP)
 			sw->reason = FE_SWITCH_HW_UNSUPPORTED;
@@ -920,7 +1044,8 @@ static void fe_switch_work(struct work_struct *work)
 		if (ret)
 			goto failure;
 	}
-	sw->native_mask = plan.ports;
+	fe_switch_static_stage(sw);
+	sw->native_mask = native_ports;
 	sw->route_mask &= ~sw->native_mask;
 	native = true;
 arm:
@@ -928,6 +1053,16 @@ arm:
 		sw->reason = FE_SWITCH_GUARDED;
 		ret = -EAGAIN;
 		goto failure;
+	}
+	if (native) {
+		mutex_unlock(&fe->lock);
+		ret = fe_switch_static_publish(sw, generation);
+		mutex_lock(&fe->lock);
+		if (!ret && (!sw->active || generation !=
+		    rtl9617c_switch_guard_generation(&sw->guard)))
+			ret = -EAGAIN;
+		if (ret)
+			goto failure;
 	}
 	sw->rebuilds++;
 	if (native)
@@ -1037,7 +1172,8 @@ static void fe_switch_scan(struct work_struct *work)
 			if (!ret)
 				break;
 			rtl_l2_fdb_decode(row.words, &entry);
-			if (fe_switch_learned_owned(&entry, sw->native_mask)) {
+			if (fe_switch_learned_owned(&entry,
+					sw->native_mask & sw->hw.learning_mask)) {
 				ether_addr_copy(sw->next[sw->scan_count].address, entry.mac);
 				sw->next[sw->scan_count++].port = entry.destination;
 			}
@@ -1141,6 +1277,8 @@ out:
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe)
 {
 	struct rtl_fe_bridge *sw;
+	unsigned short *row_index = NULL;
+	unsigned int index_count = rtl_l2_journal_index_count();
 	int ret;
 
 	sw = kzalloc(sizeof(*sw), GFP_KERNEL);
@@ -1160,12 +1298,20 @@ static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe)
 	sw->atomic_nb.notifier_call = fe_switch_atomic_event;
 	sw->blocking_nb.notifier_call = fe_switch_blocking_event;
 	sw->rules = kvcalloc(RTL_L2_FDB_ENTRIES, sizeof(*sw->rules), GFP_KERNEL);
+	sw->published = kvcalloc(RTL_L2_FDB_ENTRIES, sizeof(*sw->published), GFP_KERNEL);
 	sw->learned = kvcalloc(RTL_L2_FDB_ENTRIES, sizeof(*sw->learned), GFP_KERNEL);
 	sw->next = kvcalloc(RTL_L2_FDB_ENTRIES, sizeof(*sw->next), GFP_KERNEL);
-	if (!sw->rules || !sw->learned || !sw->next) {
+	sw->hw.rows = kvcalloc(FE_SW_SNAPSHOTS, sizeof(*sw->hw.rows), GFP_KERNEL);
+	row_index = kvcalloc(index_count, sizeof(*row_index), GFP_KERNEL);
+	if (!sw->rules || !sw->published || !sw->learned || !sw->next ||
+	    !sw->hw.rows || !row_index) {
 		ret = -ENOMEM;
 		goto fail;
 	}
+	ret = rtl_l2_journal_init(&sw->hw.journal, row_index, index_count,
+				  FE_SW_SNAPSHOTS);
+	if (ret)
+		goto fail;
 	ret = register_switchdev_notifier(&sw->atomic_nb);
 	if (ret)
 		goto fail;
@@ -1198,9 +1344,14 @@ fail:
 		unregister_switchdev_notifier(&sw->atomic_nb);
 	cancel_work_sync(&sw->work);
 	cancel_delayed_work_sync(&sw->scan_work);
+	if (!sw->hw.journal.row_index)
+		kvfree(row_index);
 	kvfree(sw->rules);
+	kvfree(sw->published);
 	kvfree(sw->learned);
 	kvfree(sw->next);
+	kvfree(sw->hw.rows);
+	kvfree(sw->hw.journal.row_index);
 	kfree(sw);
 	return ERR_PTR(ret);
 }
@@ -1212,11 +1363,31 @@ fail:
  */
 static int fe_bridge_stop(struct rtl_fe_bridge *sw)
 {
+	unsigned int port;
 	int ret;
 
 	if (!sw)
 		return 0;
+	/* The notifier keeps borrowed bridge/port pointers live until RTNL is
+	 * acquired. Do not stop that notifier first: a simultaneous unregister
+	 * could otherwise destroy the bridge FDB before cookie withdrawal.
+	 * Queued workers take RTNL too and will observe stopping after release.
+	 */
+	rtnl_lock();
 	WRITE_ONCE(sw->stopping, true);
+	mutex_lock(&sw->fe->lock);
+	fe_switch_gate(sw);
+	ret = fe_switch_restore_locked(sw);
+	mutex_unlock(&sw->fe->lock);
+	fe_switch_unoffload(sw);
+	for (port = 0; port < FE_LAN_PORTS; port++)
+		WRITE_ONCE(sw->ports[port], NULL);
+	WRITE_ONCE(sw->master, NULL);
+	rtnl_unlock();
+	/* Drain callbacks/work only outside RTNL and the FE mutex. Even an
+	 * uncertain hardware restore retains no borrowed device pointer: retry
+	 * needs the hardware journal and FDB keys, not a torn-down bridge.
+	 */
 	if (sw->guard.registered)
 		rtl9617c_switch_guard_unregister(&sw->guard);
 	if (sw->netdev_registered) {
@@ -1233,18 +1404,14 @@ static int fe_bridge_stop(struct rtl_fe_bridge *sw)
 	}
 	cancel_work_sync(&sw->work);
 	cancel_delayed_work_sync(&sw->scan_work);
-	rtnl_lock();
-	mutex_lock(&sw->fe->lock);
-	fe_switch_gate(sw);
-	ret = fe_switch_restore_locked(sw);
-	mutex_unlock(&sw->fe->lock);
-	fe_switch_unoffload(sw);
-	rtnl_unlock();
 	if (ret)
 		return ret;
 	kvfree(sw->rules);
+	kvfree(sw->published);
 	kvfree(sw->learned);
 	kvfree(sw->next);
+	kvfree(sw->hw.rows);
+	kvfree(sw->hw.journal.row_index);
 	kfree(sw);
 	return 0;
 }
@@ -1261,18 +1428,26 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 		"l2_supported=1 l2_requested=%u l2_active=%u l2_reason=%u "
 		"l2_hw_reason=%u l2_hw_reason_name=%s "
 		"l2_error=%d l2_ports=%#x l2_route_ports=%#x l2_domain_owned=%u "
-		"l2_flow_allowed=%u "
-		"l2_static=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
+		"l2_flow_allowed=%u l2_route_policy_allowed=%u "
+		"l2_static=%u l2_static_published=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
 		"l2_learn_adds=%llu l2_learn_deletes=%llu l2_scan_errors=%llu "
-		"l2_bum_hardware=0 l2_vlan_hardware=0 l2_local_target=%u "
-		"l2_retries=%u\n",
+		"l2_bum_hardware=0 l2_vlan_hardware=0 l2_mdb_hardware=0 "
+		"l2_multibridge_hardware=0 l2_local_target=%u l2_rx_gate_verified=%u "
+		"l2_learning_ports=%#x l2_isolated_ports=%#x "
+		"l2_journal_used=%u l2_journal_capacity=%u "
+		"l2_journal_quarantined=%u l2_retries=%u\n",
 		sw->requested, READ_ONCE(sw->active), sw->reason,
 		sw->hw.reason, fe_switch_hw_reason_name(&sw->hw), sw->error, sw->native_mask,
 		READ_ONCE(sw->armed_route_mask), sw->domain_owned,
-		READ_ONCE(sw->flow_allowed), READ_ONCE(sw->rule_count),
+		READ_ONCE(sw->flow_allowed), sw->route_policy_allowed,
+		READ_ONCE(sw->rule_count),
+		READ_ONCE(sw->published_count),
 		READ_ONCE(sw->learned_count), sw->rebuilds, sw->polls,
 		READ_ONCE(sw->learned_adds), READ_ONCE(sw->learned_deletes),
-		sw->scan_errors, sw->local_target, sw->retry_count);
+		sw->scan_errors, sw->local_target, READ_ONCE(sw->hw.rx_gate_verified),
+		sw->hw.learning_mask,
+		sw->hw.isolated_mask, sw->hw.count, sw->hw.journal.capacity,
+		sw->hw.journal.quarantined, sw->retry_count);
 	/* Read-only preflight evidence, not packet/FDB dumps: these are fixed
 	 * hardware configuration values and physical-port IDs, never addresses
 	 * learned from users or WAN/OMCI credentials. */
