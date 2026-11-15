@@ -117,8 +117,8 @@ static bool nft_is_valid_ether_device(const struct net_device *d){return d!=NULL
 static bool nft_flowtable_find_dev(const struct net_device *d,struct nft_flowtable *ft){(void)ft;return d!=NULL;}
 static int nft_dev_fill_forward_path(struct nf_flow_route *r,const struct dst_entry *d,const struct nf_conn *ct,unsigned dir,u8 *ha,struct net_device_path_stack *s){
  (void)r;(void)d;(void)ct;(void)dir;*s=path_stack;memset(ha,0,6);ha[5]=1;return 0;}
-static unsigned ip_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){(void)dst;(void)f;return 1500;}
-static unsigned ip6_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){return ip_dst_mtu_maybe_forward(dst,f);}
+static unsigned ip_dst_mtu_maybe_forward(const struct dst_entry *dst,bool f){(void)dst;(void)f;return 1500;}
+static unsigned ip6_dst_mtu_maybe_forward(const struct dst_entry *dst,bool f){return ip_dst_mtu_maybe_forward(dst,f);}
 static void dst_release(struct dst_entry *dst){assert(dst && dst->references);dst->references--;}
 static struct dst_entry *dst_rt6_info(struct dst_entry *dst){return dst;}
 static u32 rt6_get_cookie(struct dst_entry *dst){return dst->cookie;}
@@ -199,11 +199,21 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
         ppp_policy = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch'
         has_ppp = 'nf_flow_offload_ppp_prepare(' in (kernel / 'net/netfilter/nf_flow_table_offload.c').read_text()
         has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
-        copied = patch.read_text() + (ppp.read_text() if has_ppp else '') + (ppp_policy.read_text() if has_ppp_policy else '')
+        later = []
+        for marker, source, name in [
+            ('nf_flow_direct_mtu_valid(', 'net/netfilter/nf_flow_table_core.c', '227-flowtable-direct-mtu-lifetime.patch'),
+            ('route_mtu', 'include/net/flow_offload.h', '226-flowtable-route-mtu.patch'),
+        ]:
+            if marker in (kernel / source).read_text():
+                later.append(root / 'port/overlay/target/linux/rtl9617c/patches-6.18' / name)
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else '') + (ppp_policy.read_text() if has_ppp_policy else '') + ''.join(p.read_text() for p in later)
         for name in sorted(set(re.findall(r'^\+\+\+ b/(.+)$', copied, re.M))):
             target = work / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        for dependent in later:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(dependent)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
         if has_ppp_policy:
             subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(ppp_policy)],
                            cwd=work, check=True, stdout=subprocess.DEVNULL)
@@ -236,6 +246,8 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
     code += function(path, 'nft_dev_path_info') + function(path, 'nft_dev_forward_path')
     code += function(core, 'nft_route_dst_fetch') + function(core, 'flow_offload_fill_route')
     code += function(core, 'nft_flow_dst_release')
+    if 'static bool nf_flow_direct_mtu_valid(' in core:
+        code += function(core, 'nf_flow_direct_mtu_valid')
     if 'static bool nf_flow_direct_route_changed(' in core:
         code += function(core, 'nf_flow_direct_route_changed')
     if 'static bool nf_flow_bridge_changed(' in core:

@@ -12,9 +12,13 @@ root = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--kernel', type=Path,
                     help='Prepared kernel tree (default: OpenWrt build directory)')
+parser.add_argument('--revision', help='Historical native parser for a negative control')
 args = parser.parse_args()
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 native = (drivers / 'rtl9617c-fe.c').read_text()
+if args.revision:
+    native = subprocess.check_output(['git', 'show', args.revision + ':' +
+        str((drivers / 'rtl9617c-fe.c').relative_to(root))], cwd=root, text=True)
 kernel = args.kernel or Path(subprocess.check_output([
     'python3', str(root / 'port/tools/project_paths.py'),
     '--kernel-directory', str(root / 'sources/openwrt')], text=True).strip())
@@ -99,7 +103,7 @@ struct flow_rule {
  struct flow_dissector_key_eth_addrs eth,eth_mask;
  struct flow_action action;
 };
-struct flow_cls_offload {struct flow_rule *rule;};
+struct flow_cls_offload {struct flow_rule *rule;u16 route_mtu;};
 #define FLOW_MATCH(name,type) \
  struct flow_match_##name {struct flow_dissector_key_##type *key,*mask;};
 FLOW_MATCH(meta,meta)
@@ -204,12 +208,13 @@ int main(void)
     struct flow_rule rule={.used=15,.meta={.ingress_ifindex=dir?4:2},.meta_mask={.ingress_ifindex=-1},
      .basic={.n_proto=htons(ETH_P_IP),.ip_proto=protocol},.basic_mask={.n_proto=htons(65535),.ip_proto=255},
      .ipv4={t->src_v4.s_addr,t->dst_v4.s_addr},.ipv4_mask={~0U,~0U},.ports={t->src_port,t->dst_port},.ports_mask={65535,65535}};
-    struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule};
+    struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};
     struct rtl_fe_rule parsed={};
     assert(!flow_offload_ipv4_snat(NULL,&flow,dir,&nf));
     assert(!flow_offload_port_snat(NULL,&flow,dir,&nf));
     ethernet_actions(&nf,source,destination,dir?&lan:&pon);
     assert(!fe_parse(dir?&pp:&lp,&cls,&parsed));
+    assert(parsed.mtu==1500);
     assert(parsed.key.source==ntohl(t->src_v4.s_addr) && parsed.key.destination==ntohl(t->dst_v4.s_addr));
     assert(parsed.key.source_port==ntohs(t->src_port) && parsed.key.destination_port==ntohs(t->dst_port));
     assert(parsed.action.translate && parsed.action.translate_destination==dir);
@@ -231,7 +236,7 @@ int main(void)
     (1U<<FLOW_DISSECTOR_KEY_PORTS)|(1U<<FLOW_DISSECTOR_KEY_IPV6_ADDRS),
     .meta={.ingress_ifindex=direction?4:2},.meta_mask={.ingress_ifindex=-1},.basic={.n_proto=htons(ETH_P_IPV6),.ip_proto=protocol},
     .basic_mask={.n_proto=65535,.ip_proto=255},.ports={htons(53123),htons(443)},.ports_mask={65535,65535}};
-   struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule};
+   struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};
    struct rtl_fe_rule parsed={};
    for(unsigned int word=0;word<4;word++) {
     rule.ipv6.src.s6_addr32[word]=htonl(0x20010db8+word*37);
@@ -240,6 +245,7 @@ int main(void)
    }
    ethernet_actions(&nf,source,destination,direction?&lan:&pon);
    assert(!fe_parse(direction?&pp:&lp,&cls,&parsed) && parsed.ipv6 && !parsed.action.translate);
+   assert(parsed.mtu==1400);
    for(unsigned int word=0;word<4;word++) {
     assert(parsed.key6.source[word]==0x20010db8+word*37);
     assert(parsed.key6.destination[word]==0x20010db8+word*103+1);
@@ -258,7 +264,7 @@ int main(void)
       .basic={.n_proto=htons(ETH_P_IP),.ip_proto=protocol},.basic_mask={.n_proto=htons(65535),.ip_proto=255},
       .ipv4={htonl(0x0a172a01),htonl(0x74e46f76)},.ipv4_mask={~0U,~0U},
       .ports={htons(53000),htons(53)},.ports_mask={65535,65535}};
-     struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule};
+     struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};
      struct flow_offload flow={};struct rtl_fe_rule parsed={};
      unsigned int id=vector*4095/15;
      flow.tuplehash[0].tuple.encap_num=input;flow.tuplehash[1].tuple.encap_num=output;
@@ -276,6 +282,7 @@ int main(void)
      assert(!linux_vlan_actions(&flow,0,&nf));
      ethernet_actions(&nf,source,destination,&pon);
      assert(!fe_parse(&lp,&cls,&parsed));
+     assert(parsed.mtu==1400); /* Logical VLAN/route limit, not physical1500. */
      assert(parsed.vlan_count==input && parsed.action.vlan_count==output);
      assert(parsed.action.vlan_set==(input!=0||output!=0));
      assert(parsed.ethernet_bytes==14+4*output);
@@ -337,7 +344,7 @@ int main(void)
      .ports=match.key.tp,.ports_mask=match.mask.tp,
      .vlan=match.key.vlan,.vlan_mask=match.mask.vlan,
      .pppoe=match.key.pppoe,.pppoe_mask=match.mask.pppoe};
-    struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule};
+    struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule,.route_mtu=direction?1500:1492};
     struct rtl_fe_rule parsed={};unsigned int words[8];
     if(!ipv6) {
      assert(!flow_offload_ipv4_snat(NULL,&flow,direction,&nf));
@@ -351,7 +358,7 @@ int main(void)
     if(!ipv6)assert(parsed.action.address==(direction?0x0a172a01:0xc0a8471c));
     assert(parsed.pppoe_session==(direction?sid:0));
     assert(parsed.egress_pppoe==(direction?0:3U|sid<<2));
-    assert(parsed.mtu==(direction?0:1492));
+    assert(parsed.mtu==(direction?1500:1492));
     assert(parsed.ethernet_bytes==(direction?14:26));
     for(unsigned int llid=0;llid<32;llid++) {
      pp.llid=llid;pp.destination=32+llid;
@@ -387,6 +394,11 @@ int main(void)
     rtl_fe_ipv4_action(words,&parsed.action);
     assert(((words[190/32]>>(190%32))&1)==direction);
     assert(!((words[189/32]>>(189%32))&1));
+    if(!direction) {
+     /* A second, inconsistent MTU must not silently replace the route's. */
+     cls.route_mtu=1400;memset(&parsed,0,sizeof(parsed));
+     assert(fe_parse(&lp,&cls,&parsed)==-EOPNOTSUPP);
+    }
    }
 
  unsigned int bridge_cases=0;
@@ -448,7 +460,7 @@ int main(void)
  struct nf_flow_rule nf={.rule=&base};ethernet_actions(&nf,source,destination,&pon);
  for(unsigned int mutation=0;mutation<20;mutation++) {
   struct flow_rule rule=base;
-  struct flow_cls_offload cls={.rule=&rule};struct rtl_fe_rule parsed={};
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
   switch(mutation) {
   case 0:rule.used|=BIT(FLOW_DISSECTOR_KEY_IP);break;
   case 1:rule.meta_mask.ingress_ifindex=0;break;
@@ -482,14 +494,14 @@ int main(void)
   assert(parsed.reject_reason>FE_REJECT_UNSPECIFIED && parsed.reject_reason<FE_REJECT_COUNT);
  }
  for(unsigned int mask=0;mask<8;mask++) {
-  struct flow_rule rule=base;struct flow_cls_offload cls={.rule=&rule};struct rtl_fe_rule parsed={};
+  struct flow_rule rule=base;struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
   rule.used|=BIT(FLOW_DISSECTOR_KEY_TCP);rule.tcp_mask.flags=htons(mask);
   assert(!fe_parse(&lp,&cls,&parsed));
  }
  /* Insert a supported checksum action before REDIRECT without losing the
   * complete MAC rewrite; both nft TCP and UDP checksum builders are legal. */
  for(unsigned int udp=0;udp<2;udp++) {
-  struct flow_rule rule=base;struct flow_cls_offload cls={.rule=&rule};struct rtl_fe_rule parsed={};
+  struct flow_rule rule=base;struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
   rule.basic.ip_proto=udp?IPPROTO_UDP:IPPROTO_TCP;
   unsigned int n=rule.action.num_entries++;
   rule.action.entries[n]=rule.action.entries[n-1];
@@ -497,7 +509,15 @@ int main(void)
    .csum_flags=TCA_CSUM_UPDATE_FLAG_IPV4HDR|(udp?TCA_CSUM_UPDATE_FLAG_UDP:TCA_CSUM_UPDATE_FLAG_TCP)};
   assert(!fe_parse(&lp,&cls,&parsed));
  }
- printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, 8 bidirectional PPPoE and %u authorized bridge vectors; 20 widened-rule rejections, 8 TCP masks and valid checksum actions passed\n",cases,vlan_cases,bridge_cases);
+ unsigned int limits[]={0,1,68,576,1280,1400,1492,1500,0x3fff,0x4000,0xffff};
+ for(unsigned int i=0;i<sizeof(limits)/sizeof(limits[0]);i++) {
+  struct flow_rule rule=base;
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=limits[i]};
+  struct rtl_fe_rule parsed={};int ret=fe_parse(&lp,&cls,&parsed);
+  if(!limits[i] || limits[i]>0x3fff)assert(ret==-EOPNOTSUPP);
+  else assert(!ret && parsed.mtu==limits[i]);
+ }
+ printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, 8 bidirectional PPPoE and %u authorized bridge vectors; 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,bridge_cases);
 }
 '''
 

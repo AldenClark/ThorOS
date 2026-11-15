@@ -296,7 +296,9 @@ patches = ('220-l2-switchdev-policy-gate.patch',
            '222-flowtable-direct-route-validation.patch',
            '223-switch-policy-noop-events.patch',
            '224-ppp-channel-generation.patch',
-           '225-ppp-flow-policy-fence.patch')
+           '225-ppp-flow-policy-fence.patch',
+           '226-flowtable-route-mtu.patch',
+           '227-flowtable-direct-mtu-lifetime.patch')
 callers = {
     line.removeprefix('+++ b/').removesuffix('.c') + '.o'
     for patch in patches

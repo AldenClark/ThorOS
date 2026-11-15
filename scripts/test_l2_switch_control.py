@@ -67,10 +67,10 @@ struct work_struct {bool initialized,queued,cancelled;void (*callback)(struct wo
 struct delayed_work {struct work_struct work;};
 #define INIT_WORK(work,fn) do{(work)->initialized=true;(work)->callback=(fn);}while(0)
 #define INIT_DELAYED_WORK(delayed,fn) INIT_WORK(&(delayed)->work,fn)
-struct rtl9617c_switch_guard {struct list_head list;bool registered;void *owner;};
-struct rtl_fe_switch_hw {bool owned;};
+struct rtl9617c_switch_guard {struct list_head list;bool registered,blocked;u64 generation;void *owner;};
+struct rtl_fe_switch_hw {bool owned,globals_owned,prepared;unsigned count;};
 struct rtl_fe_bridge;
-struct rtl_fe {bool lock,shutting_down;struct rtl_fe_bridge *bridge;};
+struct rtl_fe {bool lock,shutting_down,engine_ready;int error;unsigned pending_withdrawals;struct rtl_fe_bridge *bridge;};
 struct switchdev_notifier_info {struct net_device *dev;const void *ctx;};
 enum {NETDEV_UP=1,NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_CHANGE,NETDEV_CHANGEADDR,
  NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_UNREGISTER,NETDEV_PRECHANGEUPPER};
@@ -153,6 +153,8 @@ static void rtl9617c_switch_guard_unregister(struct rtl9617c_switch_guard *guard
 static void rtl9617c_switch_guard_invalidate(struct rtl9617c_switch_guard *guard){
  assert(guard==&live->guard && guard->registered);invalidates++;
 }
+static bool rtl9617c_switch_guard_blocked(struct rtl9617c_switch_guard *guard){return guard->blocked;}
+static u64 rtl9617c_switch_guard_generation(struct rtl9617c_switch_guard *guard){return guard->generation;}
 static bool queue_work(unsigned int queue,struct work_struct *work){
  assert(queue==system_long_wq && work->initialized && live && !live->stopping);
  queues++;bool idle=!work->queued;work->queued=true;return idle;
@@ -169,7 +171,11 @@ static void mutex_lock(bool *lock){assert(!*lock);*lock=true;}
 static void mutex_unlock(bool *lock){assert(*lock);*lock=false;}
 static void fe_switch_gate(void *private){assert(private==live && fe.lock && rtnl_held);live->active=false;gates++;}
 static int fe_switch_restore_locked(struct rtl_fe_bridge *sw){assert(sw==live && fe.lock && rtnl_held);restores++;return restore_error;}
-static int fe_switch_quiesce_locked(struct rtl_fe *owner){assert(owner==&fe && fe.lock && rtnl_held);gates++;return restore_error;}
+static int fe_switch_quiesce_locked(struct rtl_fe *owner){
+ assert(owner==&fe && fe.lock && rtnl_held);gates++;
+ if(restore_error){live->error=restore_error;live->reason=FE_SWITCH_IO_ERROR;}
+ return restore_error;
+}
 static void fe_switch_unoffload(struct rtl_fe_bridge *sw){assert(sw==live && !fe.lock && rtnl_held);unoffloads++;sw->offloaded=0;}
 static void reset(void){
  assert(!live);memset(&fe,0,sizeof(fe));memset(allocations,0,sizeof(allocations));memset(registered,0,sizeof(registered));
@@ -285,8 +291,74 @@ static void netdev_notifications(void){
  rtnl_unlock();restore_error=0;
  assert(!fe_bridge_stop(sw) && !live && freed==4);cases++;
 }
-int main(void){construction_and_stop();notifier_and_replay();netdev_notifications();
- printf("Native switch production control: %u allocation/registration/stop/replay/early-down scenarios; 2048 ordinary-learning notifications do not rebuild; quarantine retains owners and cancels every callback before free PASS\n",cases);return 0;}
+static void request_snapshot(struct rtl_fe_bridge *sw,bool requested){
+ fe.error=0;fe.pending_withdrawals=0;fe.shutting_down=false;fe.engine_ready=true;
+ sw->requested=requested;sw->stopping=sw->replaying=false;
+ sw->error=sw->replay_error=0;sw->guard.blocked=false;
+ sw->route_generation_valid=true;sw->route_generation=sw->guard.generation=7;
+ sw->active=sw->domain_owned=sw->hw.globals_owned=sw->hw.prepared=requested;
+ sw->native_mask=sw->offloaded=requested?7:0;sw->hw.count=requested?23:0;
+ sw->learned_count=sw->pending_count=0;restore_error=0;
+}
+static void repeated_requests(void){
+ reset();assert(fe_switch_request_locked(&fe,true)==-EOPNOTSUPP);
+ struct rtl_fe_bridge *sw=fe_bridge_start(&fe);assert(!IS_ERR(sw));fe.bridge=sw;
+ rtnl_lock();mutex_lock(&fe.lock);
+ for(unsigned request=0;request<2;request++){
+  request_snapshot(sw,request);unsigned before_gates=gates,before_queues=queues;
+  for(unsigned n=0;n<100;n++)assert(!fe_switch_request_locked(&fe,request));
+  assert(gates==before_gates && queues==before_queues);cases++;
+  /* Every pending/error/epoch condition must still reach reconciliation,
+   * including capability fallback which ordinary FE mode writes ignore. */
+  for(unsigned condition=0;condition<14;condition++){
+   request_snapshot(sw,request);
+   switch(condition){
+    case 0:sw->error=-EIO;break;
+    case 1:sw->error=-EOPNOTSUPP;sw->reason=FE_SWITCH_HW_UNSUPPORTED;break;
+    case 2:sw->error=-EEXIST;sw->reason=FE_SWITCH_FOREIGN_FDB;break;
+    case 3:fe.error=-EIO;break;
+    case 4:sw->route_generation_valid=false;break;
+    case 5:sw->guard.generation++;break;
+    case 6:sw->guard.blocked=true;break;
+    case 7:sw->replaying=true;break;
+    case 8:sw->replay_error=-ENOSPC;break;
+    case 9:fe.engine_ready=false;break;
+    case 10:fe.shutting_down=true;break;
+    case 11:sw->active=!request;break;
+    case 12:sw->native_mask=request?0:7;break;
+    case 13:fe.pending_withdrawals=1;break;
+   }
+   before_gates=gates;before_queues=queues;
+   assert(!fe_switch_request_locked(&fe,request));
+   assert(queues==before_queues+1 && gates==before_gates+!request);cases++;
+  }
+ }
+ /* Each retained-off owner prevents a false clean no-op independently. */
+ for(unsigned dirty=0;dirty<8;dirty++){
+  request_snapshot(sw,false);
+  switch(dirty){
+   case 0:sw->offloaded=1;break;case 1:sw->domain_owned=true;break;
+   case 2:sw->hw.globals_owned=true;break;case 3:sw->hw.prepared=true;break;
+   case 4:sw->hw.count=1;break;case 5:sw->learned_count=1;break;
+   case 6:sw->pending_count=1;break;case 7:sw->native_mask=1;break;
+  }
+  unsigned before_gates=gates,before_queues=queues;
+  assert(!fe_switch_request_locked(&fe,false));
+  assert(gates==before_gates+1 && queues==before_queues+1);cases++;
+ }
+ /* An uncertain synchronous disable remains retryable on the same value. */
+ request_snapshot(sw,true);restore_error=-ETIMEDOUT;
+ assert(fe_switch_request_locked(&fe,false)==-ETIMEDOUT && !sw->requested && sw->error==-ETIMEDOUT);
+ unsigned before_gates=gates,before_queues=queues;restore_error=0;
+ assert(!fe_switch_request_locked(&fe,false));
+ assert(gates==before_gates+1 && queues==before_queues+1);cases++;
+ request_snapshot(sw,false);before_gates=gates;before_queues=queues;
+ assert(!fe_switch_request_locked(&fe,true) && sw->requested && gates==before_gates && queues==before_queues+1);cases++;
+ mutex_unlock(&fe.lock);rtnl_unlock();
+ assert(!fe_bridge_stop(sw) && !live && freed==4);
+}
+int main(void){construction_and_stop();notifier_and_replay();netdev_notifications();repeated_requests();
+ printf("Native switch production control: %u lifetime/replay/request scenarios; 2048 learning notifications and 200 healthy same-value requests do not rebuild; error/epoch/dirty ownership retries preserved PASS\n",cases);return 0;}
 '''
 
 definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
@@ -295,7 +367,8 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_queue", "fe_switch_port_index", "fe_switch_replay_fdb",
+    "fe_switch_queue", "fe_switch_reconcile_locked", "fe_switch_request_current", "fe_switch_request_locked",
+    "fe_switch_port_index", "fe_switch_replay_fdb",
     "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_switch_netdev_event", "fe_bridge_start", "fe_bridge_stop",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
@@ -310,6 +383,9 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-control.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),
-    "scope": "production constructor/destructor, notifier filtering and static replay; workqueue/HW operations stubbed",
+    "scope": "production constructor/destructor, notifier filtering, static replay and same-value requests; workqueue/HW operations stubbed",
+    "healthy_same_value_requests_without_rebuild": 200,
+    "request_health_and_recovery_scenarios": 40,
+    "error_generation_and_retained_owner_retries": True,
     "hardware_verified": False,
 }, indent=2) + "\n")

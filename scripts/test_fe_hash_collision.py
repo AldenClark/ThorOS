@@ -64,14 +64,16 @@ static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,w
 static int fe_source_get(struct rtl_fe *f,const u8 *a,unsigned int *i){(void)f;(void)a;*i=0;return 0;}
 static int fe_destination_get(struct rtl_fe *f,struct rtl_fe_flow *v,const u8 *a){(void)f;(void)a;v->destination_index=1;v->destination_owned=true;return 0;}
 static int fe_interface_get(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;v->counter=1;v->interface_owned=true;return 0;}
-static int fe_mtu_get(struct rtl_fe *f,struct rtl_fe_flow *v,unsigned int size){(void)f;(void)v;(void)size;return 0;}
+/* Actual MTU pool ownership is tested separately by test_fe_mtu. Select a
+ * nonzero slot here so production install/packing cannot pass by default. */
+static int fe_mtu_get(struct rtl_fe *f,struct rtl_fe_flow *v,unsigned int size){(void)f;assert(size==1400);v->mtu_owned=true;v->mtu_index=9;return 0;}
 static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;assert(!"unexpected rollback");return 0;}
 '''
 fixture+=symbol('fe_install')+r'''
 int main(void){
  struct rtl_fe f={.enabled=true,.fabric_authorized=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
  struct net_device n={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q=p;
- struct rtl_fe_rule a={.input=&p,.output=&q,.pppoe_input=true,.pppoe_session=1234,
+ struct rtl_fe_rule a={.input=&p,.output=&q,.mtu=1400,.pppoe_input=true,.pppoe_session=1234,
   .key={.source=0x0a000001,.destination=0xc6336401,.source_port=10000,.destination_port=443,.protocol=6,.ingress=7,.llid=1,.mask=63},
   .action={.translate=1,.translate_destination=1,.address=0x0a000064,.destination=3,.check_mask=63}};
  struct rtl_fe_rule b=a;b.key.source=0x0ab82e30;b.key.destination=0xc63364cf;b.key.source_port=8894;b.action.address=0x0a0000c8;
@@ -93,6 +95,9 @@ int main(void){
  assert(!fe_install(&p,a,1));int ret=fe_install(&p,b,2);
  const unsigned int *ddr=f.memory;
  assert(ddr[16416]==0x07b0aa2b);
+ const unsigned int *action=(void *)((char *)f.memory+RTL_FE_ACTION_OFFSET+16416*RTL_FE_ACTION_BYTES);
+ assert((action[207/32]>>(207%32))&1);
+ assert(((action[208/32]>>(208%32))&15)==9);
  assert(ret==-EOPNOTSUPP && !ddr[16417]);
  assert(!traversed); /* The ordinary insertion path must not scan all flows. */
  /* Once deletion has cleared the DDR key, a timed-out cache invalidation

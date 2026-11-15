@@ -38,11 +38,21 @@ if args.before and "flow_offload_refresh_bridge" in offload:
         ppp_policy = root / "port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch"
         has_ppp = "nf_flow_offload_ppp_prepare(" in offload
         has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
-        copied = patch.read_text() + (ppp.read_text() if has_ppp else "") + (ppp_policy.read_text() if has_ppp_policy else "")
+        later = []
+        for marker, source, name in [
+            ("nf_flow_direct_mtu_valid(", "net/netfilter/nf_flow_table_core.c", "227-flowtable-direct-mtu-lifetime.patch"),
+            ("route_mtu", "include/net/flow_offload.h", "226-flowtable-route-mtu.patch"),
+        ]:
+            if marker in (kernel / source).read_text():
+                later.append(root / "port/overlay/target/linux/rtl9617c/patches-6.18" / name)
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else "") + (ppp_policy.read_text() if has_ppp_policy else "") + "".join(p.read_text() for p in later)
         for name in sorted(set(re.findall(r"^\+\+\+ b/(.+)$", copied, re.M))):
             target = before / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        for dependent in later:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(dependent)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
         if has_ppp_policy:
             subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(ppp_policy)],
                            cwd=before, check=True, stdout=subprocess.DEVNULL)

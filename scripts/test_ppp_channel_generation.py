@@ -75,6 +75,7 @@ typedef uint8_t u8; typedef uint16_t u16,__u16,__be16; typedef uint32_t u32;
 #define ETH_ALEN 6
 #define ARPHRD_ETHER 1
 #define ARPHRD_PPP 512
+#define NFPROTO_IPV4 2
 #define NFPROTO_IPV6 10
 #define NF_FLOW_OFFLOAD_ROUTE 1
 #define NF_FLOW_TABLE_ENCAP_MAX 2
@@ -159,6 +160,8 @@ struct neighbour {u8 ha[6],nud_state;int lock;};
 #define NUD_VALID 0xde
 struct dst_entry {struct net_device *dev;bool valid;struct neighbour *neigh;};
 static struct dst_entry *dst_check(struct dst_entry *d,u32 c){(void)c;return d&&d->valid?d:NULL;}
+static unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *d,bool forwarding){assert(d&&forwarding);return 1500;}
+static unsigned int ip6_dst_mtu_maybe_forward(const struct dst_entry *d,bool forwarding){return ip_dst_mtu_maybe_forward(d,forwarding);}
 static struct neighbour *dst_neigh_lookup(struct dst_entry *d,const void *a){(void)a;return d->neigh;}
 #define read_lock_bh(l) ((void)(l))
 #define read_unlock_bh(l) ((void)(l))
@@ -216,6 +219,7 @@ static void worker_rearm(void){mutex_lock(&hardware.lock);hw_rule=false;rearm();
 PRODUCTION = "\n".join([
     function(flow_offload, "flow_cls_offload_ppp_valid"),
     function(path, "nft_dev_forward_path"), function(xt, "nf_dev_forward_path"),
+    function(core, "nf_flow_direct_mtu_valid"),
     function(core, "nf_flow_direct_route_changed"), function(core, "nf_flow_direct_neigh_valid"),
     function(offload, "nf_flow_offload_ppp_release"), function(offload, "nf_flow_offload_ppp_prepare"),
     function(fe, "fe_block_callback"),
@@ -226,7 +230,7 @@ static unsigned int cases;
 struct stress {struct channel channel;struct ppp_channel backend;};
 static void *writer(void *data){struct stress *s=data;for(unsigned int i=0;i<500;i++){assert(!ppp_connect_channel(&s->channel,1));assert(!ppp_disconnect_channel(&s->channel));}return NULL;}
 static void *add(void *data){int ret=fe_block_callback(TC_SETUP_CLSFLOWER,data,&hardware_port);assert(!ret);return NULL;}
-static void flow_init(struct flow_offload *f,struct dst_entry *d){memset(f,0,sizeof(*f));f->type=NF_FLOW_OFFLOAD_ROUTE;for(int i=0;i<2;i++){f->tuplehash[i].tuple.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT;f->tuplehash[i].tuple.out.route_dst=d;f->tuplehash[i].tuple.out.ppp_cookie=netdev_ppp_path_cookie(&device);}}
+static void flow_init(struct flow_offload *f,struct dst_entry *d){memset(f,0,sizeof(*f));f->type=NF_FLOW_OFFLOAD_ROUTE;for(int i=0;i<2;i++){f->tuplehash[i].tuple.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT;f->tuplehash[i].tuple.l3proto=NFPROTO_IPV4;f->tuplehash[i].tuple.mtu=1500;f->tuplehash[i].tuple.out.route_dst=d;f->tuplehash[i].tuple.out.ppp_cookie=netdev_ppp_path_cookie(&device);}}
 int main(void){
  setup();init_lock(&hardware.lock);
  struct channel c;struct ppp_channel driver={0};channel_init(&c,&driver);

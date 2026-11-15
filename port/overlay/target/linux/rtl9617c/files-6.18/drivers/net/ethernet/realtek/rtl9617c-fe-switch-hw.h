@@ -773,12 +773,23 @@ static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			    unsigned int native, unsigned int route)
 {
 	unsigned int port, value;
+	bool withdrawing = READ_ONCE(fe->pending_withdrawals);
 
 	if ((native | route) & ~FE_SW_LAN_MASK || (native & route) ||
 	    (native && (!READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
 			native != hw->ports)) ||
 	    (route && (!READ_ONCE(fe->enabled) || !READ_ONCE(fe->prepared))))
 		return false;
+	/* Disabling routes in software is not proof that an uncertain cached
+	 * action cannot still execute. Verify the CPU-only L3 gate BEFORE any
+	 * native/RX selector opens, even after a failed disable set enabled=0.
+	 * A verified gate preserves independent LAN switching while withdrawal
+	 * retries continue. The FE mutex keeps this latch stable during arm.
+	 */
+	if (withdrawing && !fe_route_arm(fe)) {
+		fe_switch_hw_gate(fe, hw);
+		return false;
+	}
 	if (native) {
 		/* Prepared, drained, static FDB replayed; learning is enabled only
 		 * immediately before opening native ingress. No indirect MMIO. */
@@ -796,7 +807,7 @@ static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		fe_write(fe, FE_LAN_RX_CTRL(port), value);
 	}
 	fe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));
-	if (READ_ONCE(fe->enabled) && READ_ONCE(fe->prepared)) {
+	if (!withdrawing && READ_ONCE(fe->enabled) && READ_ONCE(fe->prepared)) {
 		if (!fe_route_arm(fe)) {
 			fe_switch_hw_gate(fe, hw);
 			return false;

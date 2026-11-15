@@ -566,16 +566,39 @@ static int rtl_poll(struct napi_struct *napi, int budget)
 	return packets;
 }
 
+/* tx_lock held with local IRQs disabled. Only a stopped/busy producer needs
+ * an earlier completion poll: normal idle traffic must not keep restarting
+ * the timer or turn the idle interval into permanent one-millisecond work.
+ * A running callback whose deadline has expired will see wake_pending under
+ * this same lock. If it already forwarded to an idle deadline, starting the
+ * timer here safely queues the earlier expiry while that callback finishes.
+ * No synchronous cancellation is allowed under tx_lock.
+ */
+static void rtl_tx_timer_kick_locked(struct rtl_xram *priv)
+{
+	ktime_t fast = ms_to_ktime(1);
+
+	if (!priv->host_active || priv->removing || priv->engine_poisoned)
+		return;
+	if (!hrtimer_active(&priv->timer) ||
+	    ktime_compare(hrtimer_get_remaining(&priv->timer), fast) > 0)
+		hrtimer_start(&priv->timer, fast, HRTIMER_MODE_REL);
+}
+
 static enum hrtimer_restart rtl_timer(struct hrtimer *timer)
 {
 	struct rtl_xram *priv = container_of(timer, struct rtl_xram, timer);
 	unsigned int interval = READ_ONCE(priv->idle_poll_ms);
 
+	spin_lock(&priv->tx_lock);
+	if (!priv->host_active || priv->removing || priv->engine_poisoned) {
+		spin_unlock(&priv->tx_lock);
+		return HRTIMER_NORESTART;
+	}
 	if (!priv->qm_rx || READ_ONCE(priv->qm.refill.pending)) {
 		napi_schedule(&priv->napi);
 		interval = 1;
 	}
-	spin_lock(&priv->tx_lock);
 	if (priv->dma_tx) {
 		struct rtl9617c_ni_endpoint *endpoint;
 		bool wake;
@@ -608,12 +631,16 @@ static enum hrtimer_restart rtl_timer(struct hrtimer *timer)
 	}
 	if (priv->tx_pending)
 		interval = 1;
-	spin_unlock(&priv->tx_lock);
 	if (interval == 1)
 		priv->timer_fast_ticks++;
 	else
 		priv->timer_idle_ticks++;
+	/* Serialize choosing/publishing this deadline with a BUSY kick. An
+	 * unlock before forwarding could overwrite a new fast expiry with the
+	 * stale idle interval (and forward an already re-enqueued timer).
+	 */
 	hrtimer_forward_now(timer, ms_to_ktime(interval));
+	spin_unlock(&priv->tx_lock);
 	return HRTIMER_RESTART;
 }
 
@@ -656,6 +683,8 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 		};
 		netdev_tx_t result = rtl_dma_tx_frame(&priv->dma, skb, dev, &frame);
 
+		if (result == NETDEV_TX_BUSY)
+			rtl_tx_timer_kick_locked(priv);
 		spin_unlock_irqrestore(&priv->tx_lock, flags);
 		return result;
 	}
@@ -814,6 +843,12 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->host_active, true);
 	rtl_pon_host_gate(priv, true);
+	/* PON recovery can transmit independently of RTNL as soon as this
+	 * owner is visible. Publish the first timer under the same lock as
+	 * BUSY kicks and callback forwarding; a later unlocked initial start
+	 * could otherwise re-enqueue the timer while its callback advances it.
+	 */
+	hrtimer_start(&priv->timer, ms_to_ktime(1), HRTIMER_MODE_REL);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	if (priv->qm_rx) {
 		spin_lock_irqsave(&priv->rx_lock, flags);
@@ -824,7 +859,6 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	/* A retained EPP can already contain packets when IRQs are rearmed.
 	 * Poll explicitly instead of depending on a new interrupt edge. */
 	napi_schedule(&priv->napi);
-	hrtimer_start(&priv->timer, ms_to_ktime(1), HRTIMER_MODE_REL);
 	return 0;
 
 poison:
@@ -994,6 +1028,8 @@ netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 		return NETDEV_TX_OK;
 	}
 	result = rtl_dma_tx_frame(&priv->dma, skb, owner, frame);
+	if (result == NETDEV_TX_BUSY)
+		rtl_tx_timer_kick_locked(priv);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	return result;
 }

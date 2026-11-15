@@ -60,9 +60,11 @@ python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py
 python3 scripts/test_dma_tx_fastpath.py
 python3 scripts/test_ni_adaptive_timer.py
+python3 scripts/test_ni_timer_deadlines.py --mutants
 python3 scripts/test_rx_checksum_policy.py
 python3 scripts/test_rx_shutdown.py
 python3 scripts/test_fe_interface_capacity.py
+python3 scripts/test_fe_mtu.py
 python3 scripts/test_fe_flow_release.py
 python3 scripts/test_fe_flow_stats.py
 python3 scripts/test_fe_cleanup_isolation.py

@@ -108,6 +108,7 @@ struct rtl_fe_flow {
  bool destination_created, destination_ready;
  bool mtu_owned;
  bool published, source_owned, destination_owned, interface_owned, counted, installed, deleting;
+ bool withdrawal_pending;
  u8 destination[ETH_ALEN];
  u64 bytes;
  u32 packets;
@@ -148,6 +149,10 @@ struct rtl_fe {
  /* NI stop/start must not confuse requested policy with live ASIC state. */
  bool engine_ready, shutting_down;
  bool route_gate_ready, route_admitted, dma_exposed;
+ bool route_gate_verified;
+ /* fe->lock owns this count and each flow's withdrawal_pending flag.
+  * The generation-checked arm holds that mutex before route_lock. */
+ unsigned int pending_withdrawals;
  /* prepared owns the pre-write snapshot; base_ready is only published
   * after every base table/profile has been installed. An exposed partial
   * setup is not a reusable CPU path and is quarantined until reboot. */
@@ -265,9 +270,13 @@ static bool fe_route_select_locked(struct rtl_fe *fe, unsigned int profile)
 static void fe_route_gate(struct rtl_fe *fe)
 {
  unsigned long flags;
+ bool gated=false;
 
  spin_lock_irqsave(&fe->route_lock,flags);
- if(fe->route_gate_ready)fe_route_select_locked(fe,1);
+ if(fe->route_gate_ready)gated=fe_route_select_locked(fe,1);
+ /* No software admission is not proof that both hardware selectors
+  * accepted the gate. Keep readback failure observable independently. */
+ WRITE_ONCE(fe->route_gate_verified,gated);
  WRITE_ONCE(fe->route_admitted,false);
  spin_unlock_irqrestore(&fe->route_lock,flags);
 }
@@ -276,17 +285,23 @@ static void fe_route_gate(struct rtl_fe *fe)
 static bool fe_route_arm(struct rtl_fe *fe)
 {
  unsigned long flags;
- bool admitted=false, safe=true;
+ bool admitted=false, gated=false, safe=true;
 
  spin_lock_irqsave(&fe->route_lock,flags);
- if(!fe->enabled) {
-  if(fe->route_gate_ready)safe=fe_route_select_locked(fe,1);
+ if(!fe->enabled || fe->pending_withdrawals) {
+  if(fe->route_gate_ready)gated=safe=fe_route_select_locked(fe,1);
+  else if(fe->pending_withdrawals)safe=false;
+  /* A failed published-flow withdrawal may have left a cached action.
+   * Never admit routes while ANY such owner remains, including after an
+   * unrelated policy reconcile or a same-mode enable request. A verified
+   * CPU-only L3 gate still permits independent native LAN switching. */
  } else if(fe->prepared && fe->route_gate_ready &&
            fe->engine_ready && !fe->shutting_down) {
   admitted=fe_route_select_locked(fe,0);
-  if(!admitted)fe_route_select_locked(fe,1);
+  if(!admitted)gated=fe_route_select_locked(fe,1);
   safe=admitted;
  } else safe=false;
+ WRITE_ONCE(fe->route_gate_verified,gated);
  WRITE_ONCE(fe->route_admitted,admitted);
  spin_unlock_irqrestore(&fe->route_lock,flags);
  return safe;
@@ -450,6 +465,7 @@ static int fe_prepare(struct rtl_fe *fe)
  spin_lock_irqsave(&fe->route_lock,flags);
  fe->route_gate_ready=true;
  ret=fe_route_select_locked(fe,1)?0:-EIO;
+ fe->route_gate_verified=!ret;
  fe->route_admitted=false;
  spin_unlock_irqrestore(&fe->route_lock,flags);
  if(ret)return ret;
@@ -508,6 +524,7 @@ static int fe_restore(struct rtl_fe *fe)
   * LAN admission remains CPU-only throughout this ownership handoff. */
  spin_lock_irqsave(&fe->route_lock,flags);
  fe->route_gate_ready=false;
+ fe->route_gate_verified=false;
  fe->route_admitted=false;
  spin_unlock_irqrestore(&fe->route_lock,flags);
  for(i=0;i<3;i++) {
@@ -659,6 +676,7 @@ static int fe_mtu_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,unsigned int si
  unsigned int i,index=16,address,shift,value;
  struct rtl_fe_mtu *mtu;
 
+ if(!size || size>0x3fff)return -EOPNOTSUPP;
  for(i=0;i<16;i++) {
   if(fe->mtus[i].users && fe->mtus[i].size==size){index=i;break;}
   if(!fe->mtus[i].users && index==16)index=i;
@@ -690,12 +708,19 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  struct rtl_dq_io io=fe_io(fe);
  struct rtl_fe_flow *other;
  unsigned int words[4],result;
+ bool retiring=false;
  int ret;
 
  ether_addr_copy(flow->destination,address);
  list_for_each_entry(other,&fe->flows,list)
   if(other!=flow && other->destination_owned && ether_addr_equal(other->destination,address)) {
-   if(!other->destination_ready || other->deleting)return -EBUSY;
+   if(!other->destination_ready)return -EBUSY;
+   /* A failed hash/cache withdrawal does not invalidate a shared, ready
+    * DA row. A later live owner may still authorize sharing it. Do not
+    * let list order turn one retiring flow into a gateway-wide veto.
+    * An uncertain FDB writer above, or ONLY retiring owners below, must
+    * still block reuse and any new APPEND until cleanup completes. */
+   if(other->deleting){retiring=true;continue;}
    flow->destination_index=other->destination_index;
    memcpy(flow->destination_saved,other->destination_saved,sizeof(flow->destination_saved));
    flow->destination_created=other->destination_created;
@@ -703,6 +728,7 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
    flow->destination_ready=true;
    return 0;
   }
+ if(retiring)return -EBUSY;
  rtl_fe_fdb_key(words,address);
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
@@ -935,6 +961,12 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   if(ret)return ret;
   goto itu_paths;
  }
+ /* All routed actions need their logical L3 limit, including plain
+  * Ethernet/VLAN and PPPoE decapsulation. A physical egress MTU or the
+  * bootloader's default MTU slot cannot stand in for the route metric. */
+ data->reject_reason=FE_REJECT_ACTION;
+ if(!cls->route_mtu || cls->route_mtu>0x3fff)return -EOPNOTSUPP;
+ data->mtu=cls->route_mtu;
  /* Never silently drop match predicates. In particular, an IP TOS/TTL,
   * tunnel, connection-state or arbitrary TCP flag restriction cannot be
   * widened into this fixed five-tuple hardware template. */
@@ -1044,10 +1076,9 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
 
   switch(act->id) {
   case FLOW_ACTION_PPPOE_PUSH:
-   if(data->egress_pppoe || !act->pppoe.sid || !act->pppoe.mtu ||
-      act->pppoe.mtu>0x3fff)return -EOPNOTSUPP;
+   if(data->egress_pppoe || !act->pppoe.sid ||
+      act->pppoe.mtu!=data->mtu)return -EOPNOTSUPP;
    data->egress_pppoe=3U|((unsigned int)act->pppoe.sid<<2);
-   data->mtu=act->pppoe.mtu;
    break;
   case FLOW_ACTION_VLAN_POP:
    if(!output_vlan_count)return -EOPNOTSUPP;
@@ -1152,6 +1183,40 @@ itu_paths:
  return 0;
 }
 
+/* Resource quarantine alone cannot stop a stale hardware route. An age or
+ * cache timeout leaves publication uncertain: close both L3 connectors
+ * until every affected owner has a verified withdrawal. Neither failure
+ * to restore an already retired EIF/CAM nor native L2 needs this latch. */
+static void fe_withdrawal_failed(struct rtl_fe *fe,struct rtl_fe_flow *flow)
+{
+ bool expedite=false;
+
+ if(!flow->withdrawal_pending) {
+  flow->withdrawal_pending=true;
+  expedite=!fe->pending_withdrawals && fe->cleanup_delay>HZ;
+  fe->pending_withdrawals++;
+ }
+ /* Retry direct gating as well if a previous selector write did not
+  * read back. A failed gate cannot prove traffic isolation; keep the
+  * owner quarantined and expose route_gate_verified=0 in that case. */
+ fe_route_gate(fe);
+ /* A new route fault must not inherit up to32 seconds of EIF/CAM-only
+  * backoff. Expedite only the0->1 transition; repeated callbacks/another
+  * pending owner must not continually reset or postpone the timer. */
+ if(expedite && !fe->shutting_down) {
+  fe->cleanup_delay=HZ;
+  mod_delayed_work(system_wq,&fe->cleanup_work,HZ);
+ }
+}
+
+static void fe_withdrawal_completed(struct rtl_fe *fe,struct rtl_fe_flow *flow)
+{
+ if(!flow->withdrawal_pending)return;
+ flow->withdrawal_pending=false;
+ if(!--fe->pending_withdrawals && !fe->shutting_down)
+  fe_switch_reconcile_locked(fe);
+}
+
 static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 {
  struct rtl_dq_io io=fe_io(fe);
@@ -1172,6 +1237,7 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
   if(ret)goto retry;
   flow->published=false;
  }
+ fe_withdrawal_completed(fe,flow);
  if(flow->destination_owned) {
   ret=fe_destination_put(fe,flow);
   if(ret)goto retry;
@@ -1197,6 +1263,7 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  kfree(flow);
  return 0;
 retry:
+ if(flow->published)fe_withdrawal_failed(fe,flow);
  /* Keep the cookie reserved until every hardware owner is released. */
  if(list_empty(&flow->retry))list_add_tail(&flow->retry,&fe->retries);
  /* Repeated failed callbacks must not postpone an already queued retry. */
@@ -1207,8 +1274,9 @@ retry:
 static void fe_cleanup_work(struct work_struct *work)
 {
  struct rtl_fe *fe=container_of(to_delayed_work(work),struct rtl_fe,cleanup_work);
- struct rtl_fe_flow *flow;
+ struct rtl_fe_flow *flow,*candidate;
  unsigned int budget=8;
+ bool was_pending;
  int ret;
 
  mutex_lock(&fe->lock);
@@ -1218,9 +1286,25 @@ static void fe_cleanup_work(struct work_struct *work)
   * release gets a turn. Never recycle its hash/EIF/CAM before withdrawal. */
  while(budget-- && !list_empty(&fe->retries)) {
   flow=list_first_entry(&fe->retries,struct rtl_fe_flow,retry);
+  /* Only uncertain publication holds the global route gate. An unrelated
+   * post-withdrawal EIF/CAM timeout must not make a recovered hash wait
+   * behind its long resource-only backoff. Failed pending owners still
+   * rotate fairly; the normal resource queue resumes once they retire. */
+  if(fe->pending_withdrawals)
+   list_for_each_entry(candidate,&fe->retries,retry)
+    if(candidate->withdrawal_pending){flow=candidate;break;}
+  was_pending=flow->withdrawal_pending;
   ret=fe_delete(fe,flow);
   if(ret) {
    list_move_tail(&flow->retry,&fe->retries);
+   /* Successful hash/cache retirement is progress even if restoring
+    * this owner's EIF/CAM fails afterwards. Let another still-published
+    * owner use the remaining budget instead of inheriting that failure's
+    * backoff. An actual publication failure still stops this batch. */
+   if(was_pending && !flow->withdrawal_pending && fe->pending_withdrawals) {
+    fe->cleanup_delay=HZ;
+    continue;
+   }
    fe->cleanup_delay=fe->cleanup_delay?min(fe->cleanup_delay*2,32U*HZ):HZ;
    break;
   }
@@ -2363,8 +2447,9 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   "engine_ready=%u requested_mode=%u shutting_down=%u\n",
   fe->engine_ready,fe->desired_mode,fe->shutting_down);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
-  "route_gate_ready=%u route_admitted=%u dma_exposed=%u\n",
-  READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted),fe->dma_exposed);
+  "route_gate_ready=%u route_admitted=%u route_gate_verified=%u route_withdrawals_pending=%u dma_exposed=%u\n",
+  READ_ONCE(fe->route_gate_ready),READ_ONCE(fe->route_admitted),
+  READ_ONCE(fe->route_gate_verified),fe->pending_withdrawals,fe->dma_exposed);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "base_ready=%u base_failed=%u base_lifetime_owner=%u full_l3_drain_verified=0 "
   "base_rejected_register=0x%x base_rejected_value=0x%x\n",

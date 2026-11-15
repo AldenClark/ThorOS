@@ -398,12 +398,42 @@ static void fe_switch_reconcile_locked(struct rtl_fe *fe)
 		fe_switch_queue(fe->bridge);
 }
 
+static bool fe_switch_request_current(struct rtl_fe *fe, bool requested)
+{
+	struct rtl_fe_bridge *sw = fe->bridge;
+
+	/* Only a completely committed matching generation is a cheap repeat.
+	 * error==0 alone is insufficient: policy quiescence and a worker between
+	 * snapshots can leave a clean-looking but unpublished or retained owner.
+	 * Capability/conflict fallback deliberately remains explicitly retryable.
+	 */
+	if (!sw || sw->requested != requested || sw->stopping || sw->replaying ||
+	    sw->error || sw->replay_error || fe->error || fe->pending_withdrawals ||
+	    fe->shutting_down ||
+	    !fe->engine_ready || !sw->guard.registered ||
+	    !sw->route_generation_valid || rtl9617c_switch_guard_blocked(&sw->guard) ||
+	    sw->route_generation != rtl9617c_switch_guard_generation(&sw->guard))
+		return false;
+	if (requested)
+		return READ_ONCE(sw->active) && sw->hw.prepared &&
+		       sw->hw.globals_owned && sw->domain_owned && sw->native_mask &&
+		       sw->native_mask == READ_ONCE(sw->offloaded);
+	/* unoffload drops the FE mutex while holding RTNL. Its counts only
+	 * move towards zero, and its worker still owns the pending rebuild. */
+	return !READ_ONCE(sw->active) && !sw->native_mask && !READ_ONCE(sw->offloaded) &&
+	       !sw->domain_owned && !sw->hw.globals_owned && !sw->hw.prepared &&
+	       !sw->hw.count && !READ_ONCE(sw->learned_count) &&
+	       !READ_ONCE(sw->pending_count);
+}
+
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested)
 {
 	int ret = 0;
 
 	if (!fe->bridge)
 		return -EOPNOTSUPP;
+	if (fe_switch_request_current(fe, requested))
+		return 0;
 	WRITE_ONCE(fe->bridge->requested, requested);
 	if (!requested)
 		ret = fe_switch_quiesce_locked(fe);
@@ -654,7 +684,7 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *sw)
 			switchdev_bridge_port_unoffload(sw->ports[i], sw,
 				&sw->atomic_nb, &sw->blocking_nb);
 	}
-	sw->offloaded = 0;
+	WRITE_ONCE(sw->offloaded, 0);
 }
 
 static int fe_switch_netdev_event(struct notifier_block *nb,
@@ -815,7 +845,7 @@ static void fe_switch_work(struct work_struct *work)
 			&sw->atomic_nb, &sw->blocking_nb, false, NULL);
 		if (ret)
 			break;
-		sw->offloaded |= BIT(i);
+		WRITE_ONCE(sw->offloaded, READ_ONCE(sw->offloaded) | BIT(i));
 	}
 	mutex_lock(&fe->lock);
 	sw->replaying = false;

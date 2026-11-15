@@ -77,7 +77,7 @@ struct netlink_ext_ack {int unused;};
 struct flow_stats {u64 lastused,pkts,bytes;};
 struct net_device {unsigned type,ppp_channel_generation,references;};
 struct dst_entry {struct net_device *dev;};
-struct flow_offload_tuple {unsigned dir,xmit_type;
+struct flow_offload_tuple {unsigned dir,xmit_type,mtu;
  struct {struct dst_entry *route_dst;u32 ppp_cookie;}out;};
 struct flow_offload_tuple_rhash {struct flow_offload_tuple tuple;};
 struct nf_conn {unsigned long status;};
@@ -86,6 +86,7 @@ struct nf_flow_rule {void *rule;};
 struct flow_cls_offload {
  struct {__be16 protocol;int prio;struct netlink_ext_ack *extack;} common;
  enum flow_cls_command command;unsigned long cookie;void *rule;struct flow_stats stats;
+ uint16_t route_mtu;
  struct {struct net_device *dev;u32 cookie;}ppp_paths[2];
 };
 struct flow_block_cb {int (*cb)(int,void *,void *);void *cb_priv;struct flow_block_cb *next;};
@@ -106,6 +107,7 @@ static void route_init(struct flow_offload *flow){
  flow->type=NF_FLOW_OFFLOAD_ROUTE;
  for(unsigned dir=0;dir<2;dir++){
   flow->tuplehash[dir].tuple.dir=dir;
+  flow->tuplehash[dir].tuple.mtu=dir?1400:1492;
   flow->tuplehash[dir].tuple.xmit_type=FLOW_OFFLOAD_XMIT_DIRECT;
   flow->tuplehash[dir].tuple.out.route_dst=&ether_route;
   flow->tuplehash[dir].tuple.out.ppp_cookie=0;
@@ -122,15 +124,17 @@ static int callback(int type,void *data,void *priv){
  for(unsigned i=0;i<2;i++)if(cls->ppp_paths[i].dev)
   assert(cls->command==FLOW_CLS_REPLACE && cls->ppp_paths[i].dev->references>1);
  if(cls->command==FLOW_CLS_REPLACE){
+  assert(cls->route_mtu==tuple->mtu);
   add_calls[dir]++;if(!fabric_authorized)return -EAGAIN;
   if(replies[dir]<0)return replies[dir];
   installed[dir]=true;return 0;
  }
  if(cls->command==FLOW_CLS_STATS){
+  assert(!cls->route_mtu);
   stats_calls[dir]++;if(!installed[dir])return -ENOENT;
   cls->stats.lastused=now;return 0;
  }
- assert(cls->command==FLOW_CLS_DESTROY);del_calls[dir]++;installed[dir]=false;return 0;
+ assert(cls->command==FLOW_CLS_DESTROY && !cls->route_mtu);del_calls[dir]++;installed[dir]=false;return 0;
 }
 static int nf_flow_offload_alloc(struct flow_offload_work *offload,struct nf_flow_rule *out[]){
  (void)offload;allocated++;if(allocation_error)return allocation_error;

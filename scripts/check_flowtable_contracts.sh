@@ -16,6 +16,6 @@ for test in fe_flow_parser fe_cookie_index fe_pppoe_cleanup \
             flowtable_bridge_move flowtable_bridge_ageing flowtable_software_ageing \
             flowtable_work_lifetime flowtable_bridge_policy flowtable_partial_offload \
             flowtable_direct_route l2_policy_noop ppp_channel_generation \
-            ppp_flow_policy; do
+            ppp_flow_policy flowtable_mtu_lifetime; do
     python3 "scripts/test_$test.py" --kernel "$kernel"
 done

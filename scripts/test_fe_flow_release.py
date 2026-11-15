@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise production flow teardown with shared MACs and a failed CAM restore."""
+"""Exercise production flow withdrawal, route fault gating and shared resource release."""
 import argparse
 import hashlib
 import json
@@ -40,6 +40,10 @@ typedef uint32_t __le32;typedef uint64_t u64;
 #define FE_INTERFACES 32
 #define FE_SOURCE_MACS 15
 #define BIT(n) (1U<<(n))
+#define WRITE_ONCE(dst,value) ((dst)=(value))
+struct spinlock {bool held;};
+#define spin_lock_irqsave(lock,flags) do{(flags)=0;assert(!(lock)->held);(lock)->held=true;}while(0)
+#define spin_unlock_irqrestore(lock,flags) do{(void)(flags);assert((lock)->held);(lock)->held=false;}while(0)
 static unsigned int dma_barriers;
 #define dma_wmb() (++dma_barriers)
 #define readl_poll_timeout(address,status,condition,delay,timeout) ((void)(status=0),0)
@@ -69,7 +73,7 @@ struct rtl_fe_mac {unsigned int users,saved[5];bool ready;u8 address[6];};
 struct rtl_fe_interface {unsigned int users,saved,source_mac,pppoe;bool counted,ready;};
 struct rtl_fe_mtu {unsigned int users,size,saved;};
 struct work_struct {int unused;};
-struct delayed_work {struct work_struct work;unsigned int queued;};
+struct delayed_work {struct work_struct work;unsigned int queued,modified,delay;};
 #define to_delayed_work(w) container_of(w,struct delayed_work,work)
 struct rtl_fe {
  struct list_head flows,ports,retries;
@@ -83,20 +87,34 @@ struct rtl_fe {
  unsigned int registers[0x4000/4],ages[RTL_FE_HASH_ENTRIES/32][4],cam[5];
  unsigned int deletes_FDB,restores_CAM,restores_IF,cache_invalidates;
  bool fail_CAM,fail_IF,fail_age,fail_age_write,fail_cache;
+ unsigned int fail_IF_retries,oracle_hash_sequence[2],oracle_hash_count,oracle_hash_cursor;
  unsigned int oracle_hash_index,age_withdraw_barriers;
  struct delayed_work cleanup_work;
  unsigned int cleanup_delay;
  bool shutting_down;
+ struct spinlock route_lock;
+ bool enabled,prepared,engine_ready,route_gate_ready,route_admitted,route_gate_verified;
+ unsigned int pending_withdrawals,reconciles,fail_gate_mask,selector_writes,route_opens;
  int lock;
 };
 #define system_wq 0
 #define HZ 100
-static void mod_delayed_work(int queue,struct delayed_work *work,unsigned int delay){assert(queue==0 && delay>=HZ && delay<=32U*HZ);work->queued++;}
-#define queue_delayed_work mod_delayed_work
+static void mod_delayed_work(int queue,struct delayed_work *work,unsigned int delay){assert(queue==0 && delay>=HZ && delay<=32U*HZ);work->modified++;work->delay=delay;}
+static void queue_delayed_work(int queue,struct delayed_work *work,unsigned int delay){assert(queue==0 && delay>=HZ && delay<=32U*HZ);work->queued++;}
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
 static unsigned int fe_read(void *context,unsigned int reg){return ((struct rtl_fe *)context)->registers[reg/4];}
-static void fe_write(void *context,unsigned int reg,unsigned int value){((struct rtl_fe *)context)->registers[reg/4]=value;}
+static void fe_write(void *context,unsigned int reg,unsigned int value){
+ struct rtl_fe *fe=context;
+ if(reg==0x3418 || reg==0x3424){
+  assert(fe->route_lock.held);fe->selector_writes++;
+  unsigned int side=reg==0x3424;
+  if(((value>>10)&15)==1 && (fe->fail_gate_mask&BIT(side)))return;
+  if(((value>>10)&15)==0)fe->route_opens++;
+ }
+ fe->registers[reg/4]=value;
+}
+static void fe_switch_reconcile_locked(struct rtl_fe *fe){assert(!fe->shutting_down);fe->reconciles++;}
 static int fe_access(void *context,unsigned int reg,unsigned int value){
  struct rtl_fe *fe=context;
  if(reg==0x3928){
@@ -114,7 +132,12 @@ static int fe_access(void *context,unsigned int reg,unsigned int value){
    * quoted by same-chip SDK aal_hash_delete at 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0:
    * first clear Main Hash's32-bit DDR field, then invalidate the cache.
    * A completed DMA write barrier must publish the clear before this command. */
-  assert(!((u32 *)fe->memory)[fe->oracle_hash_index]);
+  unsigned int expected=fe->oracle_hash_index;
+  if(fe->oracle_hash_count){
+   assert(fe->oracle_hash_cursor<fe->oracle_hash_count);
+   expected=fe->oracle_hash_sequence[fe->oracle_hash_cursor++];
+  }
+  assert(!((u32 *)fe->memory)[expected]);
   assert(dma_barriers>fe->age_withdraw_barriers);
   if(fe->fail_cache){fe->fail_cache=false;return -ETIMEDOUT;}
   fe->cache_invalidates++;
@@ -124,17 +147,167 @@ static int fe_access(void *context,unsigned int reg,unsigned int value){
   if(fe->fail_CAM){fe->fail_CAM=false;return -ETIMEDOUT;}
   fe->restores_CAM++;
   for(unsigned int i=0;i<5;i++)fe->cam[i]=fe_read(fe,0x3214-i*4);
- } else if(reg==0x3000){if(fe->fail_IF){fe->fail_IF=false;return -ETIMEDOUT;}fe->restores_IF++;}
+ } else if(reg==0x3000){
+  if(fe->fail_IF || fe->fail_IF_retries){
+   fe->fail_IF=false;if(fe->fail_IF_retries)fe->fail_IF_retries--;return -ETIMEDOUT;
+  }
+  fe->restores_IF++;
+ }
  else assert(0);
  return 0;
 }
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe,fe_read,fe_write,fe_access};}
 '''
 test = r'''
+static void initialize(struct rtl_fe *fe){
+ memset(fe,0,sizeof(*fe));init_list(&fe->flows);init_list(&fe->ports);init_list(&fe->retries);
+ fe->memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(fe->memory);
+ fe->enabled=fe->prepared=fe->engine_ready=fe->route_gate_ready=true;
+ assert(fe_route_arm(fe) && fe->route_admitted && !fe->route_gate_verified);
+}
+static void check_gate(struct rtl_fe *fe){
+ assert(!fe->route_admitted && fe->route_gate_verified);
+ assert(((fe_read(fe,0x3418)>>10)&15)==1 && ((fe_read(fe,0x3424)>>10)&15)==1);
+}
+static struct rtl_fe_flow *new_flow(struct rtl_fe *fe,unsigned int index,bool published){
+ struct rtl_fe_flow *flow=calloc(1,sizeof(*flow));assert(flow);
+ flow->hash_index=index;flow->crc16=index;flow->published=published;
+ init_list(&flow->retry);list_add_tail(&flow->list,&fe->flows);
+ set_bit(index,fe->hashes);((u32 *)fe->memory)[index]=index+0x12345678U;
+ return flow;
+}
+static void withdrawal_recovery_priority(void){
+ struct rtl_fe fe;initialize(&fe);
+ struct rtl_fe_flow *resource=new_flow(&fe,95,false);
+ resource->interface_owned=true;resource->counter=0;
+ fe.interfaces[0]=(struct rtl_fe_interface){.users=1,.ready=true};set_bit(0,fe.counters);
+ fe.fail_IF=true;assert(fe_delete(&fe,resource)==-ETIMEDOUT);
+ fe.cleanup_delay=32*HZ;mod_delayed_work(system_wq,&fe.cleanup_work,32*HZ);
+ unsigned int modified=fe.cleanup_work.modified;
+ struct rtl_fe_flow *route=new_flow(&fe,66,true);
+ fe.oracle_hash_index=route->hash_index;fe.fail_age=true;
+ assert(fe_delete(&fe,route)==-ETIMEDOUT && fe.pending_withdrawals==1);
+ assert(fe.cleanup_delay==HZ && fe.cleanup_work.modified==modified+1);
+ assert(fe.cleanup_work.delay==HZ);check_gate(&fe);
+ /* Repeated destroy/cache failures keep the existing expedited timer. */
+ fe.fail_cache=true;assert(fe_delete(&fe,route)==-ETIMEDOUT);
+ assert(fe.cleanup_work.modified==modified+1 && fe.cleanup_delay==HZ);
+ /* A later retry backoff is respected by both the same callback and a
+  * newly failing second owner while the existing fault epoch is live. */
+ fe.cleanup_delay=8*HZ;mod_delayed_work(system_wq,&fe.cleanup_work,8*HZ);
+ modified=fe.cleanup_work.modified;
+ fe.fail_cache=true;assert(fe_delete(&fe,route)==-ETIMEDOUT);
+ assert(fe.cleanup_work.modified==modified && fe.cleanup_delay==8*HZ);
+ struct rtl_fe_flow *second=new_flow(&fe,67,true);
+ fe.oracle_hash_index=second->hash_index;fe.fail_age=true;
+ assert(fe_delete(&fe,second)==-ETIMEDOUT && fe.pending_withdrawals==2);
+ assert(fe.cleanup_work.modified==modified && fe.cleanup_delay==8*HZ);
+ assert(!fe_delete(&fe,second) && fe.pending_withdrawals==1 && !fe.reconciles);
+ fe.oracle_hash_index=route->hash_index;
+ /* Actual worker must withdraw B first, then retry the still-failing
+  * resource A. The route latch clears even though A stays quarantined. */
+ fe.fail_IF=true;fe_cleanup_work(&fe.cleanup_work.work);
+ assert(!fe.pending_withdrawals && fe.reconciles==1 && !test_bit(66,fe.hashes));
+ assert(resource->interface_owned && fe.retries.next==&resource->retry);
+ assert(!fe.fail_IF && fe.cleanup_delay==2*HZ);
+ assert(fe_route_arm(&fe) && fe.route_admitted);
+ fe_cleanup_work(&fe.cleanup_work.work);
+ assert(list_empty(&fe.flows) && list_empty(&fe.retries) && !fe.cleanup_delay);
+ free(fe.memory);
+}
+static void withdrawal_to_resource_progress(void){
+ struct rtl_fe fe;initialize(&fe);
+ struct rtl_fe_flow *a=new_flow(&fe,33,true),*b=new_flow(&fe,66,true);
+ a->interface_owned=true;a->counter=0;
+ fe.interfaces[0]=(struct rtl_fe_interface){.users=1,.ready=true};set_bit(0,fe.counters);
+ fe.oracle_hash_index=a->hash_index;fe.fail_age=true;
+ assert(fe_delete(&fe,a)==-ETIMEDOUT);
+ fe.oracle_hash_index=b->hash_index;fe.fail_age=true;
+ assert(fe_delete(&fe,b)==-ETIMEDOUT && fe.pending_withdrawals==2);
+ fe.oracle_hash_sequence[0]=a->hash_index;fe.oracle_hash_sequence[1]=b->hash_index;
+ fe.oracle_hash_count=2;fe.cleanup_delay=16*HZ;fe.fail_IF_retries=2;
+ /* A's publication retires, but its EIF restoration fails. In the SAME
+  * bounded batch B must still retire; A's unrelated resource error must
+  * neither retain the global route latch nor make B wait another timer. */
+ fe_cleanup_work(&fe.cleanup_work.work);
+ assert(!fe.pending_withdrawals && fe.reconciles==1 && fe.oracle_hash_cursor==2);
+ assert(!a->published && !a->withdrawal_pending && a->interface_owned);
+ assert(!test_bit(66,fe.hashes) && fe.retries.next==&a->retry);
+ assert(!fe.fail_IF_retries && fe.cleanup_delay==2*HZ);
+ assert(fe_route_arm(&fe) && fe.route_admitted);
+ fe_cleanup_work(&fe.cleanup_work.work);
+ assert(list_empty(&fe.flows) && list_empty(&fe.retries));free(fe.memory);
+}
+static void withdrawal_faults(void){
+ struct rtl_fe fe;
+ /* Each failed owner latches once, including a partially published
+  * install rollback. Recovery of one direction cannot reopen the other. */
+ for(unsigned int first=0;first<2;first++){
+  initialize(&fe);
+  struct rtl_fe_flow *flow[2]={new_flow(&fe,33,true),new_flow(&fe,66,true)};
+  flow[0]->installed=true;
+  for(unsigned int i=0;i<2;i++){
+   fe.oracle_hash_index=flow[i]->hash_index;fe.fail_age=true;
+   assert(fe_delete(&fe,flow[i])==-ETIMEDOUT);
+   assert(flow[i]->published && flow[i]->withdrawal_pending);
+   assert(fe.pending_withdrawals==i+1 && !fe.reconciles);check_gate(&fe);
+  }
+  fe.oracle_hash_index=flow[0]->hash_index;fe.fail_cache=true;
+  assert(fe_delete(&fe,flow[0])==-ETIMEDOUT && fe.pending_withdrawals==2);
+  unsigned int opens=fe.route_opens;
+  assert(fe_route_arm(&fe));check_gate(&fe); /* Native L2 remains eligible. */
+  assert(fe.route_opens==opens && !fe.reconciles);
+  fe.oracle_hash_index=flow[first]->hash_index;
+  assert(!fe_delete(&fe,flow[first]));
+  assert(fe.pending_withdrawals==1 && !fe.reconciles);
+  assert(fe_route_arm(&fe));check_gate(&fe);assert(fe.route_opens==opens);
+  fe.oracle_hash_index=flow[1-first]->hash_index;
+  assert(!fe_delete(&fe,flow[1-first]));
+  assert(!fe.pending_withdrawals && fe.reconciles==1);
+  check_gate(&fe); /* Queuing reconciliation is not hardware readmission. */
+  assert(fe_route_arm(&fe) && fe.route_admitted && !fe.route_gate_verified);
+  assert(fe.deletes==1 && list_empty(&fe.flows) && list_empty(&fe.retries));
+  free(fe.memory);
+ }
+ /* A failed selector write must remain distinguishable from a proved
+  * gate. Age success alone never releases an uncertain cached action. */
+ for(unsigned int side=0;side<2;side++){
+  initialize(&fe);struct rtl_fe_flow *flow=new_flow(&fe,127,true);
+  fe.oracle_hash_index=flow->hash_index;fe.fail_age=true;fe.fail_gate_mask=BIT(side);
+  assert(fe_delete(&fe,flow)==-ETIMEDOUT && flow->withdrawal_pending);
+  assert(fe.pending_withdrawals==1 && !fe.route_admitted && !fe.route_gate_verified);
+  assert(((fe_read(&fe,0x3418+side*12)>>10)&15)==0);
+  unsigned int opens=fe.route_opens;
+  assert(!fe_route_arm(&fe) && !fe.route_gate_verified && fe.route_opens==opens);
+  fe.fail_cache=true;
+  assert(fe_delete(&fe,flow)==-ETIMEDOUT && flow->published);
+  assert(flow->withdrawal_pending && fe.pending_withdrawals==1 && !fe.reconciles);
+  assert(test_bit(flow->hash_index,fe.hashes) && !fe.cookies.erases);
+  assert(!((u32 *)fe.memory)[flow->hash_index]);
+  fe.fail_gate_mask=0;
+  assert(fe_route_arm(&fe));check_gate(&fe);assert(fe.route_opens==opens);
+  assert(!fe_delete(&fe,flow) && !fe.pending_withdrawals && fe.reconciles==1);
+  assert(fe_route_arm(&fe) && fe.route_admitted);
+  free(fe.memory);
+ }
+ /* Resource-only rollback cannot have forwarded a packet. Retain its
+  * unfinished EIF but do not turn it into a global route withdrawal. */
+ initialize(&fe);struct rtl_fe_flow *flow=new_flow(&fe,95,false);
+ flow->interface_owned=true;flow->counter=0;
+ fe.interfaces[0]=(struct rtl_fe_interface){.users=1,.ready=true};
+ set_bit(0,fe.counters);fe.fail_IF=true;
+ unsigned int writes=fe.selector_writes;
+ assert(fe_delete(&fe,flow)==-ETIMEDOUT && flow->interface_owned);
+ assert(!flow->withdrawal_pending && !fe.pending_withdrawals && fe.route_admitted);
+ assert(fe.selector_writes==writes && !fe.reconciles);
+ assert(!fe_delete(&fe,flow));free(fe.memory);
+}
 int main(void){
- struct rtl_fe fe={};init_list(&fe.flows);init_list(&fe.ports);init_list(&fe.retries);
+ withdrawal_faults();
+ withdrawal_recovery_priority();
+ withdrawal_to_resource_progress();
+ struct rtl_fe fe;initialize(&fe);
  struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);port->retired=true;list_add_tail(&port->list,&fe.ports);
- fe.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(fe.memory);
  fe.source_macs[0].users=2;
  for(unsigned int i=0;i<5;i++)fe.source_macs[0].saved[i]=0x51000000+i;
  struct rtl_fe_flow *a=calloc(1,sizeof(*a)),*b=calloc(1,sizeof(*b));assert(a&&b);
@@ -163,14 +336,17 @@ int main(void){
   * live hardware owner until the existing cleanup can finish withdrawal. */
  fe.oracle_hash_index=b->hash_index;fe.fail_age=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->deleting);
+ assert(b->withdrawal_pending && fe.pending_withdrawals==1);check_gate(&fe);
  assert(b->source_owned && b->destination_owned && b->interface_owned);
  assert(test_bit(65344,fe.hashes) && test_bit(30,fe.counters));
  assert(((u32 *)fe.memory)[65344]==0x87654321); /* Failed withdrawal preserves the DDR key. */
  fe.fail_age_write=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
+ assert(fe.pending_withdrawals==1 && !fe.reconciles);check_gate(&fe);
  assert(((u32 *)fe.memory)[65344]==0x87654321 && !fe.deletes_FDB);
  fe.fail_cache=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
+ assert(fe.pending_withdrawals==1 && !fe.reconciles);check_gate(&fe);
  assert(!fe.deletes_FDB && fe.source_macs[0].users==1);
  assert(!((u32 *)fe.memory)[65344] && b->interface_owned && b->mtu_owned);
  assert(fe.interfaces[30].users==1 && fe.mtus[0].users==1);
@@ -178,10 +354,15 @@ int main(void){
   * and the physical row reservation until restoration can be retried. */
  fe.fail_IF=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->source_owned && b->interface_owned);
+ assert(!b->withdrawal_pending && !fe.pending_withdrawals && fe.reconciles==1);
+ /* Cache withdrawal is complete even though EIF/CAM restoration is not.
+  * A normal reconciliation can now recover unrelated routed flows. */
+ assert(fe_route_arm(&fe) && fe.route_admitted);
  assert(fe.source_macs[0].users==1 && !fe.restores_CAM && fe.interfaces[30].users==1);
  assert(test_bit(30,fe.counters) && !fe.interfaces[30].ready);
  fe.fail_CAM=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT);
+ assert(!fe.pending_withdrawals && fe.reconciles==1 && fe.route_admitted);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  assert(fe.deletes_FDB==1 && fe.source_macs[0].users==1);
  assert(!b->published && !b->destination_owned && b->source_owned && !b->interface_owned);
@@ -216,35 +397,98 @@ int main(void){
  init_list(&d->retry);list_add_tail(&d->list,&fe.flows);
  set_bit(d->hash_index,fe.hashes);((u32 *)fe.memory)[d->hash_index]=0xfeedbeef;
  fe.oracle_hash_index=d->hash_index;fe.shutting_down=true;fe.fail_age=true;
- unsigned int queued=fe.cleanup_work.queued;
+ unsigned int queued=fe.cleanup_work.queued,modified=fe.cleanup_work.modified;
+ fe.cleanup_delay=32*HZ;
+ unsigned int reconciles=fe.reconciles;
  assert(fe_delete(&fe,d)==-ETIMEDOUT && d->published);
+ assert(d->withdrawal_pending && fe.pending_withdrawals==1);check_gate(&fe);
  assert(fe.cleanup_work.queued==queued);
+ assert(fe.cleanup_work.modified==modified); /* Shutdown must not expedite a timer. */
  fe.fail_age=true;fe_cleanup_work(&fe.cleanup_work.work);
  assert(fe.fail_age && d->published && fe.cleanup_work.queued==queued);
- fe.shutting_down=false;fe.fail_age=false;assert(!fe_delete(&fe,d));
+ fe.fail_age=false;assert(!fe_delete(&fe,d));
+ assert(!fe.pending_withdrawals && fe.reconciles==reconciles && fe.cleanup_work.queued==queued);
  assert(list_empty(&fe.flows) && list_empty(&fe.retries));
  free(fe.memory);
  assert(!fe.mtus[0].users && fe_read(&fe,0x3520)==0x23451234);
  puts("G3 removal order: DDR key zero and DMA barrier precede invalidation; age/cache failures retain ownership; unpublished rollback clears without invalidation");
  puts("Native FE teardown:shared FDB/source MAC,last-owner restore,failed CAM retry and DMA/hash/counter ownership passed");
+ puts("Published withdrawal faults: route-only latch, two-owner recovery, selector readback refusal, partial-install rollback, resource-only isolation and shutdown passed");
 }
 '''
-parts = [common,re.search(r'struct rtl_fe_flow \{.*?\n\};',native,re.S)[0]]
+flow_struct = re.search(r'struct rtl_fe_flow \{.*?\n\};',native,re.S)[0]
+if args.revision and 'withdrawal_pending' not in flow_struct:
+    # Keep the old implementation executable under the same behavioral
+    # oracle: an unused zero-initialized diagnostic field is not a fix.
+    flow_struct = flow_struct.replace('\n};','\n bool withdrawal_pending;\n};')
+parts = [common,flow_struct]
 if 'static int fe_interface_transfer(' in native:
     parts += [function('fe_interface_transfer')]
-parts += [function(n) for n in ('fe_collect_ports','fe_source_put','fe_interface_put','fe_mtu_get','fe_mtu_put','fe_destination_put','fe_delete','fe_cleanup_work')]
+parts += [function(n) for n in ('fe_route_select_locked','fe_route_gate','fe_route_arm',
+    'fe_collect_ports','fe_source_put','fe_interface_put','fe_mtu_get','fe_mtu_put','fe_destination_put')]
+for name in ('fe_withdrawal_failed','fe_withdrawal_completed'):
+    if re.search(r'^static void '+name+r'\(',native,re.M):
+        parts.append(function(name))
+parts += [function(n) for n in ('fe_delete','fe_cleanup_work')]
 parts.append(test)
 with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as work:
     source=Path(work)/'release.c';binary=Path(work)/'release'
-    source.write_text('\n'.join(parts))
+    executable='\n'.join(parts)
+    source.write_text(executable)
     subprocess.run(['cc','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
         '-I'+str(drivers),str(source),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)
+    mutants = {
+        'arm_ignores_pending_withdrawals': (
+            'if(!fe->enabled || fe->pending_withdrawals)', 'if(!fe->enabled)'),
+        'first_owner_recovers_too_soon': (
+            'if(!--fe->pending_withdrawals && !fe->shutting_down)',
+            'if((--fe->pending_withdrawals, !fe->shutting_down))'),
+        'age_success_retires_before_cache_invalidation': (
+            'if(flow->published) {\n  ret=rtl_fe_cache_command',
+            'fe_withdrawal_completed(fe,flow);\n if(flow->published) {\n  ret=rtl_fe_cache_command'),
+        'resource_only_failure_globally_gates_routes': (
+            'if(flow->published)fe_withdrawal_failed(fe,flow);',
+            'fe_withdrawal_failed(fe,flow);'),
+        'resource_only_owner_blocks_pending_withdrawal': (
+            'if(fe->pending_withdrawals)\n   list_for_each_entry(candidate',
+            'if(false)\n   list_for_each_entry(candidate'),
+        'new_fault_inherits_resource_only_backoff': (
+            'if(expedite && !fe->shutting_down)',
+            'if(false && expedite && !fe->shutting_down)'),
+        'second_pending_owner_resets_existing_deadline': (
+            'expedite=!fe->pending_withdrawals && fe->cleanup_delay>HZ;',
+            'expedite=fe->cleanup_delay>HZ;'),
+        'post_withdrawal_resource_failure_blocks_next_pending': (
+            'if(was_pending && !flow->withdrawal_pending && fe->pending_withdrawals)',
+            'if(false && was_pending && !flow->withdrawal_pending && fe->pending_withdrawals)'),
+    }
+    for name,(before,after) in mutants.items():
+        assert executable.count(before)==1, name
+        mutant=Path(work)/(name+'.c');program=Path(work)/name
+        mutant.write_text(executable.replace(before,after,1))
+        subprocess.run(['cc','-I'+str(drivers),str(mutant),'-o',str(program)],check=True)
+        rejected=subprocess.run([str(program)],capture_output=True,text=True)
+        assert rejected.returncode and 'Assertion' in rejected.stderr, name
+        print('Withdrawal mutation rejected:',name)
 (root/'logs/fe-flow-release.json').write_text(json.dumps({
     'production_source_sha256':hashlib.sha256(native.encode()).hexdigest(),
     'DDR_key_clear_and_barrier_before_cache_invalidation':True,
     'failed_age_read_and_write_preserve_DDR_key':True,
     'failed_cache_invalidation_retains_resource_owners':True,
+    'published_withdrawal_failure_gates_both_L3_connectors':True,
+    'uncertain_publication_count_is_idempotent_and_last_owner_recovers':True,
+    'verified_CPU_gate_keeps_native_L2_eligible_without_routes':True,
+    'failed_gate_readback_is_not_claimed_as_hardware_isolation':True,
+    'age_success_alone_does_not_retire_uncertain_cache_owner':True,
+    'partial_published_install_rollback_uses_same_fault_latch':True,
+    'EIF_CAM_only_failure_does_not_hold_global_route_gate':True,
+    'shutdown_never_schedules_recovery_or_retry':True,
+    'first_pending_withdrawal_accelerates_old_resource_backoff_to_HZ':True,
+    'repeated_pending_callbacks_do_not_rewrite_the_retry_deadline':True,
+    'resource_only_failures_cannot_block_recovered_publication_withdrawal':True,
+    'partial_withdrawal_progress_keeps_next_pending_in_same_bounded_batch':True,
+    'independent_withdrawal_mutations_rejected':list(mutants),
     'failed_EIF_restore_retains_source_CAM_owner':True,
     'unpublished_rollback_clears_without_cache_command':True,
     'shared_MAC_last_owner_release':True,'retired_port_retained_until_failed_flow_cleanup_retries_finish':True,'CAM_restore_failure_retried_without_double_release':True,

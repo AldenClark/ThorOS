@@ -41,7 +41,8 @@ names = ('rtl_ni_owner_claim', 'rtl_ni_owner_expose', 'rtl_ni_owner_release',
          'rtl_pon_host_gate',
          'rtl_engine_poison', 'rtl_engine_prepare', 'rtl_engine_start',
          'rtl_engine_stop', 'rtl_engine_get', 'rtl_engine_put',
-         'rtl_ni_release_dma', 'rtl_remove', 'rtl9617c_ni_transmit', 'rtl9617c_ni_pon_gate')
+         'rtl_ni_release_dma', 'rtl_remove', 'rtl_tx_timer_kick_locked',
+         'rtl9617c_ni_transmit', 'rtl9617c_ni_pon_gate')
 functions = '\n'.join(function(source, name) for name in names)
 dma_functions = '\n'.join(function(dma_source, name) for name in
                           ('rtl_dma_vp', 'rtl_dma_tx_quiesce'))
@@ -74,6 +75,7 @@ common = r'''
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 typedef int netdev_tx_t;
+typedef int ktime_t;
 #define EPROBE_DEFER 517
 #define __iomem
 #define BIT(n) (1U<<(n))
@@ -108,6 +110,7 @@ typedef int netdev_tx_t;
 #define ES_CTRL 0x6108
 #define RMU_CTRL 0x6104
 #define NETDEV_TX_OK 0
+#define NETDEV_TX_BUSY 1
 struct list_head {struct list_head *next,*prev;};
 #define container_of(ptr,type,member) ((type *)((char *)(ptr)-offsetof(type,member)))
 #define LIST_HEAD(name) struct list_head name={&name,&name}
@@ -226,6 +229,9 @@ static void napi_schedule(struct napi_struct *n){assert(n->active);schedules++;}
 static void synchronize_irq(int n){(void)n;assert(!irq_off && !active_priv->rx_active);}
 static void synchronize_net(void){assert(!irq_off && !active_priv->napi.active);graces++;}
 static int ms_to_ktime(int n){return n;}
+static bool hrtimer_active(int *timer){return *timer!=0;}
+static int hrtimer_get_remaining(int *timer){return *timer;}
+static int ktime_compare(int a,int b){return (a>b)-(a<b);}
 static void hrtimer_start(int *timer,int time,int mode){
  assert(time==1 && mode==HRTIMER_MODE_REL && active_priv->napi.active && active_priv->host_active);*timer=1;
 }

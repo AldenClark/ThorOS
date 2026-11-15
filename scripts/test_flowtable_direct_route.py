@@ -134,8 +134,8 @@ static struct dst_entry *dst_check(struct dst_entry *dst,u32 cookie){
  if(dst->family==NFPROTO_IPV6 && cookie!=dst->cookie)return NULL;
  if(dst->family==NFPROTO_IPV4)assert(cookie==0);return dst;
 }
-static unsigned int ip_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){assert(dst && f && dst->refs);return 1500;}
-static unsigned int ip6_dst_mtu_maybe_forward(struct dst_entry *dst,bool f){return ip_dst_mtu_maybe_forward(dst,f);}
+static unsigned int ip_dst_mtu_maybe_forward(const struct dst_entry *dst,bool f){assert(dst && f && dst->refs);return 1500;}
+static unsigned int ip6_dst_mtu_maybe_forward(const struct dst_entry *dst,bool f){return ip_dst_mtu_maybe_forward(dst,f);}
 static void dst_release(struct dst_entry *dst){if(dst){assert(dst->refs);dst->refs--;}}
 static struct neighbour *dst_neigh_lookup(struct dst_entry *dst,const void *daddr){
  assert(dst->refs && dst->alive && dst->dev->type==ARPHRD_ETHER);
@@ -281,7 +281,7 @@ int main(void){route_and_neighbor_cases();bridge_and_pending_cases();
 functions = function("netdev_ppp_path_valid", netdevice) + "\n".join(function(name) for name in [
     "flow_offload_alloc", "flow_offload_dst_cookie", "nft_route_dst_fetch", "flow_offload_fill_route",
     "nft_flow_dst_release", "flow_offload_route_init", "flow_offload_route_release",
-    "flow_offload_free_rcu", "flow_offload_free", "nf_flow_direct_route_changed",
+    "flow_offload_free_rcu", "flow_offload_free", "nf_flow_direct_mtu_valid", "nf_flow_direct_route_changed",
     "flow_offload_lookup", "nf_flow_direct_neigh_valid", "nf_flow_dst_valid",
     "nf_flow_offload_gc_step", "nf_flow_tuple_uses_dev",
 ])
