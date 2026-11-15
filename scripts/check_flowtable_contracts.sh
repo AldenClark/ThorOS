@@ -20,3 +20,4 @@ for test in fe_flow_parser fe_cookie_index fe_pppoe_cleanup \
             flowtable_initial_publication; do
     python3 "scripts/test_$test.py" --kernel "$kernel"
 done
+python3 scripts/test_fe_destination_index.py --kernel "$kernel" --mutants

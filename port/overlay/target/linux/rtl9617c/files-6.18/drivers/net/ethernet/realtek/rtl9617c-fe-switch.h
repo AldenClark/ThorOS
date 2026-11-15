@@ -12,6 +12,7 @@
  */
 #include <linux/if_bridge.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/rtl9617c-switch.h>
 #include <linux/rtnetlink.h>
 #include <linux/sort.h>
@@ -42,6 +43,7 @@ enum fe_switch_reason {
 	FE_SWITCH_FOREIGN_FDB,
 	FE_SWITCH_FDB_CAPACITY,
 	FE_SWITCH_HW_UNSUPPORTED,
+	FE_SWITCH_AGING_UNSUPPORTED,
 };
 
 struct fe_switch_plan {
@@ -108,6 +110,13 @@ struct fe_switch_learned {
 	u8 port;
 };
 
+/* A populated 4K table must not monopolize RTNL or the shared FE mutex.
+ * Count every MMIO scan/merge/feedback operation, and also yield on elapsed
+ * time: a slow indirect command must not consume a whole batch unchecked.
+ */
+#define FE_SWITCH_SCAN_BUDGET 64
+#define FE_SWITCH_SCAN_SLICE_MS 2
+
 struct rtl_fe_bridge {
 	struct rtl_fe *fe;
 	struct rtl9617c_switch_guard guard;
@@ -134,6 +143,13 @@ struct rtl_fe_bridge {
 	unsigned int rule_count, local_target, retry_count;
 	struct fe_switch_learned *learned, *next;
 	unsigned int learned_count, pending_count;
+	/* Only MACs/physical IDs survive a slice. Device pointers are always
+	 * resolved under RTNL. next[] remains private until a complete scan,
+	 * duplicate-key rejection and every feedback batch have succeeded.
+	 */
+	unsigned int scan_start, scan_count, scan_old, scan_cursor;
+	u64 scan_generation;
+	bool scan_running, scan_complete, scan_removed;
 	bool requested, stopping, active, replaying, domain_owned, flow_allowed;
 	bool route_generation_valid;
 	bool netdev_registered, atomic_registered, blocking_registered;
@@ -142,6 +158,20 @@ struct rtl_fe_bridge {
 	u64 rebuilds, polls, learned_adds, learned_deletes, scan_errors;
 	u64 route_generation;
 };
+
+static void fe_switch_scan_reset(struct rtl_fe_bridge *sw)
+{
+	sw->scan_start = 0;
+	sw->scan_count = 0;
+	sw->scan_old = 0;
+	sw->scan_cursor = 0;
+	sw->scan_running = false;
+	sw->scan_complete = false;
+	sw->scan_removed = false;
+	/* Do not clear pending_count: a partially published feedback prefix
+	 * still belongs to next[] and must be forgotten during unoffload.
+	 */
+}
 
 static void fe_switch_queue(struct rtl_fe_bridge *sw)
 {
@@ -677,6 +707,7 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *sw)
 	for (i = 0; i < sw->pending_count; i++)
 		fe_switch_feedback(sw, &sw->next[i], false, 0);
 	WRITE_ONCE(sw->pending_count, 0);
+	fe_switch_scan_reset(sw);
 	for (i = 0; i < FE_LAN_PORTS; i++) {
 		if (!(sw->offloaded & BIT(i)))
 			continue;
@@ -755,6 +786,10 @@ static void fe_switch_work(struct work_struct *work)
 	mutex_lock(&fe->lock);
 	if (sw->stopping || fe->shutting_down)
 		goto unlock;
+	/* Rebuild can quiesce/re-arm without changing the policy generation.
+	 * Never resume a partial physical scan across that table replacement.
+	 */
+	fe_switch_scan_reset(sw);
 	/* This operation does NOT increment the epoch or queue this work. A
 	 * worker which invalidated itself here would rebuild forever.
 	 */
@@ -825,8 +860,12 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	if (age_ticks <= 0 || age_ticks % USER_HZ ||
 	    age_ticks / USER_HZ > GENMASK(18, 0)) {
-		sw->reason = FE_SWITCH_PRIVATE_POLICY;
-		goto unlock;
+		/* This timer belongs to autonomous L2 learning only. The earlier
+		 * route-policy checks still govern independently authorized L3
+		 * flows, just as for an unsupported native VLAN/bridge topology.
+		 */
+		sw->reason = FE_SWITCH_AGING_UNSUPPORTED;
+		goto arm;
 	}
 	seconds = age_ticks / USER_HZ;
 	sw->rule_count = 0;
@@ -940,6 +979,13 @@ static int fe_switch_learned_compare(const void *a, const void *b)
 	return memcmp(left->address, right->address, ETH_ALEN);
 }
 
+static bool fe_switch_scan_slice_done(unsigned int operations, u64 started)
+{
+	return operations >= FE_SWITCH_SCAN_BUDGET ||
+	       (operations && ktime_get_ns() - started >=
+		FE_SWITCH_SCAN_SLICE_MS * NSEC_PER_MSEC);
+}
+
 static void fe_switch_scan(struct work_struct *work)
 {
 	struct rtl_fe_bridge *sw = container_of(to_delayed_work(work),
@@ -948,12 +994,13 @@ static void fe_switch_scan(struct work_struct *work)
 	struct rtl_l2_fdb_result row;
 	struct rtl_l2_fdb_entry entry;
 	struct fe_switch_learned *swap;
-	unsigned int start = 0, count = 0, old, cursor;
-	u64 generation;
+	unsigned int operations = 0, cursor;
+	u64 generation, started;
 	int ret = 0;
 
 	rtnl_lock();
 	mutex_lock(&sw->fe->lock);
+	started = ktime_get_ns();
 	if (sw->stopping || sw->fe->shutting_down)
 		goto out;
 	if (!sw->active) {
@@ -964,68 +1011,129 @@ static void fe_switch_scan(struct work_struct *work)
 		goto out;
 	}
 	generation = rtl9617c_switch_guard_generation(&sw->guard);
-	while (start < RTL_L2_FDB_ENTRIES) {
-		ret = rtl_l2_fdb_scan(&io, start, &row);
-		if (ret <= 0)
-			break;
-		rtl_l2_fdb_decode(row.words, &entry);
-		if (fe_switch_learned_owned(&entry, sw->native_mask)) {
-			ether_addr_copy(sw->next[count].address, entry.mac);
-			sw->next[count++].port = entry.destination;
+	if (sw->scan_running && sw->scan_generation != generation) {
+		/* No old next[] prefix may be overwritten before its withdrawal.
+		 * Normally the invalidation/rebuild has already gated and reset
+		 * us; also fail closed if a stale slice ever finds itself armed.
+		 */
+		if (sw->pending_count) {
+			ret = -EAGAIN;
+			goto failure;
 		}
-		start = row.index + 1;
+		fe_switch_scan_reset(sw);
 	}
-	if (ret < 0) {
-		sw->scan_errors++;
-		sw->error = ret;
-		rtl9617c_switch_guard_invalidate(&sw->guard);
-		goto out;
+	if (!sw->scan_running) {
+		sw->scan_generation = generation;
+		sw->scan_running = true;
 	}
-	if (!sw->active || generation !=
-	    rtl9617c_switch_guard_generation(&sw->guard))
-		goto out;
-	sort(sw->next, count, sizeof(*sw->next), fe_switch_learned_compare, NULL);
-	for (cursor = 1; cursor < count; cursor++) {
-		if (!fe_switch_learned_compare(&sw->next[cursor - 1],
-					       &sw->next[cursor])) {
-			/* A moving key observed twice is not a coherent new owner.
-			 * Retain the last complete mirror and retry after learning
-			 * settles, rather than picking an arbitrary physical slot.
-			 */
-			mod_delayed_work(system_long_wq, &sw->scan_work, HZ);
+	if (!sw->scan_complete) {
+		while (sw->scan_start < RTL_L2_FDB_ENTRIES) {
+			if (fe_switch_scan_slice_done(operations, started))
+				goto resume;
+			ret = rtl_l2_fdb_scan(&io, sw->scan_start, &row);
+			operations++;
+			if (ret < 0)
+				goto failure;
+			if (!ret)
+				break;
+			rtl_l2_fdb_decode(row.words, &entry);
+			if (fe_switch_learned_owned(&entry, sw->native_mask)) {
+				ether_addr_copy(sw->next[sw->scan_count].address, entry.mac);
+				sw->next[sw->scan_count++].port = entry.destination;
+			}
+			sw->scan_start = row.index + 1;
+		}
+		if (!sw->active || generation !=
+		    rtl9617c_switch_guard_generation(&sw->guard))
 			goto out;
+		/* Sorting touches only this worker's MAC snapshot. RTNL excludes
+		 * rebuild/unoffload and stop waits for this work before freeing it;
+		 * do not block unrelated FE flow/stat operations on that CPU work.
+		 */
+		mutex_unlock(&sw->fe->lock);
+		sort(sw->next, sw->scan_count, sizeof(*sw->next),
+		     fe_switch_learned_compare, NULL);
+		mutex_lock(&sw->fe->lock);
+		if (sw->stopping || sw->fe->shutting_down || !sw->active ||
+		    generation != rtl9617c_switch_guard_generation(&sw->guard))
+			goto out;
+		for (cursor = 1; cursor < sw->scan_count; cursor++) {
+			if (!fe_switch_learned_compare(&sw->next[cursor - 1],
+						       &sw->next[cursor])) {
+				/* A moving key observed twice is not a coherent new
+				 * owner. Keep the last complete mirror and restart
+				 * after learning settles; never publish this prefix.
+				 */
+				fe_switch_scan_reset(sw);
+				mod_delayed_work(system_long_wq, &sw->scan_work, HZ);
+				goto out;
+			}
 		}
+		sw->scan_complete = true;
 	}
 	/* Complete snapshot only. Delete absent KEYS before adding moves:
 	 * br_fdb_external_learn_del() ignores the old port and deletes by key,
 	 * so delete-after-add would erase a newly moved entry on its new port.
 	 */
-	for (old = 0, cursor = 0; old < sw->learned_count; old++) {
-		while (cursor < count && fe_switch_learned_compare(
-		       &sw->next[cursor], &sw->learned[old]) < 0)
-			cursor++;
-		if (cursor == count || fe_switch_learned_compare(
-		    &sw->next[cursor], &sw->learned[old]))
-			fe_switch_feedback(sw, &sw->learned[old], false, 0);
-	}
-	for (cursor = 0; cursor < count; cursor++) {
-		ret = fe_switch_feedback(sw, &sw->next[cursor], true, generation);
-		if (ret) {
-			sw->error = ret;
-			sw->scan_errors++;
-			rtl9617c_switch_guard_invalidate(&sw->guard);
-			goto out;
+	if (!sw->scan_removed) {
+		while (sw->scan_old < sw->learned_count) {
+			if (fe_switch_scan_slice_done(operations, started))
+				goto resume;
+			operations++;
+			ret = sw->scan_cursor < sw->scan_count ?
+				fe_switch_learned_compare(&sw->next[sw->scan_cursor],
+							 &sw->learned[sw->scan_old]) : 1;
+			if (ret < 0) {
+				sw->scan_cursor++;
+				continue;
+			}
+			if (ret)
+				fe_switch_feedback(sw, &sw->learned[sw->scan_old], false, 0);
+			sw->scan_old++;
 		}
-		sw->pending_count = cursor + 1;
+		sw->scan_removed = true;
+		sw->scan_cursor = 0;
 	}
+	while (sw->scan_cursor < sw->scan_count) {
+		if (fe_switch_scan_slice_done(operations, started))
+			goto resume;
+		ret = fe_switch_feedback(sw, &sw->next[sw->scan_cursor], true, generation);
+		operations++;
+		if (ret)
+			goto failure;
+		sw->pending_count = ++sw->scan_cursor;
+	}
+	/* An epoch can close immediately after the final feedback (or during a
+	 * delete-only round). Retain that prefix for withdrawal, not as a newly
+	 * committed snapshot of the replacement policy.
+	 */
+	if (!sw->active || generation !=
+	    rtl9617c_switch_guard_generation(&sw->guard))
+		goto out;
 	swap = sw->learned;
 	sw->learned = sw->next;
 	sw->next = swap;
-	sw->learned_count = count;
+	sw->learned_count = sw->scan_count;
 	sw->pending_count = 0;
+	fe_switch_scan_reset(sw);
 	sw->polls++;
 	mod_delayed_work(system_long_wq, &sw->scan_work, HZ);
+	goto out;
+resume:
+	if (sw->active && generation == rtl9617c_switch_guard_generation(&sw->guard))
+		/* Every slice advances at least one bounded operation. Requeue
+		 * after dropping the locks without adding one HZ=100 tick per
+		 * batch (over a second of artificial full-table mirror latency).
+		 */
+		mod_delayed_work(system_long_wq, &sw->scan_work, 0);
+	goto out;
+failure:
+	sw->error = ret;
+	sw->scan_errors++;
+	rtl9617c_switch_guard_invalidate(&sw->guard);
 out:
+	if (!sw->active || sw->stopping || sw->fe->shutting_down)
+		fe_switch_scan_reset(sw);
 	mutex_unlock(&sw->fe->lock);
 	rtnl_unlock();
 }

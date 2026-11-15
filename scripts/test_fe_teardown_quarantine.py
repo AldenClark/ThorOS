@@ -44,11 +44,12 @@ struct rtl_fe {
  int lock,error,fail_disable,fail_switch_stop;
  unsigned int fdb_cmd_mode_saved,fdb_control,fdb_access,limit_access;
  void *memory,*itu_paths,*device,*bridge,*debug;
+ struct rtl_fe_flow **hash_owners;
  uintptr_t dma;
  unsigned int cleanup_work;
 };
 static struct rtl_fe *current;
-static unsigned int frees,dma_frees,path_frees,warnings,cancelled,debug_removed,mode_writes,last_mode;
+static unsigned int frees,dma_frees,path_frees,index_frees,warnings,cancelled,debug_removed,mode_writes,last_mode;
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
 static int fe_bridge_stop(void *bridge){assert(!bridge && current->shutting_down);return current->fail_switch_stop;}
@@ -71,17 +72,21 @@ static void dev_err(void *device,const char *format,int error,unsigned int bound
  (void)device;(void)format;(void)error;(void)bound;assert(current->shutting_down);warnings++;
 }
 static void kfree(void *pointer){frees++;free(pointer);}
-static void kvfree(void *pointer){path_frees++;free(pointer);}
+static void kvfree(void *pointer){
+ if(!pointer)return;
+ if(pointer==current->hash_owners)index_frees++;else path_frees++;
+ free(pointer);
+}
 static void dma_free_coherent(void *device,unsigned int bytes,void *pointer,uintptr_t dma){
  (void)device;(void)dma;assert(bytes==RTL_FE_MEMORY_BYTES);assert(cancelled);dma_frees++;free(pointer);
 }
 static struct rtl_fe *make_owner(void){
  struct rtl_fe *fe=calloc(1,sizeof(*fe));assert(fe);
  init_list(&fe->ports);init_list(&fe->flows);init_list(&fe->blocks);
- fe->memory=malloc(RTL_FE_MEMORY_BYTES);fe->itu_paths=malloc(16);
- assert(fe->memory && fe->itu_paths);fe->engine_ready=true;fe->desired_mode=RTL_FE_MODE_HARDWARE;
+ fe->memory=malloc(RTL_FE_MEMORY_BYTES);fe->itu_paths=malloc(16);fe->hash_owners=calloc(65536,sizeof(*fe->hash_owners));
+ assert(fe->memory && fe->itu_paths && fe->hash_owners);fe->engine_ready=true;fe->desired_mode=RTL_FE_MODE_HARDWARE;
  fe->fdb_control=0xa5123456;
- current=fe;frees=dma_frees=path_frees=warnings=cancelled=debug_removed=mode_writes=0;return fe;
+ current=fe;frees=dma_frees=path_frees=index_frees=warnings=cancelled=debug_removed=mode_writes=0;return fe;
 }
 '''
 tests = r'''
@@ -90,10 +95,12 @@ int main(void){
  struct rtl_fe *fe=make_owner();
  struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
  assert(rtl_fe_free(fe));
- assert(dma_frees==1 && path_frees==1 && frees==2 && !warnings && cancelled==1 && debug_removed==1);
+ assert(dma_frees==1 && path_frees==1 && index_frees==1 && frees==2 && !warnings && cancelled==1 && debug_removed==1);
  assert(mode_writes==1 && last_mode==0x25123456);
  fe=make_owner();fe->fdb_cmd_mode_saved=BIT(31);fe->fdb_control=0x12345678;
  assert(rtl_fe_free(fe));assert(mode_writes==1 && last_mode==0x92345678 && dma_frees==1);
+ fe=make_owner();free(fe->hash_owners);fe->hash_owners=NULL;
+ assert(rtl_fe_free(fe));assert(dma_frees==1 && path_frees==1 && !index_frees);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
  for(unsigned int fault=0;fault<11;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
@@ -111,12 +118,12 @@ int main(void){
   if(fault==10)fe->fabric.poisoned=true; /* A cold SCAN can outlive a failed probe. */
   assert(!rtl_fe_free(fe));
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
-  assert(!dma_frees && !path_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
+  assert(!dma_frees && !path_frees && !index_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
   assert(!mode_writes && fe->fdb_control==0xa5123456);
   assert(fe->error==(fault>=5?-EBUSY:fault==4?-ETIMEDOUT:fe->fail_disable));
   /* Test-only deallocation of deliberately quarantined model objects. Real
    * hardware owners stay allocated until a reboot/drain can be proved. */
-  free(port);free(fe->memory);free(fe->itu_paths);free(fe);
+  free(port);free(fe->memory);free(fe->itu_paths);free(fe->hash_owners);free(fe);
  }
  puts("FE teardown: release result distinguishes never-exposed cleanup from quarantine; exposed/partial bases preserve FDB leases and DMA, with async users stopped");
 }

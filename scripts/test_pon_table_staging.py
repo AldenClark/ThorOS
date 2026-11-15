@@ -125,6 +125,8 @@ with tempfile.TemporaryDirectory(prefix='pon-table-staging-') as directory:
     for name in ('rtl9617c-epon-sla.h', 'rtl9617c-pon-itu-puc.h',
                  'rtl9617c-pon-queue.h', 'rtl9617c-qm-deepq.h'):
         (work / name).write_text(read(name))
+    if 'rtl9617c-qm-resources.h' in read('rtl9617c-qm-deepq.h'):
+        (work / 'rtl9617c-qm-resources.h').write_text(read('rtl9617c-qm-resources.h'))
     cfile = work / 'test.c'
     binary = work / 'test'
     cfile.write_text(fixture + constants + '\n' + functions + test)

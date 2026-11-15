@@ -13,9 +13,10 @@ parser.add_argument('--revision', help='Run the same fault oracle on older produ
 args = parser.parse_args()
 relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
 source = subprocess.check_output(['git', 'show', args.revision + ':' + relative], cwd=root, text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
+indexed = 'struct rtl_fe_destination {' in source
 
 def function(name):
-    start = re.search(r'^static int ' + name + r'\(', source, re.M).start()
+    start = re.search(r'^static [^;{]*\b' + name + r'\(', source, re.M).start()
     end = source.index('{', start) + 1
     depth = 1
     while depth:
@@ -29,27 +30,39 @@ fixture = r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c_destination_tree.h"
 typedef unsigned char u8;
+#define ETH_ALEN 6
+#define FE_DESTINATIONS (4096+32)
+#define GFP_KERNEL 0
+#define kzalloc(bytes,flags) calloc(1,bytes)
+#define kfree(p) free(p)
 #define BIT(n) (1U<<(n))
 struct list_head {struct list_head *next,*prev;};
 static void init(struct list_head *h){h->next=h->prev=h;}
 static void add(struct list_head *n,struct list_head *h){n->prev=h->prev;n->next=h;h->prev->next=n;h->prev=n;}
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define list_for_each_entry(p,h,m) for(struct list_head *c=(h)->next;c!=(h) && ((p)=container_of(c,__typeof__(*(p)),m));c=c->next)
+struct rtl_fe_destination;
 struct rtl_fe_flow {
  struct list_head list;
  u8 destination[6];unsigned int destination_index,destination_saved[4];
  bool destination_created,destination_owned,destination_ready,deleting;
+ struct rtl_fe_destination *destination_owner;
+ bool destination_live;
 };
 struct rtl_fe {
  struct list_head flows;
+ struct rb_root destinations;
+ unsigned int destination_count;
  unsigned int window[4],table[4],control,result,writes,commands;
  bool exists,timeout_append,limit_busy;
 };
-static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
+static inline bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
 static void ether_addr_copy(u8 *a,const u8 *b){memcpy(a,b,6);}
 static unsigned int rd(void *p,unsigned int reg){
  struct rtl_fe *f=p;
@@ -86,6 +99,33 @@ static int req(void *p,unsigned int reg,unsigned int value){
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,wr,req};}
 '''
 test = r'''
+static bool ready(struct rtl_fe_flow *flow){
+#ifdef INDEXED_DESTINATIONS
+ return flow->destination_owner && flow->destination_owner->ready;
+#else
+ return flow->destination_ready;
+#endif
+}
+static bool created(struct rtl_fe_flow *flow){
+#ifdef INDEXED_DESTINATIONS
+ return flow->destination_owner->created;
+#else
+ return flow->destination_created;
+#endif
+}
+static unsigned int *saved(struct rtl_fe_flow *flow){
+#ifdef INDEXED_DESTINATIONS
+ return flow->destination_owner->saved;
+#else
+ return flow->destination_saved;
+#endif
+}
+static void retiring(struct rtl_fe_flow *flow){
+ flow->deleting=true;
+#ifdef INDEXED_DESTINATIONS
+ fe_destination_retire(flow);
+#endif
+}
 static void retiring_shared_owner(void){
  const u8 mac[]={2,1,2,3,4,5};
  const unsigned int order[6][3]={{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
@@ -101,14 +141,14 @@ static void retiring_shared_owner(void){
   /* fe_delete marks deleting before withdrawing hash age/cache. A timeout
    * there leaves this confirmed-ready FDB untouched. The second flow owns
    * the same row; list order must not veto new sharing through that owner. */
-  flows[retiring_first?0:1].deleting=true;
+  retiring(&flows[retiring_first?0:1]);
   unsigned int writes=f.writes,commands=f.commands;
   assert(!fe_destination_get(&f,&flows[2],mac));
-  assert(flows[2].destination_owned && flows[2].destination_ready);
+  assert(flows[2].destination_owned && ready(&flows[2]));
   assert(flows[2].destination_index==flows[0].destination_index);
-  assert(flows[2].destination_created==!existing);
+  assert(created(&flows[2])==!existing);
   assert(f.writes==writes && f.commands==commands);
-  if(existing)assert(!memcmp(flows[2].destination_saved,original,sizeof(original)));
+  if(existing)assert(!memcmp(saved(&flows[2]),original,sizeof(original)));
   /* Every release ordering keeps the row until the actual last owner.
    * Sharing does not detach the retiring flow's rollback reference. */
   for(unsigned int i=0;i<3;i++) {
@@ -118,16 +158,25 @@ static void retiring_shared_owner(void){
    assert(f.commands==commands+(i==2));
   }
   if(existing)assert(!memcmp(f.table,original,sizeof(original)));
+  assert(!f.destination_count && RB_EMPTY_ROOT(&f.destinations));
  }
  /* No live owner: do not bypass a pending restore by starting a new
   * lookup/APPEND. A ready retiring row and an uncertain row both refuse. */
- for(unsigned int ready=0;ready<2;ready++) {
+ for(unsigned int is_ready=0;is_ready<2;is_ready++) {
   struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};
   init(&f.flows);add(&a.list,&f.flows);add(&b.list,&f.flows);
-  a.destination_owned=true;a.destination_ready=ready;a.deleting=true;
-  ether_addr_copy(a.destination,mac);
+  assert(!fe_destination_get(&f,&a,mac));
+#ifdef INDEXED_DESTINATIONS
+  a.destination_owner->ready=is_ready;
+#else
+  a.destination_ready=is_ready;
+#endif
+  retiring(&a);
+  unsigned int writes=f.writes,commands=f.commands;
   assert(fe_destination_get(&f,&b,mac)==-EBUSY);
-  assert(!b.destination_owned && !f.writes && !f.commands);
+  assert(!b.destination_owned && f.writes==writes && f.commands==commands);
+  assert(!fe_destination_put(&f,&a));
+  assert(!f.destination_count && RB_EMPTY_ROOT(&f.destinations));
  }
 }
 int main(void){
@@ -146,8 +195,8 @@ int main(void){
   assert(!a.destination_owned && !f.writes && !f.commands);
   f.limit_busy=false;
   assert(fe_destination_get(&f,&a,mac)==-ETIMEDOUT);
-  assert(a.destination_owned && !a.destination_ready);
-  assert(a.destination_created==!existing);
+  assert(a.destination_owned && !ready(&a));
+  assert(created(&a)==!existing);
   assert(fe_destination_get(&f,&b,mac)==-EBUSY && !b.destination_owned);
   /* A late MAC-limit command must also block rollback, without discarding
    * the destination's ownership or changing the shared mode/DATA windows. */
@@ -158,21 +207,25 @@ int main(void){
   assert(!fe_destination_put(&f,&a));a.destination_owned=false;
   assert(f.exists==existing);
   if(existing)assert(!memcmp(f.table,original,sizeof(original)));
-  assert(!fe_destination_get(&f,&a,mac) && a.destination_ready);
-  assert(!fe_destination_get(&f,&b,mac) && b.destination_ready);
+  assert(!fe_destination_get(&f,&a,mac) && ready(&a));
+  assert(!fe_destination_get(&f,&b,mac) && ready(&b));
   assert(a.destination_index==b.destination_index);
   assert(!fe_destination_put(&f,&a));a.destination_owned=false;
   assert(f.exists);
   assert(!fe_destination_put(&f,&b));b.destination_owned=false;
   assert(f.exists==existing);
   if(existing)assert(!memcmp(f.table,original,sizeof(original)));
+  assert(!f.destination_count && RB_EMPTY_ROOT(&f.destinations));
  }
  puts("FDB: 24 retiring/live sharing and release orders; ambiguous APPEND retains ownership; unready/only-retiring rows refused; last-owner restore passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fe-fdb-') as tmp:
     path = Path(tmp)
-    (path / 'test.c').write_text(fixture + function('fe_destination_get') + function('fe_destination_put') + test)
+    owner = re.search(r'struct rtl_fe_destination \{.*?\n\};', source, re.S)[0] if indexed else ''
+    support = ''.join(function(n) for n in ('fe_destination_find', 'fe_destination_index', 'fe_destination_retire')) if indexed else ''
+    fixture = fixture.replace('struct rtl_fe_destination;', owner or 'struct rtl_fe_destination;')
+    (path / 'test.c').write_text(('#define INDEXED_DESTINATIONS 1\n' if indexed else '') + fixture + support + function('fe_destination_get') + function('fe_destination_put') + test)
     subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
-                    '-I' + str(drivers), str(path / 'test.c'), '-o', str(path / 'test')], check=True)
+                    '-I' + str(drivers), '-I' + str(root / 'scripts/fixtures'), str(path / 'test.c'), '-o', str(path / 'test')], check=True)
     subprocess.run([str(path / 'test')], check=True)

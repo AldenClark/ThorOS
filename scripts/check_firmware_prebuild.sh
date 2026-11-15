@@ -65,6 +65,7 @@ python3 scripts/test_qm_rx_bounds.py
 python3 scripts/test_qm_switch_rx.py
 python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py
+python3 scripts/test_qm_resources.py --mutants
 python3 scripts/test_dma_tx_fastpath.py
 python3 scripts/test_xram_tx_copy.py --mutants
 python3 scripts/test_ni_adaptive_timer.py
@@ -75,6 +76,9 @@ python3 scripts/test_fe_interface_capacity.py
 python3 scripts/test_fe_mtu.py
 python3 scripts/test_fe_flow_release.py
 python3 scripts/test_fe_flow_stats.py
+python3 scripts/test_fe_age_batch.py --mutants
+python3 scripts/test_fe_activity_cache.py --mutants
+python3 scripts/test_fe_allocation.py --mutants
 python3 scripts/test_fe_cleanup_isolation.py
 python3 scripts/test_release_uboot_archive.py
 python3 scripts/test_datapath_observer.py

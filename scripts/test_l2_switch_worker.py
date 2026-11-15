@@ -190,7 +190,7 @@ static int switchdev_bridge_port_offload(struct net_device *dev,struct net_devic
 }
 static int fe_switch_hw_prepare(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,unsigned long seconds,bool snooping){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open && !sw.active);
- assert(fe.engine_ready && native==online_ports && seconds==300 && snooping);prepares++;
+ assert(fe.engine_ready && native==online_ports && seconds==(unsigned long)(ageing/USER_HZ) && snooping);prepares++;
  hw->owned=true;return hw_error;
 }
 static int fe_switch_domain_claim(struct rtl_fe_bridge *owner){
@@ -229,6 +229,12 @@ static void success_and_policy(void){
  assert(prepares==1 && claims==1 && appends==2 && route_flushes==1 && sw.rebuilds==1 && last_delay==HZ && sw.local_target==25);
  assert(sw.route_generation_valid && sw.route_generation==1);
  run();assert(sw.active && sw.rebuilds==2 && route_flushes==1); /* Same epoch does not churn routed owners. */
+ /* A queued scan can belong to the same policy epoch yet predate the
+  * worker's complete hardware teardown/rebuild. It must start over. */
+ sw.scan_running=sw.scan_complete=sw.scan_removed=true;
+ sw.scan_start=17;sw.scan_count=9;sw.scan_cursor=5;sw.scan_old=3;sw.scan_generation=sw.guard.generation;
+ run();assert(sw.active && !sw.scan_running && !sw.scan_complete && !sw.scan_removed &&
+  !sw.scan_start && !sw.scan_count && !sw.scan_cursor && !sw.scan_old && route_flushes==1);
  sw.guard.generation++;run();assert(route_flushes==2 && sw.route_generation==2);
  setup();fe.enabled=fe.prepared=false;run();
  assert(sw.active && sw.hw.open && !sw.flow_allowed && !fe.route_admitted && !sw.armed_route_mask && sw.local_target==16);
@@ -285,7 +291,23 @@ static void transaction_failures(void){
  assert(sw.hw.owned && sw.domain_owned && !sw.hw.open && !snapshots && !arms && sw.error==-ETIMEDOUT);
  setup();flush_error=-ETIMEDOUT;run();assert(!sw.hw.open && !prepares && !arms && sw.error==-ETIMEDOUT);
  const clock_t invalid_age[]={0,-1,USER_HZ-1,((clock_t)1<<19)*USER_HZ};
- for(unsigned int i=0;i<4;i++){setup();ageing=invalid_age[i];run();assert(!sw.hw.open && !prepares && !arms && sw.reason==FE_SWITCH_PRIVATE_POLICY);}
+ for(unsigned int i=0;i<4;i++){
+  setup();ageing=invalid_age[i];run();
+  assert(sw.hw.open && sw.flow_allowed && !sw.active && !prepares && !claims && !offloads &&
+   arms==1 && sw.armed_route_mask==31 && sw.reason==FE_SWITCH_AGING_UNSUPPORTED && !sw.error);
+  /* Timer capability fallback must never mask real bridge/netfilter policy. */
+  setup();ageing=invalid_age[i];additional_policy=true;run();
+  assert(!sw.hw.open && !sw.flow_allowed && !arms && !sw.route_mask && !offloads);
+  setup();ageing=invalid_age[i];sw.guard.blocked=true;run();
+  assert(!sw.hw.open && !sw.flow_allowed && !arms && !sw.route_mask && !offloads);
+  setup();ageing=invalid_age[i];arm_failure=true;run();
+  assert(!sw.hw.open && !sw.flow_allowed && !sw.active && !offloads && sw.error==-EAGAIN &&
+   sw.reason==FE_SWITCH_GUARDED && fe_switch_needs_recovery(&fe));
+ }
+ const clock_t valid_age[]={USER_HZ,((clock_t)((1U<<19)-1))*USER_HZ};
+ for(unsigned int i=0;i<ARRAY_SIZE(valid_age);i++){
+  setup();ageing=valid_age[i];run();assert(sw.hw.open && sw.active && prepares==1 && sw.reason==FE_SWITCH_OK);
+ }
  for(unsigned int port=1;port<=2;port++){
   setup();offload_fail_at=port;run();assert(!sw.hw.open && !prepares && !sw.offloaded && sw.error==-ENOMEM);
   setup();replay_error_at=port;run();assert(!sw.hw.open && !prepares && !sw.offloaded && sw.error==-ENOSPC);
@@ -310,7 +332,7 @@ static void transaction_failures(void){
 }
 static void retry_classification(void){
  setup();assert(!fe_switch_needs_recovery(&fe));
- for(unsigned int reason=0;reason<=FE_SWITCH_HW_UNSUPPORTED;reason++){
+ for(unsigned int reason=0;reason<=FE_SWITCH_AGING_UNSUPPORTED;reason++){
   sw.reason=reason;sw.error=0;assert(!fe_switch_needs_recovery(&fe));
   sw.error=-EIO;
   assert(fe_switch_needs_recovery(&fe)==(reason!=FE_SWITCH_HW_UNSUPPORTED && reason!=FE_SWITCH_FOREIGN_FDB));cases++;
@@ -367,10 +389,15 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"struct fe_switch_learned \{.*?\n\};", r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_route_plan_validate", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_atomic_event",
+    "fe_switch_scan_reset", "fe_switch_route_plan_validate", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_atomic_event",
     "fe_switch_gate", "fe_switch_arm", "fe_switch_work",
 ])
 mutants = {
+    "rebuild_retains_same_generation_scan": functions.replace(
+        "\tfe_switch_scan_reset(sw);\n\t/* This operation", "\tif (0) fe_switch_scan_reset(sw);\n\t/* This operation", 1),
+    "native_aging_disables_independent_routing": functions.replace(
+        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tgoto arm;",
+        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tgoto unlock;", 1),
     "native_capability_disables_routing": functions.replace(
         "if (fe_switch_route_plan_validate(&plan) != FE_SWITCH_OK)",
         "if ((fe_switch_route_plan_validate(&plan), sw->reason != FE_SWITCH_OK && sw->reason != FE_SWITCH_NO_BRIDGE))", 1),

@@ -3,14 +3,7 @@
 #define RTL9617C_QM_DEEPQ_H
 
 #include <linux/errno.h>
-
-/* Native WAN private/shared DRAM pools. CPU EQ4/5 own BIDs0..511;
- * these two hardware-managed pools own BIDs512..1535. */
-#define RTL_DQ_BUFFERS 512
-#define RTL_DQ_BUFFER_BYTES 2048
-#define RTL_DQ_MEMORY_BYTES (2 * RTL_DQ_BUFFERS * RTL_DQ_BUFFER_BYTES)
-#define RTL_DQ_EQ_PRIVATE 1
-#define RTL_DQ_EQ_SHARED 2
+#include "rtl9617c-qm-resources.h"
 
 struct rtl_dq_io {
 	void *context;
@@ -29,14 +22,17 @@ static inline int rtl_qm_deepq_prepare(const struct rtl_dq_io *io, unsigned int 
 	unsigned int high = low * 2;
 	int ret;
 
+	if (!rtl_qm_dma_range_valid(address, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFER_BYTES))
+		return -ERANGE;
+
 	/* Keep PUC dequeue disabled until the native pools and credits are ready. */
 	io->write(io->context, 0x610c, io->read(io->context, 0x610c) & ~0xffffU);
-	for (pool = 0; pool < 2; pool++) {
+	for (pool = 0; pool < RTL_DQ_POOL_COUNT; pool++) {
 		unsigned int eq = RTL_DQ_EQ_PRIVATE + pool;
 		unsigned int cfg = 0x61e8 + eq * 20;
 
 		io->write(io->context, cfg, (address + pool * count * RTL_DQ_BUFFER_BYTES) | 1U);
-		io->write(io->context, cfg + 4, (count << 16) | (512 + pool * count));
+		io->write(io->context, cfg + 4, (count << 16) | (RTL_DQ_BID_FIRST + pool * count));
 		io->write(io->context, cfg + 8, 5); /* 2KiB, hardware-owned, no CPU refill. */
 		/* Linux coherent allocations use the same CCI alias as native CPU EQs. */
 		io->write(io->context, cfg + 12, 0x61008060);

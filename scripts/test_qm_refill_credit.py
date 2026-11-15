@@ -37,7 +37,7 @@ static u32 readl(void *p) {
 static void writel(u32 value,void *p) {
  assert((char *)p-(char *)registers==CPU_PUSH);
  unsigned eq=(value&15)-4;assert(eq<2&&ready&&credit[eq]);
- assert((value&~127U)==0x4000000+eq*0x100000+pushed[eq]*128);
+ assert((value&~127U)==0x4000000+eq*0x100000+pushed[eq]*2048);
  pushed[eq]++;credit[eq]--;
  if(pushed[0]+pushed[1]==add_after)credit[0]+=64;
  if(pushed[0]+pushed[1]==stop_after)ready=0;
@@ -49,7 +49,7 @@ static void setup(struct rtl_qm_rx *rx,unsigned n0,unsigned n1,unsigned c0,unsig
  memset(reads,0,sizeof(reads));memset(pushed,0,sizeof(pushed));fifo_reads=0;
  credit[0]=c0;credit[1]=c1;ready=1;stop_after=add_after=~0U;
  for(unsigned e=0;e<2;e++)for(unsigned i=0;i<(e?n1:n0);i++)
-  rtl_qm_refill_add(&rx->refill,(0x4000000+e*0x100000+i*128)|(e+4));
+  rtl_qm_refill_add(&rx->refill,(0x4000000+e*0x100000+i*2048)|(e+4));
 }
 int main(void) {
  struct rtl_qm_rx rx;unsigned count=0;
@@ -71,12 +71,30 @@ int main(void) {
  assert(pushed[0]==64&&reads[0]>=2); /* New credit is observed on exhaustion. */
  setup(&rx,2,0,64,0);rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
  /* Unused cached allowance must not survive a later call. */
- rtl_qm_refill_add(&rx.refill,(0x4000000+2*128)|4);credit[0]=0;
+ rtl_qm_refill_add(&rx.refill,(0x4000000+2*2048)|4);credit[0]=0;
  unsigned before=reads[0];rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
  assert(pushed[0]==2&&rx.refill.pending==1&&reads[0]==before+1);
  credit[0]=1;rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);assert(pushed[0]==3);
  setup(&rx,64,64,0,64);rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
  assert(!pushed[0]&&pushed[1]==63&&rx.refill.count[0]==64);
+ /* Both expanded pools may be entirely CPU-owned while PUSH is blocked.
+  * Wrap at every queue head, then resume each full 512-entry pool exactly
+  * once. This catches the old independent 256-slot software queue. */
+ assert(RTL_QM_BUFFERS_PER_EQ==512 && RTL_QM_REFILL_SIZE>=512);
+ for(unsigned head=0;head<512;head++) {
+  setup(&rx,0,0,0,0);rx.refill.head[0]=head;rx.refill.head[1]=511-head;
+  for(unsigned e=0;e<2;e++)for(unsigned i=0;i<512;i++)
+   rtl_qm_refill_add(&rx.refill,(0x4000000+e*0x100000+i*2048)|(e+4));
+  assert(rx.refill.pending==1024 && rx.refill.peak==1024);
+  rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
+  assert(!pushed[0] && !pushed[1] && rx.refill.pending==1024);
+  credit[0]=credit[1]=512;
+  for(unsigned poll=0;rx.refill.pending && poll<32;poll++)
+   rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
+  assert(!rx.refill.pending && rx.refill.returned==1024 && pushed[0]==512 && pushed[1]==512);
+  assert(rx.refill.head[0]==head && rx.refill.head[1]==511-head);
+  count++;
+ }
  printf("%u dual-EQ credit/FIFO/resume cases; full64 EQ reads=%u, FIFO reads=64; cross-drain reset and EQ isolation passed\n",count,full_reads);
  assert(full_reads==1);
 }

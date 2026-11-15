@@ -4,7 +4,7 @@
  * Register sequences: Cortina-Access 2015 GPL-2.0+ aal_l3qm.c; ingress
  * classification: Realtek 2020 GPL-2.0+ aal_l2_classification.c, from
  * GPL-for-GP3000 5090fbcb6ba743dd7b1314811ef557bad0460147.
- * CPU rings: 1024 bytes per VOQ, 8-byte commands, as TYFZA1 ca-ne.ko.
+ * CPU rings: 2048 bytes per VOQ, retaining the SDK's 8-byte command format.
  */
 #include <linux/bitfield.h>
 #include <linux/etherdevice.h>
@@ -20,7 +20,11 @@
 #include "rtl9617c-rx-checksum.h"
 #include "rtl9617c-l2qm.h"
 
-#define EQ_ID 4
+#if NAPI_POLL_WEIGHT != RTL_QM_REFILL_RESERVE
+#error "QM refill reserve must track the native default NAPI weight"
+#endif
+
+#define EQ_ID RTL_QM_CPU_EQ_FIRST
 #define EQ_CFG (0x61e8 + EQ_ID * 20)
 #define EQ_PROFILE (0x6128 + EQ_ID * 4)
 #define RMU_CTRL 0x6104
@@ -234,26 +238,42 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 
 int rtl_qm_rx_alloc(struct device *dev, struct rtl_qm_rx *rx)
 {
+	int ret = -ENOMEM;
+
 	rx->device = dev;
 	rx->memory = dma_alloc_noncoherent(dev, RTL_QM_MEMORY_BYTES, &rx->memory_dma,
 		DMA_FROM_DEVICE, GFP_KERNEL);
 	if (!rx->memory)
 		return -ENOMEM;
-	rx->ring_memory = dma_alloc_noncoherent(dev, RTL_QM_RING_BYTES * RTL_QM_VOQS,
+	if (!rtl_qm_dma_range_valid(rx->memory_dma, RTL_QM_MEMORY_BYTES, RTL_QM_BUFFER_BYTES)) {
+		ret = -ERANGE;
+		goto free_payload;
+	}
+	rx->ring_memory = dma_alloc_noncoherent(dev, RTL_QM_RING_MEMORY_BYTES,
 		&rx->ring_dma, DMA_FROM_DEVICE, GFP_KERNEL);
 	if (!rx->ring_memory)
 		goto free_payload;
+	if (!rtl_qm_dma_range_valid(rx->ring_dma, RTL_QM_RING_MEMORY_BYTES, L1_CACHE_BYTES)) {
+		ret = -ERANGE;
+		goto free_ring;
+	}
 	rx->deepq_memory = dma_alloc_coherent(dev, RTL_DQ_MEMORY_BYTES, &rx->deepq_dma, GFP_KERNEL);
-	if (!rx->deepq_memory) {
-		dma_free_noncoherent(dev, RTL_QM_RING_BYTES * RTL_QM_VOQS, rx->ring_memory, rx->ring_dma, DMA_FROM_DEVICE);
-		rx->ring_memory = NULL;
-		goto free_payload;
+	if (!rx->deepq_memory)
+		goto free_ring;
+	if (!rtl_qm_dma_range_valid(rx->deepq_dma, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFER_BYTES)) {
+		ret = -ERANGE;
+		dma_free_coherent(dev, RTL_DQ_MEMORY_BYTES, rx->deepq_memory, rx->deepq_dma);
+		rx->deepq_memory = NULL;
+		goto free_ring;
 	}
 	return 0;
+free_ring:
+	dma_free_noncoherent(dev, RTL_QM_RING_MEMORY_BYTES, rx->ring_memory, rx->ring_dma, DMA_FROM_DEVICE);
+	rx->ring_memory = NULL;
 free_payload:
 	dma_free_noncoherent(dev, RTL_QM_MEMORY_BYTES, rx->memory, rx->memory_dma, DMA_FROM_DEVICE);
 	rx->memory = NULL;
-	return -ENOMEM;
+	return ret;
 }
 
 static unsigned int rtl_dq_read(void *context, unsigned int reg)
@@ -385,13 +405,14 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		writel(0, ni + 0x61e8 + i * 20);
 		writel(0, ni + 0x61ec + i * 20);
 	}
-	/* Distinct EQ4/EQ5: each has 256 buffers and its own BID range. */
-	for (i = 0; i < 2; i++) {
+	/* Distinct EQ4/EQ5: each has its own pool and disjoint BID range. */
+	for (i = 0; i < RTL_QM_CPU_EQ_COUNT; i++) {
 		unsigned int cfg = EQ_CFG + i * 20;
 
 		writel(1, ni + cfg);
-		writel((RTL_QM_BUFFERS_PER_EQ << 16) | (i * RTL_QM_BUFFERS_PER_EQ), ni + cfg + 4);
-		writel(5 | BIT(3) | (24 << 8), ni + cfg + 8);
+		writel((RTL_QM_BUFFERS_PER_EQ << 16) |
+		       (RTL_QM_CPU_BID_FIRST + i * RTL_QM_BUFFERS_PER_EQ), ni + cfg + 4);
+		writel(5 | BIT(3) | (RTL_QM_REFILL_THRESHOLD << 8), ni + cfg + 8);
 		writel(0x61008060, ni + cfg + 12);
 		writel(2, ni + cfg + 16);
 	}
@@ -427,7 +448,7 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		writel(rx->ring_dma + i * RTL_QM_RING_BYTES, ni + EPP_BASE + i * 4);
 	}
 	for (i = 0; i < RTL_QM_BUFFERS; i++) {
-		ret = rtl_qm_push(rx, rx->memory_dma + RTL_QM_RING_BYTES * RTL_QM_VOQS +
+		ret = rtl_qm_push(rx, rx->memory_dma + RTL_QM_PAYLOAD_OFFSET +
 				  i * RTL_QM_BUFFER_BYTES, EQ_ID + i / RTL_QM_BUFFERS_PER_EQ);
 		if (ret)
 			return ret;
@@ -568,17 +589,18 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			length_word = get_unaligned_le32(entry + 4);
 			address = command & 0xffffff80;
 			offset = address - lower_32_bits(rx->memory_dma);
-			/* Each CPU EQ owns a separate 256-buffer partition. Returning an
+			/* Each CPU EQ owns a separate buffer partition. Returning an
 			 * address from EQ4 as EQ5 (or vice versa) would create two owners
 			 * of that RAM, even though the address is in the overall pool. */
-			valid_buffer = offset >= RTL_QM_RING_BYTES * RTL_QM_VOQS &&
-				offset <= RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES &&
+			/* Unsigned subtraction also rejects addresses below the payload
+			 * base. Allocation validation already excluded 32-bit wrap. */
+			valid_buffer = offset <= RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES &&
 				!(offset & (RTL_QM_BUFFER_BYTES - 1)) &&
 				(command & 15) == EQ_ID +
-				(offset - RTL_QM_RING_BYTES * RTL_QM_VOQS) /
+				offset /
 				(RTL_QM_BUFFERS_PER_EQ * RTL_QM_BUFFER_BYTES);
 			if (valid_buffer &&
-			    rx->refill.count[(command & 15) - EQ_ID] == RTL_QM_REFILL_SIZE)
+			    rx->refill.count[(command & 15) - EQ_ID] >= RTL_QM_REFILL_SIZE)
 				break;
 			rx->last_address = command;
 			rx->last_size = length_word;
@@ -728,8 +750,9 @@ ssize_t rtl_qm_deepq_state(struct rtl_qm_rx *rx, char *buf)
 	ssize_t length;
 	unsigned int eq, cfg;
 
-	length = sysfs_emit(buf, "configured=%u memory=%pad bytes=%u buffers_per_pool=%u map=%08x puc_enable=%08x profile=%08x port16=%08x port31=%08x\n",
+	length = sysfs_emit(buf, "configured=%u memory=%pad bytes=%u buffers_per_pool=%u bid_first=%u bid_end_exclusive=%u lan_deepq_supported=0 map=%08x puc_enable=%08x profile=%08x port16=%08x port31=%08x\n",
 		rx->deepq_configured, &rx->deepq_dma, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFERS,
+		RTL_DQ_BID_FIRST, RTL_DQ_BID_END,
 		readl(rx->ni + 0x68f8), readl(rx->ni + 0x610c), readl(rx->ni + 0x612c),
 		readl(rx->ni + 0x6148 + 16 * 4), readl(rx->ni + 0x6148 + 31 * 4));
 	for (eq = RTL_DQ_EQ_PRIVATE; eq <= RTL_DQ_EQ_SHARED; eq++) {
@@ -758,10 +781,14 @@ ssize_t rtl_qm_rx_trace(struct rtl_qm_rx *rx, char *buf)
 
 ssize_t rtl_qm_rx_pool(struct rtl_qm_rx *rx, char *buf)
 {
-	ssize_t length = 0;
+	ssize_t length;
 	unsigned int i;
 
-	for (i = 0; i < 2; i++) {
+	length = sysfs_emit(buf, "cpu_buffers=%u buffers_per_eq=%u payload_bytes=%u ring_bytes_per_voq=%u ring_commands_per_voq=%u refill_slots_per_eq=%u bid_first=%u bid_end_exclusive=%u\n",
+		RTL_QM_BUFFERS, RTL_QM_BUFFERS_PER_EQ, RTL_QM_PAYLOAD_BYTES,
+		RTL_QM_RING_BYTES, RTL_QM_RING_COMMANDS, RTL_QM_REFILL_SIZE,
+		RTL_QM_CPU_BID_FIRST, RTL_QM_CPU_BID_END);
+	for (i = 0; i < RTL_QM_CPU_EQ_COUNT; i++) {
 		unsigned int cfg = EQ_CFG + i * 20;
 		unsigned int monitor = 0x66d8 + (EQ_ID + i) * 16;
 		length += scnprintf(buf + length, PAGE_SIZE - length,

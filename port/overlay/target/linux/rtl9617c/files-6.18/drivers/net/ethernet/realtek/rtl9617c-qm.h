@@ -8,12 +8,9 @@
 #include "rtl9617c-qm-refill.h"
 #include "rtl9617c-qm-deepq.h"
 
-#define RTL_QM_RING_BYTES 1024
-#define RTL_QM_COMMAND_BYTES 8
-#define RTL_QM_VOQS 8
-#define RTL_QM_BUFFERS_PER_EQ 256
-#define RTL_QM_BUFFERS (2 * RTL_QM_BUFFERS_PER_EQ)
-#define RTL_QM_MEMORY_BYTES (RTL_QM_RING_BYTES * RTL_QM_VOQS + RTL_QM_BUFFERS * RTL_QM_BUFFER_BYTES)
+#if RTL_QM_BUFFER_BYTES != RTL_QM_RESOURCE_BUFFER_BYTES
+#error "QM packet layout and the CPU/DQ allocation plan must use the same buffer size"
+#endif
 
 struct rtl_fe;
 

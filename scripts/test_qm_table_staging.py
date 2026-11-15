@@ -58,8 +58,6 @@ fixture = r'''
 typedef uint32_t u32;
 #define BIT(n) (1U<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
-#define RTL_QM_BUFFERS_PER_EQ 256
-#define RTL_QM_VOQS 8
 #define EQ_ID 4
 #include "rtl9617c-qm-deepq.h"
 struct rtl_qm_rx {void *ni;};
@@ -133,6 +131,10 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='qm-staging-', dir=root / 'artifacts') as temp:
     path = Path(temp)
     (path / 'rtl9617c-qm-deepq.h').write_text(read('rtl9617c-qm-deepq.h'))
+    if 'rtl9617c-qm-resources.h' in read('rtl9617c-qm-deepq.h'):
+        (path / 'rtl9617c-qm-resources.h').write_text(read('rtl9617c-qm-resources.h'))
+    else:
+        fixture = '#define RTL_QM_BUFFERS_PER_EQ 256\n#define RTL_QM_VOQS 8\n' + fixture
     # Keep --revision self-contained: older code used the literal credit
     # word and did not yet have this allocation-contract header.
     if 'RTL_L2QM_PORT_FREE_CREDIT' in production:

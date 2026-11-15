@@ -51,6 +51,7 @@ python3 scripts/check_sdk_report_sources.py --source-root "$work/bpi" \
     --gpl-registers "$work/rtl8277c_registers.h"
 python3 scripts/test_gpio_readback.py --sdk "$work/gpio-ca77xx.c"
 python3 scripts/test_fe_sdk_contract.py --sdk "$work/sdk"
+python3 scripts/test_fe_age_batch.py --sdk-root "$work/sdk/$sdk_path"
 python3 scripts/test_fe_register_contract.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fe_mtu.py --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_fabric_baseline.py --registers "$work/rtl8277c_registers.h"

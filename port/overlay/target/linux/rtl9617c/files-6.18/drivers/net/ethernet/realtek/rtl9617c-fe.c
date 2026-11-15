@@ -24,11 +24,13 @@
 #include <linux/spinlock.h>
 #include <linux/tc_act/tc_csum.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 #include <net/flow_offload.h>
 #include <net/pkt_cls.h>
 #include "rtl9617c-fe.h"
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-fe-age.h"
 #include "rtl9617c-fe-cache-snapshot.h"
 #include "rtl9617c-fe-observe.h"
 #include "rtl9617c-l2-evidence.h"
@@ -52,6 +54,7 @@ static void fe_switch_track_port_locked(struct rtl_fe *fe, struct net_device *de
 #define FE_INTERFACES 32
 #define FE_COUNTERS 32
 #define FE_SOURCE_MACS 15
+#define FE_DESTINATIONS (4096 + 32)
 #define FE_LAN_PORTS 5
 #define FE_LAN_RX_CTRL(port) (0xa5f8+0x90*(port))
 
@@ -80,11 +83,22 @@ struct rtl_fe_interface {
 struct rtl_fe_mtu {
  unsigned int users, size, saved;
 };
+/* A MAC pin is a shared hardware resource, not a property of an arbitrary
+ * first flow. Keep one snapshot and one indexed owner until the last release
+ * has completed. Retiring references still own the row, but cannot by
+ * themselves authorize new users while withdrawal/rollback is pending. */
+struct rtl_fe_destination {
+ struct rb_node node;
+ unsigned int users, live_users, index, saved[4];
+ u8 address[ETH_ALEN];
+ bool created, ready;
+};
 struct rtl_fe_flow {
  struct list_head list, retry;
  struct rb_node cookie_node;
  unsigned long cookie, lastused;
  struct rtl_fe_port *input, *output;
+ struct rtl_fe_destination *destination_owner;
  unsigned int hash_index, counter, source_mac, destination_index;
  unsigned int pppoe, mtu_index;
  unsigned int ingress_session;
@@ -101,13 +115,13 @@ struct rtl_fe_flow {
  struct {u16 tci,protocol;} bridge_tag[2];
  u16 bridge_vid;
  u16 bridge_ppp_protocol;
- unsigned int destination_saved[4];
  u16 crc16;
  u32 crc32;
  unsigned char ethernet_bytes;
- bool destination_created, destination_ready;
+ bool destination_live;
  bool mtu_owned;
  bool published, source_owned, destination_owned, interface_owned, counted, installed, deleting;
+ bool activity_cached;
  bool withdrawal_pending;
  u8 destination[ETH_ALEN];
  u64 bytes;
@@ -142,7 +156,11 @@ struct rtl_fe {
  struct delayed_work cleanup_work;
  unsigned int cleanup_delay;
  struct list_head ports, flows, blocks, retries;
- struct rb_root cookies;
+ struct rb_root cookies, destinations;
+ unsigned int destination_count;
+ /* Optional, bounded CPU-side index; not another hardware Hash table.
+  * The FE mutex owns every pointer until verified final flow release. */
+ struct rtl_fe_flow **hash_owners;
  void *memory;
  dma_addr_t dma;
  bool enabled, prepared, cpu_path, lan_redirected;
@@ -783,32 +801,64 @@ static void fe_mtu_put(struct rtl_fe *fe,struct rtl_fe_flow *flow)
   fe_write(fe,address,(fe_read(fe,address)&~(0x3fffU<<shift))|mtu->saved<<shift);
  flow->mtu_owned=false;
 }
+static struct rtl_fe_destination *fe_destination_find(struct rtl_fe *fe,const u8 *address)
+{
+ struct rb_node *node=fe->destinations.rb_node;
+
+ while(node) {
+  struct rtl_fe_destination *owner=rb_entry(node,struct rtl_fe_destination,node);
+  int order=memcmp(address,owner->address,ETH_ALEN);
+
+  if(!order)return owner;
+  node=order<0?node->rb_left:node->rb_right;
+ }
+ return NULL;
+}
+static void fe_destination_index(struct rtl_fe *fe,struct rtl_fe_destination *owner)
+{
+ struct rb_node **link=&fe->destinations.rb_node,*parent=NULL;
+
+ while(*link) {
+  struct rtl_fe_destination *other=rb_entry(*link,struct rtl_fe_destination,node);
+
+  parent=*link;
+  link=memcmp(owner->address,other->address,ETH_ALEN)<0?
+       &(*link)->rb_left:&(*link)->rb_right;
+ }
+ rb_link_node(&owner->node,parent,link);
+ rb_insert_color(&owner->node,&fe->destinations);
+ fe->destination_count++;
+}
+static void fe_destination_retire(struct rtl_fe_flow *flow)
+{
+ if(flow->destination_live) {
+  flow->destination_owner->live_users--;
+  flow->destination_live=false;
+ }
+}
 static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u8 *address)
 {
  struct rtl_dq_io io=fe_io(fe);
- struct rtl_fe_flow *other;
+ struct rtl_fe_destination *owner;
  unsigned int words[4],result;
- bool retiring=false;
  int ret;
 
+ if(flow->destination_owned)return -EALREADY;
  ether_addr_copy(flow->destination,address);
- list_for_each_entry(other,&fe->flows,list)
-  if(other!=flow && other->destination_owned && ether_addr_equal(other->destination,address)) {
-   if(!other->destination_ready)return -EBUSY;
-   /* A failed hash/cache withdrawal does not invalidate a shared, ready
-    * DA row. A later live owner may still authorize sharing it. Do not
-    * let list order turn one retiring flow into a gateway-wide veto.
-    * An uncertain FDB writer above, or ONLY retiring owners below, must
-    * still block reuse and any new APPEND until cleanup completes. */
-   if(other->deleting){retiring=true;continue;}
-   flow->destination_index=other->destination_index;
-   memcpy(flow->destination_saved,other->destination_saved,sizeof(flow->destination_saved));
-   flow->destination_created=other->destination_created;
-   flow->destination_owned=true;
-   flow->destination_ready=true;
-   return 0;
-  }
- if(retiring)return -EBUSY;
+ owner=fe_destination_find(fe,address);
+ if(owner) {
+  if(!owner->ready || !owner->live_users)return -EBUSY;
+  owner->users++;
+  owner->live_users++;
+  flow->destination_owner=owner;
+  flow->destination_index=owner->index;
+  flow->destination_owned=true;
+  flow->destination_live=true;
+  return 0;
+ }
+ /* Hardware has 4096 hash rows plus 32 overflow rows. Count uncertain
+  * owners too: a timed-out APPEND is not permission to overcommit pins. */
+ if(fe->destination_count>=FE_DESTINATIONS)return -ENOSPC;
  rtl_fe_fdb_key(words,address);
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
@@ -818,16 +868,22 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  /* The private VID/SC key is not permission to overwrite a foreign or
   * indeterminate row. A real L2 forwarding entry must never be pinned here. */
  if((result&15)==5 && !rtl_fe_fdb_is_pin(words))return -EADDRINUSE;
- flow->destination_created=(result&15)==15;
- if(!flow->destination_created)memcpy(flow->destination_saved,words,sizeof(words));
+ owner=kzalloc(sizeof(*owner),GFP_KERNEL);
+ if(!owner)return -ENOMEM;
+ ether_addr_copy(owner->address,address);
+ owner->created=(result&15)==15;
+ if(!owner->created)memcpy(owner->saved,words,sizeof(words));
  /* APPEND updates an existing key in place. Pin its MAC/permissions until
   * the last Linux flow releases it, then restore its original contents. */
- if(flow->destination_created)rtl_fe_fdb_key(words,address);
+ if(owner->created)rtl_fe_fdb_key(words,address);
  else words[0]|=BIT(9)|BIT(19)|BIT(20)|BIT(21);
  /* APPEND can change the table before its completion poll times out.
   * Retain the original row/key for rollback before issuing the command. */
+ owner->users=owner->live_users=1;
+ fe_destination_index(fe,owner);
+ flow->destination_owner=owner;
  flow->destination_owned=true;
- flow->destination_ready=false;
+ flow->destination_live=true;
  ret=rtl_fe_fdb_command(&io,0x45,words,&result);
  if(ret)return ret;
  if((result&15)==10)return -ENOSPC;
@@ -838,33 +894,41 @@ static int fe_destination_get(struct rtl_fe *fe,struct rtl_fe_flow *flow,const u
  ret=rtl_fe_fdb_command(&io,4,words,&result);
  if(ret)return ret;
  if((result&15)!=5 || !rtl_fe_fdb_is_pin(words) ||
-    ((result>>4)&0x1fff)>=4128)return -EIO;
- flow->destination_index=(result>>4)&0x1fff;
- flow->destination_ready=true;
+    ((result>>4)&0x1fff)>=FE_DESTINATIONS)return -EIO;
+ owner->index=(result>>4)&0x1fff;
+ owner->ready=true;
+ flow->destination_index=owner->index;
  return 0;
 }
 static int fe_destination_put(struct rtl_fe *fe,struct rtl_fe_flow *flow)
 {
  struct rtl_dq_io io=fe_io(fe);
- struct rtl_fe_flow *other;
+ struct rtl_fe_destination *owner=flow->destination_owner;
  unsigned int words[4],result;
  int ret;
 
- flow->destination_ready=false;
- list_for_each_entry(other,&fe->flows,list)
-  if(other!=flow && other->destination_owned && ether_addr_equal(other->destination,flow->destination))return 0;
- if(flow->destination_created) {
-  rtl_fe_fdb_key(words,flow->destination);
-  ret=rtl_fe_fdb_command(&io,0x85,words,&result);
+ if(!flow->destination_owned || !owner || !owner->users)return -EINVAL;
+ fe_destination_retire(flow);
+ if(owner->users==1) {
+  owner->ready=false;
+  if(owner->created)rtl_fe_fdb_key(words,owner->address);
+  else memcpy(words,owner->saved,sizeof(words));
+  ret=rtl_fe_fdb_command(&io,owner->created?0x85:0x45,words,&result);
   if(ret)return ret;
-  /* Deletion is idempotent only for the documented HIT/MISS results. */
-  return (result&15)==5 || (result&15)==15?0:-EIO;
+  /* Release is idempotent only for the documented DELETE HIT/MISS or
+   * APPEND HIT/port-limit-warning results. Keep the index and sole owner
+   * through busy/timeouts/semantic failures, including late completion. */
+  if(!owner->created && (result&15)==10)return -ENOSPC;
+  if((result&15)!=5 && (result&15)!=(owner->created?15U:4U))return -EIO;
+  rb_erase(&owner->node,&fe->destinations);
+  fe->destination_count--;
+  kfree(owner);
+ } else {
+  owner->users--;
  }
- memcpy(words,flow->destination_saved,sizeof(words));
- ret=rtl_fe_fdb_command(&io,0x45,words,&result);
- if(ret)return ret;
- if((result&15)==10)return -ENOSPC;
- return (result&15)==5 || (result&15)==4?0:-EIO;
+ flow->destination_owner=NULL;
+ flow->destination_owned=false;
+ return 0;
 }
 
 struct rtl_fe_rule {
@@ -1303,6 +1367,7 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
  int ret;
 
  flow->deleting=true;
+ fe_destination_retire(flow);
  if(flow->published) {
   ret=rtl_fe_main_age(&io,flow->hash_index,0);
   if(ret)goto retry;
@@ -1335,6 +1400,7 @@ static int fe_delete(struct rtl_fe *fe,struct rtl_fe_flow *flow)
   flow->source_owned=false;
  }
  if(flow->mtu_owned)fe_mtu_put(fe,flow);
+ if(fe->hash_owners)fe->hash_owners[flow->hash_index]=NULL;
  __clear_bit(flow->hash_index,fe->hashes);
  rb_erase(&flow->cookie_node,&fe->cookies);
  list_del(&flow->retry);
@@ -1487,6 +1553,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  __set_bit(index,fe->hashes);
  list_add_tail(&flow->list,&fe->flows);
  fe_index_flow(fe,flow);
+ if(fe->hash_owners)fe->hash_owners[index]=flow;
  if(!data.bridge) {
   flow->source_mac=FE_SOURCE_MACS;
   ret=fe_source_get(fe,data.source,&flow->source_mac);
@@ -1551,10 +1618,56 @@ static int fe_replace(struct rtl_fe_port *port,struct flow_cls_offload *cls)
  rtl_fe_observe_install(observe,ret);
  return ret;
 }
+/* One hardware activity row serves 32 main-Hash slots. Record positive hits
+ * for all live owners before acknowledging that row, instead of rereading
+ * and rewriting it for each stats callback. Only a recent POSITIVE sample
+ * is reusable: an idle neighbor must be sampled again if traffic arrives
+ * before its own callback. The cache never slides an idle lastused forward.
+ *
+ * Allocation of the 64K pointer index is optional (512KiB on ARM64). Falling
+ * back to the original per-flow transaction must not prevent LAN startup.
+ */
+static int fe_refresh_activity(struct rtl_fe *fe,struct rtl_fe_flow *flow)
+{
+ struct rtl_dq_io io=fe_io(fe);
+ struct rtl_fe_flow *owner;
+ unsigned int age,first,i,owned=0,hits;
+ unsigned long now=jiffies;
+ int ret;
+
+ if(!fe->hash_owners) {
+  ret=rtl_fe_main_age_read(&io,flow->hash_index,&age);
+  if(ret)return ret;
+  if(age>1) {
+   ret=rtl_fe_main_age(&io,flow->hash_index,1);
+   if(ret)return ret;
+   flow->lastused=now;
+  }
+  return 0;
+ }
+ if(flow->hash_index>=RTL_FE_HASH_ENTRIES ||
+    fe->hash_owners[flow->hash_index]!=flow)return -EIO;
+ if(!flow->installed || !flow->published || flow->deleting)return -ENOENT;
+ if(flow->activity_cached && time_before(now,flow->lastused+HZ))return 0;
+ first=flow->hash_index&~31U;
+ for(i=0;i<32;i++) {
+  owner=fe->hash_owners[first+i];
+  if(owner && owner->installed && owner->published && !owner->deleting)
+   owned|=1U<<i;
+ }
+ ret=rtl_fe_main_age_batch(&io,first,owned,flow->hash_index&31U,&hits);
+ if(ret)return ret;
+ for(i=0;i<32;i++)if(hits&(1U<<i)) {
+  owner=fe->hash_owners[first+i];
+  owner->lastused=now;
+  owner->activity_cached=true;
+ }
+ return 0;
+}
 static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *flow,struct flow_cls_offload *cls)
 {
  struct rtl_dq_io io=fe_io(fe);
- unsigned int words[7],age;
+ unsigned int words[7];
  u64 bytes;
  u64 byte_delta;
  u32 packets;
@@ -1562,13 +1675,8 @@ static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *flow,struct flow_cls_o
  int ret;
 
  if(!flow->published)return -ENOENT;
- ret=rtl_fe_main_age_read(&io,flow->hash_index,&age);
+ ret=fe_refresh_activity(fe,flow);
  if(ret)return ret;
- if(age>1) {
-  ret=rtl_fe_main_age(&io,flow->hash_index,1);
-  if(ret)return ret;
-  flow->lastused=jiffies;
- }
  if(!flow->counted) {
   flow_stats_update(&cls->stats,0,0,0,flow->lastused,FLOW_ACTION_HW_STATS_DELAYED);
   return 0;
@@ -1576,7 +1684,11 @@ static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *flow,struct flow_cls_o
  ret=rtl_fe_tx_counter_read(&io,flow->counter,words);
  if(ret)return ret;
  bytes=(u64)words[1]<<32|words[0];packets=words[2]+words[3];
- if(bytes!=flow->bytes || packets!=flow->packets)flow->lastused=jiffies;
+ if(bytes!=flow->bytes || packets!=flow->packets) {
+  flow->lastused=jiffies;
+  /* A MIB update is not a fresh sample of the shared Hash age row. */
+  flow->activity_cached=false;
+ }
  byte_delta=bytes-flow->bytes;packet_delta=packets-flow->packets;
  /* The PE MIB measures the output frame, including its VLAN headers. */
  flow_stats_update(&cls->stats,byte_delta-(u64)packet_delta*flow->ethernet_bytes,packet_delta,0,
@@ -1885,9 +1997,11 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  INIT_LIST_HEAD(&fe->ports);INIT_LIST_HEAD(&fe->flows);INIT_LIST_HEAD(&fe->blocks);
  INIT_LIST_HEAD(&fe->retries);
  fe->cookies=RB_ROOT;
+ fe->destinations=RB_ROOT;
  fe->cache_target=RTL_FE_HASH_ENTRIES;
  fe->memory=dma_alloc_coherent(device,RTL_FE_MEMORY_BYTES,&fe->dma,GFP_KERNEL);
  if(!fe->memory){kfree(fe);return ERR_PTR(-ENOMEM);}
+ fe->hash_owners=kvcalloc(RTL_FE_HASH_ENTRIES,sizeof(*fe->hash_owners),GFP_KERNEL);
  defaults=fe->memory+RTL_FE_DEFAULT_OFFSET;
  for(i=0;i<32;i++)rtl_fe_cpu_miss(defaults+i*4);
  dma_wmb();
@@ -1900,6 +2014,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
   int ret=PTR_ERR(fe->bridge);
   debugfs_remove_recursive(fe->debug);
   dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
+  kvfree(fe->hash_owners);
   kfree(fe);
   return ERR_PTR(ret);
  }
@@ -2426,6 +2541,7 @@ bool rtl_fe_free(struct rtl_fe *fe)
  list_for_each_entry_safe(flow,flow_next,&fe->flows,list){list_del(&flow->list);kfree(flow);}
  list_for_each_entry_safe(port,next,&fe->ports,list){list_del(&port->list);kfree(port);}
  dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
+ kvfree(fe->hash_owners);
  kvfree(fe->itu_paths);
  kfree(fe);
  return true;

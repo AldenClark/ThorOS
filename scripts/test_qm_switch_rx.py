@@ -53,7 +53,7 @@ static void dma_sync_single_for_cpu(void *dev,dma_addr_t addr,unsigned bytes,int
  (void)addr;assert(dev==active->device && (bytes==64 || bytes==2048) && dir==DMA_FROM_DEVICE);
 }
 static int rtl_qm_try_push(void *ctx,unsigned addr,unsigned eq) {
- assert(ctx==active && retired && addr==active->memory_dma+8192 && eq==4);pushed++;return 0;
+ assert(ctx==active && retired && addr==active->memory_dma+RTL_QM_PAYLOAD_OFFSET && eq==4);pushed++;return 0;
 }
 ''' + common[end:]
 common = common.replace(body(common, 'rtl_fe_switch_rx'), r'''
@@ -92,13 +92,13 @@ static void setup(struct rtl_qm_rx *rx,struct net_device *owner,struct net_devic
                   struct rtl_fe *fe,unsigned source,unsigned cpu,unsigned type,
                   unsigned packet_type,unsigned mirror) {
  *rx=(struct rtl_qm_rx){.memory_dma=0x4000000,.ring_dma=0x6000000,.device=owner,.fe=fe};
- rx->memory=calloc(1,RTL_QM_MEMORY_BYTES);rx->ring_memory=calloc(1,8192);rx->ni=calloc(1,65536);
+ rx->memory=calloc(1,RTL_QM_MEMORY_BYTES);rx->ring_memory=calloc(1,RTL_QM_RING_MEMORY_BYTES);rx->ni=calloc(1,65536);
  memset(owner,0,sizeof(*owner));memset(ports,0,5*sizeof(*ports));
  for(unsigned i=0;i<5;i++){ports[i].running=true;rx->lan[i]=&ports[i];}
  active=rx;wanted_source=source;wanted_input=source<5?&ports[source]:0;wanted_fe=fe;
  wanted_h0=(cpu<<31)|(5U<<18)|(mirror<<14)|(packet_type<<11);
  wanted_h1=(type<<30)|((64+cpu*8)<<15)|(source<<9)|(16<<3)|7;
- unsigned off=8192,header=8+cpu*8;
+ unsigned off=RTL_QM_PAYLOAD_OFFSET,header=8+cpu*8;
  put(__builtin_bswap32(wanted_h0),rx->memory+off+RTL_QM_HEADROOM);
  put(__builtin_bswap32(wanted_h1),rx->memory+off+RTL_QM_HEADROOM+4);
  packet_bytes(23,rx->memory+off+RTL_QM_HEADROOM+header);

@@ -45,7 +45,7 @@ struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;bool retired;};
 '''
 fixture+=flow+rule+r'''
-struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized;int error;unsigned long installs;void *memory;struct list_head flows,retries;unsigned long hashes[65536/64];};
+struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized;int error;unsigned long installs;void *memory;struct rtl_fe_flow **hash_owners;struct list_head flows,retries;unsigned long hashes[65536/64];};
 static bool fe_switch_flow_allowed(struct rtl_fe *f){return f->fabric_authorized;}
 static int netif_running(struct net_device *d){return d->up;}
 static int netif_carrier_ok(struct net_device *d){return d->up;}
@@ -72,6 +72,7 @@ static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;ass
 fixture+=symbol('fe_install')+r'''
 int main(void){
  struct rtl_fe f={.enabled=true,.fabric_authorized=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
+ f.hash_owners=calloc(RTL_FE_HASH_ENTRIES,sizeof(*f.hash_owners));assert(f.hash_owners);
  struct net_device n={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q=p;
  struct rtl_fe_rule a={.input=&p,.output=&q,.mtu=1400,.pppoe_input=true,.pppoe_session=1234,
   .key={.source=0x0a000001,.destination=0xc6336401,.source_port=10000,.destination_port=443,.protocol=6,.ingress=7,.llid=1,.mask=63},
@@ -103,12 +104,15 @@ int main(void){
  /* Once deletion has cleared the DDR key, a timed-out cache invalidation
   * may still retain it in hardware. Its retry owner must block reuse. */
  struct rtl_fe_flow *first=container_of(f.flows.next,struct rtl_fe_flow,list);
+ assert(f.hash_owners[16416]==first && !f.hash_owners[16417]);
  ((unsigned int *)f.memory)[16416]=0;
  list_add_tail(&first->retry,&f.retries);
  assert(fe_install(&p,b,2)==-EOPNOTSUPP && !ddr[16417]);
  assert(f.retries.next==&first->retry && first->published);
  assert(traversed==1); /* Only the single unresolved cache owner was checked. */
+ assert(f.hash_owners[16416]==first); /* A quarantined slot keeps its owner. */
  free(first);
+ free(f.hash_owners);
  free(f.memory);
  return 0;
 }

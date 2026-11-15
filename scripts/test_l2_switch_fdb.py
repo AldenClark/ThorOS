@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute production native-domain rollback and full-scan FDB reconciliation.
+"""Execute production native-domain rollback and bounded FDB reconciliation.
 
 The backend represents hardware command outcomes, including a mutation whose
 completion times out. No policy/ownership logic is copied into the backend.
@@ -51,6 +51,7 @@ static inline struct task_struct *get_current(void){return NULL;}
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
 #define HZ 100
+#define NSEC_PER_MSEC 1000000U
 #define BIT(n) (1U<<(n))
 #define READ_ONCE(value) (value)
 #define WRITE_ONCE(target,value) ((target)=(value))
@@ -75,6 +76,8 @@ struct rtl_fe_bridge {
  struct rtl_fe *fe;struct rtl9617c_switch_guard guard;struct rtl_fe_switch_hw hw;
  struct net_device *ports[5];struct delayed_work scan_work;struct work_struct work;
  struct fe_switch_learned *learned,*next;unsigned int learned_count,pending_count;
+ unsigned int scan_start,scan_count,scan_old,scan_cursor;u64 scan_generation;
+ bool scan_running,scan_complete,scan_removed;
  struct notifier_block atomic_nb,blocking_nb;u32 offloaded;
  unsigned int rules[RTL_L2_FDB_ENTRIES][4],rule_count;
  bool stopping,active,domain_owned,requested;u32 native_mask;
@@ -90,13 +93,18 @@ static unsigned int scans,deletes,appends,fail_scan_at,fail_delete_at;
 static int command_error,status_override;
 static bool pending,epoch_change,rtnl_held,relocate_delete,retain_delete;
 static bool policy_blocked;
-static unsigned int learn_calls,fail_learn_at,epoch_on_learn,protected_mac,unoffloads;
+static unsigned int learn_calls,fail_learn_at,epoch_on_learn,epoch_after_learn,epoch_on_forget,protected_mac,unoffloads;
+static u64 nanoseconds,operation_ns;
+static unsigned long last_delay;
+static unsigned int max_slice_operations;
+static unsigned int change_during_sort;
 struct feedback {bool add;unsigned int port;u8 mac[6];};
-static struct feedback events[32];static unsigned int event_count,cases;
+static struct feedback events[RTL_L2_FDB_ENTRIES*4];static unsigned int event_count,cases;
 static bool is_valid_ether_addr(const u8 *mac) {
  unsigned int any=0;for(unsigned int i=0;i<6;i++)any|=mac[i];return any && !(mac[0]&1);
 }
 static void ether_addr_copy(u8 *to,const u8 *from){memcpy(to,from,6);}
+static u64 ktime_get_ns(void){return nanoseconds;}
 static struct rtl_dq_io fe_io(struct rtl_fe *owner){return (struct rtl_dq_io){owner};}
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
@@ -120,7 +128,7 @@ static int fe_switch_hw_restore(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw
  hw->owned=false;return 0;
 }
 static int rtl_l2_fdb_scan(const struct rtl_dq_io *io,unsigned int start,struct rtl_l2_fdb_result *out){
- assert(io->context->lock && start<RTL_L2_FDB_ENTRIES);scans++;
+ assert(io->context->lock && start<RTL_L2_FDB_ENTRIES);scans++;nanoseconds+=operation_ns;
  if(pending)return -EBUSY;
  if(fail_scan_at && scans==fail_scan_at)return -ETIMEDOUT;
  if(epoch_change){epoch_change=false;rtl9617c_switch_guard_invalidate(&sw.guard);}
@@ -170,16 +178,19 @@ static int rtl_l2_fdb_command(const struct rtl_dq_io *io,enum rtl_l2_fdb_command
 static bool netif_is_bridge_port(struct net_device *dev){return dev->bridge;}
 static int br_rtl9617c_fdb_learn(struct net_device *dev,const u8 *address,
  struct rtl9617c_switch_guard *guard,u64 generation){
- assert(rtnl_held && event_count<32);learn_calls++;
+ assert(rtnl_held && event_count<RTL_L2_FDB_ENTRIES*4);learn_calls++;nanoseconds+=operation_ns;
  if(epoch_on_learn && learn_calls==epoch_on_learn)rtl9617c_switch_guard_invalidate(guard);
  if(generation!=guard->generation || !guard->owner->active)return -EAGAIN;
  if(fail_learn_at && learn_calls==fail_learn_at)return -ENOMEM;
  events[event_count]=(struct feedback){.add=true,.port=dev->port};
- memcpy(events[event_count++].mac,address,6);return 0;
+ memcpy(events[event_count++].mac,address,6);
+ if(epoch_after_learn && learn_calls==epoch_after_learn)rtl9617c_switch_guard_invalidate(guard);
+ return 0;
 }
 static bool br_rtl9617c_fdb_forget(struct net_device *dev,const u8 *address){
- assert(rtnl_held && event_count<32);
+ assert(rtnl_held && event_count<RTL_L2_FDB_ENTRIES*4);nanoseconds+=operation_ns;
  if(protected_mac && address[5]==protected_mac)return false;
+ if(epoch_on_forget){epoch_on_forget=0;rtl9617c_switch_guard_invalidate(&sw.guard);}
  events[event_count]=(struct feedback){.add=false,.port=dev->port};
  memcpy(events[event_count++].mac,address,6);return true;
 }
@@ -189,10 +200,19 @@ static void switchdev_bridge_port_unoffload(struct net_device *dev,struct rtl_fe
  unoffloads++;
 }
 static void sort(void *base,size_t count,size_t bytes,int (*compare)(const void *,const void *),void *swap){
- assert(!swap);qsort(base,count,bytes,compare);
+ assert(!swap && rtnl_held && !fe.lock);
+ /* FE transactions can run while sorting without borrowing any device
+  * pointer. An invalidation there must still prevent all feedback. */
+ mutex_lock(&fe.lock);
+ if(change_during_sort==1)rtl9617c_switch_guard_invalidate(&sw.guard);
+ if(change_during_sort==2)sw.stopping=true;
+ if(change_during_sort==3)fe.shutting_down=true;
+ mutex_unlock(&fe.lock);
+ qsort(base,count,bytes,compare);
 }
 static void mod_delayed_work(unsigned int queue,struct delayed_work *work,unsigned int delay){
- assert(queue==system_long_wq && delay==HZ && fe.lock && rtnl_held);work->work.queued++;
+ assert(queue==system_long_wq && (delay==HZ || delay==0) && fe.lock && rtnl_held);
+ last_delay=delay;work->work.queued++;
 }
 static void setup(void){
  memset(&fe,0,sizeof(fe));memset(&sw,0,sizeof(sw));memset(first,0,sizeof(first));memset(second,0,sizeof(second));
@@ -200,12 +220,14 @@ static void setup(void){
  sw.fe=&fe;fe.bridge=&sw;fe.engine_ready=true;sw.requested=true;sw.guard.owner=&sw;sw.learned=first;sw.next=second;
  sw.native_mask=3;sw.active=true;sw.hw.owned=true;status_override=-1;
  scans=deletes=appends=fail_scan_at=fail_delete_at=event_count=0;
- learn_calls=fail_learn_at=epoch_on_learn=protected_mac=unoffloads=0;
+ learn_calls=fail_learn_at=epoch_on_learn=epoch_after_learn=epoch_on_forget=protected_mac=unoffloads=0;
+ nanoseconds=operation_ns=last_delay=0;
+ change_during_sort=0;
  command_error=0;pending=epoch_change=rtnl_held=relocate_delete=retain_delete=policy_blocked=false;
  for(unsigned int i=0;i<5;i++){ports[i]=(struct net_device){.port=i,.bridge=true};sw.ports[i]=&ports[i];}
 }
 static void put_row(unsigned int index,unsigned int mac,unsigned int port,unsigned int vid,bool permanent){
- struct rtl_l2_fdb_entry entry={.mac={2,0,0,0,0,mac},.valid=1,.destination=port,.key_vid=vid,
+ struct rtl_l2_fdb_entry entry={.mac={2,0,0,0,mac>>8,mac},.valid=1,.destination=port,.key_vid=vid,
   .is_static=permanent,.sa_permit=1,.da_permit=1};
  assert(index<RTL_L2_FDB_ENTRIES && !rtl_l2_fdb_encode(rows[index],&entry));used[index]=true;
 }
@@ -337,29 +359,237 @@ static void scan_reconciliation(void){
   assert(event_count==1 && !events[0].add && events[0].mac[5]==1);cases++;
  }
 }
-int main(void){domain_and_rollback();scan_reconciliation();
- printf("Native switch production FDB: %u rollback/status/scan scenarios; foreign-domain preservation, ambiguous mutation ownership, drain-before-delete, complete-scan-only ageing and move ordering passed\n",cases);
+static void scan_slice(void){
+ unsigned int before=scans,feedback=event_count;
+ unsigned int queued=sw.scan_work.work.queued;
+ const u64 previous_state[]={sw.scan_start,sw.scan_count,sw.scan_old,sw.scan_cursor,
+  sw.scan_running,sw.scan_complete,sw.scan_removed,sw.scan_generation};
+ fe_switch_scan(&sw.scan_work.work);
+ assert(!fe.lock && !rtnl_held);
+ assert(sw.scan_work.work.queued-queued<=1);
+ if(sw.scan_work.work.queued!=queued && !last_delay){
+  const u64 next_state[]={sw.scan_start,sw.scan_count,sw.scan_old,sw.scan_cursor,
+   sw.scan_running,sw.scan_complete,sw.scan_removed,sw.scan_generation};
+  assert(sw.active && sw.scan_running && memcmp(previous_state,next_state,sizeof(next_state)));
+ }
+ unsigned int operations=scans-before+event_count-feedback;
+ if(operations>max_slice_operations)max_slice_operations=operations;
+ /* The independent contract is 64 boundary operations, not a copied
+  * driver constant. Merge-only work also consumes the driver's budget. */
+ assert(operations<=64);
+ /* A different FE/RTNL owner can run at every continuation boundary. */
+ rtnl_lock();mutex_lock(&fe.lock);mutex_unlock(&fe.lock);rtnl_unlock();
+}
+static void finish_scan(void){
+ u64 before=sw.polls;unsigned int slices=0;
+ do {scan_slice();assert(++slices<20000);}while(sw.active && sw.polls==before && sw.scan_running);
+}
+static unsigned int address_id(const u8 *address){return (address[4]<<8)|address[5];}
+static void put_old(unsigned int count){
+ sw.learned_count=count;
+ for(unsigned int i=0;i<count;i++){
+  unsigned int key=8192+i;
+  sw.learned[i]=(struct fe_switch_learned){.address={2,0,0,0,key>>8,key},.port=i&1};
+ }
+}
+static void put_many(unsigned int count){
+ for(unsigned int i=0;i<count;i++)put_row(i,i+1,i&1,0,false);
+}
+static void bounded_scale_and_moves(void){
+ const unsigned int sizes[]={0,1,63,64,65,127,128,129,RTL_L2_FDB_ENTRIES-1,RTL_L2_FDB_ENTRIES};
+ for(unsigned int size=0;size<sizeof(sizes)/sizeof(sizes[0]);size++){
+  unsigned int count=sizes[size];setup();put_old(count);put_many(count);
+  struct fe_switch_learned *committed=sw.learned;unsigned int slices=0;
+  do {
+   scan_slice();assert(++slices<1000);
+   if(!sw.polls){
+    assert(sw.learned==committed && sw.learned_count==count && sw.scan_running && last_delay==0);
+    if(count)assert(address_id(sw.learned[0].address)==8192);
+    /* No prefix can imply that any old MAC disappeared. */
+    if(!sw.scan_complete)assert(!event_count && !sw.pending_count);
+   }
+  }while(!sw.polls);
+  assert(sw.learned_count==count && sw.polls==1 && !sw.pending_count && !sw.scan_running);
+  assert(!sw.scan_start && !sw.scan_count && !sw.scan_cursor && !sw.scan_old && last_delay==HZ);
+  assert(event_count==count*2 && sw.learned_adds==count && sw.learned_deletes==count);
+  for(unsigned int i=0;i<count;i++){
+   assert(!events[i].add && address_id(events[i].mac)==8192+i);
+   assert(events[count+i].add && address_id(events[count+i].mac)==i+1);
+   assert(address_id(sw.learned[i].address)==i+1 && sw.learned[i].port==(i&1));
+  }
+  if(count>64)assert(slices>1);
+  cases++;
+ }
+ /* A same-slot MAC move on the next complete poll must update its port,
+  * never delete the newly moved key using the old committed destination. */
+ setup();put_many(129);finish_scan();assert(sw.polls==1 && sw.learned[0].port==0);
+ event_count=0;put_row(0,1,1,0,false);finish_scan();
+ assert(sw.polls==2 && sw.learned_count==129 && sw.learned[0].port==1 && event_count==129);
+ for(unsigned int i=0;i<event_count;i++)assert(events[i].add);
+ cases++;
+ /* A move which crosses slice boundaries can expose both old and new
+  * slots. Reject the entire duplicate-key snapshot, not only its tail. */
+ setup();put_old(1);put_many(129);scan_slice();assert(sw.scan_count==64 && !event_count);
+ used[0]=false;put_row(128,1,1,0,false);finish_scan();
+ assert(!sw.polls && sw.active && !sw.scan_running && !sw.pending_count && !event_count && last_delay==HZ);
+ assert(sw.learned_count==1 && address_id(sw.learned[0].address)==8192);
+ finish_scan();assert(sw.polls==1 && sw.learned_count==128 && sw.learned[0].port==1);cases++;
+}
+static void bounded_time_and_generation(void){
+ /* Even a small table must yield when a single indirect operation uses
+  * the elapsed-time budget. Elapsed monotonic nanoseconds work below one
+  * HZ=100 tick and their unsigned difference also survives wrap. */
+ for(unsigned int wrap=0;wrap<2;wrap++){
+  setup();put_many(65);operation_ns=2*NSEC_PER_MSEC;
+  if(wrap)nanoseconds=UINT64_MAX-1;
+  scan_slice();assert(scans==1 && sw.scan_count==1 && !event_count && last_delay==0);
+  finish_scan();assert(sw.polls==1 && sw.learned_count==65 && last_delay==HZ);cases++;
+ }
+ /* An inactive guard drops an unfinished physical scan, with the old
+  * complete mirror retained until the normal unoffload withdrawal. */
+ setup();put_old(1);put_many(129);scan_slice();assert(sw.scan_start==64 && sw.scan_count==64);
+ rtl9617c_switch_guard_invalidate(&sw.guard);scan_slice();
+ assert(!sw.scan_running && !sw.scan_start && !sw.scan_count && !event_count && sw.learned_count==1);
+ rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+ assert(!sw.learned_count && !sw.pending_count);cases++;
+ /* Defense in depth for an armed but different epoch: old buffered MACs
+  * must not leak into the restarted physical scan. */
+ setup();put_many(129);scan_slice();assert(sw.scan_count==64);
+ for(unsigned int i=0;i<129;i++)put_row(i,1000+i,i&1,0,false);
+ sw.guard.generation++;finish_scan();
+ assert(sw.polls==1 && sw.learned_count==129 && address_id(sw.learned[0].address)==1000);
+ for(unsigned int i=0;i<event_count;i++)assert(address_id(events[i].mac)>=1000);
+ cases++;
+ /* Rebuild/unoffload can replace the table without an epoch increment. */
+ setup();put_many(129);scan_slice();u64 epoch=sw.guard.generation;
+ rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+ assert(!sw.scan_running && !sw.scan_start && !sw.scan_count && sw.guard.generation==epoch);
+ memset(used,0,sizeof(used));put_row(3,77,1,0,false);finish_scan();
+ assert(sw.polls==1 && sw.learned_count==1 && address_id(sw.learned[0].address)==77);cases++;
+ /* A feedback prefix is retained on invalidation until unoffload. In
+  * particular resetting the phase must not erase its ownership count. */
+ for(unsigned int armed=0;armed<2;armed++){
+  setup();put_many(129);
+  do {scan_slice();}while(!sw.pending_count);
+  unsigned int prefix=sw.pending_count;assert(prefix && prefix<129 && !sw.polls);
+  if(armed)sw.guard.generation++;else rtl9617c_switch_guard_invalidate(&sw.guard);
+  scan_slice();assert(!sw.active && !sw.scan_running && sw.pending_count==prefix && !sw.polls);
+  event_count=0;rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+  assert(!sw.pending_count && !sw.learned_count && event_count==prefix);
+  for(unsigned int i=0;i<prefix;i++)assert(!events[i].add && address_id(events[i].mac)==i+1);
+  cases++;
+ }
+ /* Policy can close after the last add succeeds, or in a delete-only
+  * round. Neither boundary may swap the buffers or commit that epoch. */
+ for(unsigned int adding=0;adding<2;adding++){
+  setup();put_old(1);
+  if(adding){put_many(65);epoch_after_learn=65;}else epoch_on_forget=1;
+  finish_scan();
+  assert(!sw.active && !sw.scan_running && !sw.polls && sw.learned_count==1 &&
+   sw.pending_count==(adding?65:0) && address_id(sw.learned[0].address)==8192);
+  event_count=0;rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+  assert(!sw.pending_count && !sw.learned_count && event_count==(adding?66:1));cases++;
+ }
+ for(unsigned int change=1;change<=3;change++){
+  setup();put_old(1);put_many(65);change_during_sort=change;finish_scan();
+  assert(!sw.scan_running && !sw.polls && sw.learned_count==1 && !sw.pending_count && !event_count);cases++;
+ }
+}
+static void batch_fault_matrix(void){
+ const unsigned int positions[]={1,64,65,128,129,130};
+ for(unsigned int i=0;i<sizeof(positions)/sizeof(positions[0]);i++){
+  setup();put_old(1);put_many(129);fail_scan_at=positions[i];finish_scan();
+  assert(!sw.active && !sw.scan_running && !sw.polls && !event_count && !sw.pending_count);
+  assert(sw.error==-ETIMEDOUT && sw.scan_errors==1 && sw.learned_count==1);cases++;
+ }
+ for(unsigned int i=0;i<sizeof(positions)/sizeof(positions[0])-1;i++){
+  setup();put_old(1);put_many(129);fail_learn_at=positions[i];finish_scan();
+  assert(!sw.active && !sw.scan_running && !sw.polls && sw.pending_count==positions[i]-1);
+  assert(sw.error==-ENOMEM && sw.scan_errors==1 && sw.learned_count==1);
+  unsigned int prefix=sw.pending_count;event_count=0;
+  rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+  assert(!sw.pending_count && !sw.learned_count && event_count==prefix+1);
+  assert(!events[0].add && address_id(events[0].mac)==8192);
+  for(unsigned int j=0;j<prefix;j++)assert(!events[j+1].add && address_id(events[j+1].mac)==j+1);
+  cases++;
+ }
+}
+int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();batch_fault_matrix();
+ printf("Native switch production FDB: %u rollback/status/batched-scan scenarios; full 4128-row capacity, timed slices, generation/rebuild restart, partial feedback ownership and MAC moves passed (max %u boundary operations/slice)\n",cases,max_slice_operations);
  return 0;}
 '''
 
 enum = re.search(r"enum fe_switch_reason \{.*?\n\};", source, re.S)[0]
+constants = "\n" + "\n".join(re.findall(r"^#define FE_SWITCH_SCAN_\w+ .+$", source, re.M)) + "\n"
 functions = "\n".join(function(name) for name in [
-    "fe_switch_native_key", "fe_switch_learned_owned", "fe_switch_fdb_write",
+    "fe_switch_scan_reset", "fe_switch_scan_slice_done", "fe_switch_native_key", "fe_switch_learned_owned", "fe_switch_fdb_write",
     "fe_switch_domain_claim", "fe_switch_domain_flush", "fe_switch_restore_locked",
     "fe_switch_feedback", "fe_switch_unoffload", "fe_switch_learned_compare", "fe_switch_scan",
 ])
+mutants = {
+    "unbounded_mmio_batch": functions.replace(
+        "\treturn operations >= FE_SWITCH_SCAN_BUDGET ||",
+        "\treturn false ||", 1),
+    "elapsed_time_ignored": functions.replace(
+        "(operations && ktime_get_ns() - started >=",
+        "(operations && false && ktime_get_ns() - started >=", 1),
+    "sort_keeps_shared_fe_lock": functions.replace(
+        "\t\tmutex_unlock(&sw->fe->lock);\n\t\tsort(sw->next, sw->scan_count, sizeof(*sw->next),\n\t\t     fe_switch_learned_compare, NULL);\n\t\tmutex_lock(&sw->fe->lock);",
+        "\t\tsort(sw->next, sw->scan_count, sizeof(*sw->next),\n\t\t     fe_switch_learned_compare, NULL);", 1),
+    "sort_policy_change_not_rechecked": functions.replace(
+        "\t\tif (sw->stopping || sw->fe->shutting_down || !sw->active ||\n\t\t    generation != rtl9617c_switch_guard_generation(&sw->guard))\n\t\t\tgoto out;",
+        "", 1),
+    "budget_exhaustion_commits_partial_scan": functions.replace(
+        "if (fe_switch_scan_slice_done(operations, started))\n\t\t\t\tgoto resume;",
+        "if (fe_switch_scan_slice_done(operations, started))\n\t\t\t\tbreak;", 1),
+    "epoch_change_reuses_partial_rows": functions.replace(
+        "if (sw->scan_running && sw->scan_generation != generation)",
+        "if (false && sw->scan_running && sw->scan_generation != generation)", 1),
+    "unbounded_feedback_batch": functions.replace(
+        "while (sw->scan_cursor < sw->scan_count) {\n\t\tif (fe_switch_scan_slice_done(operations, started))",
+        "while (sw->scan_cursor < sw->scan_count) {\n\t\tif (false && fe_switch_scan_slice_done(operations, started))", 1),
+    "phase_reset_loses_feedback_ownership": functions.replace(
+        "\tsw->scan_running = false;", "\tsw->pending_count = 0;\n\tsw->scan_running = false;", 1),
+    "unoffload_keeps_partial_cursor": functions.replace(
+        "\tWRITE_ONCE(sw->pending_count, 0);\n\tfe_switch_scan_reset(sw);",
+        "\tWRITE_ONCE(sw->pending_count, 0);", 1),
+    "duplicate_mac_publishes_arbitrary_owner": functions.replace(
+        "if (!fe_switch_learned_compare(&sw->next[cursor - 1],",
+        "if (false && !fe_switch_learned_compare(&sw->next[cursor - 1],", 1),
+    "last_feedback_epoch_not_checked": functions.replace(
+        "\tif (!sw->active || generation !=\n\t    rtl9617c_switch_guard_generation(&sw->guard))\n\t\tgoto out;\n\tswap =",
+        "\tswap =", 1),
+    "full_poll_loses_hz_throttle": functions.replace(
+        "\tsw->polls++;\n\tmod_delayed_work(system_long_wq, &sw->scan_work, HZ);",
+        "\tsw->polls++;\n\tmod_delayed_work(system_long_wq, &sw->scan_work, 0);", 1),
+    "continuation_without_forward_progress": functions.replace(
+        "while (sw->scan_start < RTL_L2_FDB_ENTRIES) {",
+        "while (sw->scan_start < RTL_L2_FDB_ENTRIES) {\n\t\t\tgoto resume;", 1),
+}
+for name, mutated in mutants.items():
+    if mutated == functions:
+        raise SystemExit(f"Mutation anchor missing: {name}")
+environment = dict(os.environ)
+environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
 with tempfile.TemporaryDirectory(prefix="l2-switch-fdb-") as directory:
     temporary = Path(directory)
-    (temporary / "test.c").write_text(COMMON + enum + BACKEND + functions + TEST)
-    subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
-                    "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(DRIVERS),
-                    str(temporary / "test.c"), "-o", str(temporary / "test")], check=True)
-    environment = dict(os.environ)
-    environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
-    subprocess.run([str(temporary / "test")], check=True, env=environment)
+    for name, candidate in {"production": functions, **mutants}.items():
+        (temporary / "test.c").write_text(COMMON + enum + constants + BACKEND + candidate + TEST)
+        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
+                        "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(DRIVERS),
+                        str(temporary / "test.c"), "-o", str(temporary / "test")], check=True)
+        if name == "production":
+            subprocess.run([str(temporary / "test")], check=True, env=environment)
+        else:
+            result = subprocess.run([str(temporary / "test")], env=environment, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode != -6 or "Assertion" not in result.stderr:
+                raise SystemExit(f"{name}: expected a contract assertion, got {result.returncode}: {result.stderr}")
+            print(f"Runtime regression mutant rejected: {name}")
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-fdb.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),
-    "scope": "production FDB domain/restore/scan orchestration with hardware-command fault injection",
+    "scope": "production FDB domain/restore/bounded-scan orchestration with hardware-command fault injection, 4128-row full capacity, timed slices, epoch/rebuild interruption and feedback ownership",
+    "runtime_mutants_rejected": list(mutants),
     "hardware_verified": False,
 }, indent=2) + "\n")
