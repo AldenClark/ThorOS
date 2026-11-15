@@ -330,6 +330,9 @@ static void rtl_oam_free(struct net_device *dev)
 {
  struct rtl_oam_port *port=netdev_priv(dev);
  if(!port->control)rtl9617c_ni_fe_remove_port(port->pon->ni_dev,dev);
+ /* Unregister has stopped normal TX; retire any retained descriptor owner
+  * even when the interface was already down or never fully registered. */
+ rtl9617c_ni_forget_tx(port->pon->ni_dev,dev);
  free_netdev(dev);
 }
 

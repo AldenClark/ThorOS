@@ -30,6 +30,10 @@ struct rtl9617c_switch_guard_ops {
 	void (*quiesce)(void *priv);
 	void (*rebuild)(void *priv);
 	bool (*arm)(void *priv);
+	/* Identity predicate only, called under the gate lock and RCU. The core
+	 * walks lower devices so bridge/VLAN policy covers their owner. PPP
+	 * channels are not netdev adjacency and are treated conservatively. */
+	bool (*owns_device)(void *priv, const struct net_device *dev);
 };
 
 struct rtl9617c_switch_guard {
@@ -115,6 +119,7 @@ void rtl9617c_switch_tcx_change(struct net_device *dev, bool old, bool new);
 void rtl9617c_switch_xdp_change(struct net_device *dev, bool old, bool new);
 struct net *rtl9617c_switch_move_begin(struct net_device *dev, struct net *net);
 bool rtl9617c_switch_device_has_policy(const struct net_device *dev);
+bool rtl9617c_switch_net_has_ppp_policy(struct net *net);
 #else
 static inline struct net *rtl9617c_switch_policy_begin(struct net_device *dev)
 {

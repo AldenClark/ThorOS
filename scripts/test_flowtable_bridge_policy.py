@@ -252,10 +252,40 @@ with tempfile.TemporaryDirectory(prefix='flowtable-bridge-policy-') as directory
     kernel = args.kernel
     if args.before:
         patch = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/219-flowtable-bridge-policy.patch'
-        for name in re.findall(r'^\+\+\+ b/(.+)$', patch.read_text(), re.M):
+        ppp = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/224-ppp-channel-generation.patch'
+        ppp_policy = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch'
+        has_ppp = 'nf_flow_offload_ppp_prepare(' in (kernel / 'net/netfilter/nf_flow_table_offload.c').read_text()
+        has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
+        later = []
+        for marker, source, name in [
+            ('try_cmpxchg(&flow->timeout', 'net/netfilter/nf_flow_table_core.c', '230-flowtable-refresh-timeout-order.patch'),
+            ('NF_FLOW_INITIALIZING', 'include/net/netfilter/nf_flow_table.h', '229-flowtable-initial-publication.patch'),
+            ('try_cmpxchg(&offload->flow->timeout', 'net/netfilter/nf_flow_table_offload.c', '228-flowtable-stats-timeout-wrap.patch'),
+            ('nf_flow_direct_mtu_valid(', 'net/netfilter/nf_flow_table_core.c', '227-flowtable-direct-mtu-lifetime.patch'),
+            ('route_mtu', 'include/net/flow_offload.h', '226-flowtable-route-mtu.patch'),
+        ]:
+            if marker in (kernel / source).read_text():
+                later.append(root / 'port/overlay/target/linux/rtl9617c/patches-6.18' / name)
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else '') + (ppp_policy.read_text() if has_ppp_policy else '') + ''.join(p.read_text() for p in later)
+        for name in sorted(set(re.findall(r'^\+\+\+ b/(.+)$', copied, re.M))):
             target = work / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        for dependent in later:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(dependent)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp_policy:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(ppp_policy)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp:
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(ppp)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
+        # Reverse the later route-ownership patch before its shared header
+        # context; the negative case must execute pre219 production code.
+        if 'nf_flow_direct_route_changed(' in (work / 'net/netfilter/nf_flow_table_core.c').read_text():
+            direct = root / 'port/overlay/target/linux/rtl9617c/patches-6.18/222-flowtable-direct-route-validation.patch'
+            subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(direct)],
+                           cwd=work, check=True, stdout=subprocess.DEVNULL)
         subprocess.run(['patch', '-R', '-p1', '--fuzz=0', '-i', str(patch)],
                        cwd=work, check=True, stdout=subprocess.DEVNULL)
         kernel = work

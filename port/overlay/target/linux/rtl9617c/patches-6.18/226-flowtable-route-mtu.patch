@@ -1,0 +1,32 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: carry every routed flow's MTU into hardware admission
+
+The physical redirect device is not the route MTU: VLANs, PPP decapsulation,
+and route metrics can impose a smaller L3 limit. Carry the directional MTU
+already used by the software flowtable into every routed REPLACE, not only
+the PPPoE PUSH action. Drivers without a route MTU implementation ignore
+the metadata; the RTL9617C backend requires and programs it explicitly.
+
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -701,6 +701,9 @@ struct flow_cls_offload {
+ 	struct flow_rule *rule;
+ 	struct flow_stats stats;
+ 	u32 classid;
++	/* NF routed flowtable REPLACE only: directional L3 MTU, before any
++	 * egress VLAN/PPPoE encapsulation. Zero means not supplied. */
++	u16 route_mtu;
+ 	/* NF flowtable REPLACE only: held through the driver callback. Both
+ 	 * directions depend on the same connection's PPP channel lifetime. */
+ 	struct {
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1002,6 +1002,8 @@ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 			     &flow->tuplehash[dir].tuple, &extack);
+ 	if (cmd == FLOW_CLS_REPLACE) {
+ 		cls_flow.rule = flow_rule->rule;
++		if (flow->type == NF_FLOW_OFFLOAD_ROUTE)
++			cls_flow.route_mtu = flow->tuplehash[dir].tuple.mtu;
+ 		if (!nf_flow_offload_ppp_prepare(&cls_flow, flow))
+ 			return 0; /* Number of accepting callbacks, not an errno. */
+ 	}

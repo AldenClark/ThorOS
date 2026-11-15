@@ -29,6 +29,7 @@ typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
 #define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
+#define HRTIMER_NORESTART 0
 #define HRTIMER_RESTART 1
 #define TX_READ 0xaa48
 #define TX_WRITE 0xaa44
@@ -41,7 +42,8 @@ struct rtl_dma_tx {unsigned read,write,hardware_read;bool wake_pending;};
 struct rtl_qm_rx {unsigned refill_pending;struct {unsigned pending;}refill;struct rtl9617c_ni_endpoint *pon;};
 struct rtl9617c_ni_endpoint {void (*wake)(struct rtl9617c_ni_endpoint *);};
 struct rtl_xram {struct hrtimer timer;struct rtl_qm_rx qm;struct rtl_dma_tx dma;
- bool qm_rx,dma_tx,tx_pending;struct napi_struct napi;struct net_device *netdev,*ports[5];
+ bool qm_rx,dma_tx,tx_pending,host_active,removing,engine_poisoned;
+ struct napi_struct napi;struct net_device *netdev,*ports[5];
  int tx_lock;u32 idle_poll_ms;u64 timer_fast_ticks,timer_idle_ticks;unsigned tx_length;};
 static unsigned calls,wakes,napi_calls,hardware_cursor;
 static unsigned xram_read,xram_write;
@@ -67,7 +69,7 @@ test = r'''
 int main(void) {
  struct net_device main={.running=true},port={.running=true,.stopped=true};
  struct rtl9617c_ni_endpoint pon={.wake=pon_wake};
- struct rtl_xram x={.netdev=&main,.ports={&port},.qm_rx=true,.dma_tx=true,.idle_poll_ms=4};
+ struct rtl_xram x={.netdev=&main,.ports={&port},.qm_rx=true,.dma_tx=true,.host_active=true,.idle_poll_ms=4};
  x.qm.pon=&pon;
  for(unsigned i=0;i<100;i++){
   assert(rtl_timer(&x.timer)==HRTIMER_RESTART);

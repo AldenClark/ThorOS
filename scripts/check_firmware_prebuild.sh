@@ -16,6 +16,7 @@ python3 scripts/test_lan_pm_mapping.py
 python3 scripts/test_ni_mib_evidence.py
 python3 scripts/test_lan_link_mode.py
 python3 scripts/test_fe_lan_lifecycle.py
+python3 scripts/test_fe_route_fallback.py
 python3 scripts/test_fe_cache_slot_zero.py
 python3 scripts/test_fe_hash_collision.py
 python3 scripts/test_fe_source_cam_timeout.py
@@ -27,6 +28,8 @@ python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_hardware_recipe.py
 python3 scripts/test_fabric_baseline.py
 python3 scripts/test_pon_cold_handoff.py
+python3 scripts/test_pon_probe_unwind.py --mutants
+python3 scripts/test_pon_dma_owner.py --mutants
 python3 scripts/test_ni_cold_handoff.py --mutants
 python3 scripts/test_l2_policy_races.py
 python3 scripts/test_l2_parent_id.py
@@ -47,23 +50,31 @@ python3 scripts/test_itu_cpu_path.py
 python3 scripts/test_pon_fe_stop.py
 python3 scripts/test_pon_table_staging.py
 python3 scripts/test_pon_reconfigure_guard.py
+python3 scripts/test_gpon_queue_recovery.py
 python3 scripts/test_pon_data_path.py
 python3 scripts/test_omci_compatibility.py
 python3 scripts/test_itu_pppoe_datapath.py
 python3 scripts/test_bridge_learning.py
 python3 scripts/test_fe_evto.py
+python3 scripts/test_fe_evto_dependencies.py
 python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_qm_rx_bounds.py
 python3 scripts/test_qm_switch_rx.py
 python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py
 python3 scripts/test_dma_tx_fastpath.py
+python3 scripts/test_xram_tx_copy.py --mutants
 python3 scripts/test_ni_adaptive_timer.py
+python3 scripts/test_ni_timer_deadlines.py --mutants
 python3 scripts/test_rx_checksum_policy.py
 python3 scripts/test_rx_shutdown.py
 python3 scripts/test_fe_interface_capacity.py
+python3 scripts/test_fe_mtu.py
 python3 scripts/test_fe_flow_release.py
+python3 scripts/test_fe_flow_stats.py
+python3 scripts/test_fe_cleanup_isolation.py
 python3 scripts/test_release_uboot_archive.py
 python3 scripts/test_datapath_observer.py
 python3 scripts/test_datapath_summary.py
+python3 scripts/test_tm_summary.py
 python3 scripts/test_firmware_build_info.py

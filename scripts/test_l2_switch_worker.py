@@ -52,6 +52,7 @@ typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
 #define READ_ONCE(value) (value)
+#define ARRAY_SIZE(value) (sizeof(value)/sizeof((value)[0]))
 #define WRITE_ONCE(target,value) ((target)=(value))
 #define min(a,b) ((a)<(b)?(a):(b))
 #define system_long_wq 7
@@ -60,6 +61,18 @@ typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define notifier_from_errno(error) (error)
 #define SWITCHDEV_FDB_ADD_TO_DEVICE 1
 #define SWITCHDEV_FDB_DEL_TO_DEVICE 2
+#define BR_BPDU_GUARD BIT(1)
+#define BR_ROOT_BLOCK BIT(2)
+#define BR_MULTICAST_FAST_LEAVE BIT(3)
+#define BR_ADMIN_COST BIT(4)
+#define BR_LEARNING BIT(5)
+#define BR_FLOOD BIT(6)
+#define BR_PROMISC BIT(7)
+#define BR_LEARNING_SYNC BIT(9)
+#define BR_MCAST_FLOOD BIT(11)
+#define BR_BCAST_FLOOD BIT(14)
+#define BR_BPDU_FILTER BIT(24)
+#define BR_STATE_FORWARDING 3
 struct net_device {unsigned int index;};
 struct notifier_block {int (*notifier_call)(struct notifier_block *,unsigned long,void *);};
 struct switchdev_notifier_info {struct net_device *dev;void *ctx;};
@@ -72,7 +85,7 @@ struct delayed_work {struct work_struct work;};
 struct rtl_fe_bridge;
 struct rtl9617c_switch_guard {struct rtl_fe_bridge *owner;u64 generation;bool blocked;};
 struct rtl_fe_switch_hw {bool owned,open;};
-struct rtl_fe {bool lock,enabled,prepared,engine_ready,shutting_down,route_admitted;};
+struct rtl_fe {bool lock,enabled,prepared,engine_ready,shutting_down,route_admitted;struct rtl_fe_bridge *bridge;};
 '''
 
 BACKEND = r'''
@@ -85,7 +98,7 @@ static unsigned int restore_fail_at,offload_fail_at,append_fail_at,replay_error_
 static unsigned int online_ports,static_port,offline_port,invalidates;
 static struct rtl_l2_fdb_entry installed[32];
 static int hw_error,domain_error,flush_error;
-static bool rtnl_held,arm_failure,epoch_during_append;
+static bool rtnl_held,arm_failure,epoch_during_append,additional_policy;
 static enum fe_switch_reason policy_reason;
 static clock_t ageing;
 static void mutex_lock(bool *lock){assert(!*lock);*lock=true;}
@@ -130,7 +143,16 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *owner){
 static enum fe_switch_reason fe_switch_snapshot(struct rtl_fe_bridge *owner,struct fe_switch_plan *plan){
  assert(owner==&sw && fe.lock && rtnl_held && !sw.hw.open);snapshots++;
  memset(plan,0,sizeof(*plan));plan->ports=online_ports;sw.master=&master;sw.route_mask=fe.enabled?31:0;
- for(unsigned int i=0;i<5;i++)sw.ports[i]=&ports[i];
+ for(unsigned int i=0;i<5;i++){
+  sw.ports[i]=&ports[i];plan->flags[i]=BR_LEARNING;plan->state[i]=BR_STATE_FORWARDING;
+ }
+ plan->multi_bridge=policy_reason==FE_SWITCH_MULTI_BRIDGE;
+ plan->mixed=policy_reason==FE_SWITCH_MIXED_PORTS;
+ plan->vlan_filtering=policy_reason==FE_SWITCH_VLAN_UNSUPPORTED;
+ plan->private_policy=policy_reason==FE_SWITCH_PRIVATE_POLICY;
+ plan->promisc=policy_reason==FE_SWITCH_PROMISC;
+ plan->software_policy=additional_policy || policy_reason==FE_SWITCH_GUARDED;
+ if(policy_reason==FE_SWITCH_PORT_POLICY)plan->flags[0]=0;
  return policy_reason;
 }
 static void change_state(unsigned int kind){
@@ -189,13 +211,13 @@ static void mod_delayed_work(unsigned int queue,struct delayed_work *work,unsign
 }
 static void setup(void){
  fe=(struct rtl_fe){.enabled=true,.prepared=true,.engine_ready=true};memset(&sw,0,sizeof(sw));
- sw.fe=&fe;sw.guard.owner=&sw;sw.guard.generation=1;sw.rules=rules;sw.requested=true;
+ sw.fe=&fe;fe.bridge=&sw;sw.guard.owner=&sw;sw.guard.generation=1;sw.rules=rules;sw.requested=true;
  sw.atomic_nb.notifier_call=fe_switch_atomic_event;
  online_ports=3;static_port=1;offline_port=2;invalidates=0;memset(installed,0,sizeof(installed));
  policy_reason=FE_SWITCH_OK;ageing=300*USER_HZ;
  closures=restores=unoffloads=snapshots=syncs=route_flushes=offloads=prepares=claims=appends=arms=scheduled=last_delay=0;
  restore_fail_at=offload_fail_at=append_fail_at=replay_error_at=change_in_sync=change_in_replay=0;
- hw_error=domain_error=flush_error=0;rtnl_held=arm_failure=epoch_during_append=false;
+ hw_error=domain_error=flush_error=0;rtnl_held=arm_failure=epoch_during_append=additional_policy=false;
 }
 static void run(void){fe_switch_work(&sw.work);assert(!fe.lock && !rtnl_held && !sw.replaying && !sw.replay_ports);cases++;}
 '''
@@ -214,10 +236,17 @@ static void success_and_policy(void){
  assert(!sw.active && sw.hw.open && sw.flow_allowed && sw.reason==FE_SWITCH_REQUEST_OFF);
  assert(!prepares && !claims && !appends && !offloads && !scheduled && !sw.offloaded && sw.armed_route_mask==31);
  setup();policy_reason=FE_SWITCH_NO_BRIDGE;run();assert(sw.hw.open && !sw.active && !prepares && sw.armed_route_mask==31);
- for(unsigned int reason=0;reason<=FE_SWITCH_HW_UNSUPPORTED;reason++){
-  if(reason==FE_SWITCH_OK || reason==FE_SWITCH_NO_BRIDGE)continue;
-  setup();policy_reason=reason;run();
+ const enum fe_switch_reason vetoes[]={FE_SWITCH_PRIVATE_POLICY,FE_SWITCH_PROMISC,FE_SWITCH_GUARDED,FE_SWITCH_PORT_POLICY};
+ for(unsigned int i=0;i<sizeof(vetoes)/sizeof(vetoes[0]);i++){
+  setup();policy_reason=vetoes[i];run();
   assert(!sw.hw.open && !sw.active && !sw.flow_allowed && !prepares && !route_flushes && !arms && sw.route_mask==0);
+ }
+ const enum fe_switch_reason capabilities[]={FE_SWITCH_MULTI_BRIDGE,FE_SWITCH_MIXED_PORTS,FE_SWITCH_VLAN_UNSUPPORTED};
+ for(unsigned int i=0;i<sizeof(capabilities)/sizeof(capabilities[0]);i++)for(unsigned int requested=0;requested<2;requested++){
+  setup();policy_reason=capabilities[i];sw.requested=requested;run();
+  assert(sw.hw.open && sw.flow_allowed && !sw.active && !prepares && !offloads && sw.armed_route_mask==31);
+  setup();policy_reason=capabilities[i];sw.requested=requested;additional_policy=true;run();
+  assert(!sw.hw.open && !sw.flow_allowed && !arms && !route_flushes && !sw.route_mask);
  }
  setup();sw.guard.blocked=true;run();assert(!sw.hw.open && !syncs && !route_flushes && !prepares && !arms && sw.reason==FE_SWITCH_GUARDED);
  for(unsigned int mode=0;mode<3;mode++){
@@ -279,7 +308,57 @@ static void transaction_failures(void){
   if(retry<8)assert(scheduled==before+1 && last_delay==delays[retry]*HZ);else assert(scheduled==before);
  }
 }
-int main(void){success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();
+static void retry_classification(void){
+ setup();assert(!fe_switch_needs_recovery(&fe));
+ for(unsigned int reason=0;reason<=FE_SWITCH_HW_UNSUPPORTED;reason++){
+  sw.reason=reason;sw.error=0;assert(!fe_switch_needs_recovery(&fe));
+  sw.error=-EIO;
+  assert(fe_switch_needs_recovery(&fe)==(reason!=FE_SWITCH_HW_UNSUPPORTED && reason!=FE_SWITCH_FOREIGN_FDB));cases++;
+ }
+ setup();restore_fail_at=1;run();assert(fe_switch_needs_recovery(&fe));
+ restore_fail_at=0;run();assert(sw.active && !fe_switch_needs_recovery(&fe));
+ setup();arm_failure=true;run();assert(fe_switch_needs_recovery(&fe));
+ arm_failure=false;run();assert(sw.active && !fe_switch_needs_recovery(&fe));
+ setup();domain_error=-EEXIST;run();assert(!fe_switch_needs_recovery(&fe));
+ setup();hw_error=-EOPNOTSUPP;run();assert(!fe_switch_needs_recovery(&fe));
+ /* A capability fallback whose final hardware gate failed is still an
+  * operational failure, not a healthy unsupported-native state. */
+ setup();hw_error=-EOPNOTSUPP;arm_failure=true;run();
+ assert(!sw.hw.open && !sw.flow_allowed && sw.reason==FE_SWITCH_GUARDED &&
+        sw.error==-EAGAIN && fe_switch_needs_recovery(&fe));
+ arm_failure=false;run();assert(sw.hw.open && sw.flow_allowed &&
+        sw.reason==FE_SWITCH_HW_UNSUPPORTED && !fe_switch_needs_recovery(&fe));
+ /* The same applies before and after the eight bounded foreign-owner
+  * retries. Exhaustion must not make a later route-gate failure sticky. */
+ for(unsigned int exhausted=0;exhausted<2;exhausted++){
+  setup();domain_error=-EEXIST;
+  if(exhausted){for(unsigned int retry=0;retry<8;retry++)run();assert(sw.retry_count==8);}
+  arm_failure=true;unsigned int before=scheduled;run();
+  assert(!sw.hw.open && !sw.flow_allowed && sw.reason==FE_SWITCH_GUARDED &&
+         sw.error==-EAGAIN && fe_switch_needs_recovery(&fe) && scheduled==before);
+  arm_failure=false;run();assert(sw.hw.open && sw.flow_allowed &&
+         sw.reason==FE_SWITCH_FOREIGN_FDB && !fe_switch_needs_recovery(&fe));
+ }
+}
+static void stable_owner_identity(void){
+ setup();assert(!fe_switch_owns_device(&sw,&ports[0]));
+ const unsigned int destinations[]={0,4,32,63};
+ for(unsigned int i=0;i<ARRAY_SIZE(destinations);i++){
+  unsigned int destination=destinations[i];
+  fe_switch_track_port_locked(&fe,&ports[0],destination,true);
+  assert(fe_switch_owns_device(&sw,&ports[0]) && sw.owned_devices[destination]==&ports[0]);
+  fe_switch_track_port_locked(&fe,&ports[1],destination,true);
+  assert(sw.owned_devices[destination]==&ports[1]);
+  fe_switch_track_port_locked(&fe,&ports[0],destination,false);
+  assert(sw.owned_devices[destination]==&ports[1]);
+  fe_switch_track_port_locked(&fe,&ports[1],destination,false);
+  assert(!sw.owned_devices[destination]);cases++;
+ }
+ unsigned int before=invalidates;
+ fe_switch_track_port_locked(&fe,&ports[0],64,true);assert(invalidates==before);
+ fe.bridge=NULL;fe_switch_track_port_locked(&fe,&ports[0],0,true);assert(invalidates==before);cases++;
+}
+int main(void){success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();retry_classification();stable_owner_identity();
  printf("Native switch production worker: %u policy/RCU/actual-FDB-replay/rollback cases; static destinations survive staged publication, offline entries stay excluded, stale/failed snapshots never arm, route-only fallback and bounded retries PASS\n",cases);return 0;}
 '''
 
@@ -288,16 +367,25 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"struct fe_switch_learned \{.*?\n\};", r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_atomic_event",
+    "fe_switch_route_plan_validate", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_atomic_event",
     "fe_switch_gate", "fe_switch_arm", "fe_switch_work",
 ])
 mutants = {
+    "native_capability_disables_routing": functions.replace(
+        "if (fe_switch_route_plan_validate(&plan) != FE_SWITCH_OK)",
+        "if ((fe_switch_route_plan_validate(&plan), sw->reason != FE_SWITCH_OK && sw->reason != FE_SWITCH_NO_BRIDGE))", 1),
+    "capability_masks_real_policy": functions.replace(
+        "if (fe_switch_route_plan_validate(&plan) != FE_SWITCH_OK)",
+        "if ((fe_switch_route_plan_validate(&plan), sw->reason == FE_SWITCH_GUARDED || sw->reason == FE_SWITCH_PRIVATE_POLICY || sw->reason == FE_SWITCH_PROMISC || sw->reason == FE_SWITCH_PORT_POLICY))", 1),
     "replay_uses_unpublished_native_mask": functions.replace(
         "!(sw->replay_ports & BIT(port))", "!(sw->native_mask & BIT(port))", 1),
     "native_mask_published_before_static_fdb": functions.replace(
         "\tsw->native_mask = plan.ports;\n", "", 1).replace(
         "\tfor (i = 0; i < sw->rule_count; i++) {\n\t\tret = fe_switch_fdb_write",
         "\tsw->native_mask = plan.ports;\n\tfor (i = 0; i < sw->rule_count; i++) {\n\t\tret = fe_switch_fdb_write", 1),
+    "failed_route_fallback_claimed_healthy": functions.replace(
+        "\t\tret = sw->error = -EAGAIN;\n\t\tsw->reason = FE_SWITCH_GUARDED;",
+        "\t\tret = 0;", 1),
 }
 for name, mutated in mutants.items():
     if mutated == functions:

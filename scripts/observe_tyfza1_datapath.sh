@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Read-only A/B snapshots. Copy this one file to the router; no companion needed.
 # Usage: sh observe_tyfza1_datapath.sh [seconds] [--output new-file]
-# --active-diagnostics permits bounded FE table transactions and QM/DMA status
-# reads. --details separately permits FE addresses, ports and session IDs.
+# --active-diagnostics permits bounded FE table transactions, QM/DMA status
+# reads and one NI-owned TM/TE sample (which may consume read-clear counters).
+# --details separately permits FE addresses, ports and session IDs.
 # Neither option toggles offload, flushes tables or mounts debugfs.
 set -u
 umask 077
@@ -252,6 +253,7 @@ printf 'counter_note=FE_MIBs_are_raw_cumulative_rows_not_all_flows;compare_each_
 printf 'netdev_note=Linux_host_path_counters_are_not_ASIC_LAN_MIBs;no_hardware_hit_ratio_is_inferred\n'
 printf 'offload_note=enabled_installs_and_HW_OFFLOAD_do_not_prove_two_direction_hardware_hits\n'
 printf 'l2_note=requested_is_not_active;LAN_LAN_known_unicast_and_routed_WAN_are_separate_test_paths\n'
+printf 'fabric_note=passive_reads_cache_only;active_sample_has_one_NI_owner;TE_direct_counter_mode_and_board_mapping_remain_unverified\n'
 printf 'privacy=default_omits_flow_addresses_MACs_sessions_PON_identity_and_WAN_credentials\n'
 [ "$details" = 0 ] || printf 'warning=details_includes_flow_IP_MAC_ports_and_PPPoE_sessions;redact_before_sharing\n'
 [ "$active_diagnostics" = 0 ] || printf 'warning=active_diagnostics_invoke_indirect_table_reads_and_unproven_status_counter_read_semantics;not_an_unperturbed_capture\n'
@@ -308,7 +310,15 @@ snapshot() {
     fe_state=$(read_probe "$fe_state_file")
     printf '%s\n' "$fe_state"
     fe_counters
-    for attribute in cold_bootstrap l2_switch l2_evidence lan_mib_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
+    printf '\n[fabric_sample]\n'
+    if [ "$active_diagnostics" = 1 ] && [ -n "$ni_dir" ]; then
+        # This is the only TM/TE sampling trigger. No parallel devmem reader,
+        # mode change, counter reset or shared indirect transaction is used.
+        read_probe "$ni_dir/fabric_sample"
+    else
+        printf 'skipped=active_diagnostics_not_requested\n'
+    fi
+    for attribute in cold_bootstrap l2_switch l2_evidence lan_mib_evidence fabric_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
         printf '\n[%s]\n' "$attribute"
         if [ -n "$ni_dir" ]; then
             read_probe "$ni_dir/$attribute"

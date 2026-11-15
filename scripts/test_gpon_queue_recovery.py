@@ -51,7 +51,7 @@ struct rtl9617c_pon {
  int lock,control_lock,mpcp_irq;enum rtl_pon_mode mode;
  unsigned char *mac;void *control,*gpon_control,*top_irq,*ni_dev,*tx_disable,*serdes_init;
  struct net_device *omci_device;struct work_struct gpon_recovery_work;
- bool gpon_recover,gpon_enabled,gpon_omcc_ready,mac_prepared,puc_configured,pdc_configured,fe_enabled;
+ bool gpon_recover,gpon_enabled,gpon_omcc_ready,mac_prepared,puc_configured,pdc_configured,fe_enabled,itu_paths_ready;
  unsigned int gpon_omcc_onu_id,gpon_omcc_gem,itu_alloc_valid;u16 itu_alloc_ids[32];u64 itu_line_epoch;
  int gpon_activation_error;struct rtl_gpon_drain gpon_drain;unsigned int xgpon_recovery_phase;
 };
@@ -193,6 +193,9 @@ int main(void){
   for(unsigned int i=0;i<16;i++)assert(regs[(0x8090+i*4)/4]==0x55555555);
   assert(allocations==frees && !pon.lock && !pon.control_lock);
   assert(!rtl_pon_puc_configure(&pon) && !rtl_pon_pdc_configure(&pon) && public_inits==2);
+  pon.itu_paths_ready=true;
+  assert(rtl_pon_puc_configure(&pon)==-EBUSY && rtl_pon_pdc_configure(&pon)==-EBUSY && public_inits==2);
+  pon.itu_paths_ready=false;
   pon.mode=RTL_PON_XGPON;pon.xgpon_recovery_phase=3;
   assert(rtl_pon_puc_configure(&pon)==-EBUSY && rtl_pon_pdc_configure(&pon)==-EBUSY && public_inits==2);
  }

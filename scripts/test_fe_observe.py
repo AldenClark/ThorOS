@@ -21,16 +21,20 @@ def function(name):
 fixture = r'''
 #include <assert.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include "rtl9617c-fe-observe.h"
+struct rtl_fe_flow {bool deleting;};
 struct rtl_fe {struct rtl_fe_observe observe;};
 struct rtl_fe_port {struct rtl_fe *fe;};
 struct rtl_fe_rule {unsigned int reject_reason;};
 struct flow_cls_offload {unsigned long cookie;};
 static int parse_error,install_error;
-static unsigned int reason,installs;
+static unsigned int reason,installs,parses;
+static struct rtl_fe_flow *existing;
+static struct rtl_fe_flow *fe_flow(struct rtl_fe *fe,unsigned long cookie){(void)fe;(void)cookie;return existing;}
 static int fe_parse(struct rtl_fe_port *p,struct flow_cls_offload *c,struct rtl_fe_rule *r){
- (void)p;(void)c;r->reject_reason=reason;return parse_error;
+ (void)p;(void)c;r->reject_reason=reason;parses++;return parse_error;
 }
 static int fe_install(struct rtl_fe_port *p,struct rtl_fe_rule r,unsigned long cookie){
  (void)p;(void)r;(void)cookie;installs++;return install_error;
@@ -55,6 +59,16 @@ int main(void){
  assert(fe.observe.install_unavailable==2 && fe.observe.install_duplicate==1);
  assert(fe.observe.install_collision==1 && fe.observe.install_no_space==1);
  assert(fe.observe.install_no_memory==1 && fe.observe.install_io==3 && fe.observe.install_other==1);
+ struct rtl_fe_flow live={0};existing=&live;
+ unsigned int before=parses,installed=installs;
+ /* A live refresh and a quarantined cookie both skip all EVTO parsing,
+  * table allocation and MMIO; only the matching tombstone stays blocked. */
+ assert(fe_replace(&port,&cls)==-EEXIST && parses==before && installs==installed);
+ live.deleting=true;
+ assert(fe_replace(&port,&cls)==-EBUSY && parses==before && installs==installed);
+ existing=NULL;parse_error=0;install_error=0;
+ assert(!fe_replace(&port,&cls) && parses==before+1 && installs==installed+1);
+ assert(fe.observe.install_duplicate==2 && fe.observe.install_io==4);
  puts("FE admission: every unsupported predicate/PON rejection recorded; install errors classified separately; success is not a packet-hit claim");
 }
 '''

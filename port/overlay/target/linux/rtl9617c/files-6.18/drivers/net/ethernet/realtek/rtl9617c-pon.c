@@ -1054,8 +1054,12 @@ static int rtl9617c_pon_probe(struct platform_device *pdev)
 	}
 	ret = rtl_pon_dying_gasp_init(pon, pdev);
 	if (ret) {
-		rtl_pon_omci_remove(pon);
+		/* NI can already be running for LAN while this consumer probes.
+		 * Retire its shared RX/TX-wake endpoint before freeing OMCI, just
+		 * as the normal remove path does. unregister_netdev() does not
+		 * withdraw the driver's separate endpoint->wake/readers. */
 		rtl_pon_oam_remove(pon);
+		rtl_pon_omci_remove(pon);
 	}
 	return ret;
 }

@@ -1,0 +1,321 @@
+From: ThorOS maintainers
+Subject: [PATCH] ppp: preserve per-protocol and data-path policy across offload
+
+PPP ioctl policy does not use the netdevice flags/MTU paths. Fence actual
+changes with the channel generation and refuse new DIRECT recipes when
+PPP must filter, compress, loop or reject the flow. Keep IPv4/IPv6 NPMODE
+independent, preserve normal CCP_OPEN negotiation, and do not add a per-
+packet path walk. Installed compressors must observe plain packets too.
+Both native and compat filter ioctls use the same transactional helper.
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -925,6 +925,9 @@ struct net_device_path_stack {
+ struct net_device_path_ctx {
+ 	const struct net_device *dev;
+ 	u8			daddr[ETH_ALEN];
++	/* Inner network protocol, before VLAN/PPPoE encapsulation. Zero means
++	 * unspecified; protocol-sensitive devices must then decline bypass. */
++	__be16			l3_proto;
+ 
+ 	int			num_vlans;
+ 	struct {
+
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -54,6 +54,8 @@ static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
+ 	struct net_device_path_ctx ctx = {
+ 		.dev = dev,
+ 		.ieee80211 = true,
++		.l3_proto = ct->tuplehash[dir].tuple.src.l3num == NFPROTO_IPV4 ?
++			htons(ETH_P_IP) : htons(ETH_P_IPV6),
+ 	};
+ 	struct neighbour *n;
+ 	u8 nud_state;
+
+--- a/net/netfilter/xt_FLOWOFFLOAD.c
++++ b/net/netfilter/xt_FLOWOFFLOAD.c
+@@ -377,6 +377,8 @@ static int nf_dev_fill_forward_path(const struct nf_flow_route *route,
+ 	struct net_device_path_ctx ctx = {
+ 		.dev = dev,
+ 		.ieee80211 = true,
++		.l3_proto = ct->tuplehash[dir].tuple.src.l3num == NFPROTO_IPV4 ?
++			htons(ETH_P_IP) : htons(ETH_P_IPV6),
+ 	};
+ 	struct neighbour *n;
+ 	u8 nud_state;
+
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -385,6 +385,73 @@ static const int npindex_to_ethertype[NUM_NP] = {
+ #define ppp_unlock(ppp)		do { ppp_recv_unlock(ppp); \
+ 				     ppp_xmit_unlock(ppp); } while (0)
+ 
++static struct net *ppp_flow_change_begin(struct ppp *ppp);
++static void ppp_flow_change_end(struct ppp *ppp, struct net *policy);
++
++/* All policy writers use the same two locks and generation as channel
++ * handoff. A new DIRECT recipe sees either the old policy/cookie or the
++ * new pair, never a stable cookie spanning the first policy publication.
++ */
++static void ppp_flow_set_flags(struct ppp *ppp, int flags)
++{
++	struct net *policy;
++	int cleared;
++
++	flags &= SC_FLAG_BITS;
++	ppp_lock(ppp);
++	cleared = ppp->flags & ~flags;
++	if (flags != ppp->flags) {
++		policy = ppp_flow_change_begin(ppp);
++#ifdef CONFIG_PPP_MULTILINK
++		if (!(ppp->flags & SC_MULTILINK) && (flags & SC_MULTILINK))
++			ppp->nextseq = 0;
++#endif
++		WRITE_ONCE(ppp->flags, flags);
++		ppp_flow_change_end(ppp, policy);
++	}
++	ppp_unlock(ppp);
++	if (cleared & SC_CCP_OPEN)
++		ppp_ccp_closed(ppp);
++}
++
++static void ppp_flow_set_npmode(struct ppp *ppp, int index, enum NPmode mode)
++{
++	struct net *policy = NULL;
++	bool ip = index == NP_IP || index == NP_IPV6;
++
++	ppp_lock(ppp);
++	if (ppp->npmode[index] != mode) {
++		if (ip)
++			policy = ppp_flow_change_begin(ppp);
++		WRITE_ONCE(ppp->npmode[index], mode);
++		if (ip)
++			ppp_flow_change_end(ppp, policy);
++	}
++	ppp_unlock(ppp);
++}
++
++#ifdef CONFIG_PPP_FILTER
++static void ppp_flow_set_filter(struct ppp *ppp, struct bpf_prog **which,
++				struct bpf_prog *filter)
++{
++	struct net *policy;
++	struct bpf_prog *old;
++
++	ppp_lock(ppp);
++	old = *which;
++	if (old != filter) {
++		policy = ppp_flow_change_begin(ppp);
++		WRITE_ONCE(*which, filter);
++		ppp_flow_change_end(ppp, policy);
++	}
++	ppp_unlock(ppp);
++	/* Both data-path locks have drained all old filter readers. Freeing
++	 * its program need not extend the synchronous admission fence. */
++	if (old && old != filter)
++		bpf_prog_destroy(old);
++}
++#endif
++
+ /*
+  * /dev/ppp device routines.
+  * The /dev/ppp device is used by pppd to control the ppp unit.
+@@ -727,7 +794,7 @@ static long ppp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	struct ppp_idle32 idle32;
+ 	struct ppp_idle64 idle64;
+ 	struct npioctl npi;
+-	int unit, cflags;
++	int unit;
+ 	struct slcompress *vj;
+ 	void __user *argp = (void __user *)arg;
+ 	int __user *p = argp;
+@@ -828,16 +895,7 @@ static long ppp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 	case PPPIOCSFLAGS:
+ 		if (get_user(val, p))
+ 			break;
+-		ppp_lock(ppp);
+-		cflags = ppp->flags & ~val;
+-#ifdef CONFIG_PPP_MULTILINK
+-		if (!(ppp->flags & SC_MULTILINK) && (val & SC_MULTILINK))
+-			ppp->nextseq = 0;
+-#endif
+-		ppp->flags = val & SC_FLAG_BITS;
+-		ppp_unlock(ppp);
+-		if (cflags & SC_CCP_OPEN)
+-			ppp_ccp_closed(ppp);
++		ppp_flow_set_flags(ppp, val);
+ 		err = 0;
+ 		break;
+ 
+@@ -929,7 +987,7 @@ static long ppp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			if (copy_to_user(argp, &npi, sizeof(npi)))
+ 				break;
+ 		} else {
+-			WRITE_ONCE(ppp->npmode[i], npi.mode);
++			ppp_flow_set_npmode(ppp, i, npi.mode);
+ 			/* we may be able to transmit more packets now (??) */
+ 			netif_wake_queue(ppp->dev);
+ 		}
+@@ -951,11 +1009,7 @@ static long ppp_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ 			which = &ppp->pass_filter;
+ 		else
+ 			which = &ppp->active_filter;
+-		ppp_lock(ppp);
+-		if (*which)
+-			bpf_prog_destroy(*which);
+-		*which = filter;
+-		ppp_unlock(ppp);
++		ppp_flow_set_filter(ppp, which, filter);
+ 		err = 0;
+ 		break;
+ 	}
+@@ -1017,11 +1071,7 @@ static long ppp_compat_ioctl(struct file *file, unsigned int cmd, unsigned long
+ 				which = &ppp->pass_filter;
+ 			else
+ 				which = &ppp->active_filter;
+-			ppp_lock(ppp);
+-			if (*which)
+-				bpf_prog_destroy(*which);
+-			*which = filter;
+-			ppp_unlock(ppp);
++			ppp_flow_set_filter(ppp, which, filter);
+ 			err = 0;
+ 			break;
+ 		}
+@@ -1597,6 +1647,34 @@ static void ppp_dev_priv_destructor(struct net_device *dev)
+ 		ppp_destroy_interface(ppp);
+ }
+ 
++static bool ppp_flow_policy_allows(const struct ppp *ppp, __be16 protocol)
++{
++	int index;
++
++	/* CCP_OPEN alone is negotiation, not a data-plane transformation.
++	 * A configured compressor is different: even before CCP_UP its state
++	 * can start tracking plain packets after CONFACK. Do not bypass it.
++	 */
++	if (READ_ONCE(ppp->flags) & (SC_MULTILINK | SC_LOOP_TRAFFIC |
++				   SC_COMP_TCP | SC_CCP_UP | SC_MUST_COMP))
++		return false;
++	if (READ_ONCE(ppp->xc_state) || READ_ONCE(ppp->rc_state))
++		return false;
++#ifdef CONFIG_PPP_FILTER
++	if (READ_ONCE(ppp->pass_filter) || READ_ONCE(ppp->active_filter))
++		return false;
++#endif
++	/* Only the flow's actual network protocol matters. A normal v4-only
++	 * PPPoE link may intentionally DROP IPv6, and vice versa. */
++	if (protocol == htons(ETH_P_IP))
++		index = NP_IP;
++	else if (protocol == htons(ETH_P_IPV6))
++		index = NP_IPV6;
++	else
++		return false;
++	return READ_ONCE(ppp->npmode[index]) == NPMODE_PASS;
++}
++
+ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
+ 				 struct net_device_path *path)
+ {
+@@ -1604,7 +1682,7 @@ static int ppp_fill_forward_path(struct net_device_path_ctx *ctx,
+ 	struct ppp_channel *chan;
+ 	struct channel *pch;
+ 
+-	if (ppp->flags & SC_MULTILINK)
++	if (!ppp_flow_policy_allows(ppp, ctx->l3_proto))
+ 		return -EOPNOTSUPP;
+ 
+ 	pch = list_first_or_null_rcu(&ppp->channels, struct channel, clist);
+@@ -3143,6 +3221,31 @@ ppp_output_wakeup(struct ppp_channel *chan)
+  */
+ 
+ /* Process the PPPIOCSCOMPRESS ioctl. */
++static void ppp_flow_replace_compressor(struct ppp *ppp, struct compressor *cp,
++				       void *state, bool transmit,
++				       struct compressor **old_cp, void **old_state)
++{
++	struct net *policy;
++
++	ppp_lock(ppp);
++	policy = ppp_flow_change_begin(ppp);
++	if (transmit) {
++		ppp->xstate &= ~SC_COMP_RUN;
++		*old_cp = ppp->xcomp;
++		*old_state = ppp->xc_state;
++		ppp->xcomp = cp;
++		WRITE_ONCE(ppp->xc_state, state);
++	} else {
++		ppp->rstate &= ~SC_DECOMP_RUN;
++		*old_cp = ppp->rcomp;
++		*old_state = ppp->rc_state;
++		ppp->rcomp = cp;
++		WRITE_ONCE(ppp->rc_state, state);
++	}
++	ppp_flow_change_end(ppp, policy);
++	ppp_unlock(ppp);
++}
++
+ static int
+ ppp_set_compress(struct ppp *ppp, struct ppp_option_data *data)
+ {
+@@ -3170,13 +3273,8 @@ ppp_set_compress(struct ppp *ppp, struct ppp_option_data *data)
+ 	if (data->transmit) {
+ 		state = cp->comp_alloc(ccp_option, data->length);
+ 		if (state) {
+-			ppp_xmit_lock(ppp);
+-			ppp->xstate &= ~SC_COMP_RUN;
+-			ocomp = ppp->xcomp;
+-			ostate = ppp->xc_state;
+-			ppp->xcomp = cp;
+-			ppp->xc_state = state;
+-			ppp_xmit_unlock(ppp);
++			ppp_flow_replace_compressor(ppp, cp, state, true,
++						    &ocomp, &ostate);
+ 			if (ostate) {
+ 				ocomp->comp_free(ostate);
+ 				module_put(ocomp->owner);
+@@ -3188,13 +3286,8 @@ ppp_set_compress(struct ppp *ppp, struct ppp_option_data *data)
+ 	} else {
+ 		state = cp->decomp_alloc(ccp_option, data->length);
+ 		if (state) {
+-			ppp_recv_lock(ppp);
+-			ppp->rstate &= ~SC_DECOMP_RUN;
+-			ocomp = ppp->rcomp;
+-			ostate = ppp->rc_state;
+-			ppp->rcomp = cp;
+-			ppp->rc_state = state;
+-			ppp_recv_unlock(ppp);
++			ppp_flow_replace_compressor(ppp, cp, state, false,
++						    &ocomp, &ostate);
+ 			if (ostate) {
+ 				ocomp->decomp_free(ostate);
+ 				module_put(ocomp->owner);
+@@ -3304,17 +3397,24 @@ ppp_ccp_closed(struct ppp *ppp)
+ {
+ 	void *xstate, *rstate;
+ 	struct compressor *xcomp, *rcomp;
++	struct net *policy = NULL;
++	bool changing;
+ 
+ 	ppp_lock(ppp);
+-	ppp->flags &= ~(SC_CCP_OPEN | SC_CCP_UP);
++	changing = (ppp->flags & SC_CCP_UP) || ppp->xc_state || ppp->rc_state;
++	if (changing)
++		policy = ppp_flow_change_begin(ppp);
++	WRITE_ONCE(ppp->flags, ppp->flags & ~(SC_CCP_OPEN | SC_CCP_UP));
+ 	ppp->xstate = 0;
+ 	xcomp = ppp->xcomp;
+ 	xstate = ppp->xc_state;
+-	ppp->xc_state = NULL;
++	WRITE_ONCE(ppp->xc_state, NULL);
+ 	ppp->rstate = 0;
+ 	rcomp = ppp->rcomp;
+ 	rstate = ppp->rc_state;
+-	ppp->rc_state = NULL;
++	WRITE_ONCE(ppp->rc_state, NULL);
++	if (changing)
++		ppp_flow_change_end(ppp, policy);
+ 	ppp_unlock(ppp);
+ 
+ 	if (xstate) {

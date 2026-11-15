@@ -62,7 +62,8 @@ struct rtl_fe {
  struct mutex lock;struct list_head flows;
  uint64_t dma;bool prepared,enabled,cpu_path,lan_redirected;int error;
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
- struct spinlock route_lock;bool route_gate_ready,route_admitted,dma_exposed;
+ struct spinlock route_lock;bool route_gate_ready,route_admitted,route_gate_verified,dma_exposed;
+ unsigned int pending_withdrawals;
  bool base_ready,base_failed;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][4][2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
@@ -75,7 +76,7 @@ struct rtl_fe {
  unsigned int pp_rejected_register,pp_rejected_value;
  unsigned int base_rejected_register,base_rejected_value;
  unsigned int commands,fail_command,base_writes;
- int switch_error;
+ int switch_error;bool switch_recovery;
  unsigned int expected_lan[5];
 };
 static unsigned int fe_read(void *ctx,unsigned int reg){struct rtl_fe *f=ctx;assert(reg<0x10000);return f->reg[reg/4];}
@@ -92,7 +93,7 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
   assert(((f->cls[1024][4]>>26)&7)==7 && ((f->cls[1028][4]>>26)&7)==7);
  }
  if((reg==0x3418 || reg==0x3424) && f->route_gate_ready && ((value>>10)&15)==0){
-  assert(f->route_lock.held && f->prepared && f->enabled);
+  assert(f->route_lock.held && f->prepared && f->enabled && !f->pending_withdrawals);
   if(f->fail_route_open){f->fail_route_open--;return;}
  }
  if(reg==f->fail_cpu_selector && ((value>>10)&15)==1)return;
@@ -150,6 +151,7 @@ static __attribute__((unused)) int fe_switch_quiesce_locked(struct rtl_fe *f){
 static __attribute__((unused)) void fe_switch_reconcile_locked(struct rtl_fe *f){
  assert(f->lock.held);f->switch_reconciles++;
 }
+static __attribute__((unused)) bool fe_switch_needs_recovery(struct rtl_fe *f){assert(f->lock.held);return f->switch_recovery;}
 static void fe_collect_ports(struct rtl_fe *f){(void)f;}
 static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){
  assert(!f->enabled && f->flows.first==p);
@@ -184,7 +186,7 @@ static void initialize(struct rtl_fe *f) {
 }
 static void check_cpu_gate(struct rtl_fe *f) {
  assert(f->prepared && f->base_ready && !f->base_failed && !f->shutting_down);
- assert(f->route_gate_ready && !f->route_admitted);
+ assert(f->route_gate_ready && f->route_gate_verified && !f->route_admitted);
  assert(((fe_read(f,0x3418)>>10)&15)==1 && ((fe_read(f,0x3424)>>10)&15)==1);
  for(unsigned int i=0;i<5;i++)
   assert((fe_read(f,FE_LAN_RX_CTRL(i))&(BIT(28)|(63U<<16)))==(BIT(28)|(16U<<16)));
@@ -256,7 +258,10 @@ int main(void) {
  assert((fe_read(&f,0x3948)&1U) && (fe_read(&f,0x3c80)&255U)==255U);
  assert((fe_read(&f,0x3940)&0xffff)==0xd0d0);
  assert(!(f.mask[6]&BIT(25)));
- for(unsigned int i=0;i<3;i++)assert(!(f.bridge_mask[i][6]&BIT(25)));
+ /* Only the routed template is active. Native L2 owns FDB, so the old
+  * empty MAC-only templates must not consume forwarding lookups. */
+ assert(fe_read(&f,0x3700)==1 && fe_read(&f,0x3704)==63);
+ assert(!memcmp(f.bridge_mask,cold.bridge_mask,sizeof(f.bridge_mask)));
  assert(fe_read(&f,0x30a4)==0x8001b000U);
  assert(f.ppp_protocol_ids[0]==1 && f.ppp_protocol_ids[1]==2);
  assert(f.cam[2][0][0]==0x18864 && f.cam[8][0][0]==0x10021 && f.cam[8][1][0]==0x10057);
@@ -272,12 +277,22 @@ int main(void) {
  /* Successful OFF is policy OFF, not a handoff to arbitrary boot profiles.
   * Ten complete CPU/HW/OFF transitions keep every exposed base table. */
  for(unsigned int cycle=0;cycle<10;cycle++){
+  unsigned int reconciles=f.switch_reconciles,writes=f.register_writes,commands=f.commands;
   assert(!rtl_fe_enable(&f) && f.enabled);
+  if(cycle==0)assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(fe_route_arm(&f) && f.route_admitted);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
+  assert(!rtl_fe_enable(&f) && f.route_admitted);
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_disable(&f) && !f.enabled && !f.cpu_path);
   assert(f.desired_mode==RTL_FE_MODE_OFF);check_base_retained(&f,&base);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
+  assert(!rtl_fe_disable(&f));
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_cpu_path(&f) && f.cpu_path);check_base_retained(&f,&base);
+  reconciles=f.switch_reconciles;writes=f.register_writes;commands=f.commands;
   assert(!rtl_fe_cpu_path(&f));check_base_retained(&f,&base);
+  assert(f.switch_reconciles==reconciles && f.register_writes==writes && f.commands==commands);
   assert(!rtl_fe_enable(&f) && f.enabled && !f.cpu_path);
   struct rtl_fe_flow second={},first={.next=&second};f.flows.first=&first;
   unsigned int deleted=f.deletes;
@@ -285,6 +300,56 @@ int main(void) {
   check_base_retained(&f,&base);
  }
  assert(!f.admission_writes);
+ /* Same-mode writes are a no-op only while healthy. A worker which failed
+  * an IO/withdrawal may no longer be queued: explicitly request recovery
+  * without pretending that merely queueing it has reopened admission. */
+ for(unsigned int mode=0;mode<=RTL_FE_MODE_HARDWARE;mode++) {
+  f=base;
+  int (*select)(struct rtl_fe*)=mode==RTL_FE_MODE_HARDWARE?rtl_fe_enable:
+   mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path:rtl_fe_disable;
+  assert(!select(&f));
+  f.switch_recovery=true;
+  unsigned int reconciles=f.switch_reconciles;
+  fe_route_gate(&f);
+  assert(!select(&f) && f.switch_reconciles==reconciles+1 && !f.route_admitted);
+  f.switch_recovery=false;reconciles=f.switch_reconciles;
+  assert(!select(&f) && f.switch_reconciles==reconciles);
+  /* A previous front-end error must likewise retain the explicit retry. */
+  f.error=-ETIMEDOUT;
+  assert(!select(&f) && !f.error && f.switch_reconciles==reconciles+1);
+ }
+ /* A same-mode recovery or another policy reconciliation is NOT authority
+  * to resurrect a hardware route whose cache withdrawal is unproved.
+  * All requested modes honor the latch; native L2 may still use an arm
+  * which verifies CPU-only profile1, without claiming routed admission. */
+ for(unsigned int mode=0;mode<=RTL_FE_MODE_HARDWARE;mode++) {
+  f=base;assert(fe_route_arm(&f) && f.route_admitted);
+  f.pending_withdrawals=2;fe_route_gate(&f);check_cpu_gate(&f);
+  int (*select)(struct rtl_fe*)=mode==RTL_FE_MODE_HARDWARE?rtl_fe_enable:
+   mode==RTL_FE_MODE_CPU?rtl_fe_cpu_path:rtl_fe_disable;
+  assert(!select(&f));
+  f.switch_recovery=true;
+  unsigned int reconciles=f.switch_reconciles;
+  assert(!select(&f) && f.switch_reconciles==reconciles+1);
+  assert(fe_route_arm(&f));check_cpu_gate(&f);
+  f.pending_withdrawals=1;
+  assert(fe_route_arm(&f));check_cpu_gate(&f);
+  f.pending_withdrawals=0;
+  assert(fe_route_arm(&f));
+  assert(f.route_admitted==(mode==RTL_FE_MODE_HARDWARE));
+  assert(f.route_gate_verified==(mode!=RTL_FE_MODE_HARDWARE));
+ }
+ for(unsigned int side=0;side<2;side++) {
+  f=base;assert(fe_route_arm(&f));f.pending_withdrawals=1;
+  f.fail_cpu_selector=0x3418+side*12;fe_route_gate(&f);
+  assert(!f.route_admitted && !f.route_gate_verified);
+  assert(!fe_route_arm(&f) && !f.route_gate_verified);
+  assert(((fe_read(&f,f.fail_cpu_selector)>>10)&15)==0);
+  f.fail_cpu_selector=0;
+  assert(fe_route_arm(&f));check_cpu_gate(&f);
+  f.pending_withdrawals=0;
+  assert(fe_route_arm(&f) && f.route_admitted);
+ }
  /* A failed route withdrawal stays gated and retryable. It does NOT justify
   * restoring the base or claiming the requested CPU mode was completed. */
  assert(!rtl_fe_enable(&f));
@@ -435,6 +500,9 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'stale_saved_RX_selector_cannot_reopen_native_or_route_admission': True,
     'CPU_only_prepares_without_LAN_admission_and_preserves_snapshot': True,
     'CPU_only_cleanup_failure_requires_retry': True,
+    'pending_route_withdrawals_block_same_mode_and_policy_readmission': True,
+    'verified_CPU_route_gate_preserves_native_L2_arm_eligibility': True,
+    'failed_route_gate_readback_is_visible_and_refuses_arm': True,
     'cold_CPU_request_waits_for_NI_ready': True,
     'NI_warm_restart_reuses_and_validates_permanent_base': True,
     'failed_suspend_blocks_resume_and_retains_owners': True,

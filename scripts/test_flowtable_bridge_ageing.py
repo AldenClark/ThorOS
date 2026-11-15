@@ -34,10 +34,34 @@ if args.before and "flow_offload_refresh_bridge" in offload:
     patch = root / "port/overlay/target/linux/rtl9617c/patches-6.18/217-flowtable-bridge-ageing.patch"
     with tempfile.TemporaryDirectory(prefix="flowtable-ageing-before-") as directory:
         before = Path(directory)
-        for name in re.findall(r"^\+\+\+ b/(.+)$", patch.read_text(), re.M):
+        ppp = root / "port/overlay/target/linux/rtl9617c/patches-6.18/224-ppp-channel-generation.patch"
+        ppp_policy = root / "port/overlay/target/linux/rtl9617c/patches-6.18/225-ppp-flow-policy-fence.patch"
+        has_ppp = "nf_flow_offload_ppp_prepare(" in offload
+        has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
+        later = []
+        for marker, source, name in [
+            ("try_cmpxchg(&flow->timeout", "net/netfilter/nf_flow_table_core.c", "230-flowtable-refresh-timeout-order.patch"),
+            ("NF_FLOW_INITIALIZING", "include/net/netfilter/nf_flow_table.h", "229-flowtable-initial-publication.patch"),
+            ("try_cmpxchg(&offload->flow->timeout", "net/netfilter/nf_flow_table_offload.c", "228-flowtable-stats-timeout-wrap.patch"),
+            ("nf_flow_direct_mtu_valid(", "net/netfilter/nf_flow_table_core.c", "227-flowtable-direct-mtu-lifetime.patch"),
+            ("route_mtu", "include/net/flow_offload.h", "226-flowtable-route-mtu.patch"),
+        ]:
+            if marker in (kernel / source).read_text():
+                later.append(root / "port/overlay/target/linux/rtl9617c/patches-6.18" / name)
+        copied = patch.read_text() + (ppp.read_text() if has_ppp else "") + (ppp_policy.read_text() if has_ppp_policy else "") + "".join(p.read_text() for p in later)
+        for name in sorted(set(re.findall(r"^\+\+\+ b/(.+)$", copied, re.M))):
             target = before / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(kernel / name, target)
+        for dependent in later:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(dependent)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp_policy:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(ppp_policy)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
+        if has_ppp:
+            subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(ppp)],
+                           cwd=before, check=True, stdout=subprocess.DEVNULL)
         subprocess.run(["patch", "-R", "-p1", "--fuzz=0", "-i", str(patch)],
                        cwd=before, check=True, stdout=subprocess.DEVNULL)
         fdb = (before / "net/bridge/br_fdb.c").read_text()
@@ -51,13 +75,14 @@ common = r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
-typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef uint64_t u64;
+typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef int32_t __s32;typedef uint64_t u64;typedef int64_t s64;
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(v,x) ((v)=(x))
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define time_before_eq(a,b) ((long)((a)-(b))<=0)
 #define time_after(a,b) ((long)((b)-(a))<0)
+static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return true;}*old=*p;return false;}
 #define FLOW_ACTION_HW_STATS_DELAYED 1
 #define EXPORT_SYMBOL_GPL(n)
 #define RCU_LOCKDEP_WARN(v,s) assert(!(v))
@@ -108,7 +133,7 @@ struct nf_conn {struct net *net;};
 struct flow_offload_tuple {unsigned xmit_type;struct {
  unsigned bridge_ifidx,bridge_port;u16 bridge_vid;u32 bridge_cookie;u8 h_dest[6];
 } out;};
-struct flow_offload {unsigned type;unsigned long flags;u64 timeout;struct nf_conn *ct;struct {struct flow_offload_tuple tuple;}tuplehash[2];};
+struct flow_offload {unsigned type;unsigned long flags;u32 timeout;struct nf_conn *ct;struct {struct flow_offload_tuple tuple;}tuplehash[2];};
 static struct net *nf_ct_net(struct nf_conn *ct){return ct->net;}
 struct nf_flowtable {unsigned flags;};
 struct flow_offload_work {struct flow_offload *flow;struct nf_flowtable *flowtable;};

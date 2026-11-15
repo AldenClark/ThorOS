@@ -1,0 +1,62 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: expire DIRECT recipes after effective MTU changes
+
+A retained dst may update its forwarding MTU in place without changing
+the route cookie. Retire both directions before a CPU lookup or GC stats
+renewal can preserve the old MTU recipe. Reuse the exact IPv4/IPv6
+forwarding helpers used to create the tuple, including PMTU policy, locks,
+expiration, IPv6 mtu6 and tunnel headroom. Unrelated learned PMTU does not
+invalidate a forwarding flow. Hardware withdrawal remains asynchronous.
+
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -416,6 +416,31 @@
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
++/* A cached dst can change its forwarding MTU without changing its route
++ * cookie (for example an existing IPv4 PMTU exception or IPv6 mtu6).
++ * Use precisely the forwarding semantics used when creating the tuple;
++ * an unrelated/unlocked learned PMTU must not churn a forwarding flow.
++ */
++static bool nf_flow_direct_mtu_valid(const struct flow_offload_tuple *tuple)
++{
++	const struct dst_entry *dst = tuple->out.route_dst;
++	unsigned int mtu;
++
++	if (!dst)
++		return false;
++	switch (tuple->l3proto) {
++	case NFPROTO_IPV4:
++		mtu = ip_dst_mtu_maybe_forward(dst, true);
++		break;
++	case NFPROTO_IPV6:
++		mtu = ip6_dst_mtu_maybe_forward(dst, true);
++		break;
++	default:
++		return false;
++	}
++	return mtu == tuple->mtu;
++}
++
+ /* Cheap route-generation check on the CPU lookup path. Neighbour lookups
+  * and MAC comparisons belong to GC, not to every forwarded packet. A
+  * change in either direction retires the paired connection. */
+@@ -433,6 +458,8 @@
+ 		if (!tuple->out.route_dst ||
+ 		    !dst_check(tuple->out.route_dst, tuple->out.route_cookie))
+ 			return true;
++		if (!nf_flow_direct_mtu_valid(tuple))
++			return true;
+ 		if ((tuple->out.ppp_cookie || tuple->out.route_dst->dev->type == ARPHRD_PPP) &&
+ 		    !netdev_ppp_path_valid(tuple->out.route_dst->dev,
+ 					  tuple->out.ppp_cookie))
+@@ -658,6 +685,8 @@
+ 	dst = tuple->out.route_dst;
+ 	if (!dst || !dst_check(dst, tuple->out.route_cookie))
+ 		return false;
++	if (!nf_flow_direct_mtu_valid(tuple))
++		return false;
+ 	if ((tuple->out.ppp_cookie || dst->dev->type == ARPHRD_PPP) &&
+ 	    !netdev_ppp_path_valid(dst->dev, tuple->out.ppp_cookie))
+ 		return false;

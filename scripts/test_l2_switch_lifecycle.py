@@ -121,9 +121,26 @@ static void policy_and_domains(void) {
   assert(fe_switch_plan_validate(&plan) != FE_SWITCH_OK); cases++;
  }
  plan.ports = 3;
- plan.multi_bridge = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_MULTI_BRIDGE); plan.multi_bridge = false;
- plan.mixed = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_MIXED_PORTS); plan.mixed = false;
- plan.vlan_filtering = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_VLAN_UNSUPPORTED); plan.vlan_filtering = false;
+ for (unsigned int capability = 0; capability < 3; capability++) {
+  plan.multi_bridge = capability == 0;
+  plan.mixed = capability == 1;
+  plan.vlan_filtering = capability == 2;
+  const enum fe_switch_reason reasons[] = {FE_SWITCH_MULTI_BRIDGE, FE_SWITCH_MIXED_PORTS, FE_SWITCH_VLAN_UNSUPPORTED};
+  assert(fe_switch_plan_validate(&plan) == reasons[capability]);
+  assert(fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK);
+  /* Capability fallback must never mask an independent policy veto. */
+  plan.software_policy = true;
+  assert(fe_switch_plan_validate(&plan) == FE_SWITCH_GUARDED);
+  assert(fe_switch_route_plan_validate(&plan) == FE_SWITCH_GUARDED); plan.software_policy = false;
+  plan.private_policy = true;
+  assert(fe_switch_route_plan_validate(&plan) == FE_SWITCH_PRIVATE_POLICY); plan.private_policy = false;
+  plan.promisc = true;
+  assert(fe_switch_route_plan_validate(&plan) == FE_SWITCH_PROMISC); plan.promisc = false;
+  plan.state[0] = 0;
+  assert(fe_switch_route_plan_validate(&plan) == FE_SWITCH_PORT_POLICY); plan.state[0] = BR_STATE_FORWARDING;
+  cases++;
+ }
+ plan.multi_bridge = plan.mixed = plan.vlan_filtering = false;
  plan.private_policy = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_PRIVATE_POLICY); plan.private_policy = false;
  plan.promisc = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_PROMISC); plan.promisc = false;
  plan.software_policy = true; assert(fe_switch_plan_validate(&plan) == FE_SWITCH_GUARDED); plan.software_policy = false;
@@ -199,7 +216,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"enum fe_switch_reason \{.*?\n\};", r"struct fe_switch_plan \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_plan_validate", "fe_switch_native_key", "fe_switch_learned_owned",
+    "fe_switch_route_plan_validate", "fe_switch_plan_validate", "fe_switch_native_key", "fe_switch_learned_owned",
     "fe_switch_queue", "fe_switch_gate", "fe_switch_rebuild", "fe_switch_arm",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-lifecycle-") as directory:

@@ -1,0 +1,158 @@
+From: ThorOS maintainers
+Subject: [PATCH] netfilter: retain and validate DIRECT route and next-hop state
+
+DIRECT may be selected for hardware offload or for a bridge forwarding
+path. Retain the route reference transferred by nft_route_dst_fetch, using
+the same IPv4/IPv6 dst-cookie semantics as NEIGH. Validate both directions
+on CPU lookup and in GC, before hardware activity extends their lifetime.
+
+Neighbour validation is GC-only and uses the logical route's next hop;
+ordinary NUD transitions do not churn active rules. This is asynchronous
+invalidation, not an atomic FIB or ARP publication fence.
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -157,6 +157,9 @@
+ 			u32		bridge_cookie;
+ 			u8		h_source[ETH_ALEN];
+ 			u8		h_dest[ETH_ALEN];
++			/* Keep the L3 route independently of the resolved L2 path. */
++			struct dst_entry *route_dst;
++			u32		route_cookie;
+ 		} out;
+ 		struct {
+ 			u32		iifidx;
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -7,8 +7,11 @@
+ #include <linux/if_vlan.h>
+ #include <linux/netdevice.h>
+ #include <linux/if_bridge.h>
++#include <linux/if_arp.h>
++#include <linux/etherdevice.h>
+ #include <net/ip.h>
+ #include <net/ip6_route.h>
++#include <net/neighbour.h>
+ #include <net/netfilter/nf_flow_table.h>
+ #include <net/netfilter/nf_conntrack.h>
+ #include <net/netfilter/nf_conntrack_core.h>
+@@ -136,7 +139,12 @@
+ 		flow_tuple->out.bridge_port = route->tuple[dir].out.bridge_port;
+ 		flow_tuple->out.bridge_vid = route->tuple[dir].out.bridge_vid;
+ 		flow_tuple->out.bridge_cookie = route->tuple[dir].out.bridge_cookie;
+-		dst_release(dst);
++		/* Transfer the route reference, just as the NEIGH path does.
++		 * Cached headers alone cannot detect a same-ifindex route or
++		 * next-hop change while hardware keeps the flow alive. */
++		flow_tuple->out.route_dst = dst;
++		flow_tuple->out.route_cookie = flow_tuple->l3proto == NFPROTO_IPV6 ?
++			rt6_get_cookie(dst_rt6_info(dst)) : 0;
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+@@ -159,6 +167,8 @@
+ 	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
+ 	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
+ 		dst_release(flow->tuplehash[dir].tuple.dst_cache);
++	else if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
++		dst_release(flow->tuplehash[dir].tuple.out.route_dst);
+ }
+ 
+ void flow_offload_route_init(struct flow_offload *flow,
+@@ -406,6 +416,27 @@
+ }
+ EXPORT_SYMBOL_GPL(flow_offload_teardown);
+ 
++/* Cheap route-generation check on the CPU lookup path. Neighbour lookups
++ * and MAC comparisons belong to GC, not to every forwarded packet. A
++ * change in either direction retires the paired connection. */
++static bool nf_flow_direct_route_changed(const struct flow_offload *flow)
++{
++	unsigned int dir;
++
++	if (flow->type != NF_FLOW_OFFLOAD_ROUTE)
++		return false;
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++
++		if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT)
++			continue;
++		if (!tuple->out.route_dst ||
++		    !dst_check(tuple->out.route_dst, tuple->out.route_cookie))
++			return true;
++	}
++	return false;
++}
++
+ /* Called under the flowtable lookup/iterator RCU read section. A bridge
+  * move invalidates the whole connection, including its reverse HW rule. */
+ static bool nf_flow_bridge_changed(const struct flow_offload *flow)
+@@ -452,7 +483,7 @@
+ 
+ 	if (unlikely(nf_ct_is_dying(flow->ct)))
+ 		return NULL;
+-	if (nf_flow_bridge_changed(flow)) {
++	if (nf_flow_direct_route_changed(flow) || nf_flow_bridge_changed(flow)) {
+ 		flow_offload_teardown(flow);
+ 		return NULL;
+ 	}
+@@ -606,3 +637,36 @@
++/* A routed DIRECT entry caches an Ethernet destination which NEIGH would
++ * resolve on each transmission. Use the retained L3 dst to look up the
++ * actual next hop (bridge/VLAN device or gateway), not its physical port.
++ * PPP/P2P routes have no ARP/ND neighbour; their session lifetime is fenced
++ * by route/device cleanup instead. NUD_VALID includes STALE/DELAY/PROBE. */
++static bool nf_flow_direct_neigh_valid(struct flow_offload *flow, int dir)
++{
++	const struct flow_offload_tuple *tuple = &flow->tuplehash[dir].tuple;
++	const struct flow_offload_tuple *other = &flow->tuplehash[!dir].tuple;
++	struct dst_entry *dst;
++	struct neighbour *n;
++	bool valid;
++
++	if (flow->type != NF_FLOW_OFFLOAD_ROUTE ||
++	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT)
++		return true;
++	dst = tuple->out.route_dst;
++	if (!dst || !dst_check(dst, tuple->out.route_cookie))
++		return false;
++	if (dst->dev->type != ARPHRD_ETHER || dst->dev->addr_len != ETH_ALEN)
++		return true;
++
++	n = dst_neigh_lookup(dst, &other->src_v4);
++	if (!n)
++		return false;
++	read_lock_bh(&n->lock);
++	valid = (n->nud_state & NUD_VALID) &&
++		ether_addr_equal(n->ha, tuple->out.h_dest);
++	read_unlock_bh(&n->lock);
++	neigh_release(n);
++	return valid;
++}
++
+ static bool nf_flow_dst_valid(struct nf_flowtable *flow_table,
+ 			      struct flow_offload *flow, int dir)
+ {
+@@ -616,6 +680,12 @@
+ 	u16 vid = 0;
+ 	int i;
+ 
++	/* Validate before requesting HW stats: activity cannot renew a stale
++	 * route/next-hop. GC plus asynchronous rule withdrawal is bounded by
++	 * scheduling and driver completion, not an atomic FIB/ARP barrier. */
++	if (!nf_flow_direct_neigh_valid(flow, dir))
++		return false;
++
+ 	if (!tuple->bridge_path)
+ 		return true;
+ 
+@@ -818,7 +888,8 @@
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+ 		return tuple->dst_cache->dev == dev;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+-		return tuple->out.ifidx == dev->ifindex ||
++		return (tuple->out.route_dst && tuple->out.route_dst->dev == dev) ||
++		       tuple->out.ifidx == dev->ifindex ||
+ 		       tuple->out.hw_ifidx == dev->ifindex ||
+ 		       tuple->out.bridge_ifidx == dev->ifindex ||
+ 		       tuple->out.bridge_port == dev->ifindex;

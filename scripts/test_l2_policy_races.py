@@ -20,6 +20,7 @@ SOURCE = OVERLAY / "net/core/rtl9617c-switch.c"
 HEADER = OVERLAY / "include/linux/rtl9617c-switch.h"
 
 HEADERS = {
+    "linux/if_arp.h": "#pragma once\n#define ARPHRD_ETHER 1\n#define ARPHRD_PPP 512\n",
     "linux/types.h": r'''
 #pragma once
 #include_next <linux/types.h>
@@ -80,7 +81,7 @@ static inline bool test_warn(bool value) { if (value) test_warnings++; return va
 #include <assert.h>
 #include <stdatomic.h>
 #include <linux/rtl9617c-switch.h>
-struct net { struct rtl9617c_switch_net rtl9617c_switch; atomic_uint references; };
+struct net { struct rtl9617c_switch_net rtl9617c_switch; atomic_uint references; struct net_device *devices[8]; unsigned int device_count; };
 static inline struct net *get_net(struct net *net) { atomic_fetch_add(&net->references, 1); return net; }
 static inline void put_net(struct net *net) { assert(atomic_fetch_sub(&net->references, 1)); }
 ''',
@@ -94,9 +95,37 @@ struct net_device {
  struct Qdisc *qdisc;
  unsigned int num_tx_queues;
  unsigned int xdp_count;
+ unsigned int type;
  void *tcx_ingress, *tcx_egress;
  struct netdev_queue tx[4];
+ struct net_device *lower[4], *upper[4];
+ unsigned int lower_count, upper_count;
 };
+struct netdev_nested_priv { void *data; };
+#define for_each_netdev(net, dev) for(unsigned int n=0;n<(net)->device_count && ((dev)=(net)->devices[n]);n++)
+static _Thread_local unsigned int test_rcu_depth;
+static inline void rcu_read_lock(void) { test_rcu_depth++; }
+static inline void rcu_read_unlock(void) { assert(test_rcu_depth); test_rcu_depth--; }
+/* Simulated acyclic device topology; production relatedness logic and its
+ * callback/policy decisions are compiled unchanged below. */
+static inline int netdev_walk_all_lower_dev_rcu(struct net_device *dev,
+ int (*fn)(struct net_device *, struct netdev_nested_priv *), struct netdev_nested_priv *priv) {
+ assert(test_rcu_depth);
+ for (unsigned int i = 0; i < dev->lower_count; i++) {
+  int ret = fn(dev->lower[i], priv); if (ret) return ret;
+  ret = netdev_walk_all_lower_dev_rcu(dev->lower[i], fn, priv); if (ret) return ret;
+ }
+ return 0;
+}
+static inline int netdev_walk_all_upper_dev_rcu(struct net_device *dev,
+ int (*fn)(struct net_device *, struct netdev_nested_priv *), struct netdev_nested_priv *priv) {
+ assert(test_rcu_depth);
+ for (unsigned int i = 0; i < dev->upper_count; i++) {
+  int ret = fn(dev->upper[i], priv); if (ret) return ret;
+  ret = netdev_walk_all_upper_dev_rcu(dev->upper[i], fn, priv); if (ret) return ret;
+ }
+ return 0;
+}
 static inline struct net *dev_net(const struct net_device *dev) { return dev->net; }
 static inline unsigned int dev_xdp_prog_count(const struct net_device *dev) { return dev->xdp_count; }
 static inline struct netdev_queue *netdev_get_tx_queue(const struct net_device *dev, unsigned int i) {
@@ -123,7 +152,7 @@ TEST = r'''
 #include <string.h>
 #include "production.c"
 
-struct switch_model { bool open, arm_succeeds; unsigned int closed, rebuilt, armed; };
+struct switch_model { bool open, arm_succeeds; unsigned int closed, rebuilt, armed; struct net_device *owned; };
 static unsigned int cases;
 static void close_gate(void *private) {
  struct switch_model *model = private; assert(test_gate_depth == 1);
@@ -137,7 +166,17 @@ static bool arm(void *private) {
  /* Model an arm which may have partly changed MMIO before reporting failure. */
  model->open = true; model->armed++; return model->arm_succeeds;
 }
-static const struct rtl9617c_switch_guard_ops operations = { close_gate, rebuild, arm };
+static const struct rtl9617c_switch_guard_ops operations = {
+ .quiesce=close_gate, .rebuild=rebuild, .arm=arm,
+};
+static bool owns_device(void *private, const struct net_device *dev) {
+ struct switch_model *model = private;
+ assert(test_gate_depth == 1 && test_rcu_depth);
+ return model->owned == dev;
+}
+static const struct rtl9617c_switch_guard_ops scoped_operations = {
+ .quiesce=close_gate, .rebuild=rebuild, .arm=arm, .owns_device=owns_device,
+};
 struct publication { unsigned int writes; int result; };
 static int publish_fdb(void *private) {
  struct publication *publication = private;
@@ -409,7 +448,70 @@ static void qdisc_policy(void) {
   dev.qdisc = &plain; dev.tx[3].qdisc_sleeping = &candidate;
   assert(rtl9617c_switch_device_has_policy(&dev)); dev.tx[3].qdisc_sleeping = &plain; cases++;
  }
+ struct net_device vlan={.qdisc=&plain}, upper={.qdisc=&plain};
+ dev.upper[0]=&vlan;dev.upper_count=1;vlan.upper[0]=&upper;vlan.upper_count=1;
+ assert(!rtl9617c_switch_device_has_policy(&dev));
+ vlan.qdisc=&custom;assert(rtl9617c_switch_device_has_policy(&dev));vlan.qdisc=&plain;
+ upper.qdisc=&changed;assert(rtl9617c_switch_device_has_policy(&dev));upper.qdisc=&plain;
+ assert(!rtl9617c_switch_device_has_policy(&dev));cases+=3;
  test_rtnl = false;
+}
+
+static void device_scope(void) {
+ struct net net={0},foreign_net={0};
+ struct net_device lan={.net=&net},other={.net=&net},vlan={.net=&net},stacked_vlan={.net=&net};
+ struct net_device bridge={.net=&net},foreign={.net=&foreign_net};
+ struct switch_model model={.owned=&lan,.arm_succeeds=true};
+ struct rtl9617c_switch_guard guard={0};
+ assert(!rtl9617c_switch_guard_register(&guard,&net,&scoped_operations,&model));
+ fresh_arm(&guard,&model);
+ vlan.lower[0]=&lan;vlan.lower_count=1;stacked_vlan.lower[0]=&vlan;stacked_vlan.lower_count=1;
+ bridge.lower[0]=&other;bridge.lower[1]=&lan;bridge.lower_count=2;
+ struct net_device *related[]={&lan,&vlan,&stacked_vlan,&bridge};
+ for(unsigned int i=0;i<4;i++){
+  u64 before=rtl9617c_switch_guard_generation(&guard);
+  struct net *scope=rtl9617c_switch_policy_begin(related[i]);
+  assert(scope==&net && !model.open && net.rtl9617c_switch.active==1);
+  rtl9617c_switch_policy_end(scope);
+  assert(rtl9617c_switch_guard_generation(&guard)>before);fresh_arm(&guard,&model);cases++;
+ }
+ u64 before=rtl9617c_switch_guard_generation(&guard);
+ unsigned int closed=model.closed,rebuilt=model.rebuilt;
+ assert(!rtl9617c_switch_policy_begin(&other));
+ assert(!rtl9617c_switch_policy_begin(&foreign));
+ vlan.lower[0]=&other;
+ assert(!rtl9617c_switch_policy_begin(&vlan));assert(!rtl9617c_switch_policy_begin(&stacked_vlan));
+ assert(model.open && model.closed==closed && model.rebuilt==rebuilt);
+ assert(rtl9617c_switch_guard_generation(&guard)==before && !net.rtl9617c_switch.active);
+ model.owned=NULL;assert(!rtl9617c_switch_policy_begin(&lan));
+ assert(model.open && rtl9617c_switch_guard_generation(&guard)==before);
+ /* Persistent packet-hook vetoes stay namespace-wide even if its device
+  * is not presently related to the physical owner. */
+ rtl9617c_switch_tcx_change(&other,false,true);assert(!model.open);
+ rtl9617c_switch_tcx_change(&other,true,false);fresh_arm(&guard,&model);
+ rtl9617c_switch_nf_block(&net);assert(!model.open);rtl9617c_switch_nf_unblock(&net);
+ fresh_arm(&guard,&model);rtl9617c_switch_guard_unregister(&guard);cases+=7;
+ assert(!test_rcu_depth);
+}
+
+static void ppp_without_adjacency(void) {
+ struct net net={0};struct net_device lan={.net=&net};
+ const struct Qdisc_ops noop={.id="noqueue"};struct Qdisc plain={.ops=&noop},policy={.ops=&noop,.handle=1};
+ struct net_device ppp={.net=&net,.type=ARPHRD_PPP,.qdisc=&plain};
+ struct net_device unrelated={.net=&net,.type=ARPHRD_ETHER,.qdisc=&policy};
+ net.devices[0]=&ppp;net.devices[1]=&unrelated;net.device_count=2;
+ struct switch_model model={.owned=&lan,.arm_succeeds=true};struct rtl9617c_switch_guard guard={0};
+ assert(!rtl9617c_switch_guard_register(&guard,&net,&scoped_operations,&model));fresh_arm(&guard,&model);
+ /* A real PPP netdev has no netdev lower/upper links to its channel. */
+ assert(!ppp.lower_count && !lan.upper_count);
+ struct net *scope=rtl9617c_switch_policy_begin(&ppp);assert(scope==&net && !model.open);
+ ppp.qdisc=&policy;rtl9617c_switch_policy_end(scope);
+ test_rtnl=true;assert(rtl9617c_switch_net_has_ppp_policy(&net));
+ ppp.qdisc=&plain;assert(!rtl9617c_switch_net_has_ppp_policy(&net));
+ ppp.num_tx_queues=1;ppp.tx[0].qdisc_sleeping=&policy;
+ assert(rtl9617c_switch_net_has_ppp_policy(&net));ppp.tx[0].qdisc_sleeping=&plain;
+ assert(!rtl9617c_switch_net_has_ppp_policy(&net));test_rtnl=false;
+ fresh_arm(&guard,&model);rtl9617c_switch_guard_unregister(&guard);cases+=5;
 }
 
 static void namespace_move(void) {
@@ -458,7 +560,7 @@ static void namespace_move(void) {
 
 int main(void) {
  basic_and_nested(); persistent_vetoes(); feedback_publication(); namespaces_and_poison();
- threaded_interleavings(); qdisc_policy(); namespace_move();
+ threaded_interleavings(); qdisc_policy(); device_scope(); ppp_without_adjacency(); namespace_move();
  assert(list_empty(&rtl9617c_switch_guards));
  printf("L2 production gate: %u lifecycle/policy cases including 80 actual two-thread interleavings; stale epochs, nested scopes, late probe, persistent vetoes and namespace isolation PASS\n", cases);
  return 0;
@@ -474,6 +576,8 @@ def main():
         "ignore_nested_policy": ("state->poisoned || state->active ||", "state->poisoned || false ||"),
         "partial_arm_not_closed": ("if (!armed)\n\t\tguard->ops->quiesce", "if (false && !armed)\n\t\tguard->ops->quiesce"),
         "stale_fdb_publish": ("state->generation == generation", "((void)generation, true)"),
+        "unrelated_device_closes_all": ("if (!rtl9617c_switch_related(net, dev))", "if (!rtl9617c_switch_related(net, dev) && false)"),
+        "upper_device_policy_bypassed": ("policy = netdev_walk_all_upper_dev_rcu", "policy = false && netdev_walk_all_upper_dev_rcu"),
     }
     environment = dict(os.environ)
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")

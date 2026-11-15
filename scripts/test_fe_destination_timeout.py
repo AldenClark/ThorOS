@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A timed-out FDB APPEND retains its original row and cannot be shared."""
+"""Exercise FDB rollback and ready sharing across a pending hash withdrawal."""
 from pathlib import Path
 import argparse
 import re
@@ -86,7 +86,52 @@ static int req(void *p,unsigned int reg,unsigned int value){
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,wr,req};}
 '''
 test = r'''
+static void retiring_shared_owner(void){
+ const u8 mac[]={2,1,2,3,4,5};
+ const unsigned int order[6][3]={{0,1,2},{0,2,1},{1,0,2},{1,2,0},{2,0,1},{2,1,0}};
+ for(unsigned int existing=0;existing<2;existing++)
+ for(unsigned int retiring_first=0;retiring_first<2;retiring_first++)
+ for(unsigned int permutation=0;permutation<6;permutation++) {
+  struct rtl_fe f={0};struct rtl_fe_flow flows[3]={0};unsigned int original[4];
+  init(&f.flows);add(&flows[0].list,&f.flows);add(&flows[1].list,&f.flows);add(&flows[2].list,&f.flows);
+  rtl_fe_fdb_key(original,mac);original[0]=(original[0]&~(255U<<11))|(37U<<11)|BIT(6);
+  memcpy(f.table,original,sizeof(original));f.exists=existing;
+  assert(!fe_destination_get(&f,&flows[0],mac));
+  assert(!fe_destination_get(&f,&flows[1],mac));
+  /* fe_delete marks deleting before withdrawing hash age/cache. A timeout
+   * there leaves this confirmed-ready FDB untouched. The second flow owns
+   * the same row; list order must not veto new sharing through that owner. */
+  flows[retiring_first?0:1].deleting=true;
+  unsigned int writes=f.writes,commands=f.commands;
+  assert(!fe_destination_get(&f,&flows[2],mac));
+  assert(flows[2].destination_owned && flows[2].destination_ready);
+  assert(flows[2].destination_index==flows[0].destination_index);
+  assert(flows[2].destination_created==!existing);
+  assert(f.writes==writes && f.commands==commands);
+  if(existing)assert(!memcmp(flows[2].destination_saved,original,sizeof(original)));
+  /* Every release ordering keeps the row until the actual last owner.
+   * Sharing does not detach the retiring flow's rollback reference. */
+  for(unsigned int i=0;i<3;i++) {
+   struct rtl_fe_flow *owner=&flows[order[permutation][i]];
+   assert(!fe_destination_put(&f,owner));owner->destination_owned=false;
+   assert(f.exists==(i==2?existing:true));
+   assert(f.commands==commands+(i==2));
+  }
+  if(existing)assert(!memcmp(f.table,original,sizeof(original)));
+ }
+ /* No live owner: do not bypass a pending restore by starting a new
+  * lookup/APPEND. A ready retiring row and an uncertain row both refuse. */
+ for(unsigned int ready=0;ready<2;ready++) {
+  struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};
+  init(&f.flows);add(&a.list,&f.flows);add(&b.list,&f.flows);
+  a.destination_owned=true;a.destination_ready=ready;a.deleting=true;
+  ether_addr_copy(a.destination,mac);
+  assert(fe_destination_get(&f,&b,mac)==-EBUSY);
+  assert(!b.destination_owned && !f.writes && !f.commands);
+ }
+}
 int main(void){
+ retiring_shared_owner();
  const u8 mac[]={2,1,2,3,4,5};
  for(unsigned int existing=0;existing<2;existing++){
   struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};unsigned int original[4];
@@ -122,7 +167,7 @@ int main(void){
   assert(f.exists==existing);
   if(existing)assert(!memcmp(f.table,original,sizeof(original)));
  }
- puts("FDB: ambiguous APPEND retains rollback ownership; unready rows cannot be shared; existing/new last-owner restore passed");
+ puts("FDB: 24 retiring/live sharing and release orders; ambiguous APPEND retains ownership; unready/only-retiring rows refused; last-owner restore passed");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='fe-fdb-') as tmp:

@@ -48,7 +48,7 @@ struct model {
  bool pending, table_seen_idle[RTL_L2_TBL_COUNT], active, route_closed, arm_failure;
 };
 static struct model model, original;
-struct rtl_fe { struct model *model; bool enabled, prepared; };
+struct rtl_fe { struct model *model; bool enabled, prepared; unsigned pending_withdrawals; };
 static unsigned int cases, fault_cases, cold_cases;
 
 static int table_at(unsigned int address, bool access)
@@ -167,9 +167,10 @@ static void fe_route_gate(struct rtl_fe *fe) {
 }
 static bool fe_route_arm(struct rtl_fe *fe) {
  assert(fe->model->rx_writes && !(fe->model->rx_writes%5));
- assert(fe->enabled && fe->prepared);
+ assert(fe->pending_withdrawals || (fe->enabled && fe->prepared));
  fe->model->route_arms++;
  if(fe->model->arm_failure)return false;
+ if(fe->pending_withdrawals) {fe->model->route_closed=true;return true;}
  fe->model->route_closed=false;return true;
 }
 #include "rtl9617c-fe-switch-hw.h"
@@ -182,7 +183,7 @@ static void reset(void)
 {
  memset(&model, 0, sizeof(model)); memset(&hw, 0, sizeof(hw));
  model.route_closed=true;
- fe.enabled = false; fe.prepared = false;
+ fe.enabled = false; fe.prepared = false; fe.pending_withdrawals = 0;
  model.reg[RTL_L2_FDB_CONTROL/4] = BIT(31) | BIT(22) | BIT(25) | BIT(29) | 0xff9;
  model.reg[0x1c04/4] = (3830U << 19) | 300U;
  model.reg[0x1414/4] = 3;
@@ -438,6 +439,20 @@ static void guards(void)
  reset();fe.enabled=fe.prepared=true;
  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true));model.arm_failure=true;
  assert(!fe_switch_hw_arm(&fe,&hw,3,0)&&model.route_closed);cpu_only();cases++;
+ /* The route-off mode may still have a published action whose age/cache
+  * withdrawal timed out. Native L2 must demand a verified CPU gate in
+  * BOTH modes; neither enabled=false nor the presence of L2 owners proves
+  * the route connectors actually closed. Refusal precedes native writes. */
+ for(unsigned enabled=0;enabled<2;enabled++)for(unsigned fail=0;fail<2;fail++) {
+  reset();fe.enabled=enabled;fe.prepared=true;fe.pending_withdrawals=1;
+  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true));model.arm_failure=fail;
+  unsigned before=model.native_writes;
+  assert(fe_switch_hw_arm(&fe,&hw,3,0)==!fail);
+  assert(model.route_arms==1 && model.route_closed);
+  if(fail) {assert(model.native_writes==before);cpu_only();}
+  else for(unsigned p=0;p<2;p++)assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28)));
+  cases++;
+ }
 }
 
 static void faults(void)
@@ -601,6 +616,8 @@ def main():
                 "RTL_L2_ILPB_C_TPID_MATCH, FE_SW_TPID_ALL", "RTL_L2_ILPB_C_TPID_MATCH, 1", 1),
             "old_false_tpid_veto": production.replace(
                 "/* Cold fabric owns", "if (hw->observed.tpid[0] == 0x8100) return -EOPNOTSUPP;\n\t/* Cold fabric owns", 1),
+            "disabled_pending_route_skips_gate": production.replace(
+                "if (withdrawing && !fe_route_arm(fe))", "if (withdrawing && fe->enabled && !fe_route_arm(fe))", 1),
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -620,7 +637,7 @@ def main():
                 evidence = json.loads(result.stdout)
             else:
                 assert result.returncode and "Assertion" in result.stderr, (name, result.stderr)
-        print("Recipe self-check: rejected wrong MRU, missing SVL/learning/route gates and TPID builtin/false-veto faults")
+        print("Recipe self-check: rejected wrong MRU, missing SVL/learning/route gates, disabled pending-withdrawal gate and TPID faults")
     evidence.update({"production_sha256": hashlib.sha256(HEADER.read_bytes()).hexdigest(),
                      "fabric_sha256": hashlib.sha256((DRIVERS / "rtl9617c-fabric.h").read_bytes()).hexdigest(),
                      "actual_sdk_registers_verified": sdk_verified,

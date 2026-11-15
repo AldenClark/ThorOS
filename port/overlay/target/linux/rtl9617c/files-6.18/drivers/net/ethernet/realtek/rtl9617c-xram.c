@@ -41,6 +41,7 @@
 #include "rtl9617c-fe.h"
 #include "rtl9617c-mib.h"
 #include "rtl9617c-pon-cold.h"
+#include "rtl9617c-tm-evidence.h"
 
 #define GLB_STATIC 0xa01c
 #define PORT_TO_CPU GENMASK(3, 0)
@@ -176,6 +177,10 @@ struct rtl_xram {
 	spinlock_t rx_lock;
 	struct mutex mib_lock;
 	struct mutex fabric_lock;
+	/* Direct TM PM reads have one owner; sysfs cache readers never consume PM. */
+	struct mutex tm_evidence_lock;
+	struct rtl_tm_evidence tm_evidence;
+	u64 tm_owner_generation; /* Before publication, then RTNL-serialized. */
 	bool cold_handoff_required;
 	bool cold_attempted;
 	bool provider_ready;
@@ -561,16 +566,39 @@ static int rtl_poll(struct napi_struct *napi, int budget)
 	return packets;
 }
 
+/* tx_lock held with local IRQs disabled. Only a stopped/busy producer needs
+ * an earlier completion poll: normal idle traffic must not keep restarting
+ * the timer or turn the idle interval into permanent one-millisecond work.
+ * A running callback whose deadline has expired will see wake_pending under
+ * this same lock. If it already forwarded to an idle deadline, starting the
+ * timer here safely queues the earlier expiry while that callback finishes.
+ * No synchronous cancellation is allowed under tx_lock.
+ */
+static void rtl_tx_timer_kick_locked(struct rtl_xram *priv)
+{
+	ktime_t fast = ms_to_ktime(1);
+
+	if (!priv->host_active || priv->removing || priv->engine_poisoned)
+		return;
+	if (!hrtimer_active(&priv->timer) ||
+	    ktime_compare(hrtimer_get_remaining(&priv->timer), fast) > 0)
+		hrtimer_start(&priv->timer, fast, HRTIMER_MODE_REL);
+}
+
 static enum hrtimer_restart rtl_timer(struct hrtimer *timer)
 {
 	struct rtl_xram *priv = container_of(timer, struct rtl_xram, timer);
 	unsigned int interval = READ_ONCE(priv->idle_poll_ms);
 
+	spin_lock(&priv->tx_lock);
+	if (!priv->host_active || priv->removing || priv->engine_poisoned) {
+		spin_unlock(&priv->tx_lock);
+		return HRTIMER_NORESTART;
+	}
 	if (!priv->qm_rx || READ_ONCE(priv->qm.refill.pending)) {
 		napi_schedule(&priv->napi);
 		interval = 1;
 	}
-	spin_lock(&priv->tx_lock);
 	if (priv->dma_tx) {
 		struct rtl9617c_ni_endpoint *endpoint;
 		bool wake;
@@ -603,12 +631,16 @@ static enum hrtimer_restart rtl_timer(struct hrtimer *timer)
 	}
 	if (priv->tx_pending)
 		interval = 1;
-	spin_unlock(&priv->tx_lock);
 	if (interval == 1)
 		priv->timer_fast_ticks++;
 	else
 		priv->timer_idle_ticks++;
+	/* Serialize choosing/publishing this deadline with a BUSY kick. An
+	 * unlock before forwarding could overwrite a new fast expiry with the
+	 * stale idle interval (and forward an already re-enqueued timer).
+	 */
 	hrtimer_forward_now(timer, ms_to_ktime(interval));
+	spin_unlock(&priv->tx_lock);
 	return HRTIMER_RESTART;
 }
 
@@ -643,11 +675,16 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	if (priv->dma_tx) {
 		const struct rtl9617c_ni_frame frame = {
+			/* Legacy CPU LAN injection uses SDK HeaderA No-Drop priority.
+			 * FE actions inherit ingress policy instead; do not equate
+			 * these queue treatments or blindly promote all HW traffic. */
 			.header_high = BIT(13),
 			.header_low = (16 << 9) | (lan->port << 3) | BIT(29),
 		};
 		netdev_tx_t result = rtl_dma_tx_frame(&priv->dma, skb, dev, &frame);
 
+		if (result == NETDEV_TX_BUSY)
+			rtl_tx_timer_kick_locked(priv);
 		spin_unlock_irqrestore(&priv->tx_lock, flags);
 		return result;
 	}
@@ -659,7 +696,14 @@ static netdev_tx_t rtl_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 	wire = rtl_xram_wire_length(skb->len);
 	memset(priv->tx_buffer, 0, ALIGN(8 + wire, 4));
-	skb_copy_bits(skb, 0, priv->tx_buffer + 8, skb->len);
+	if (skb_copy_bits(skb, 0, priv->tx_buffer + 8, skb->len)) {
+		/* A failed fragmented-skb copy may have written only a prefix.
+		 * Keep the unpublished XRAM slot and its producer unchanged. */
+		dev->stats.tx_dropped++;
+		spin_unlock_irqrestore(&priv->tx_lock, flags);
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
 	crc = crc32_le(~0, priv->tx_buffer + 8, wire - 4) ^ ~0;
 	put_unaligned_le32(crc, priv->tx_buffer + 8 + wire - 4);
 	offset = pointer * 8 + 4;
@@ -684,6 +728,7 @@ static void rtl_engine_poison(struct rtl_xram *priv)
 {
 	unsigned long flags;
 
+	priv->tm_owner_generation++;
 	/* Serialize the shared PON gate with recovery's rtl9617c_ni_pon_gate(). */
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->engine_poisoned, true);
@@ -778,6 +823,7 @@ static int rtl_engine_start(struct rtl_xram *priv)
 		return -ENODEV;
 	if (priv->engine_poisoned)
 		return -EIO;
+	priv->tm_owner_generation++;
 	/* FE owns its installed CPU profile for the same device lifetime. Gate
 	 * flows before first setup, but never restore a boot-time profile while
 	 * the PON classifier can still send packets to that profile. */
@@ -804,6 +850,12 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->host_active, true);
 	rtl_pon_host_gate(priv, true);
+	/* PON recovery can transmit independently of RTNL as soon as this
+	 * owner is visible. Publish the first timer under the same lock as
+	 * BUSY kicks and callback forwarding; a later unlocked initial start
+	 * could otherwise re-enqueue the timer while its callback advances it.
+	 */
+	hrtimer_start(&priv->timer, ms_to_ktime(1), HRTIMER_MODE_REL);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	if (priv->qm_rx) {
 		spin_lock_irqsave(&priv->rx_lock, flags);
@@ -814,7 +866,6 @@ static int rtl_engine_start(struct rtl_xram *priv)
 	/* A retained EPP can already contain packets when IRQs are rearmed.
 	 * Poll explicitly instead of depending on a new interrupt edge. */
 	napi_schedule(&priv->napi);
-	hrtimer_start(&priv->timer, ms_to_ktime(1), HRTIMER_MODE_REL);
 	return 0;
 
 poison:
@@ -830,6 +881,7 @@ static void rtl_engine_stop(struct rtl_xram *priv)
 
 	if (!priv->host_active)
 		return;
+	priv->tm_owner_generation++;
 	spin_lock_irqsave(&priv->tx_lock, flags);
 	WRITE_ONCE(priv->host_active, false);
 	rtl_pon_host_gate(priv, false);
@@ -968,6 +1020,19 @@ void rtl9617c_ni_close(struct device *dev, struct net_device *owner)
 }
 EXPORT_SYMBOL_GPL(rtl9617c_ni_close);
 
+void rtl9617c_ni_forget_tx(struct device *dev, struct net_device *owner)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	unsigned long flags;
+
+	/* Internal PON recovery traffic can outlive ndo_stop. Its final owner
+	 * withdrawal is independent of the shared LAN engine's user count. */
+	spin_lock_irqsave(&priv->tx_lock, flags);
+	rtl_dma_tx_forget(&priv->dma, owner);
+	spin_unlock_irqrestore(&priv->tx_lock, flags);
+}
+EXPORT_SYMBOL_GPL(rtl9617c_ni_forget_tx);
+
 netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 			       struct sk_buff *skb, const struct rtl9617c_ni_frame *frame)
 {
@@ -983,6 +1048,8 @@ netdev_tx_t rtl9617c_ni_transmit(struct device *dev, struct net_device *owner,
 		return NETDEV_TX_OK;
 	}
 	result = rtl_dma_tx_frame(&priv->dma, skb, owner, frame);
+	if (result == NETDEV_TX_BUSY)
+		rtl_tx_timer_kick_locked(priv);
 	spin_unlock_irqrestore(&priv->tx_lock, flags);
 	return result;
 }
@@ -1576,6 +1643,109 @@ static ssize_t lan_mib_evidence_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(lan_mib_evidence);
 
+static unsigned long long rtl_tm_clock(void *context)
+{
+	(void)context;
+	return ktime_get_boottime_ns();
+}
+
+static ssize_t fabric_sample_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	const struct rtl_tm_observe_io io = {priv, rtl_mib_read, rtl_tm_clock};
+	unsigned long long seq, epoch;
+	unsigned int valid;
+	int sampled;
+
+	/* This explicitly active endpoint MAY consume clear-on-read PM values.
+	 * Never use it for passive UI polling. Trylocks avoid waiting behind
+	 * device removal or a sleeping reconfiguration. RTNL excludes the NI
+	 * lifetime transitions; the helper separately checks fabric config on
+	 * both sides of the non-atomic sample. No indirect window is touched. */
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!mutex_trylock(&priv->tm_evidence_lock)) {
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	if (READ_ONCE(priv->removing) || !priv->provider_ready ||
+	    !priv->base_ready || !priv->host_active || priv->engine_poisoned) {
+		rtl_tm_evidence_invalidate(&priv->tm_evidence);
+		mutex_unlock(&priv->tm_evidence_lock);
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	sampled = rtl_tm_evidence_capture(&io, &priv->tm_evidence,
+					priv->tm_owner_generation);
+	seq = priv->tm_evidence.seq;
+	epoch = priv->tm_evidence.epoch;
+	valid = priv->tm_evidence.valid;
+	mutex_unlock(&priv->tm_evidence_lock);
+	rtnl_unlock();
+	return sysfs_emit(buf, "schema=1 sampled=%d seq=%llu epoch=%llu valid=%u\n",
+			 sampled, seq, epoch, valid);
+}
+static DEVICE_ATTR_RO(fabric_sample);
+
+static ssize_t fabric_evidence_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+	struct rtl_tm_evidence sample;
+	u64 owner_generation;
+	unsigned int i;
+	ssize_t length;
+
+	/* Cache-only: multiple readers cannot steal read-to-clear PM samples. */
+	if (!rtnl_trylock())
+		return -EAGAIN;
+	if (!mutex_trylock(&priv->tm_evidence_lock)) {
+		rtnl_unlock();
+		return -EAGAIN;
+	}
+	sample = priv->tm_evidence;
+	owner_generation = priv->tm_owner_generation;
+	mutex_unlock(&priv->tm_evidence_lock);
+	rtnl_unlock();
+	length = sysfs_emit(buf,
+		"schema=1 cached=1 clock=boottime global=1 atomic_hardware_snapshot=0 "
+		"hardware_reset_verified=0 te_direct_mode_verified=0 "
+		"capture_ns=%llu seq=%llu epoch=%llu owner_generation=%llu current_owner_generation=%llu "
+		"valid=%u delta_valid=%u epoch_reason=%u begin_ns=%llu end_ns=%llu\n",
+		ktime_get_boottime_ns(), sample.seq, sample.epoch,
+		sample.owner_generation, owner_generation,
+		sample.valid, sample.delta_valid, sample.epoch_reason,
+		sample.begin_ns, sample.end_ns);
+	length += sysfs_emit_at(buf, length,
+		"contract=partial tm_te_baseline_verified=0 wan_arb_readback=0 "
+		"sw_lan_nodrop=1 hw_nodrop_policy=ingress_inherited "
+		"bm_clear_on_read=%u te_mem_clear_on_read=%u l3lan_rxpfc=%#x\n",
+		sample.config[RTL_TM_CLEAR_CONTROL] >> 31,
+		(sample.config[RTL_TM_TE_PM_CONTROL] >> 5) & 1U,
+		sample.config[RTL_TM_FC_CONTROL] >> 24);
+	for (i = 0; i < RTL_TM_CONFIGS; i++)
+		length += sysfs_emit_at(buf, length, "%s=%#x%c",
+			rtl_tm_config_registers[i].name, sample.config[i],
+			i == RTL_TM_CONFIGS - 1 ? '\n' : ' ');
+	for (i = 0; i < RTL_TM_STATUSES; i++)
+		length += sysfs_emit_at(buf, length, "%s=%#x%c",
+			rtl_tm_status_registers[i].name, sample.status[i],
+			i == RTL_TM_STATUSES - 1 ? '\n' : ' ');
+	for (i = 0; i < RTL_TM_COUNTERS; i++) {
+		length += sysfs_emit_at(buf, length, "counter=%s raw=%u",
+			rtl_tm_counter_registers[i].name, sample.raw[i]);
+		if (i < RTL_TM_BM_COUNTERS)
+			length += sysfs_emit_at(buf, length, " observed=%llu mode=%s\n",
+				sample.observed[i],
+				sample.config[RTL_TM_CLEAR_CONTROL] >> 31 ? "read_clear" : "cumulative");
+		else
+			length += sysfs_emit_at(buf, length, " mode=unknown\n");
+	}
+	return length;
+}
+static DEVICE_ATTR_RO(fabric_evidence);
+
 static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_xram_state.attr,
 	&dev_attr_dma_state.attr,
@@ -1598,6 +1768,8 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_l2_evidence.attr,
 	&dev_attr_cold_bootstrap.attr,
 	&dev_attr_lan_mib_evidence.attr,
+	&dev_attr_fabric_sample.attr,
+	&dev_attr_fabric_evidence.attr,
 	NULL,
 };
 static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, int index)
@@ -1899,6 +2071,7 @@ static int rtl_probe(struct platform_device *pdev)
 	spin_lock_init(&priv->rx_lock);
 	mutex_init(&priv->mib_lock);
 	mutex_init(&priv->fabric_lock);
+	mutex_init(&priv->tm_evidence_lock);
 	priv->cold_handoff_required =
 		of_property_read_bool(dev->of_node, "realtek,cold-fabric-bootstrap") ||
 		of_property_read_bool(dev->of_node, "realtek,pon-cold-handoff");

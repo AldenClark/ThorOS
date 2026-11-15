@@ -37,7 +37,8 @@ enum { FLOW_OFFLOAD_XMIT_UNSPEC, FLOW_OFFLOAD_XMIT_NEIGH,
  FLOW_OFFLOAD_XMIT_XFRM, FLOW_OFFLOAD_XMIT_DIRECT };
 struct flow_offload_tuple {
  int iifidx,xmit_type;
- union {struct dst_entry *dst_cache;struct {int ifidx,hw_ifidx,bridge_ifidx,bridge_port;} out;};
+ union {struct dst_entry *dst_cache;struct {int ifidx,hw_ifidx,bridge_ifidx,bridge_port;
+  struct dst_entry *route_dst;unsigned int route_cookie;} out;};
 };
 struct flow_offload {
  struct {struct flow_offload_tuple tuple;} tuplehash[2];
@@ -104,6 +105,18 @@ int main(void) {
  flow.tuplehash[0].tuple.out.bridge_port=logical.ifindex;
  nf_flow_table_do_cleanup(NULL,&flow,&br);assert(flow.torn_down);
  flow.torn_down=false;nf_flow_table_do_cleanup(NULL,&flow,&logical);assert(flow.torn_down);
+ /* DIRECT retains the logical PPP route independently of the physical
+  * Ethernet output. Its teardown must match either owner, not reinterpret
+  * the first union words as a dst pointer or match an unrelated session. */
+ flow.tuplehash[0].tuple=(struct flow_offload_tuple){.iifidx=lan.ifindex,
+  .xmit_type=FLOW_OFFLOAD_XMIT_DIRECT,.out={.ifidx=pon.ifindex,
+   .hw_ifidx=pon.ifindex,.route_dst=&ppp_dst}};
+ flow.tuplehash[1].tuple=(struct flow_offload_tuple){.iifidx=pon.ifindex,
+  .xmit_type=FLOW_OFFLOAD_XMIT_NEIGH,.dst_cache=&lan_dst};
+ flow.torn_down=false;nf_flow_table_do_cleanup(NULL,&flow,&other_ppp);assert(!flow.torn_down);
+ nf_flow_table_do_cleanup(NULL,&flow,&ppp);assert(flow.torn_down);
+ flow.torn_down=false;nf_flow_table_do_cleanup(NULL,&flow,&pon);assert(flow.torn_down);
+ flow.torn_down=false;flow.ct=2;nf_flow_table_do_cleanup(NULL,&flow,&ppp);assert(!flow.torn_down);
  puts("DIRECT/PPP/bridge cleanup: carrier loss, MAC, MTU and topology teardown passed");
 }
 '''

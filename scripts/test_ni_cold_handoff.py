@@ -133,6 +133,7 @@ struct rtl_qm_rx {void *pon;bool active;};
 struct napi_struct {bool active;};
 struct rtl_xram {
  struct rtl_lan lan;
+ unsigned long long tm_owner_generation;
  struct mutex fabric_lock;
  bool cold_handoff_required,cold_attempted,provider_ready,fabric_managed;
  bool removing,engine_poisoned,native_groups_created,irq_requested;

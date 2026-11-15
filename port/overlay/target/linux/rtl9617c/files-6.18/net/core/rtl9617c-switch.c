@@ -14,6 +14,7 @@
  */
 #include <linux/errno.h>
 #include <linux/export.h>
+#include <linux/if_arp.h>
 #include <linux/netdevice.h>
 #include <linux/rtl9617c-switch.h>
 #include <linux/spinlock.h>
@@ -192,6 +193,37 @@ out:
 }
 EXPORT_SYMBOL_GPL(rtl9617c_switch_guard_publish);
 
+static int rtl9617c_switch_owned_lower(struct net_device *dev,
+				       struct netdev_nested_priv *priv)
+{
+	struct rtl9617c_switch_guard *guard = priv->data;
+
+	return guard->ops->owns_device(guard->priv, dev);
+}
+
+/* RCU protects adjacency while a bridge/FDB callback may run without RTNL.
+ * Do not invalidate a fabric for lo/veth/another bridge merely because they
+ * share a namespace. Persistent NF/TCX/XDP vetoes remain namespace-wide. */
+static bool rtl9617c_switch_related(struct net *net, struct net_device *dev)
+{
+	struct rtl9617c_switch_guard *guard;
+
+	list_for_each_entry(guard, &rtl9617c_switch_guards, list) {
+		struct netdev_nested_priv priv = { .data = guard };
+
+		if (guard->net != net)
+			continue;
+		/* PPP channels resolve through ndo_fill_forward_path(), not
+		 * netdev adjacency. Do not walk channels under this gate lock. */
+		if (dev->type == ARPHRD_PPP || !guard->ops->owns_device ||
+		    guard->ops->owns_device(guard->priv, dev) ||
+		    netdev_walk_all_lower_dev_rcu(dev,
+					 rtl9617c_switch_owned_lower, &priv))
+			return true;
+	}
+	return false;
+}
+
 struct net *rtl9617c_switch_policy_begin(struct net_device *dev)
 {
 	struct net *net;
@@ -200,12 +232,19 @@ struct net *rtl9617c_switch_policy_begin(struct net_device *dev)
 	if (!dev)
 		return NULL;
 	net = dev_net(dev);
+	rcu_read_lock();
 	spin_lock_irqsave(&rtl9617c_switch_lock, flags);
+	if (!rtl9617c_switch_related(net, dev)) {
+		spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
+		rcu_read_unlock();
+		return NULL;
+	}
 	if (unlikely(++net->rtl9617c_switch.active == 0))
 		net->rtl9617c_switch.poisoned = true;
 	rtl9617c_switch_advance(net);
 	rtl9617c_switch_quiesce(net);
 	spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
+	rcu_read_unlock();
 	return net;
 }
 EXPORT_SYMBOL_GPL(rtl9617c_switch_policy_begin);
@@ -360,7 +399,7 @@ static bool rtl9617c_switch_qdisc_has_policy(const struct Qdisc *qdisc)
  * have handle 0; an explicitly configured/changed qdisc is software policy.
  * TCX and XDP are persistent namespace vetoes as well, not mere snapshots.
  */
-bool rtl9617c_switch_device_has_policy(const struct net_device *dev)
+static bool rtl9617c_switch_device_policy(const struct net_device *dev)
 {
 	struct Qdisc *qdisc;
 	unsigned int i;
@@ -376,4 +415,44 @@ bool rtl9617c_switch_device_has_policy(const struct net_device *dev)
 	}
 	return false;
 }
+
+static int rtl9617c_switch_upper_policy(struct net_device *dev,
+					struct netdev_nested_priv *priv)
+{
+	(void)priv;
+	return rtl9617c_switch_device_policy(dev);
+}
+
+bool rtl9617c_switch_device_has_policy(const struct net_device *dev)
+{
+	struct netdev_nested_priv priv = {};
+	bool policy;
+
+	ASSERT_RTNL();
+	if (rtl9617c_switch_device_policy(dev))
+		return true;
+	/* Route offload resolves VLAN uppers to a physical port. Preserve an
+	 * upper's shaping policy too, including on the PON side. */
+	rcu_read_lock();
+	policy = netdev_walk_all_upper_dev_rcu((struct net_device *)dev,
+					     rtl9617c_switch_upper_policy, &priv);
+	rcu_read_unlock();
+	return policy;
+}
 EXPORT_SYMBOL_GPL(rtl9617c_switch_device_has_policy);
+
+bool rtl9617c_switch_net_has_ppp_policy(struct net *net)
+{
+	struct net_device *dev;
+
+	ASSERT_RTNL();
+	/* PPP has no lower/upper adjacency to its Ethernet channel. Keep a
+	 * conservative namespace veto until an exact channel-policy compiler
+	 * exists; otherwise a PPP qdisc could be silently bypassed by FE. */
+	for_each_netdev(net, dev)
+		if (dev->type == ARPHRD_PPP &&
+		    rtl9617c_switch_device_has_policy(dev))
+			return true;
+	return false;
+}
+EXPORT_SYMBOL_GPL(rtl9617c_switch_net_has_ppp_policy);
