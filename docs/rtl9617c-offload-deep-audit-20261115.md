@@ -83,6 +83,11 @@ CPU 回流和 GC 增加的是同一 dst 的有效 MTU 校验。
 后者只表示 CPU profile gate 的回读证据，不表示所有硬件 pipeline 已经 drain。
 D4 的共享查找修复也不能绕开本节的全局正确性门槛；不宣称 hash 撤销不确定时仍允许无条件建流。
 
+最终配置变体复查还补上 `BRIDGE` 不可达时的 routed fallback：它原先先将 LAN RX selector 改为 25，再忽略 `fe_route_arm()` 的失败结果。
+现在先收紧到 CPU16，验证 arm 成功后才开放 25；pending 时成功必须是已验证的 CPU profile，失败保持 CPU16。
+独立回归提取真实 fallback 与 route helpers，覆盖原本已在 LAN25 的状态、两个 selector 各自读回失败、普通路由、pending、offline/shutdown 和恢复旧顺序的反例。
+**当前 TYFZA1 生产配置与 ARM64 CI 都是 `BRIDGE=y`、SWITCHDEV/GUARD/XRAM 开启，不进入该 fallback；它针对合法的非默认构建变体，不能据此解释当前板型的测速差异。**
+
 ### D5 / D6：有明确边界的性能改进
 
 NI 调整只作用于已经返回 BUSY 的生产者。正常发送不会每包重启 timer，空闲仍保持 1–10 ms 配置策略。

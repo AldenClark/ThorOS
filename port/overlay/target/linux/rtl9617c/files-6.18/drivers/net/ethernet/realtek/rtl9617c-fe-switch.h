@@ -1217,13 +1217,19 @@ static void fe_switch_reconcile_locked(struct rtl_fe *fe)
 	 */
 	if (!fe->engine_ready || !fe->enabled || fe->shutting_down)
 		return;
+	/* Close existing RX25 as well as preserving an earlier port flush.
+	 * A failed withdrawal can still own a cached route: prove the L3
+	 * selection BEFORE opening RX25. Pending owners need CPU profile1,
+	 * otherwise route0; failed readback leaves every LAN on CPU16. */
+	fe_switch_quiesce_locked(fe);
+	if (!fe_route_arm(fe))
+		return;
 	for (port = 0; port < FE_LAN_PORTS; port++) {
 		value = fe_read(fe, FE_LAN_RX_CTRL(port));
 		fe_write(fe, FE_LAN_RX_CTRL(port),
 			 (value & ~(0x3fU << 16)) | BIT(28) | (25U << 16));
 	}
 	fe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));
-	fe_route_arm(fe);
 }
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested)
 {

@@ -16,6 +16,7 @@ python3 scripts/test_lan_pm_mapping.py
 python3 scripts/test_ni_mib_evidence.py
 python3 scripts/test_lan_link_mode.py
 python3 scripts/test_fe_lan_lifecycle.py
+python3 scripts/test_fe_route_fallback.py
 python3 scripts/test_fe_cache_slot_zero.py
 python3 scripts/test_fe_hash_collision.py
 python3 scripts/test_fe_source_cam_timeout.py
