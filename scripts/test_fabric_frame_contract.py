@@ -59,7 +59,51 @@ newlink = function(sources['net/8021q/vlan_netlink.c'], 'vlan_newlink')
 mtu = newlink[newlink.index('\tmax_mtu = netif_reduces_vlan_mtu('):newlink.index('\n\t/* Note: If this initial')]
 assert 'return netif_is_macsec(dev);' in reduce_mtu
 rx = function(sources['net/core/dev.c'], '__netif_receive_skb_core')
-assert rx.index('skb = skb_vlan_untag(skb);') < rx.index('rx_handler = rcu_dereference(skb->dev->rx_handler);')
+
+
+def receive_order(text):
+    # Immutable MCE copies have a separate terminal dispatch before VLAN
+    # normalization. Its early handler capture is not the ordinary bridge
+    # dispatch whose frame budget is exercised by this oracle. The actual
+    # MCE dispatch is executed separately by test_mcast_dispatch.py.
+    start = text.index('if (rtl9617c_mcast_copy_present(skb)) {')
+    end = text.index('{', start) + 1
+    depth = 1
+    while depth:
+        depth += (text[end] == '{') - (text[end] == '}')
+        end += 1
+    copy = text[start:end]
+    assert copy.index('rtl9617c_mcast_copy_valid(') < copy.index('rx_handler(&skb)')
+    assert re.search(r'if \(rx_handler\(&skb\) != RX_HANDLER_CONSUMED\)\s+goto drop;', copy)
+    assert re.search(r'ret = NET_RX_SUCCESS;\s+goto out;\s*\}$', copy)
+    ordinary = text[end:]
+    lookup = 'rx_handler = rcu_dereference(skb->dev->rx_handler);'
+    assert ordinary.index('skb = skb_vlan_untag(skb);') < ordinary.index(lookup)
+    assert ordinary.index(lookup) < ordinary.index('switch (rx_handler(&skb))')
+    return end
+
+
+ordinary_start = receive_order(rx)
+# Negative controls ensure the branch-specific check still rejects a real
+# ordering regression and an MCE copy falling into ordinary forwarding.
+lookup = 'rx_handler = rcu_dereference(skb->dev->rx_handler);'
+ordinary = rx[ordinary_start:]
+moved_lookup = ordinary.replace(lookup, '', 1).replace(
+    'if (eth_type_vlan(skb->protocol)) {',
+    lookup + '\n\tif (eth_type_vlan(skb->protocol)) {', 1)
+for broken in (
+    rx[:ordinary_start] + moved_lookup,
+    rx.replace('ret = NET_RX_SUCCESS;\n\t\tgoto out;', 'ret = NET_RX_SUCCESS;', 1),
+    rx.replace('rx_handler(&skb) != RX_HANDLER_CONSUMED',
+               'rx_handler(&skb) != RX_HANDLER_PASS', 1),
+):
+    assert broken != rx
+    try:
+        receive_order(broken)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('receive ordering negative control was accepted')
 assert untag.index('__vlan_hwaccel_put_tag(') < untag.index('skb_pull_rcsum(skb, VLAN_HLEN)')
 assert bridge.index('skb_push(skb, ETH_HLEN)') < bridge.index('is_skb_forwardable(')
 
@@ -184,6 +228,7 @@ with tempfile.TemporaryDirectory(prefix='fabric-frame-contract-') as temporary:
         else:
             assert result.returncode!=0 and 'Assertion' in result.stderr and 'MANAGED_RECEIVE_WIRE_BUDGET' in result.stderr,result.stderr
             print('wrong_global_1522: rejected by QinQ wire-budget runtime assertion')
+print('RX dispatch source contract: terminal MCE copy branch, ordinary VLAN-before-handler order, 3 negative controls rejected')
 print('Evidence scope: Linux forwarding/MTU contract and modeled wire budget only; hardware_forwarding_proven=false')
 evidence = {
     'schema': 1, 'kernel': version, 'openwrt_commit': lock['commit'],
@@ -194,6 +239,8 @@ evidence = {
     'wire_bytes_including_modeled_fcs': [1518,1522,1526],
     'bridge_skb_bytes_after_outer_tag_metadata': [1514,1514,1518],
     'wrong_1522_negative_control_rejected': True,
+    'rx_order_source_checks': ['terminal MCE-copy branch', 'ordinary VLAN before handler'],
+    'rx_order_negative_controls_rejected': 3,
     'managed_uni_wire_budget': 1526, 'maximum_supported_tags': 2,
     'coarse_native_untagged_oversize_differs_from_software': True,
     'hardware_register_counting_semantics_proven': False,
