@@ -1,12 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/* RTL9617C L3FE native Hash type0, normal action groups18+20.
+/* RTL9617C L3FE native Hash type0, groups18+20 and optional NAPTv6 group24.
  * Hardware format: Cortina GPL aal-77c/include/aal_common.h.
- * Normal actions are224 bits; main DRAM slots are384 bits on this board. */
+ * Normal/extended actions are224/321 bits; DDR slots remain384 bits. */
 #ifndef RTL9617C_FE_FORMAT_H
 #define RTL9617C_FE_FORMAT_H
 
 #define RTL_FE_ACTION_WORDS 8
 #define RTL_FE_ACTION_GROUPS 0x00140000U
+/* The 77C NAPTv6 action appends group24 (97 bits) to the normal 224 bits.
+ * Both modes retain the same 384-bit DDR slot; only the cache geometry and
+ * profile fetch width change, before the first flow is exposed. */
+#define RTL_FE_NAPTV6_ACTION_WORDS 12
+#define RTL_FE_NAPTV6_ACTION_BITS 321
+#define RTL_FE_NAPTV6_ACTION_GROUPS (RTL_FE_ACTION_GROUPS | (1U << 24))
+
+static inline unsigned int rtl_fe_action_profile(unsigned int naptv6)
+{
+ return naptv6 ? RTL_FE_NAPTV6_ACTION_GROUPS | (4U << 25) :
+  RTL_FE_ACTION_GROUPS | (3U << 25);
+}
 
 enum rtl_fe_action_field {
 	RTL_FE_MRR_VLD,
@@ -76,6 +88,10 @@ enum rtl_fe_action_field {
 	RTL_FE_SIX_RD_DIP_REMAP_OR_FMR_IDX,
 	RTL_FE_VXLAN_SPORT_MSB15,
 	RTL_FE_VXLAN_SPORT_UPDATE_EN,
+	RTL_FE_IP_ADDR_H_96_VLD,
+	RTL_FE_IP_ADDR_H_96_1,
+	RTL_FE_IP_ADDR_H_96_2,
+	RTL_FE_IP_ADDR_H_96_3,
 	RTL_FE_FIELD_COUNT,
 };
 
@@ -148,6 +164,10 @@ static const struct rtl_fe_field_layout rtl_fe_action_fields[RTL_FE_FIELD_COUNT]
 	[RTL_FE_SIX_RD_DIP_REMAP_OR_FMR_IDX] = {215, 2},
 	[RTL_FE_VXLAN_SPORT_MSB15] = {217, 6},
 	[RTL_FE_VXLAN_SPORT_UPDATE_EN] = {223, 1},
+	[RTL_FE_IP_ADDR_H_96_VLD] = {224, 1},
+	[RTL_FE_IP_ADDR_H_96_1] = {225, 32},
+	[RTL_FE_IP_ADDR_H_96_2] = {257, 32},
+	[RTL_FE_IP_ADDR_H_96_3] = {289, 32},
 };
 
 static inline void rtl_fe_bits_set(unsigned int *words, unsigned int bit,
@@ -178,9 +198,13 @@ struct rtl_fe_vlan {
 };
 struct rtl_fe_ipv4_action {
  unsigned int address;
+ /* The selected IPv6 address's first three words, in network-address
+  * order but host-endian values. `address` supplies its last word. */
+ unsigned int address6_high[3];
  unsigned short port, destination, mac_da_index;
  unsigned char ingress_interface, egress_interface, cos, check_mask;
  unsigned char translate, translate_destination, deep_queue;
+ unsigned char translate_ipv6;
  unsigned char vlan_set, vlan_count;
  unsigned char pppoe_pop, mtu_set, mtu_index;
  unsigned char gem_set, gem_index;
@@ -240,6 +264,25 @@ static inline void rtl_fe_ipv4_action(unsigned int words[RTL_FE_ACTION_WORDS],
    rtl_fe_action_set(words,i?RTL_FE_INNER_DEI1:RTL_FE_TOP_DEI1,action->vlan[i].dei);
   }
  }
+}
+
+/* All twelve words are defined, including the 63 unused DDR bits. In normal
+ * mode the publisher has rejected translate_ipv6 and the extra words are
+ * zero. Never reinterpret a published action after changing the profile. */
+static inline void rtl_fe_naptv6_action(
+ unsigned int words[RTL_FE_NAPTV6_ACTION_WORDS],
+ const struct rtl_fe_ipv4_action *action)
+{
+ unsigned int i;
+
+ rtl_fe_ipv4_action(words, action);
+ for(i=RTL_FE_ACTION_WORDS;i<RTL_FE_NAPTV6_ACTION_WORDS;i++)words[i]=0;
+ if(!action->translate || !action->translate_ipv6)return;
+ rtl_fe_action_set(words,RTL_FE_IP_ADDR_NAPT6,1);
+ rtl_fe_action_set(words,RTL_FE_IP_ADDR_H_96_VLD,1);
+ rtl_fe_action_set(words,RTL_FE_IP_ADDR_H_96_1,action->address6_high[2]);
+ rtl_fe_action_set(words,RTL_FE_IP_ADDR_H_96_2,action->address6_high[1]);
+ rtl_fe_action_set(words,RTL_FE_IP_ADDR_H_96_3,action->address6_high[0]);
 }
 
 #define RTL_FE_KEY_WORDS 23

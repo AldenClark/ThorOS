@@ -66,6 +66,8 @@ static void fe_switch_reconcile_locked(struct rtl_fe *fe);
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested);
 static bool fe_switch_requested(struct rtl_fe *fe);
 static bool fe_switch_flow_allowed(struct rtl_fe *fe);
+static bool fe_switch_flow_ports_allowed(struct rtl_fe *fe,
+ const struct net_device *input, const struct net_device *output);
 static bool fe_switch_needs_recovery(struct rtl_fe *fe);
 static void fe_switch_track_port_locked(struct rtl_fe *fe, struct net_device *dev,
                                        unsigned int destination, bool adding);
@@ -77,11 +79,21 @@ static void fe_switch_track_port_locked(struct rtl_fe *fe, struct net_device *de
 #define FE_LAN_PORTS 5
 #define FE_LAN_RX_CTRL(port) (0xa5f8+0x90*(port))
 
+static bool native_l2 = true;
+module_param(native_l2, bool, 0400);
+MODULE_PARM_DESC(native_l2, "Request native LAN switching at boot (default on; policy/capability gates still apply)");
+
 /* Boot-only namespace selection; warm policy changes never reinterpret the
  * shared FDB while native rows or L3 DA-rewrite pins may still be live. */
 static bool native_l2_ivl;
 module_param(native_l2_ivl, bool, 0400);
 MODULE_PARM_DESC(native_l2_ivl, "Select IVL at the fenced cold handoff (default SVL; reboot required)");
+
+/* Group24 needs paired cache SRAM. This is a lifetime configuration, never
+ * a runtime per-flow toggle over already exposed hardware actions. */
+static bool naptv6 = true;
+module_param(naptv6, bool, 0400);
+MODULE_PARM_DESC(naptv6, "Enable 321-bit IPv6 NAT actions and 1024-entry paired cache (reboot required)");
 
 enum rtl_fe_mode {
  RTL_FE_MODE_OFF,
@@ -189,6 +201,7 @@ struct rtl_fe {
  void *memory;
  dma_addr_t dma;
  bool enabled, prepared, cpu_path, lan_redirected;
+ bool naptv6;
  /* NI stop/start must not confuse requested policy with live ASIC state. */
  bool engine_ready, shutting_down;
  bool route_gate_ready, route_admitted, dma_exposed;
@@ -602,7 +615,8 @@ static int fe_prepare(struct rtl_fe *fe)
  /* Command-window idle is not a proof that all late AXI DMA has drained.
   * Record exposure before publishing the first hardware-visible address. */
  fe->dma_exposed=true;
- rtl_fe_dma_tables(&io,lower_32_bits(fe->dma),(upper_32_bits(fe->dma)&255)|2);
+ rtl_fe_dma_tables_mode(&io,lower_32_bits(fe->dma),
+  (upper_32_bits(fe->dma)&255)|2,fe->naptv6);
  ret=fe_access(fe,0x393c,1);
  if(ret)return ret;
  rtl_fe_ipv6_mask(mask);
@@ -686,7 +700,7 @@ static int fe_prepare(struct rtl_fe *fe)
  fe_write(fe,0x2304+12*12,0xff|(6<<16));
  fe_write(fe,0x2304+13*12,0xff|(6<<16));
  for(i=0;i<5;i++)fe_write(fe,0x394c+i*4,0);
- fe_write(fe,0x3724,RTL_FE_ACTION_GROUPS|(3U<<25));
+ fe_write(fe,0x3724,rtl_fe_action_profile(fe->naptv6));
  fe_write(fe,0x3704,63); /* IP/IPv6 five-tuple. */
  /* TC_SETUP_FT produces routed IP rules, including routed PPPoE, under
   * mask63 only. Native LAN bridging owns the L2 FDB, not the retired
@@ -1207,6 +1221,7 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  struct net_device *output=NULL;
  u8 ethernet[ETH_HLEN]={},ethernet_known[ETH_ALEN*2]={};
  __be32 new_source,new_destination;
+ __be32 new_source6[4],new_destination6[4];
  __be16 new_sport,new_dport;
  bool source_changed,destination_changed;
  struct rtl_fe_vlan output_vlan[2];
@@ -1318,6 +1333,8 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
       addresses6.mask->dst.s6_addr32[i]!=htonl(~0U))return -EOPNOTSUPP;
    data->key6.source[i]=ntohl(addresses6.key->src.s6_addr32[i]);
    data->key6.destination[i]=ntohl(addresses6.key->dst.s6_addr32[i]);
+   new_source6[i]=addresses6.key->src.s6_addr32[i];
+   new_destination6[i]=addresses6.key->dst.s6_addr32[i];
   }
   new_source=new_destination=0;
  } else {
@@ -1361,9 +1378,10 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
    if(output || i!=(int)rule->action.num_entries-1)return -EOPNOTSUPP;
    output=act->dev;break;
   case FLOW_ACTION_CSUM:
-   /* The packet editor supports the checksums implied by this IPv4
-    * TCP/UDP template, not arbitrary tc checksum-repair requests. */
-   if(data->ipv6 || act->csum_flags&~(TCA_CSUM_UPDATE_FLAG_IPV4HDR|
+   /* The packet editor supports the checksum implied by this routed
+    * TCP/UDP template, not arbitrary tc checksum-repair requests. IPv6
+    * has no header checksum and must not claim IPv4HDR repair. */
+   if(act->csum_flags&~((data->ipv6?0:TCA_CSUM_UPDATE_FLAG_IPV4HDR)|
       (basic.key->ip_proto==IPPROTO_TCP?TCA_CSUM_UPDATE_FLAG_TCP:TCA_CSUM_UPDATE_FLAG_UDP)))
     return -EOPNOTSUPP;
    break;
@@ -1380,6 +1398,22 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
     if(offset==offsetof(struct iphdr,saddr))memcpy(&new_source,&act->mangle.val,4);
     else if(offset==offsetof(struct iphdr,daddr))memcpy(&new_destination,&act->mangle.val,4);
     else return -EOPNOTSUPP;
+   } else if(act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_IP6) {
+    __be32 *address;
+
+    if(!data->ipv6 || act->mangle.mask || (offset&3))return -EOPNOTSUPP;
+    if(offset>=offsetof(struct ipv6hdr,saddr) &&
+       offset<offsetof(struct ipv6hdr,saddr)+sizeof(new_source6)) {
+     address=new_source6;
+     offset-=offsetof(struct ipv6hdr,saddr);
+    } else if(offset>=offsetof(struct ipv6hdr,daddr) &&
+              offset<offsetof(struct ipv6hdr,daddr)+sizeof(new_destination6)) {
+     address=new_destination6;
+     offset-=offsetof(struct ipv6hdr,daddr);
+    } else return -EOPNOTSUPP;
+    /* Linux emits one full network-order word per IPv6 address mangle.
+     * Unchanged words come from the exact input key, never zero-fill. */
+    memcpy(&address[offset/4],&act->mangle.val,4);
    } else if(act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_TCP || act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_UDP) {
     __be16 pair[2]={new_sport,new_dport};
     if((act->mangle.htype==FLOW_ACT_MANGLE_HDR_TYPE_TCP)!=(basic.key->ip_proto==IPPROTO_TCP))
@@ -1389,7 +1423,6 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
     value=(value&act->mangle.mask)|act->mangle.val;
     memcpy(pair,&value,4);
     new_sport=pair[0];new_dport=pair[1];
-    if(data->ipv6 && (new_sport!=ports.key->src || new_dport!=ports.key->dst))return -EOPNOTSUPP;
    } else return -EOPNOTSUPP;
    break;
   default:return -EOPNOTSUPP;
@@ -1399,16 +1432,34 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   if(ethernet_known[i]!=255)return -EOPNOTSUPP;
  data->reject_reason=FE_REJECT_PORT;
  data->output=fe_port(port->fe,output);
- if(!data->output || data->input==data->output)return -EOPNOTSUPP;
+ if(!data->output)return -EOPNOTSUPP;
+ /* A Linux routed flow may leave the same physical UNI, for example
+  * between two VLAN devices on one trunk. The owned NI LAN demux sends
+  * L3 results straight to L2TM (selector3), not through L2FE's bridge
+  * source-port filter. Keep the normal MAC/TTL/MTU/VLAN action and admit
+  * only the proven LAN0..4 identity; this does not enable bridge hairpin
+  * or reflect a PON flow into an unproved LLID/GEM service. */
+ if(data->input==data->output &&
+    (port->source>=FE_LAN_PORTS || port->destination!=port->source))return -EOPNOTSUPP;
  ether_addr_copy(data->destination,ethernet);
  ether_addr_copy(data->source,ethernet+ETH_ALEN);
  if(!is_valid_ether_addr(data->source) || !is_valid_ether_addr(data->destination))return -EINVAL;
- source_changed=!data->ipv6 && (new_source!=addresses.key->src || new_sport!=ports.key->src);
- destination_changed=!data->ipv6 && (new_destination!=addresses.key->dst || new_dport!=ports.key->dst);
+ source_changed=new_sport!=ports.key->src || (data->ipv6?
+  memcmp(new_source6,addresses6.key->src.s6_addr32,sizeof(new_source6))!=0:
+  new_source!=addresses.key->src);
+ destination_changed=new_dport!=ports.key->dst || (data->ipv6?
+  memcmp(new_destination6,addresses6.key->dst.s6_addr32,sizeof(new_destination6))!=0:
+  new_destination!=addresses.key->dst);
  data->reject_reason=FE_REJECT_NAT;
- if(!data->ipv6 && !rtl_fe_routed_unicast(0,ntohl(new_source),
-    ntohl(new_destination)))return -EOPNOTSUPP;
+ if(!rtl_fe_routed_unicast(data->ipv6,
+    ntohl(data->ipv6?new_source6[0]:new_source),
+    ntohl(data->ipv6?new_destination6[0]:new_destination)))return -EOPNOTSUPP;
  if(source_changed && destination_changed)return -EOPNOTSUPP;
+ /* NAPT6 (including a port-only change) needs the full source OR
+  * destination address in group24. NORMAL's 224-bit action cannot carry
+  * its high96 bits; never silently truncate it or enable the mode live. */
+ if(data->ipv6 && (source_changed || destination_changed) && !port->fe->naptv6)
+  return -EOPNOTSUPP;
  /* A remaining input tag has unknown PCP/DEI. Leave it untouched, or let
   * Linux perform a partial-stack edit; a new tag is fully specified. */
  data->reject_reason=FE_REJECT_VLAN;
@@ -1418,6 +1469,13 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   .deep_queue=data->output->destination>=32,.translate=source_changed||destination_changed,
   .translate_destination=destination_changed,.address=ntohl(destination_changed?new_destination:new_source),
   .port=ntohs(destination_changed?new_dport:new_sport)};
+ if(data->ipv6 && data->action.translate) {
+  const __be32 *address=destination_changed?new_destination6:new_source6;
+
+  data->action.translate_ipv6=1;
+  data->action.address=ntohl(address[3]);
+  for(i=0;i<3;i++)data->action.address6_high[i]=ntohl(address[i]);
+ }
  data->action.vlan_set=vlan_changed;
  data->action.pppoe_pop=data->pppoe_input && !data->egress_pppoe;
  data->action.vlan_count=output_vlan_count;
@@ -1607,22 +1665,30 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  struct rtl_fe *fe=port->fe;
  struct rtl_dq_io io=fe_io(fe);
  struct rtl_fe_flow *flow;
- unsigned int words[23],action[8],crc32,index,start,counters[7],i;
+ unsigned int words[23],action[RTL_FE_NAPTV6_ACTION_WORDS],crc32,index,start,counters[7],i;
  u16 crc16;
  int ret;
 
  if(port->retired || fe->shutting_down)return -ENODEV;
  /* No producer owns the old bridge hash templates. Native L2 uses FDB. */
  if(data.bridge)return -EOPNOTSUPP;
+ /* A future producer cannot publish a mismatched format or turn on a
+  * larger action than the immutable DMA/cache/profile owner acquired. */
+ if(data.action.translate_ipv6 &&
+    (!data.ipv6 || !data.action.translate || !fe->naptv6))return -EOPNOTSUPP;
+ if(data.ipv6 && data.action.translate && !data.action.translate_ipv6)return -EOPNOTSUPP;
  /* Keep the publisher independently bounded even if a future caller
   * constructs a rule without the current nft parser. An exact-MDB miss
   * must not find a multicast IP route in the ordinary unicast hash. */
  if(!rtl_fe_routed_unicast(data.ipv6,
     data.ipv6?data.key6.source[0]:data.key.source,
     data.ipv6?data.key6.destination[0]:data.key.destination) ||
-    (!data.ipv6 && data.action.translate &&
-     !rtl_fe_routed_unicast(0,data.action.address,data.action.address)))return -EOPNOTSUPP;
- if(!fe->engine_ready || !fe->enabled || !fe_switch_flow_allowed(fe) ||
+    (data.action.translate &&
+     !rtl_fe_routed_unicast(data.ipv6,
+      data.ipv6?data.action.address6_high[0]:data.action.address,
+      data.ipv6?data.action.address6_high[0]:data.action.address)))return -EOPNOTSUPP;
+ if(!fe->engine_ready || !fe->enabled ||
+    !fe_switch_flow_ports_allowed(fe,data.input->netdev,data.output->netdev) ||
     !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
  if(fe_flow(fe,cookie))return -EEXIST;
@@ -1705,7 +1771,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  }
  data.action.mac_da_index=flow->destination_index;
  data.action.egress_interface=flow->counter;
- rtl_fe_ipv4_action(action,&data.action);
+ rtl_fe_naptv6_action(action,&data.action);
  rtl_fe_action_set(action,RTL_FE_L3_IF_COUNTER_EN,flow->counted);
  ((__le32 *)fe->memory)[index]=cpu_to_le32(crc32);
  memcpy(fe->memory+RTL_FE_ACTION_OFFSET+index*RTL_FE_ACTION_BYTES,action,sizeof(action));
@@ -2050,6 +2116,7 @@ static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
  static const char *const observations[]={
   "layout_unsupported","io_incomplete","key_changed","fib_changed",
   "check_action_only","not_in_expected_set","observed_equal","observed_different",
+  "identity_ambiguous",
  };
  struct rtl_fe *fe=file->private;
  struct rtl_fe_flow *flow;
@@ -2083,7 +2150,7 @@ static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
    expected.crc16=flow->crc16;
    expected.crc32=le32_to_cpu(((__le32 *)fe->memory)[flow->hash_index]);
    action=fe->memory+RTL_FE_ACTION_OFFSET+flow->hash_index*RTL_FE_ACTION_BYTES;
-   for(i=0;i<7;i++)expected.action[i]=le32_to_cpu(action[i]);
+   for(i=0;i<RTL_FE_NAPTV6_ACTION_WORDS;i++)expected.action[i]=le32_to_cpu(action[i]);
    strscpy(input,flow->input->netdev->name,sizeof(input));
    strscpy(output,flow->output->netdev->name,sizeof(output));
    protocol=flow->protocol;source_port=flow->source_port;destination_port=flow->destination_port;
@@ -2092,11 +2159,16 @@ static int fe_cache_snapshot_show(struct seq_file *file,void *unused)
    mutex_unlock(&fe->lock);
    /* KEY/FIB bracketing observes stability, not hardware atomicity: cache
     * replacement/ABA remains possible. Raw addresses/actions never leave. */
-   seq_printf(file,"status=%s complete=%u error=%d hash=%u input=%s output=%s proto=%u sport=%u dport=%u crc32=%08x crc16=%04x scanned=%u cache=%u loc=%u age=%u check_actions=%u word_mask=%02x",
+   seq_printf(file,"status=%s complete=%u error=%d hash=%u input=%s output=%s proto=%u sport=%u dport=%u crc32=%08x crc16=%04x scanned=%u cache=%u loc=%u age=%u check_actions=%u",
     observations[result.observation],result.complete,result.error,expected.hash_index,
     input,output,protocol,source_port,destination_port,expected.crc32,expected.crc16,
-    result.scanned,result.cache_index,result.location,result.age,result.check_actions,result.word_mask);
-   for(i=0;i<7;i++)seq_printf(file," diff%u=%08x",i,result.diff[i]);
+    result.scanned,result.cache_index,result.location,result.age,result.check_actions);
+   seq_printf(file," action_bits=%u",result.action_bits);
+   /* In half mode the observable signature is incomplete. Report candidate
+    * data only, never a target match/mismatch based on a truncated key. */
+   status=result.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS?"candidate_":"";
+   seq_printf(file," %sword_mask=%03x",status,result.word_mask);
+   for(i=0;i<RTL_FE_NAPTV6_ACTION_WORDS;i++)seq_printf(file," %sdiff%u=%08x",status,i,result.diff[i]);
    seq_putc(file,'\n');
    return 0;
   }
@@ -2117,6 +2189,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  fe=kzalloc(sizeof(*fe),GFP_KERNEL);
  if(!fe)return ERR_PTR(-ENOMEM);
  fe->device=device;fe->registers=registers;
+ fe->naptv6=naptv6;
  /* The shared fabric owns the command-mode bit across timeouts. A timed-out
   * FDB operation must not have its mode changed while ACCESS is busy. */
  fe->fdb_cmd_mode_saved=fe_read(fe,0x1c00)&BIT(31);
@@ -2352,6 +2425,9 @@ static int fe_base_check_locked(struct rtl_fe *fe)
      !fe_base_match(fe,low[i],~127U,lower_32_bits(fe->dma)+offset[i]))return -EIO;
  if(!fe_base_match(fe,0x3700,0x00ffffffU,1) ||
     !fe_base_match(fe,0x3704,0x173fU,63) ||
+    !fe_base_match(fe,0x3724,0x0fffffffU,rtl_fe_action_profile(fe->naptv6)) ||
+    !fe_base_match(fe,0x3834,0x300ffU,3U|(7U<<2)|(4U<<5)) ||
+    !fe_base_match(fe,0x38a0,0x00070707U,rtl_fe_cache_config(fe->naptv6)) ||
     !fe_base_match(fe,0x3848,7,4) || !fe_base_match(fe,0x3854,7,1) ||
     !fe_base_match(fe,0x38c4,0xfc000000U,0xa0000000U) ||
     !fe_base_match(fe,0x2300,BIT(12)|BIT(13),BIT(12)|BIT(13)) ||
@@ -2778,6 +2854,12 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length=sysfs_emit(buffer,"available=1 enabled=%u prepared=%u error=%d flows=%u hash_entries=%u counter_slots=%u counted_flows=%u activity_flows=%u installs=%llu deletes=%llu rejected=%llu bridge_rules=%u learned_bridge_rules=%u cpu_path=%u\n",
   fe->enabled,fe->prepared,fe->error,flows,RTL_FE_HASH_ENTRIES,
   FE_COUNTERS,counted,flows-counted,fe->installs,fe->deletes,fe->misses,bridged,learned,fe->cpu_path);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "naptv6_configured=%u action_bits=%u cache_entries=%u cache_action_bits=%u "
+  "action_mode_runtime_change=0\n",fe->naptv6,
+  fe->naptv6?RTL_FE_NAPTV6_ACTION_BITS:224,
+  fe->naptv6?RTL_FE_NAPTV6_CACHE_ENTRIES:RTL_FE_CACHE_ENTRIES,
+  fe->naptv6?448:224);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "eif_rows_used=%u eif_recipe_sharing=1 accounting=one_flow_per_recipe retry_flows=%u cleanup_backoff_ms=%u "
   "lan_pon_rules=%u pon_lan_rules=%u lan_lan_route_rules=%u rule_counts_are_hits=0\n",

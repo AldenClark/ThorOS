@@ -221,6 +221,11 @@ new_state = {
     'l2_static_published': '4096', 'l2_journal_used': '201',
     'l2_journal_capacity': '256', 'l2_journal_quarantined': '1',
     'route_gate_verified': '0',
+    'l2_route_eligible_ports': '0x1b', 'l2_native_route_policy_allowed': '0',
+    'naptv6_configured': '1', 'action_bits': '321', 'cache_entries': '1024',
+    'cache_action_bits': '448', 'action_mode_runtime_change': '0',
+    'mdb_cpu_entries': '2', 'mdb_folded_entries': '3', 'mdb_overlap_cpu': '1',
+    'mdb_capacity_cpu': '1', 'mdb_dynamic_rows': '12',
 }
 text = capture().replace('l2_requested=1', 'l2_requested=1 ' + ' '.join(
     f'{key}={value}' for key, value in new_state.items()))

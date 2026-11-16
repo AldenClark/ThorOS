@@ -42,6 +42,7 @@ fixture = r'''
 #define FE_LAN_PORTS 5
 #define FE_LAN_RX_CTRL(port) (0xa5f8+0x90*(port))
 struct spinlock {bool held;};
+struct net_device {unsigned int index;};
 #define spin_lock_irqsave(lock,flags) do{(flags)=0;assert(!(lock)->held);(lock)->held=true;}while(0)
 #define spin_unlock_irqrestore(lock,flags) do{(void)(flags);assert((lock)->held);(lock)->held=false;}while(0)
 struct rtl_fe {
@@ -53,7 +54,13 @@ struct rtl_fe {
  unsigned int writes,lan25_writes,lan16_writes,fail_cpu_mask,fail_route_mask;
  unsigned int all_ones_mask,all_ones_at[2],selector_reads[2],selector_writes[2];
  uint32_t initial_lpb[2];
+ struct net_device *owners[2];
 };
+/* The independent FE port owner lookup is the only injected boundary in
+ * the new endpoint helper; compare identities rather than reusable IDs. */
+static void *fe_port(struct rtl_fe *fe,struct net_device *dev){
+ return dev && (dev==fe->owners[0] || dev==fe->owners[1]) ? dev : NULL;
+}
 static unsigned int fe_read(void *context,unsigned int reg){
  struct rtl_fe *fe=context;assert(reg<0x10000);
  if(reg==0x3418 || reg==0x3424){
@@ -171,9 +178,37 @@ static void selector_read_faults(void){
  fe.pending_withdrawals=1;
  assert(!fe_route_arm(&fe) && !fe.route_gate_verified && !fe.writes);
 }
+static void route_permissions(void){
+ struct rtl_fe fe;
+ struct net_device input={0},output={32},foreign={0};
+ initialize(&fe);fe.owners[0]=&input;fe.owners[1]=&output;
+ assert(!fe_switch_flow_ports_allowed(&fe,&input,&output));
+ fe_switch_reconcile_locked(&fe);
+ assert(fe_switch_flow_ports_allowed(&fe,&input,&output));
+ assert(fe_switch_flow_ports_allowed(&fe,&output,&input));
+ assert(fe_switch_flow_ports_allowed(&fe,&input,&input));
+ assert(!fe_switch_flow_ports_allowed(&fe,NULL,&output));
+ assert(!fe_switch_flow_ports_allowed(&fe,&input,NULL));
+ assert(!fe_switch_flow_ports_allowed(&fe,&foreign,&output));
+ assert(!fe_switch_flow_ports_allowed(&fe,&input,&foreign));
+ fe.owners[1]=NULL;
+ assert(!fe_switch_flow_ports_allowed(&fe,&input,&output));
+ assert(!fe_switch_flow_ports_allowed(&fe,&output,&input));
+ fe.owners[1]=&output;
+ fe.pending_withdrawals=1;fe_route_gate(&fe);
+ assert(!fe_switch_flow_ports_allowed(&fe,&input,&output));
+ for(unsigned int inactive=0;inactive<3;inactive++){
+  initialize(&fe);fe.owners[0]=&input;fe.owners[1]=&output;
+  fe_switch_reconcile_locked(&fe);
+  if(inactive==0)fe.engine_ready=false;
+  if(inactive==1)fe.enabled=false;
+  if(inactive==2)fe.shutting_down=true;
+  assert(!fe_switch_flow_ports_allowed(&fe,&input,&output));
+ }
+}
 int main(void){
  struct rtl_fe fe;
- selector_read_faults();
+ selector_read_faults();route_permissions();
  /* Valid baseline routing is still available without a reachable bridge. */
  initialize(&fe);fe_switch_reconcile_locked(&fe);
  assert(fe.route_admitted && fe_switch_flow_allowed(&fe));expect_lan(&fe,25);
@@ -234,7 +269,8 @@ production = '\n'.join(function(native, name) for name in (
     'fe_route_select_locked', 'fe_route_gate', 'fe_route_arm'))
 production += '\n'.join(function(fallback, name) for name in (
     'fe_switch_needs_recovery', 'fe_switch_quiesce_locked',
-    'fe_switch_reconcile_locked', 'fe_switch_flow_allowed'))
+    'fe_switch_reconcile_locked', 'fe_switch_flow_allowed',
+    'fe_switch_flow_ports_allowed'))
 check = '''\tfe_switch_quiesce_locked(fe);
 \tif (!fe_route_arm(fe))
 \t\treturn;
@@ -255,6 +291,13 @@ mutants = {
         check, '\tfe_switch_quiesce_locked(fe);\n\tfe_route_arm(fe);\n'),
     'failure_does_not_return_existing_route_RX_to_CPU': production.replace(
         check, '\tif (!fe_route_arm(fe))\n\t\treturn;\n'),
+    'endpoint_helper_accepts_unknown_input': production.replace(
+        'fe_port(fe, (struct net_device *)input)', '(input != NULL)'),
+    'endpoint_helper_accepts_unknown_output': production.replace(
+        'fe_port(fe, (struct net_device *)output)', '(output != NULL)'),
+    'endpoint_helper_ignores_global_gate': production.replace(
+        'return fe_switch_flow_allowed(fe) && input && output &&',
+        'return input && output &&'),
 }
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-route-fallback-') as work:
     work = Path(work)

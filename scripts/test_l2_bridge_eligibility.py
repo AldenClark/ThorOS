@@ -566,6 +566,9 @@ def main() -> None:
     args = parser.parse_args()
     added = "\n".join(line[1:] for line in PATCH.read_text().splitlines()
                       if line.startswith("+") and not line.startswith("+++"))
+    authority = "\n".join(line[1:] for line in PATCH.with_name(
+        "239-native-fdb-cpu-authority.patch").read_text().splitlines()
+        if line.startswith((" ", "+")) and not line.startswith("+++"))
     context = re.search(r"struct br_rtl9617c_learn_ctx \{[^}]+\};", added).group(0)
     if args.kernel:
         assert context in (args.kernel / "net/bridge/br_fdb.c").read_text()
@@ -576,7 +579,7 @@ def main() -> None:
                                   "__is_skb_forwardable"))
         prefix = "#define HAVE_LINUX_MTU_TEST 1\n"
     for name, relative in FUNCTIONS.items():
-        source = function(added, name)
+        source = function(authority if name == "br_rtl9617c_fdb_learn_publish" else added, name)
         if args.kernel:
             actual = function((args.kernel / relative).read_text(), name)
             assert actual == source, f"stale/mismatched applied kernel: {name}"

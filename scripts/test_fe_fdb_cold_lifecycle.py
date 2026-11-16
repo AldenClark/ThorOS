@@ -156,7 +156,7 @@ static void lifetime(unsigned int boot,bool svl,bool learning,unsigned int nativ
   assert(!fe_switch_hw_prepare(&fe,&hw,3,300,false,true));
   assert(hw.globals_owned && hw.prepared && hw.drained && hw.control==cold);
   assert(hw.control&RTL_L2_FDB_CMD_MODE);route_roundtrip();
-  assert(fe_switch_hw_arm(&fe,&hw,3,28,true));
+  assert(fe_switch_hw_arm(&fe,&hw,3,28,true,true));
   assert((fe_read(&fe,RTL_L2_FDB_CONTROL)&(RTL_L2_FDB_CMD_MODE|RTL_L2_FDB_LEARN_DISABLE))==RTL_L2_FDB_CMD_MODE);
   assert(!rtl_fabric_check(&io,&fe.fabric));route_roundtrip(); /* Active autonomous learning. */
   assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));

@@ -30,6 +30,9 @@ def transport():
 
 
 TEST = r'''
+/* Keep Linux's task-pointer macro visible at the production-header boundary.
+ * A plain host build used to miss a local variable named `current` here. */
+#define current get_current()
 #include "rtl9617c-l2-owner.h"
 static struct rtl_l2_owner owner;
 static unsigned int owner_cases, owner_faults;

@@ -1,0 +1,526 @@
+From: ThorOS maintainers
+Subject: [PATCH] bridge: preserve CPU FDB authority across native feedback
+
+Fence first CPU creation and EXT_LEARNED takeover before publication, including
+same-port takeover of an owned native source. Recheck the key under hash_lock
+after an initial RCU miss. Hardware scans must not refresh or overwrite a
+CPU-owned entry; EALREADY is a non-owned-row result for the native scanner,
+not an I/O or epoch failure.
+
+diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
+index 82867d2..288e0f4 100644
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -1078,190 +1078,214 @@ int br_fdb_fillbuf(struct net_bridge *br, void *buf,
+ 
+ 		if (has_expired(br, f))
+ 			continue;
+ 
+ 		/* ignore pseudo entry for local MAC address */
+ 		dst = READ_ONCE(f->dst);
+ 		if (!dst)
+ 			continue;
+ 
+ 		if (skip) {
+ 			--skip;
+ 			continue;
+ 		}
+ 
+ 		/* convert from internal format to API */
+ 		memcpy(fe->mac_addr, f->key.addr.addr, ETH_ALEN);
+ 
+ 		/* due to ABI compat need to split into hi/lo */
+ 		fe->port_no = dst->port_no;
+ 		fe->port_hi = dst->port_no >> 8;
+ 
+ 		fe->is_local = test_bit(BR_FDB_LOCAL, &f->flags);
+ 		if (!test_bit(BR_FDB_STATIC, &f->flags)) {
+ 			delta = jiffies - READ_ONCE(f->updated);
+ 			fe->ageing_timer_value =
+ 				jiffies_delta_to_clock_t(delta);
+ 		}
+ 		++fe;
+ 		++num;
+ 	}
+ 	rcu_read_unlock();
+ 
+ 	return num;
+ }
+ 
+ /* Add entry for local address of interface */
+ int br_fdb_add_local(struct net_bridge *br, struct net_bridge_port *source,
+ 		     const unsigned char *addr, u16 vid)
+ {
+ 	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	int ret;
+ 
+ 	spin_lock_bh(&br->hash_lock);
+ 	ret = fdb_add_local(br, source, addr, vid);
+ 	spin_unlock_bh(&br->hash_lock);
+ 	return ret;
+ }
+ 
+ /* returns true if the fdb was modified */
+ static bool __fdb_mark_active(struct net_bridge_fdb_entry *fdb)
+ {
+ 	return !!(test_bit(BR_FDB_NOTIFY_INACTIVE, &fdb->flags) &&
+ 		  test_and_clear_bit(BR_FDB_NOTIFY_INACTIVE, &fdb->flags));
+ }
+ 
+ void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ 		   const unsigned char *addr, u16 vid, unsigned long flags)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
++	struct net *policy = NULL;
++	unsigned long now = jiffies;
++	bool fdb_modified = false;
+ 
+ 	/* some users want to always flood. */
+ 	if (hold_time(br) == 0)
+ 		return;
+ 
+ 	fdb = fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
+-	if (likely(fdb)) {
+-		/* attempt to update an entry for a local interface */
+-		if (unlikely(test_bit(BR_FDB_LOCAL, &fdb->flags))) {
+-			if (net_ratelimit())
+-				br_warn(br, "received packet on %s with own address as source address (addr:%pM, vlan:%u)\n",
+-					source->dev->name, addr, vid);
+-		} else {
+-			unsigned long now = jiffies;
+-			bool fdb_modified = false;
+-			struct net *policy = NULL;
+-
+-			if (now != READ_ONCE(fdb->updated)) {
+-				WRITE_ONCE(fdb->updated, now);
+-				fdb_modified = __fdb_mark_active(fdb);
+-			}
+-
+-			/* fastpath: update of existing entry */
+-			if (unlikely(source != READ_ONCE(fdb->dst) &&
+-				     !test_bit(BR_FDB_STICKY, &fdb->flags))) {
+-				/* Only a real MAC move takes hash_lock.  Hardware
+-				 * feedback takes hash_lock then the guard lock too,
+-				 * making its epoch check + publication atomic with
+-				 * this move, without locking timestamp refreshes.
+-				 */
+-				spin_lock(&br->hash_lock);
+-				if (!hlist_unhashed(&fdb->fdb_node) &&
+-				    source != READ_ONCE(fdb->dst) &&
+-				    !test_bit(BR_FDB_LOCAL, &fdb->flags) &&
+-				    !test_bit(BR_FDB_STICKY, &fdb->flags)) {
+-					policy = rtl9617c_switch_policy_begin(br->dev);
+-					br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
+-					WRITE_ONCE(fdb->dst, source);
+-					fdb_modified = true;
+-					clear_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+-					clear_bit(BR_FDB_LOCKED, &fdb->flags);
+-				}
+-				spin_unlock(&br->hash_lock);
+-			}
+-
+-			if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
+-				set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+-				if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED,
+-						       &fdb->flags))
+-					atomic_dec(&br->fdb_n_learned);
+-			}
+-			if (unlikely(fdb_modified)) {
+-				trace_br_fdb_update(br, source, addr, vid, flags);
+-				fdb_notify(br, fdb, RTM_NEWNEIGH, true);
+-			}
+-			if (policy)
+-				rtl9617c_switch_policy_end(policy);
++	/* A CPU-owned same-port refresh cannot be superseded by native
++	 * feedback below. Keep this ordinary packet path lockless and do not
++	 * turn every timestamp refresh into a fabric-wide rebuild.
++	 */
++	if (likely(fdb && source == READ_ONCE(fdb->dst) &&
++		   !test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) &&
++		   !test_bit(BR_FDB_LOCAL, &fdb->flags) &&
++		   !test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
++		if (now != READ_ONCE(fdb->updated)) {
++			WRITE_ONCE(fdb->updated, now);
++			fdb_modified = __fdb_mark_active(fdb);
+ 		}
+-	} else {
+-		spin_lock(&br->hash_lock);
++		if (unlikely(fdb_modified)) {
++			trace_br_fdb_update(br, source, addr, vid, flags);
++			fdb_notify(br, fdb, RTM_NEWNEIGH, true);
++		}
++		return;
++	}
++
++	/* CPU creation, a move and the first EXT_LEARNED -> CPU takeover all
++	 * serialize with hardware feedback in hash_lock -> guard-lock order.
++	 * Re-lookup under the lock: a hardware publisher may have created the
++	 * key after the initial RCU miss. Losing fdb_create() in that race is
++	 * not permission to discard the CPU observation of a different port.
++	 */
++	spin_lock(&br->hash_lock);
++	fdb = fdb_find_rcu(&br->fdb_hash_tbl, addr, vid);
++	if (!fdb) {
++		policy = rtl9617c_switch_policy_begin(br->dev);
+ 		fdb = fdb_create(br, source, addr, vid, flags);
+ 		if (fdb) {
+ 			trace_br_fdb_update(br, source, addr, vid, flags);
+ 			fdb_notify(br, fdb, RTM_NEWNEIGH, true);
+ 		}
+-		/* else  we lose race and someone else inserts
+-		 * it first, don't bother updating
+-		 */
+-		spin_unlock(&br->hash_lock);
++	} else if (unlikely(test_bit(BR_FDB_LOCAL, &fdb->flags))) {
++		if (net_ratelimit())
++			br_warn(br, "received packet on %s with own address as source address (addr:%pM, vlan:%u)\n",
++				source->dev->name, addr, vid);
++	} else {
++		bool moved = source != READ_ONCE(fdb->dst) &&
++			     !test_bit(BR_FDB_STICKY, &fdb->flags);
++		bool takeover = test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) &&
++			!test_bit(BR_FDB_STATIC, &fdb->flags) &&
++			!test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) &&
++			!test_bit(BR_FDB_STICKY, &fdb->flags) &&
++			!test_bit(BR_FDB_LOCKED, &fdb->flags);
++
++		if (moved)
++			policy = rtl9617c_switch_policy_begin(br->dev);
++		else if (takeover) {
++			/* A same-port CPU refresh must not steal an unrelated
++			 * switchdev driver's entry. Only the native owner of this
++			 * physical source has the observation/feedback contract.
++			 */
++			policy = rtl9617c_switch_policy_begin(source->dev);
++			takeover = !!policy;
++		}
++		if (moved || takeover) {
++			if (moved) {
++				br_switchdev_fdb_notify(br, fdb, RTM_DELNEIGH);
++				WRITE_ONCE(fdb->dst, source);
++				clear_bit(BR_FDB_LOCKED, &fdb->flags);
++			}
++			clear_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++			if (takeover)
++				clear_bit(BR_FDB_OFFLOADED, &fdb->flags);
++			fdb_modified = true;
++		}
++		if (now != READ_ONCE(fdb->updated)) {
++			WRITE_ONCE(fdb->updated, now);
++			fdb_modified |= __fdb_mark_active(fdb);
++		}
++		if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags))) {
++			set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
++			if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
++				atomic_dec(&br->fdb_n_learned);
++		}
++		if (unlikely(fdb_modified)) {
++			trace_br_fdb_update(br, source, addr, vid, flags);
++			fdb_notify(br, fdb, RTM_NEWNEIGH, true);
++		}
+ 	}
++	spin_unlock(&br->hash_lock);
++	if (policy)
++		rtl9617c_switch_policy_end(policy);
+ }
+ 
+ /* Dump information about entries, in response to GETNEIGH */
+ int br_fdb_dump(struct sk_buff *skb,
+ 		struct netlink_callback *cb,
+ 		struct net_device *dev,
+ 		struct net_device *filter_dev,
+ 		int *idx)
+ {
+ 	struct ndo_fdb_dump_context *ctx = (void *)cb->ctx;
+ 	struct net_bridge *br = netdev_priv(dev);
+ 	struct net_bridge_fdb_entry *f;
+ 	int err = 0;
+ 
+ 	if (!netif_is_bridge_master(dev))
+ 		return err;
+ 
+ 	if (!filter_dev) {
+ 		err = ndo_dflt_fdb_dump(skb, cb, dev, NULL, idx);
+ 		if (err < 0)
+ 			return err;
+ 	}
+ 
+ 	rcu_read_lock();
+ 	hlist_for_each_entry_rcu(f, &br->fdb_list, fdb_node) {
+ 		const struct net_bridge_port *dst = READ_ONCE(f->dst);
+ 
+ 		if (*idx < ctx->fdb_idx)
+ 			goto skip;
+ 		if (filter_dev && (!dst || dst->dev != filter_dev)) {
+ 			if (filter_dev != dev)
+ 				goto skip;
+ 			/* !f->dst is a special case for bridge
+ 			 * It means the MAC belongs to the bridge
+ 			 * Therefore need a little more filtering
+ 			 * we only want to dump the !f->dst case
+ 			 */
+ 			if (dst)
+ 				goto skip;
+ 		}
+ 		if (!filter_dev && dst)
+ 			goto skip;
+ 
+ 		err = fdb_fill_info(skb, br, f,
+ 				    NETLINK_CB(cb->skb).portid,
+ 				    cb->nlh->nlmsg_seq,
+ 				    RTM_NEWNEIGH,
+ 				    NLM_F_MULTI);
+ 		if (err < 0)
+ 			break;
+ skip:
+ 		*idx += 1;
+ 	}
+ 	rcu_read_unlock();
+ 
+ 	return err;
+ }
+ 
+ int br_fdb_get(struct sk_buff *skb,
+ 	       struct nlattr *tb[],
+@@ -1757,231 +1781,239 @@ int br_fdb_external_learn_add(struct net_bridge *br, struct net_bridge_port *p,
+ 		if (modified)
+ 			fdb_notify(br, fdb, RTM_NEWNEIGH, swdev_notify);
+ 	}
+ 
+ err_unlock:
+ 	spin_unlock_bh(&br->hash_lock);
+ 
+ 	return err;
+ }
+ 
+ int br_fdb_external_learn_del(struct net_bridge *br, struct net_bridge_port *p,
+ 			      const unsigned char *addr, u16 vid,
+ 			      bool swdev_notify)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
+ 	int err = 0;
+ 
+ 	spin_lock_bh(&br->hash_lock);
+ 
+ 	fdb = br_fdb_find(br, addr, vid);
+ 	if (fdb && test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags))
+ 		fdb_delete(br, fdb, swdev_notify);
+ 	else
+ 		err = -ENOENT;
+ 
+ 	spin_unlock_bh(&br->hash_lock);
+ 
+ 	return err;
+ }
+ 
+ struct br_rtl9617c_learn_ctx {
+ 	struct net_bridge_port *port;
+ 	struct net_bridge_fdb_entry *fdb;
+ 	const unsigned char *addr;
+ 	bool changed;
+ };
+ 
+ /* Both hash_lock and the policy gate lock are held.  No notifications here:
+  * they could recurse into a policy gate or an unrelated driver's callback.
+  */
+ static int br_rtl9617c_fdb_learn_publish(void *context)
+ {
+ 	struct br_rtl9617c_learn_ctx *ctx = context;
+ 	struct net_bridge *br = ctx->port->br;
+ 	struct net_bridge_fdb_entry *fdb;
+ 
+ 	/* A current generation does not authorize learning on every member.
+ 	 * Recheck under both locks, including refreshes and port moves, before
+ 	 * any FDB mutation. Native learning admits forwarding ports only. */
+ 	if (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING ||
+ 	    !(READ_ONCE(ctx->port->flags) & BR_LEARNING))
+ 		return -EOPNOTSUPP;
+ 
+ 	fdb = br_fdb_find(br, ctx->addr, 0);
+ 	if (fdb && (test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
+ 		    test_bit(BR_FDB_STATIC, &fdb->flags) ||
+ 		    test_bit(BR_FDB_LOCAL, &fdb->flags) ||
+ 		    test_bit(BR_FDB_STICKY, &fdb->flags) ||
+ 		    test_bit(BR_FDB_LOCKED, &fdb->flags)))
+ 		return -EEXIST;
++	/* CPU observations have an independent lifetime and destination.
++	 * EALREADY is a benign non-owned row, not permission to set EXT_LEARNED
++	 * or renew its software ageing timestamp from a later hardware scan.
++	 */
++	if (fdb && !test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags))
++		return -EALREADY;
+ 	if (!fdb) {
+ 		fdb = fdb_create(br, ctx->port, ctx->addr, 0,
+ 				 BIT(BR_FDB_ADDED_BY_EXT_LEARN) | BIT(BR_FDB_OFFLOADED));
+ 		if (!fdb)
+ 			return -ENOMEM;
+ 		ctx->changed = true;
+ 	} else {
+ 		ctx->changed = READ_ONCE(fdb->dst) != ctx->port ||
+ 			!test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+ 		WRITE_ONCE(fdb->dst, ctx->port);
+ 		set_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+ 		set_bit(BR_FDB_OFFLOADED, &fdb->flags);
+ 		WRITE_ONCE(fdb->updated, jiffies);
+ 		WRITE_ONCE(fdb->used, jiffies);
+ 	}
+ 	ctx->fdb = fdb;
+ 	return 0;
+ }
+ 
+ int br_rtl9617c_fdb_learn(const struct net_device *dev,
+ 			 const unsigned char *addr,
+ 			 struct rtl9617c_switch_guard *guard, u64 generation)
+ {
+ 	struct br_rtl9617c_learn_ctx ctx = { .addr = addr };
+ 	int ret;
+ 
+ 	ASSERT_RTNL();
+ 	ctx.port = br_port_get_rtnl(dev);
+ 	if (!ctx.port)
+ 		return -ENODEV;
+ 	spin_lock_bh(&ctx.port->br->hash_lock);
+ 	ret = rtl9617c_switch_guard_publish(guard, generation,
+ 					    br_rtl9617c_fdb_learn_publish, &ctx);
+ 	if (!ret && ctx.changed)
+ 		fdb_notify(ctx.port->br, ctx.fdb, RTM_NEWNEIGH, false);
+ 	spin_unlock_bh(&ctx.port->br->hash_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_learn);
+ 
+ /* A scan/unoffload snapshot may predate a userspace replacement of a learned
+  * row.  The generic DEL_TO_BRIDGE operation checks only EXT_LEARNED and would
+  * delete the replacement too.  Revalidate ownership while holding hash_lock.
+  */
+ bool br_rtl9617c_fdb_forget(const struct net_device *dev,
+ 			    const unsigned char *addr)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
+ 	struct net_bridge_port *p;
+ 	bool removed = false;
+ 
+ 	ASSERT_RTNL();
+ 	p = br_port_get_rtnl(dev);
+ 	if (!p)
+ 		return false;
+ 	spin_lock_bh(&p->br->hash_lock);
+ 	fdb = br_fdb_find(p->br, addr, 0);
+ 	if (fdb && READ_ONCE(fdb->dst) == p &&
+ 	    test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_STATIC, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_STICKY, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_LOCKED, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_LOCAL, &fdb->flags)) {
+ 		fdb_delete(p->br, fdb, false);
+ 		removed = true;
+ 	}
+ 	spin_unlock_bh(&p->br->hash_lock);
+ 	return removed;
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_forget);
+ 
+ struct br_rtl9617c_vlan_learn_ctx {
+ 	struct net_bridge_port *port;
+ 	struct net_bridge_fdb_entry *fdb;
+ 	const unsigned char *addr;
+ 	u16 vid;
+ 	bool changed;
+ };
+ 
+ /* hash_lock and the publication guard are held, and the caller owns RTNL.
+  * Revalidate the actual (port, VID) membership here: a same-MAC row in
+  * another VLAN must never be refreshed, moved or removed by this snapshot.
+  */
+ static int br_rtl9617c_fdb_learn_vid_publish(void *context)
+ {
+ #if IS_ENABLED(CONFIG_BRIDGE_VLAN_FILTERING)
+ 	struct br_rtl9617c_vlan_learn_ctx *ctx = context;
+ 	struct net_bridge *br = ctx->port->br;
+ 	struct net_bridge_fdb_entry *fdb;
+ 	struct net_bridge_vlan *v;
+ 
+ 	if (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING ||
+ 	    !(READ_ONCE(ctx->port->flags) & BR_LEARNING) ||
+ 	    !br_opt_get(br, BROPT_VLAN_ENABLED) ||
+ 	    br->vlan_proto != htons(ETH_P_8021Q))
+ 		return -EOPNOTSUPP;
+ 	v = br_vlan_find(nbp_vlan_group(ctx->port), ctx->vid);
+ 	if (!v || !br_vlan_should_use(v) ||
+ 	    br_vlan_get_state(v) != BR_STATE_FORWARDING ||
+ 	    !v->brvlan || READ_ONCE(v->brvlan->msti) ||
+ 	    br_vlan_get_state(v->brvlan) != BR_STATE_FORWARDING ||
+ 	    (v->priv_flags & BR_VLFLAG_NEIGH_SUPPRESS_ENABLED))
+ 		return -EOPNOTSUPP;
+ 	fdb = br_fdb_find(br, ctx->addr, ctx->vid);
+ 	if (fdb && (test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
+ 		    test_bit(BR_FDB_STATIC, &fdb->flags) ||
+ 		    test_bit(BR_FDB_LOCAL, &fdb->flags) ||
+ 		    test_bit(BR_FDB_STICKY, &fdb->flags) ||
+ 		    test_bit(BR_FDB_LOCKED, &fdb->flags)))
+ 		return -EEXIST;
++	if (fdb && !test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags))
++		return -EALREADY;
+ 	if (!fdb) {
+ 		fdb = fdb_create(br, ctx->port, ctx->addr, ctx->vid,
+ 				 BIT(BR_FDB_ADDED_BY_EXT_LEARN) | BIT(BR_FDB_OFFLOADED));
+ 		if (!fdb)
+ 			return -ENOMEM;
+ 		ctx->changed = true;
+ 	} else {
+ 		ctx->changed = READ_ONCE(fdb->dst) != ctx->port ||
+ 			!test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+ 		WRITE_ONCE(fdb->dst, ctx->port);
+ 		set_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
+ 		set_bit(BR_FDB_OFFLOADED, &fdb->flags);
+ 		WRITE_ONCE(fdb->updated, jiffies);
+ 		WRITE_ONCE(fdb->used, jiffies);
+ 	}
+ 	ctx->fdb = fdb;
+ 	return 0;
+ #else
+ 	return -EOPNOTSUPP;
+ #endif
+ }
+ 
+ int br_rtl9617c_fdb_learn_vid(const struct net_device *dev,
+ 			     const unsigned char *addr, u16 vid,
+ 			     struct rtl9617c_switch_guard *guard, u64 generation)
+ {
+ 	struct br_rtl9617c_vlan_learn_ctx ctx = { .addr = addr, .vid = vid };
+ 	int ret;
+ 
+ 	ASSERT_RTNL();
+ 	if (!guard || vid >= VLAN_VID_MASK)
+ 		return -EINVAL;
+ 	ctx.port = br_port_get_rtnl(dev);
+ 	if (!ctx.port)
+ 		return -ENODEV;
+ 	if (!vid) {
+ 		if (br_opt_get(ctx.port->br, BROPT_VLAN_ENABLED))
+ 			return -EOPNOTSUPP;
+ 		return br_rtl9617c_fdb_learn(dev, addr, guard, generation);
+ 	}
+ 	spin_lock_bh(&ctx.port->br->hash_lock);
+ 	ret = rtl9617c_switch_guard_publish(guard, generation,
+ 					    br_rtl9617c_fdb_learn_vid_publish, &ctx);
+ 	if (!ret && ctx.changed)
+ 		fdb_notify(ctx.port->br, ctx.fdb, RTM_NEWNEIGH, false);
+ 	spin_unlock_bh(&ctx.port->br->hash_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_learn_vid);
+ 
+ bool br_rtl9617c_fdb_forget_vid(const struct net_device *dev,
+ 			      const unsigned char *addr, u16 vid)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
+ 	struct net_bridge_port *p;
+ 	bool removed = false;
+ 
+ 	ASSERT_RTNL();
+ 	if (vid >= VLAN_VID_MASK)
+ 		return false;
+

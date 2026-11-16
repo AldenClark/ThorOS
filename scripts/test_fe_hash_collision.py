@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Execute actual production fe_install on two independently derived colliding tuples."""
 from pathlib import Path
-import re, subprocess, tempfile
+import argparse, re, subprocess, tempfile
+parser=argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--mutants',action='store_true')
+args=parser.parse_args()
 here=Path(__file__).resolve().parent
 drivers=here.parent/'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 s=(drivers/'rtl9617c-fe.c').read_text()
@@ -45,8 +48,11 @@ struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;bool retired;};
 '''
 fixture+=flow+rule+r'''
-struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized;int error;unsigned long installs;void *memory;struct rtl_fe_flow **hash_owners;struct list_head flows,retries;unsigned long hashes[65536/64];};
-static bool fe_switch_flow_allowed(struct rtl_fe *f){return f->fabric_authorized;}
+struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized,naptv6;const struct net_device *denied_port;int error;unsigned long installs;void *memory;struct rtl_fe_flow **hash_owners;struct list_head flows,retries;unsigned long hashes[65536/64];};
+/* The actual epoch/identity policy is covered by the switch worker test.
+ * Here the publisher must honor that policy BEFORE any allocation/MMIO. */
+static bool fe_switch_flow_ports_allowed(struct rtl_fe *f,const struct net_device *input,const struct net_device *output)
+{return f->fabric_authorized && input && output && input!=f->denied_port && output!=f->denied_port;}
 static int netif_running(struct net_device *d){return d->up;}
 static int netif_carrier_ok(struct net_device *d){return d->up;}
 static struct rtl_fe_flow *fe_flow(struct rtl_fe *f,unsigned long c){(void)f;(void)c;return NULL;}
@@ -70,10 +76,67 @@ static int fe_mtu_get(struct rtl_fe *f,struct rtl_fe_flow *v,unsigned int size){
 static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *v){(void)f;(void)v;assert(!"unexpected rollback");return 0;}
 '''
 fixture+=symbol('fe_install')+r'''
+static unsigned int packed_bits(const unsigned int *words,unsigned int offset,unsigned int width)
+{
+ unsigned int result=0;
+ for(unsigned int bit=0;bit<width;bit++)
+  result|=((words[(offset+bit)/32]>>((offset+bit)%32))&1U)<<bit;
+ return result;
+}
+static void naptv6_publication(void)
+{
+ struct rtl_fe f={.enabled=true,.engine_ready=true,.fabric_authorized=true};
+ INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);
+ f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
+ f.hash_owners=calloc(RTL_FE_HASH_ENTRIES,sizeof(*f.hash_owners));assert(f.hash_owners);
+ struct net_device n={.up=true},out={.up=true};
+ struct rtl_fe_port p={.fe=&f,.netdev=&n},q={.fe=&f,.netdev=&out};
+ struct rtl_fe_rule rule={.input=&p,.output=&q,.mtu=1400,.ipv6=true,
+  .key={.protocol=17,.source_port=12345,.destination_port=443,.ingress=0,.mask=63},
+  .key6={.source={0x20010db8,0x12345678,0xc0ffee12,0x87654321},
+   .destination={0x20010db9,0xdeadbeef,0xaabbccdd,0x11223344},
+   .protocol=17,.source_port=12345,.destination_port=443,.ingress=0,.mask=63},
+  .action={.translate=1,.translate_ipv6=1,.translate_destination=1,
+   .address6_high={0x20020db8,0x98765432,0xdeadb00f},.address=0xa1b2c3d4,
+   .port=65535,.destination=3,.check_mask=63}};
+ unsigned int old_allocations=allocations,old_mmio=mmio;
+ assert(fe_install(&p,rule,300)==-EOPNOTSUPP); /* Immutable NORMAL profile. */
+ f.naptv6=true;
+ struct rtl_fe_rule bad=rule;bad.action.translate_ipv6=0;
+ assert(fe_install(&p,bad,300)==-EOPNOTSUPP);
+ bad=rule;bad.ipv6=false;
+ assert(fe_install(&p,bad,300)==-EOPNOTSUPP);
+ bad=rule;bad.action.translate=false;
+ assert(fe_install(&p,bad,300)==-EOPNOTSUPP);
+ for(unsigned int scope=0;scope<16;scope++) {
+  bad=rule;bad.action.address6_high[0]=0xff000000U|(scope<<16);
+  assert(fe_install(&p,bad,300)==-EOPNOTSUPP);
+ }
+ assert(allocations==old_allocations && mmio==old_mmio && !f.installs);
+ for(unsigned int i=0;i<RTL_FE_MEMORY_BYTES/sizeof(unsigned int);i++)assert(!((unsigned int *)f.memory)[i]);
+ assert(!fe_install(&p,rule,300));
+ struct rtl_fe_flow *flow=container_of(f.flows.next,struct rtl_fe_flow,list);
+ assert(f.hash_owners[flow->hash_index]==flow && flow->published && flow->installed);
+ const unsigned int *action=(void *)((char *)f.memory+RTL_FE_ACTION_OFFSET+flow->hash_index*RTL_FE_ACTION_BYTES);
+ assert(packed_bits(action,45,1) && packed_bits(action,46,1));
+ assert(packed_bits(action,47,32)==rule.action.address);
+ assert(packed_bits(action,79,1) && packed_bits(action,224,1));
+ for(unsigned int i=0;i<3;i++)
+  assert(packed_bits(action,225+32*i,32)==rule.action.address6_high[2-i]);
+ assert(packed_bits(action,191,16)==65535);
+ assert(packed_bits(action,207,1) && packed_bits(action,208,4)==9);
+ assert(!(action[10]&~1U) && !action[11]);
+ /* The full 48-byte slot is defined, and publication cannot scribble the
+  * next hash's slot even though NORMAL callers still use 8-word buffers. */
+ assert(RTL_FE_ACTION_BYTES==48);
+ if(flow->hash_index+1<RTL_FE_HASH_ENTRIES)
+  for(unsigned int i=0;i<RTL_FE_ACTION_BYTES/4;i++)assert(!action[12+i]);
+ free(flow);free(f.hash_owners);free(f.memory);
+}
 int main(void){
  struct rtl_fe f={.enabled=true,.fabric_authorized=true};INIT_LIST_HEAD(&f.flows);INIT_LIST_HEAD(&f.retries);f.memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(f.memory);
  f.hash_owners=calloc(RTL_FE_HASH_ENTRIES,sizeof(*f.hash_owners));assert(f.hash_owners);
- struct net_device n={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q=p;
+ struct net_device n={.up=true},out={.up=true};struct rtl_fe_port p={.fe=&f,.netdev=&n},q={.fe=&f,.netdev=&out};
  struct rtl_fe_rule a={.input=&p,.output=&q,.mtu=1400,.pppoe_input=true,.pppoe_session=1234,
   .key={.source=0x0a000001,.destination=0xc6336401,.source_port=10000,.destination_port=443,.protocol=6,.ingress=7,.llid=1,.mask=63},
   .action={.translate=1,.translate_destination=1,.address=0x0a000064,.destination=3,.check_mask=63}};
@@ -85,7 +148,14 @@ int main(void){
  assert(fe_install(&p,a,1)==-EAGAIN);
  f.engine_ready=true;f.fabric_authorized=false;
  assert(fe_install(&p,a,1)==-EAGAIN);
- f.fabric_authorized=true;f.shutting_down=true;
+ f.fabric_authorized=true;f.denied_port=&n;
+ assert(fe_install(&p,a,1)==-EAGAIN);
+ f.denied_port=&out;
+ assert(fe_install(&p,a,1)==-EAGAIN);
+ struct rtl_fe_rule same=a;same.output=&p;f.denied_port=&n;
+ assert(fe_install(&p,same,1)==-EAGAIN);
+ assert(!allocations && !mmio && !f.installs);
+ f.denied_port=NULL;f.shutting_down=true;
  assert(fe_install(&p,a,1)==-ENODEV);
  f.shutting_down=false;p.retired=true;
  assert(fe_install(&p,a,1)==-ENODEV);p.retired=false;
@@ -131,12 +201,31 @@ int main(void){
  free(first);
  free(f.hash_owners);
  free(f.memory);
+ naptv6_publication();
  return 0;
 }
 '''
 with tempfile.TemporaryDirectory(dir=here,prefix='main-publish-') as d:
- p=Path(d);(p/'repro.c').write_text(fixture)
- subprocess.run(['cc','-std=c11','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),str(p/'repro.c'),'-o',str(p/'repro')],check=True)
- r=subprocess.run([str(p/'repro')],capture_output=True,text=True)
- assert r.returncode==0, r.stdout+r.stderr
- print('PASS: multicast/reserved route/NAT endpoints and offline/policy-gated/shutdown admission have zero allocation/MMIO/DDR writes; same-bucket CRC32 collision and pending cache invalidation block publication')
+ p=Path(d)
+ def run(source,mutant=None):
+  (p/'repro.c').write_text(source)
+  subprocess.run(['cc','-std=c11','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),str(p/'repro.c'),'-o',str(p/'repro')],check=True)
+  r=subprocess.run([str(p/'repro')],capture_output=True,text=True)
+  if mutant:
+   assert r.returncode and 'Assertion' in r.stderr,(mutant,r.stdout+r.stderr)
+   print('PASS: actual publisher rejected '+mutant)
+  else:
+   assert r.returncode==0,r.stdout+r.stderr
+ run(fixture)
+ if args.mutants:
+  body=symbol('fe_install')
+  mutations={
+   'NAPT6-in-normal-mode':(' || !fe->naptv6',''),
+   'IPv6-action-loses-family-guard':('!data.ipv6 || ',''),
+   'NAPT6-upper96-not-published':('action,sizeof(action));','action,32);'),
+   'per-port-policy-not-checked':('!fe_switch_flow_ports_allowed(fe,data.input->netdev,data.output->netdev)','false'),
+  }
+  for name,(old,new) in mutations.items():
+   assert body.count(old)==1,(name,'ambiguous mutation anchor')
+   run(fixture.replace(body,body.replace(old,new,1),1),name)
+ print('PASS: multicast/reserved route/NAT endpoints and offline/per-port/shutdown admission have zero allocation/MMIO/DDR writes; same-bucket collision and pending invalidation block publication; actual NAPT6 writes all 321 bits into its bounded 48-byte DDR slot')

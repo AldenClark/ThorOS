@@ -18,6 +18,9 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DRIVERS = ROOT / "port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek"
 source = (DRIVERS / "rtl9617c-fe-switch.h").read_text()
+fe_source = (DRIVERS / "rtl9617c-fe.c").read_text()
+boot_native_declaration = re.search(r"^static bool native_l2\s*=\s*(?:true|false);", fe_source, re.M).group()
+assert re.search(r"module_param\(native_l2,\s*bool,\s*0400\)", fe_source)
 
 
 def function(name):
@@ -200,6 +203,11 @@ static void rtnl_unlock(void){
 }
 static void mutex_lock(bool *lock){assert(!*lock);*lock=true;}
 static void mutex_unlock(bool *lock){assert(*lock);*lock=false;}
+static void rcu_read_lock(void){}
+static void rcu_read_unlock(void){}
+static struct net_device *br_switchdev_fdb_find_port(struct net_device *br,const u8 *address,unsigned short vid){
+ (void)br;(void)address;(void)vid;return NULL;
+}
 static void fe_switch_gate(void *private){assert(private==live && fe.lock && rtnl_held);live->active=false;gates++;}
 static int fe_switch_restore_locked(struct rtl_fe_bridge *sw){assert(sw==live && fe.lock && rtnl_held);restores++;return restore_error;}
 static int fe_switch_quiesce_locked(struct rtl_fe *owner){
@@ -225,6 +233,7 @@ static void reset(void){
 
 TEST = r'''
 static void construction_and_stop(void){
+ assert(native_l2); /* Compile the actual shipping boot default. */
  assert(!fe_bridge_stop(NULL));
  for(unsigned int phase=1;phase<=11;phase++){
   reset();if(phase<=7)fail_allocation=phase;else fail_registration=phase-7;
@@ -236,7 +245,9 @@ static void construction_and_stop(void){
   cases++;
  }
  reset();struct rtl_fe_bridge *sw=fe_bridge_start(&fe);assert(sw==live && !IS_ERR(sw));fe.bridge=sw;
- assert(!sw->requested && sw->reason==FE_SWITCH_ENGINE_DOWN); /* Native L2 is explicit opt-in. */
+ assert(sw->requested && sw->reason==FE_SWITCH_ENGINE_DOWN);
+ assert(!fe.engine_ready && !sw->active && !sw->native_mask && !sw->flow_allowed &&
+        !sw->armed_route_eligible_mask && !sw->hw.prepared && !gates && !queues);
  assert(allocated==7 && !freed && registration_calls==4);
  assert(sw->hw.rows && sw->hw.journal.row_index && sw->hw.journal.capacity==FE_SW_SNAPSHOTS);
  assert(sw->hw.journal.index_count==rtl_l2_journal_index_count());
@@ -255,6 +266,12 @@ static void construction_and_stop(void){
  fe_switch_queue(sw);assert(queues==before_queues && invalidates==before_invalidates);
  restore_error=0;assert(!fe_bridge_stop(sw) && !live && freed==7 && cancelled==4);
  assert(gates==2 && restores==2 && unoffloads==2);cases++;
+ /* The read-only boot parameter is a real escape hatch, not an ignored
+  * advertised toggle. It changes the request, never hardware admission. */
+ reset();native_l2=false;sw=fe_bridge_start(&fe);assert(!IS_ERR(sw));fe.bridge=sw;
+ assert(!sw->requested && sw->reason==FE_SWITCH_ENGINE_DOWN && !sw->active &&
+        !sw->native_mask && !sw->flow_allowed && !fe.engine_ready);
+ assert(!fe_bridge_stop(sw) && !live && freed==7);native_l2=true;cases++;
 }
 static void notifier_and_replay(void){
  reset();struct rtl_fe_bridge *sw=fe_bridge_start(&fe);assert(!IS_ERR(sw));fe.bridge=sw;
@@ -265,7 +282,7 @@ static void notifier_and_replay(void){
   assert(!fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event));
   assert(!fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_DEL_TO_DEVICE,&event));
  }
- assert(!invalidates && !queues && !sw->rule_count); /* First source learning must not flush/rebuild. */
+ assert(!invalidates && !queues && !sw->rule_count); /* Notifications must not repeat the core's pre-publication fence. */
  event.added_by_user=true;fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event);
  assert(invalidates==1 && !sw->rule_count);
  event.info.dev=&foreign;fe_switch_atomic_event(&sw->atomic_nb,SWITCHDEV_FDB_ADD_TO_DEVICE,&event);assert(invalidates==1);
@@ -467,7 +484,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
 ])
 functions = "\n".join(function(name) for name in [
     "fe_switch_queue", "fe_switch_reconcile_locked", "fe_switch_request_current", "fe_switch_request_locked",
-    "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_is_master", "fe_switch_replay_fdb",
+    "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_is_master", "fe_switch_vlan_find", "fe_switch_bridge_for_vid", "fe_switch_replay_fdb",
     "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_switch_netdev_event", "fe_bridge_start", "fe_bridge_stop",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
@@ -477,6 +494,7 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
     stop = function("fe_bridge_stop")
     netdev = function("fe_switch_netdev_event")
+    start = function("fe_bridge_start")
     mutations = {
         "stop_before_rtnl": (
             "\trtnl_lock();\n\tWRITE_ONCE(sw->stopping, true);",
@@ -493,7 +511,12 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
         "pon_pre_unlink_not_invalidated": ("case NETDEV_PRECHANGEUPPER:\n\t\tif (upper->linking)",
                                             "case NETDEV_PRECHANGEUPPER:\n\t\tif (true || upper->linking)"),
     }
-    for name in ["production", *mutations, *netdev_mutations]:
+    boot_mutations = {
+        "native_request_permanently_disabled": ("sw->requested = native_l2;", "sw->requested = false;"),
+        "native_boot_escape_hatch_ignored": ("sw->requested = native_l2;", "sw->requested = true;"),
+        "native_request_falsely_claims_active": ("sw->requested = native_l2;", "sw->requested = native_l2; sw->active = native_l2;"),
+    }
+    for name in ["production", *mutations, *netdev_mutations, *boot_mutations]:
         body = functions
         if name in mutations:
             old, new = mutations[name]
@@ -503,9 +526,13 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
             old, new = netdev_mutations[name]
             assert old in netdev, name
             body = functions.replace(netdev, netdev.replace(old, new))
+        elif name in boot_mutations:
+            old, new = boot_mutations[name]
+            assert old in start, name
+            body = functions.replace(start, start.replace(old, new))
         c_file = temporary / (name + ".c")
         binary = temporary / name
-        c_file.write_text(COMMON + definitions + BACKEND + body + TEST)
+        c_file.write_text(COMMON + boot_native_declaration + "\n" + definitions + BACKEND + body + TEST)
         subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                         "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", str(DRIVERS),
                         str(c_file), "-o", str(binary)], check=True)
@@ -528,5 +555,6 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
     "stop_lifetime_mutants_rejected": list(mutations),
     "owned_pon_route_notifications": 30,
     "owned_pon_notifier_mutants_rejected": list(netdev_mutations),
+    "native_boot_default_and_escape_mutants_rejected": list(boot_mutations),
     "hardware_verified": False,
 }, indent=2) + "\n")

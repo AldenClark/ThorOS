@@ -35,7 +35,12 @@ typedef uint64_t u64;
 #define ETH_P_IPV6 0x86dd
 #define IFF_PROMISC 0x100
 #define BR_STATE_FORWARDING 3
+#define MDB_RTR_TYPE_TEMP_QUERY 1
 #define MDB_RTR_TYPE_PERM 2
+#define MDB_RTR_TYPE_TEMP 3
+#ifndef FE_MDB_FOCUSED
+#define FE_MDB_FOCUSED 0
+#endif
 #define BR_BPDU_GUARD BIT(1)
 #define BR_ROOT_BLOCK BIT(2)
 #define BR_MULTICAST_FAST_LEAVE BIT(3)
@@ -78,6 +83,7 @@ struct net { unsigned id; };
 struct list_head { unsigned unused; };
 struct net_device {
 	struct net *net;
+	struct net_bridge *br;
 	struct net_device *master, *lower[6];
 	unsigned long flags, port_flags;
 	unsigned state, lower_count;
@@ -133,7 +139,7 @@ struct rtl_fe_bridge {
 	struct rtl9617c_switch_guard guard;
 	struct rtl_fe_switch_hw hw;
 	struct net_device *ports[5], *master;
-	bool stopping, vlan_domain, route_policy_allowed;
+	bool stopping, vlan_domain, route_policy_allowed, native_route_policy_allowed;
 };
 struct rtl_fe_mcast { struct rtl_mcast_state state; };
 struct rtl_fe {
@@ -313,12 +319,20 @@ static struct rtl_fe_port *fe_port(struct rtl_fe *context, struct net_device *de
 #include "fe_mdb_host_helpers.h"
 #include "rtl9617c-fe-mdb.h"
 
+#ifdef FE_MDB_REAL_SNAPSHOT
+#include "fe_mdb_real_snapshot.h"
+#endif
+
 int br_rtl9617c_mdb_snapshot(const struct net_device *dev, u16 vid,
 	struct rtl9617c_switch_guard *guard, unsigned budget,
 	struct br_rtl9617c_mdb_snapshot *out, br_rtl9617c_mdb_emit_t emit, void *priv)
 {
 	assert(dev == &master && !vid && guard == &bridge.guard && budget == FE_MDB_WORK_BUDGET);
 	snapshot_calls++;
+#ifdef FE_MDB_REAL_SNAPSHOT
+	if (real_snapshot_enabled)
+		return fe_test_real_snapshot(dev, vid, guard, budget, out, emit, priv);
+#endif
 	*out = snapshot;
 	for (unsigned i = 0; i < record_count; i++) {
 		int ret = emit(priv, &records[i]);
@@ -330,6 +344,9 @@ int br_rtl9617c_mdb_snapshot(const struct net_device *dev, u16 vid,
 
 static void reset_without_profile(void)
 {
+#ifdef FE_MDB_REAL_SNAPSHOT
+	real_snapshot_enabled = false;
+#endif
 	/* Test process reset models a fresh device. Production fe_mdb_free is
 	 * separately tested to retain once-exposed state; never use this as a
 	 * runtime retirement recipe. */
@@ -345,6 +362,7 @@ static void reset_without_profile(void)
 	master.net = &network; master.running = master.bridge = master.eligible = true;
 	master.ifindex = 20; master.lower_count = 5;
 	bridge.master = &master; bridge.route_policy_allowed = true;
+	bridge.native_route_policy_allowed = true;
 	bridge.hw.prepared = true; bridge.hw.ports = 31;
 	bridge.guard = (struct rtl9617c_switch_guard){ .net = &network, .identity = 7,
 		.generation = 19, .registered = true };
@@ -479,6 +497,17 @@ static void reject(int expected, bool no_commands)
 	no_keys(); cases++;
 }
 
+static void cpu_only(unsigned expected)
+{
+	unsigned steer = 0xdead;
+
+	assert(!prepare(&steer) && !steer);
+	assert(!m.commands && !m.writes && !m.table_writes);
+	assert(fe.mdb->cpu_entries == expected && fe.mdb->reason == FE_MDB_CPU_ONLY);
+	assert(!fe.mdb->tcam.used && !fe.mdb->tcam.exposed);
+	no_keys(); cases++;
+}
+
 static void good_matrix(void)
 {
 	for (unsigned ipv6 = 0; ipv6 <= CONFIG_IPV6; ipv6++) {
@@ -531,7 +560,7 @@ static void cold_and_topology(void)
 	reset(); entry(0, 1, 0, 2); owner.ready_mask = 0; reject(-EOPNOTSUPP, true); assert(!m.reads);
 	reset(); entry(0, 1, 0, 2); owner.ledger.quarantined = 1; reject(-EOPNOTSUPP, true);
 	reset(); entry(0, 1, 0, 2); fe.native_mdb_profile = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); bridge.route_policy_allowed = false; reject(-EOPNOTSUPP, true);
+	reset(); entry(0, 1, 0, 2); bridge.native_route_policy_allowed = false; reject(-EOPNOTSUPP, true);
 	reset(); entry(0, 1, 0, 2); bridge.vlan_domain = true; reject(-EOPNOTSUPP, true);
 	reset(); entry(0, 1, 0, 2); master.vlan = true; reject(-EOPNOTSUPP, true);
 	reset(); entry(0, 1, 0, 2); master.flags |= IFF_PROMISC; reject(-EOPNOTSUPP, true);
@@ -552,30 +581,22 @@ static void cold_and_topology(void)
 
 static void policy_rejections(void)
 {
-	reset(); entry(0, 1, 0, 2); snapshot.ip4.own_querier = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); snapshot.ip4.querier_time_dependent = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); snapshot.ip4.query_delay.pending = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); snapshot.ip4.local_router_time_dependent = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); snapshot.ip4.querier_present = false; reject(-EOPNOTSUPP, true);
+	reset(); entry(0, 1, 0, 2); snapshot.ip4.own_querier = false; cpu_only(1);
+	reset(); entry(0, 1, 0, 2); snapshot.ip4.querier_time_dependent = true; cpu_only(1);
+	reset(); entry(0, 1, 0, 2); snapshot.ip4.query_delay.pending = true; cpu_only(1);
+	reset(); entry(0, 1, 0, 2); snapshot.ip4.querier_present = false; cpu_only(1);
 	reset(); entry(0, 1, 0, 2); snapshot.snooping = false; reject(-EOPNOTSUPP, true);
 	reset(); entry(0, 1, 0, 2); snapshot.context_enabled = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 9, 2); snapshot.ip4.version = 2; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); records[1].port.permanent = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); records[1].port.timer.pending = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); records[1].port.mcast_to_unicast = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); source_record(1, 2); records[2].source.user_added = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); source_record(1, 2); records[2].source.timer.pending = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); router(0, 3); records[2].router.type = 3; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); router(0, 3); records[2].router.timer.pending = true; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); router(0, 3); records[2].key.vid = 1; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); entry(0, 1, 9, 0); reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 9, 0); entry(0, 1, 0, 2); reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); entry(0, 1, 9, 4); records[3].port.permanent = false; reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 9, 2); entry(0, 1, 9, 4); reject(-EOPNOTSUPP, true);
-	reset(); entry(0, 1, 0, 2); records[0].key.proto = 0; reject(-EOPNOTSUPP, true);
+	reset(); entry(0, 1, 9, 2); snapshot.ip4.version = 2; cpu_only(1);
+	reset(); entry(0, 1, 0, 2); records[1].port.mcast_to_unicast = true; cpu_only(1);
+	reset(); entry(0, 1, 0, 2); router(0, 3); records[2].key.vid = 1; reject(-EINVAL, true);
+	reset(); entry(0, 1, 0, 2); entry(0, 1, 9, 0); cpu_only(2);
+	reset(); entry(0, 1, 9, 0); entry(0, 1, 0, 2); cpu_only(2);
+	reset(); entry(0, 1, 9, 2); entry(0, 1, 9, 4); reject(-EINVAL, true);
+	reset(); entry(0, 1, 0, 2); records[0].key.proto = 0; reject(-EINVAL, true);
 	reset(); entry(0, 1, 0, 2); records[0].id = 9; reject(-EINVAL, true);
 	reset(); entry(0, 1, 0, 2); records[1].entry_id = 2; reject(-EINVAL, true);
-	reset(); entry(0, 1, 0, 2); records[1].port_id = 1; reject(-EOPNOTSUPP, true);
+	reset(); entry(0, 1, 0, 2); records[1].port_id = 1; reject(-EINVAL, true);
 	reset(); entry(0, 1, 0, 2); records[1].port.flags ^= BR_FLOOD; reject(-EAGAIN, true);
 	reset(); entry(0, 1, 0, 2); records[1].port.state = 0; reject(-EAGAIN, true);
 	reset(); entry(0, 1, 0, 2); snapshot.record_count++; reject(-EOPNOTSUPP, true);
@@ -583,8 +604,142 @@ static void policy_rejections(void)
 	reset(); entry(0, 1, 0, 2); snapshot_error = -E2BIG; reject(-E2BIG, true);
 	reset(); record_count = 257; reject(-ENOSPC, true);
 #if !CONFIG_IPV6
-	reset(); entry(1, 1, 0, 2); reject(-EOPNOTSUPP, true);
+	reset(); entry(1, 1, 0, 2); reject(-EINVAL, true);
 #endif
+}
+
+/* Read the actual installed FULL_KEY/result rows, not the compiler's plan.
+ * The query is an untagged, checksum-valid TCP/UDP multicast data packet.
+ * Missing rules must remain CPU misses; no unspecified TCAM priority may
+ * choose between overlapping wildcard/source-specific rows. */
+static int lookup_lan(unsigned ipv6, unsigned group, unsigned source,
+		      unsigned ingress, unsigned protocol)
+{
+	struct br_ip address_key = address(ipv6, group, source);
+	struct rtl_mdb_rule query;
+	int found = -1;
+
+	assert(!fe_mdb_key(&address_key, &query));
+	for (unsigned n = 0; n < RTL_MDB_TCAM_SLOTS; n++) {
+		unsigned key[22], result[14], equal = 1;
+
+		memcpy(key, m.key[n * 2], 11 * sizeof(unsigned));
+		memcpy(key + 11, m.key[n * 2 + 1], 11 * sizeof(unsigned));
+		if (!(key[10] & RTL_MDB_KEY_VALID)) continue;
+		if (get(key, 372, 1) != ipv6 || get(key, 353, 8) != protocol ||
+		    get(key, 622, 6) != ingress || get(key, 629, 6) != ingress) continue;
+		assert(get(key, 61, 9) == (ipv6 ? 128U : 32U));
+		for (unsigned word = 0; word < 4; word++) {
+			unsigned index = ipv6 ? 3 - word : word;
+			if (get(key, 70 + word * 32, 32) != query.destination[index]) equal = 0;
+			if (get(key, 198, 9) && get(key, 207 + word * 32, 32) != query.source[index]) equal = 0;
+		}
+		if (!equal) continue;
+		assert(found == -1); /* No hardware tie-break is part of the contract. */
+		memcpy(result, m.fib[rtl_mdb_fib_index(n)], 7 * sizeof(unsigned));
+		memcpy(result + 7, m.fib[rtl_mdb_fib_index(n) + 1], 7 * sizeof(unsigned));
+		assert(get(result, 168, 1) == 1);
+		unsigned vector = get(result, 158, 10);
+		assert(vector && vector < 256 && mcast.state.vector[vector].active);
+		found = (int)mcast.state.vector[vector].egress;
+	}
+	return found;
+}
+
+static void expect_lookup(unsigned ipv6, unsigned group, unsigned source, int lan_mask)
+{
+	for (unsigned p = 0; p < 5; p++) {
+		int expected = lan_mask < 0 ? -1 : lan_mask & ~(int)BIT(p);
+		if (!expected) expected = -1; /* CPU local delivery, no LAN target. */
+		assert(lookup_lan(ipv6, group, source, p, IPPROTO_TCP) == expected);
+		assert(lookup_lan(ipv6, group, source, p, IPPROTO_UDP) == expected);
+	}
+	cases++;
+}
+
+static void dynamic_and_coexistence(void)
+{
+	unsigned steer;
+
+	for (unsigned ipv6 = 0; ipv6 <= CONFIG_IPV6; ipv6++) {
+		for (unsigned pending = 0; pending < 2; pending++) {
+			reset(); entry(ipv6, 1, 9, 2); source_record(1, 2); router(ipv6, 4);
+			records[1].port.permanent = false; records[1].port.timer.pending = pending;
+			records[2].source.user_added = false; records[2].source.timer.pending = !pending;
+			records[3].router.type = MDB_RTR_TYPE_TEMP_QUERY;
+			records[3].router.timer.pending = pending;
+			(ipv6 ? &snapshot.ip6 : &snapshot.ip4)->local_router_time_dependent = true;
+			assert(!prepare(&steer) && steer == 31);
+			assert(fe.mdb->dynamic_rows == 3 && !fe.mdb->cpu_entries);
+			expect_lookup(ipv6, 1, 9, 18); expect_lookup(ipv6, 1, 10, -1);
+			/* A dequeued PG/source/router timer has not yet changed the
+			 * materialized forwarding set. A changed writer epoch STILL
+			 * revokes this generation; no new pre-CLS retirement is guessed. */
+			assert(!fe_mdb_withdraw(&fe));
+			bridge.guard.generation = snapshot.generation = 20;
+			unsigned before = m.commands;
+			assert(fe_mdb_prepare(&fe, &bridge.guard, 20, &master, bridge.ports,
+				flags, 31, &steer) == -EOPNOTSUPP && !steer);
+			assert(m.commands == before && fe.mdb->reason == FE_MDB_RETIRED_EPOCH);
+			cases++;
+		}
+		for (unsigned reverse = 0; reverse < 2; reverse++) {
+			reset();
+			entry(ipv6, 1, reverse ? 9 : 0, 2);
+			entry(ipv6, 1, reverse ? 0 : 9, 2);
+			assert(!prepare(&steer) && fe.mdb->tcam.used == 8);
+			assert(fe.mdb->folded_entries == 1 && !fe.mdb->cpu_entries);
+			expect_lookup(ipv6, 1, 9, 2); expect_lookup(ipv6, 1, 10, 2);
+		}
+		reset(); entry(ipv6, 1, 0, 2); entry(ipv6, 1, 9, 4);
+		assert(!prepare(&steer) && fe.mdb->cpu_entries == 1 && fe.mdb->overlap_cpu == 1);
+		assert(fe.mdb->reason == FE_MDB_PARTIAL && !fe.mdb->folded_entries);
+		expect_lookup(ipv6, 1, 9, 4); expect_lookup(ipv6, 1, 10, -1);
+		reset(); entry(ipv6, 1, 0, 2); entry(ipv6, 1, 9, 0); entry(ipv6, 2, 0, 4);
+		assert(!prepare(&steer) && fe.mdb->cpu_entries == 2 && fe.mdb->overlap_cpu == 1);
+		expect_lookup(ipv6, 1, 9, -1); expect_lookup(ipv6, 1, 10, -1);
+		expect_lookup(ipv6, 2, 9, 4);
+		reset(); entry(ipv6, 1, 0, 2); entry(ipv6, 1, 9, 2);
+		records[3].port.mcast_to_unicast = true;
+		entry(ipv6, 2, 0, 4);
+		assert(!prepare(&steer) && fe.mdb->cpu_entries == 2 && fe.mdb->overlap_cpu == 1);
+		expect_lookup(ipv6, 1, 9, -1); expect_lookup(ipv6, 1, 10, -1);
+		expect_lookup(ipv6, 2, 9, 4);
+		/* Router membership wins over a blocked/empty exact PG just as
+		 * br_multicast_flood does, making these two LAN masks equivalent. */
+		reset(); entry(ipv6, 1, 0, 2); entry(ipv6, 1, 9, 2);
+		records[3].port.forward = false; records[3].port.blocked = true;
+		router(ipv6, 1);
+		assert(!prepare(&steer) && fe.mdb->folded_entries == 1);
+		expect_lookup(ipv6, 1, 9, 2); expect_lookup(ipv6, 1, 10, 2);
+	}
+	reset(); entry(0, 1, 0, 2); entry(0, 1, 9, 4); entry(0, 2, 0, 8);
+	/* An unsupported source cannot be erased from wildcard shadowing. */
+	records[2].key.src.ip4 = records[3].key.src.ip4 = htonl(0xef000009);
+	assert(!prepare(&steer) && fe.mdb->cpu_entries == 2 && fe.mdb->overlap_cpu == 1);
+	expect_lookup(0, 1, 10, -1); expect_lookup(0, 2, 10, 8);
+	reset(); entry(0, 1, 0, 2); entry(0, 2, 0, 4);
+	records[0].key.proto = records[1].key.proto = 0;
+	records[0].entry.kind = BR_RTL9617C_MDB_L2;
+	assert(!prepare(&steer) && fe.mdb->cpu_entries == 1);
+	expect_lookup(0, 2, 10, 4);
+#if CONFIG_IPV6
+	reset(); entry(0, 1, 0, 2); entry(1, 1, 0, 4);
+	snapshot.ip4.querier_time_dependent = true;
+	assert(!prepare(&steer) && fe.mdb->cpu_entries == 1);
+	expect_lookup(0, 1, 10, -1); expect_lookup(1, 1, 10, 4);
+#endif
+	reset();
+	for (unsigned i = 0; i < 80; i++) entry(0, i + 1, 9, 0);
+	entry(0, 81, 0, 2);
+	assert(!prepare(&steer) && fe.mdb->cpu_entries == 80 && fe.mdb->tcam.used == 8);
+	expect_lookup(0, 80, 9, -1); expect_lookup(0, 81, 9, 2);
+	reset();
+	for (unsigned i = 0; i < 6; i++) entry(0, i + 1, 0, 31);
+	entry(0, 7, 0, 2); entry(0, 7, 9, 2);
+	assert(!prepare(&steer) && fe.mdb->cpu_entries == 2 && fe.mdb->capacity_cpu == 2);
+	assert(!fe.mdb->folded_entries && fe.mdb->tcam.used == 60);
+	expect_lookup(0, 7, 9, -1); expect_lookup(0, 7, 10, -1);
 }
 
 static void register_rejections(void)
@@ -626,12 +781,16 @@ static void capacity_and_rollback(void)
 {
 	unsigned steer;
 	reset(); for (unsigned i = 0; i < 7; i++) entry(0, i + 1, 0, 31);
-	reject(-ENOSPC, true); assert(!fe.mdb->tcam.used && !fe.mdb->tcam.exposed);
+	assert(!prepare(&steer) && steer == 31 && fe.mdb->tcam.active == 60);
+	assert(fe.mdb->cpu_entries == 1 && fe.mdb->capacity_cpu == 1);
+	assert(fe.mdb->reason == FE_MDB_PARTIAL); cases++;
 	reset(); for (unsigned i = 0; i < 7; i++) entry(0, i + 1, 0, i < 3 ? 31 : 2);
 	assert(!prepare(&steer) && fe.mdb->tcam.used == 62 && fe.mdb->tcam.active == 62);
 	assert(!fe_mdb_withdraw(&fe));
 	unsigned before = m.commands;
-	assert(prepare(&steer) == -ENOSPC && !steer && m.commands == before); no_keys(); cases++;
+	assert(!prepare(&steer) && !steer && m.commands == before);
+	assert(fe.mdb->cpu_entries == 7 && fe.mdb->capacity_cpu == 7);
+	assert(fe.mdb->reason == FE_MDB_CPU_ONLY); no_keys(); cases++;
 	reset(); entry(0, 1, 9, 2); entry(0, 1, 10, 4);
 	assert(!prepare(&steer)); assert(fe.mdb->tcam.active == 16); cases++;
 	reset(); entry(0, 1, 0, 2); m.exhaust_after_valid = 2;
@@ -740,10 +899,20 @@ static void profile_lifecycle(void)
 	assert(fe_mdb_profile_prepare(&fe) == -ENOSPC && !fe_mdb_retained(&fe)); cases++;
 }
 
+#ifdef FE_MDB_REAL_SNAPSHOT
+#include "fe_mdb_snapshot_cases.c"
+#endif
+
 int main(void)
 {
-	good_matrix(); cold_and_topology(); policy_rejections(); register_rejections();
-	capacity_and_rollback(); transaction_faults(); profile_lifecycle();
+	cold_and_topology(); policy_rejections(); dynamic_and_coexistence();
+	capacity_and_rollback();
+	if (!FE_MDB_FOCUSED) {
+		good_matrix(); register_rejections(); transaction_faults(); profile_lifecycle();
+	}
+#ifdef FE_MDB_REAL_SNAPSHOT
+	real_snapshot_cases();
+#endif
 	char stats[1024];
 	assert(fe_mdb_stats(&fe, stats, sizeof(stats)) > 0 && strstr(stats, "mdb_state="));
 	free(fe.mdb); fe.mdb = NULL;

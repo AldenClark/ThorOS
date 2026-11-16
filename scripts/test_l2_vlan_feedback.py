@@ -194,6 +194,11 @@ int main(void)
  p2.br=&other;assert(!br_rtl9617c_fdb_learn_vid(&dev2,mac,10,&guard,17));
  assert(other.fdb[0].vid==10 && br.fdb[0].dst==&p2);p2.br=&br;
  /* Protected replacements and stale generations are byte-for-byte inert. */
+ br.fdb[0].flags=0;memcpy(before,br.fdb,sizeof(before));jiffies++;
+ assert(br_rtl9617c_fdb_learn_vid(&dev,mac,10,&guard,17)==-EALREADY);
+ assert(br_rtl9617c_fdb_learn_vid(&dev2,mac,10,&guard,17)==-EALREADY);
+ assert(!br_rtl9617c_fdb_forget_vid(&dev2,mac,10));
+ assert(!memcmp(before,br.fdb,sizeof(before)));
  for(i=BR_FDB_LOCAL;i<=BR_FDB_LOCKED;i++){
   if(i==BR_FDB_ADDED_BY_EXT_LEARN || i==BR_FDB_OFFLOADED)continue;
   br.fdb[0].flags=BIT(i)|BIT(BR_FDB_ADDED_BY_EXT_LEARN);
@@ -238,12 +243,14 @@ def production(kernel=None):
     text = (PATCHES / "238-native-bridge-vlan-feedback.patch").read_text()
     added = "\n".join(s[1:] for s in text.splitlines()
                       if s.startswith("+") and not s.startswith("+++"))
+    authority = "\n".join(s[1:] for s in (PATCHES / "239-native-fdb-cpu-authority.patch").read_text().splitlines()
+                          if s.startswith((" ", "+")) and not s.startswith("+++"))
     context = re.search(r"struct br_rtl9617c_vlan_learn_ctx \{[^}]+\};", added).group(0)
     if kernel:
         assert context in (kernel / "net/bridge/br_fdb.c").read_text()
     sources = [context]
     for name, path in NAMES.items():
-        actual = function(added, name)
+        actual = function(authority if name == "br_rtl9617c_fdb_learn_vid_publish" else added, name)
         if kernel:
             assert actual == function((kernel / path).read_text(), name), name
         sources.append(actual)

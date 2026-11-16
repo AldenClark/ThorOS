@@ -41,6 +41,7 @@ CONFIGS = [
     "L2FE_L2E_FDB_DATA0", "L2FE_L2E_FDB_DATA1", "L2FE_L2E_FDB_DATA2",
     "L2FE_L2E_FDB_DATA3",
     "L3FE_FE_L3E_HS_PROFILE0_INI", "L3FE_FE_L3E_HS_PROFILE0_TUPLE0",
+    "L3FE_FE_L3E_HS_PROFILE0_TYPE0_ACTION",
 ]
 
 
@@ -95,6 +96,19 @@ int main(void)
  assert(cache.bf.ct_size==4 && cache.bf.ca_width==3 && cache.bf.fib_sram);
  assert(!cache.bf.cache_half && cache.bf.cache_age0_hit);
  assert(overflow.bf.oa_width==4 && defaults.bf.da_width==1);
+ for(unsigned int mode=0;mode<2;mode++) {
+  rtl_fe_dma_tables_mode(&io,0x03400000,2,mode);
+  cache.wrd=read_reg(&m,OFFSET(L3FE_FE_L3E_HS_CACHE_INI));
+  hash.wrd=read_reg(&m,OFFSET(L3FE_FE_L3E_HS_HASH_INI));
+  overflow.wrd=read_reg(&m,OFFSET(L3FE_FE_L3E_HS_OVERFLOW_INI));
+  L3FE_FE_L3E_HS_PROFILE0_TYPE0_ACTION_t action={.wrd=rtl_fe_action_profile(mode)};
+  assert(hash.bf.ha_width==4 && overflow.bf.oa_width==4);
+  assert(cache.bf.ct_size==4 && cache.bf.fib_sram && cache.bf.cache_age0_hit);
+  assert(cache.bf.cache_half==mode && cache.bf.ca_width==(mode?4U:3U));
+  assert(action.bf.a_mask==(mode?((1U<<18)|(1U<<20)|(1U<<24)):((1U<<18)|(1U<<20))));
+  assert(action.bf.fetch_sz==(mode?4U:3U));
+  assert(RTL_FE_NAPTV6_CACHE_ENTRIES==1024 && RTL_FE_ACTION_BYTES==48);
+ }
  L3FE_AXIM2_CONFIG_t axi_before={.wrd=0};
  axi_before.bf.axi_xbus_len=2;axi_before.bf.read_cacheline_trans_en=1;
  write_reg(&m,OFFSET(L3FE_AXIM2_CONFIG),axi_before.wrd);

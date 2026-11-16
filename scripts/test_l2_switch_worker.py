@@ -8,6 +8,7 @@ while its FE mutex is released for RCU or switchdev replay. The switchdev
 boundary replays actual FDB records, never fabricates rule_count. No hardware
 claim is made.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -21,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVERS = ROOT / "port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek"
 source = (DRIVERS / "rtl9617c-fe-switch.h").read_text()
 source += "\n" + (DRIVERS / "rtl9617c-fe-switch-vlan.h").read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--authority-only", action="store_true", help="Only CPU-owned native fallback and independent routed admission")
+args = parser.parse_args()
 
 
 def function(name):
@@ -44,6 +48,7 @@ COMMON = r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "rtl9617c-l2-format.h"
@@ -98,7 +103,7 @@ struct rtl_fe {bool lock,enabled,prepared,engine_ready,shutting_down,route_admit
 BACKEND = r'''
 static struct rtl_fe fe;
 static struct rtl_fe_bridge sw;
-static struct net_device ports[5],master;
+static struct net_device ports[5],master,pon,foreign,internal;
 static unsigned int rules[RTL_L2_FDB_ENTRIES][4];
 static struct fe_switch_published published[RTL_L2_FDB_ENTRIES];
 struct bridge_row {u8 address[6];unsigned int port;bool local;u64 cookie;};
@@ -119,6 +124,14 @@ static bool mcast_ready,mcast_live;
 static int mdb_error,mdb_hw_error;
 static unsigned int mdb_prepares,mdb_steers;
 static bool rtnl_held,arm_failure,epoch_during_append,additional_policy;
+static bool cpu_dynamic;
+static unsigned int rcu_depth;
+static void rcu_read_lock(void){rcu_depth++;}
+static void rcu_read_unlock(void){assert(rcu_depth);rcu_depth--;}
+static struct net_device *br_switchdev_fdb_find_port(struct net_device *br,const u8 *address,unsigned short vid){
+ assert(rcu_depth && rtnl_held && br==&master && !vid);
+ return cpu_dynamic && address[5]==13?&ports[0]:NULL;
+}
 static enum fe_switch_reason policy_reason;
 static clock_t ageing;
 static void mutex_lock(bool *lock){assert(!*lock);*lock=true;}
@@ -128,12 +141,13 @@ static void rtnl_unlock(void){assert(rtnl_held);rtnl_held=false;}
 static void fe_switch_hw_gate(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw){
  assert(owner==&fe && hw==&sw.hw && !mcast_live);hw->open=false;owner->route_admitted=false;closures++;
 }
-static bool fe_switch_hw_arm(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,u32 route,bool route_allowed){
+static bool fe_switch_hw_arm(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,u32 route,bool route_allowed,bool native_route_allowed){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open);
  assert(!(native&route) && !((native|route)&~31U));
  assert(!native || (hw->owned && hw->port_policy_ready && sw.domain_owned && sw.offloaded==native));
  assert(route_allowed==sw.route_policy_allowed && (route_allowed || !route));
- assert(!native || sw.local_target==(route_allowed && owner->enabled && owner->prepared?25U:16U));
+ assert(native_route_allowed==sw.native_route_policy_allowed);
+ assert(!native || sw.local_target==(native_route_allowed && owner->enabled && owner->prepared?25U:16U));
  assert(!native || !mcast_ready || mcast_live);
  hw->open=!arm_failure;owner->route_admitted=!arm_failure && owner->enabled && route_allowed;return !arm_failure;
 }
@@ -174,12 +188,12 @@ static int fe_mdb_prepare(struct rtl_fe *owner,struct rtl9617c_switch_guard *gua
  unsigned int forwarding,unsigned int *steer){
  assert(owner==&fe && guard==&sw.guard && generation==guard->generation && bridge==&master);
  assert(devs==sw.ports && flags && forwarding && steer && fe.lock && rtnl_held);
- assert(sw.domain_owned && !sw.hw.open && !sw.active && sw.route_policy_allowed && fe.enabled && fe.prepared);
+ assert(sw.domain_owned && !sw.hw.open && !sw.active && sw.native_route_policy_allowed && fe.enabled && fe.prepared);
  mdb_prepares++;*steer=mdb_error?0:forwarding;return mdb_error;
 }
 static int fe_switch_hw_mdb_steer(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,unsigned int ports){
  assert(owner==&fe && hw==&sw.hw && !sw.replay_ports && ports==hw->ports);
- assert(sw.route_policy_allowed && fe.enabled && fe.prepared && !hw->open);mdb_steers++;return mdb_hw_error;
+ assert(sw.native_route_policy_allowed && fe.enabled && fe.prepared && !hw->open);mdb_steers++;return mdb_hw_error;
 }
 static void rtl9617c_switch_guard_invalidate(struct rtl9617c_switch_guard *guard){
  assert(guard==&sw.guard);invalidates++;guard->generation++;fe_switch_gate(&sw);
@@ -328,7 +342,7 @@ static int switchdev_bridge_port_offload(struct net_device *dev,struct net_devic
 static int fe_switch_hw_prepare(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,unsigned long seconds,bool snooping,bool route_allowed){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open && !sw.active);
  assert(fe.engine_ready && native==expected_native_ports() && seconds==(unsigned long)(ageing/HZ) && snooping);prepares++;
- assert(route_allowed==sw.route_policy_allowed);
+ assert(route_allowed==sw.native_route_policy_allowed);
  hw->owned=true;hw->ports=native;return hw_error;
 }
 static int fe_switch_hw_port_policy(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 learning,u32 isolated){
@@ -364,13 +378,15 @@ static void setup(void){
  sw.atomic_nb.notifier_call=fe_switch_atomic_event;
  online_ports=3;static_port=1;offline_port=2;invalidates=0;memset(installed,0,sizeof(installed));
  memset(rules,0,sizeof(rules));memset(published,0,sizeof(published));memset(bridge_rows,0,sizeof(bridge_rows));
- for(unsigned int i=0;i<5;i++){ports[i].index=i;configured_flags[i]=BR_LEARNING;configured_states[i]=BR_STATE_FORWARDING;}
+ for(unsigned int i=0;i<5;i++){ports[i].index=i;configured_flags[i]=BR_LEARNING;configured_states[i]=BR_STATE_FORWARDING;sw.owned_devices[i]=&ports[i];}
+ sw.owned_devices[32]=&pon;sw.owned_devices[16]=&internal;
  bridge_count=publish_calls=publish_successes=unpublish_calls=rules_reuses=port_policies=0;
  fail_publish_at=change_before_publish_at=change_after_publish_at=publish_change=extra_replay_rows=0;next_cookie=0;
  policy_reason=FE_SWITCH_OK;ageing=300*HZ;
  closures=restores=unoffloads=snapshots=syncs=route_flushes=offloads=prepares=claims=appends=arms=scheduled=last_delay=0;
  restore_fail_at=offload_fail_at=append_fail_at=replay_error_at=change_in_sync=change_in_replay=0;
  hw_error=domain_error=flush_error=port_policy_error=0;rtnl_held=arm_failure=epoch_during_append=additional_policy=false;
+ cpu_dynamic=false;rcu_depth=0;
  mcast_error=-EOPNOTSUPP;mcast_hw_error=0;mcast_prepares=mcast_applies=mcast_arms=mcast_revokes=0;
  mcast_ready=mcast_live=false;
  mdb_error=-EOPNOTSUPP;mdb_hw_error=0;mdb_prepares=mdb_steers=0;
@@ -403,11 +419,13 @@ static void success_and_policy(void){
  assert(!sw.active && sw.hw.open && sw.flow_allowed && sw.reason==FE_SWITCH_REQUEST_OFF);
  assert(!prepares && !claims && !appends && !offloads && !scheduled && !sw.offloaded && sw.armed_route_mask==31);
  setup();policy_reason=FE_SWITCH_NO_BRIDGE;run();assert(sw.hw.open && !sw.active && !prepares && sw.armed_route_mask==31);
- const enum fe_switch_reason vetoes[]={FE_SWITCH_PRIVATE_POLICY,FE_SWITCH_PROMISC,FE_SWITCH_GUARDED,FE_SWITCH_PORT_POLICY};
+ const enum fe_switch_reason vetoes[]={FE_SWITCH_PRIVATE_POLICY,FE_SWITCH_PROMISC,FE_SWITCH_GUARDED};
  for(unsigned int i=0;i<sizeof(vetoes)/sizeof(vetoes[0]);i++){
   setup();policy_reason=vetoes[i];run();
   assert(!sw.hw.open && !sw.active && !sw.flow_allowed && !prepares && !route_flushes && !arms && sw.route_mask==0);
  }
+ setup();policy_reason=FE_SWITCH_PORT_POLICY;run();
+ assert(sw.hw.open && !sw.active && sw.flow_allowed && !prepares && sw.armed_route_mask==30);
  const enum fe_switch_reason capabilities[]={FE_SWITCH_MULTI_BRIDGE,FE_SWITCH_MIXED_PORTS,FE_SWITCH_VLAN_UNSUPPORTED};
  for(unsigned int i=0;i<sizeof(capabilities)/sizeof(capabilities[0]);i++)for(unsigned int requested=0;requested<2;requested++){
   setup();policy_reason=capabilities[i];sw.requested=requested;run();
@@ -419,7 +437,8 @@ static void success_and_policy(void){
    if(restriction==0)configured_flags[0]|=BR_ISOLATED;
    if(restriction==1)configured_flags[0]&=~BR_LEARNING;
    if(restriction==2)configured_states[0]=BR_STATE_BLOCKING;
-   run();assert(!sw.hw.open && !sw.active && !sw.flow_allowed && !arms && !sw.route_mask);
+   run();assert(sw.hw.open && !sw.active && sw.flow_allowed && arms==1 && sw.route_mask==30);
+   assert(sw.armed_route_eligible_mask==30 && !fe_switch_flow_ports_allowed(&fe,&ports[0],&pon));
   }
  }
  setup();sw.guard.blocked=true;run();assert(!sw.hw.open && !syncs && !route_flushes && !prepares && !arms && sw.reason==FE_SWITCH_GUARDED);
@@ -450,6 +469,19 @@ static void replay_to_publication(void){
  append_fail_at=appends+2;sw.guard.generation++;run();
  assert(!sw.active && !sw.native_mask && !sw.hw.open && !sw.offloaded &&
         sw.reason==FE_SWITCH_FDB_CAPACITY && !sw.replay_ports);
+}
+static void cpu_dynamic_native_fallback(void){
+ setup();cpu_dynamic=true;run();
+ assert(!sw.active && sw.reason==FE_SWITCH_SOFTWARE_FDB && sw.hw.open && sw.flow_allowed);
+ assert(!prepares && !claims && !appends && !sw.offloaded && !invalidates && !sw.pending_count);
+ assert(sw.armed_route_mask==31 && fe_switch_flow_ports_allowed(&fe,&ports[0],&pon));
+ assert(!fe_switch_needs_recovery(&fe));
+ unsigned int flushes=route_flushes;run();
+ assert(route_flushes==flushes && !sw.active && !invalidates && !prepares);
+ /* Linux expiry/deletion removes the authoritative row under the normal
+  * core epoch fence; the surviving hardware-owned subset can re-enable. */
+ cpu_dynamic=false;sw.guard.generation++;run();
+ assert(sw.active && sw.native_mask==3 && prepares==1 && claims==1 && !sw.error);
 }
 static void released_lock_changes(void){
  for(unsigned int place=0;place<2;place++)for(unsigned int change=1;change<=4;change++){
@@ -495,8 +527,8 @@ static void transaction_failures(void){
    !sw.hw.open && !sw.hw.owned && !sw.domain_owned && !sw.offloaded && sw.error==policy_errors[i]);
  }
  setup();configured_flags[1]|=BR_ISOLATED;port_policy_error=-EOPNOTSUPP;run();
- assert(!sw.active && !sw.flow_allowed && !fe.route_admitted && !sw.armed_route_mask &&
-  !sw.native_mask && !sw.route_mask && !claims && !appends && !publish_calls);
+ assert(!sw.active && sw.flow_allowed && fe.route_admitted && sw.armed_route_mask==29 &&
+  !sw.native_mask && sw.route_mask==29 && !claims && !appends && !publish_calls);
  for(unsigned int i=1;i<=2;i++){setup();append_fail_at=i;run();assert(!sw.hw.open && !sw.hw.owned && !sw.domain_owned && !sw.offloaded && sw.reason==FE_SWITCH_FDB_CAPACITY);}
  setup();epoch_during_append=true;run();assert(!sw.hw.open && !sw.hw.owned && !sw.domain_owned && !sw.offloaded && sw.reason==FE_SWITCH_GUARDED);
  setup();arm_failure=true;run();assert(!sw.hw.open && !sw.active && !sw.flow_allowed && !sw.hw.owned && !sw.domain_owned);
@@ -517,13 +549,22 @@ static void independent_port_policies(void){
  for(unsigned int learning=0;learning<32;learning++)for(unsigned int isolated=0;isolated<32;isolated++){
   setup();online_ports=31;
   for(unsigned int i=0;i<5;i++)configured_flags[i]=((learning&BIT(i))?BR_LEARNING:0)|((isolated&BIT(i))?BR_ISOLATED:0);
-  run();bool route_allowed=learning==31 && !isolated;
+  run();bool route_allowed=learning==31 && !isolated;unsigned int eligible=learning&~isolated;
   assert(sw.active && sw.native_mask==31 && sw.offloaded==31 && sw.hw.port_policy_ready);
   assert(sw.hw.learning_mask==learning && sw.hw.isolated_mask==isolated);
-  assert(sw.route_policy_allowed==route_allowed && sw.flow_allowed==route_allowed && fe.route_admitted==route_allowed);
+  assert(sw.route_policy_allowed && sw.flow_allowed && fe.route_admitted);
+  assert(sw.native_route_policy_allowed==route_allowed && sw.armed_route_eligible_mask==eligible);
   assert(!sw.route_mask && !sw.armed_route_mask && sw.local_target==(route_allowed?25U:16U));
   assert(appends==3 && publish_successes==3 && sw.published_count==3 && bridge_owned_count()==3);
   assert(installed[0].destination==(route_allowed?25U:16U) && installed[1].destination==1 && installed[2].destination==2);
+  for(unsigned int i=0;i<5;i++)for(unsigned int j=0;j<5;j++){
+   bool allowed=(eligible&BIT(i)) && (eligible&BIT(j));
+   assert(fe_switch_flow_ports_allowed(&fe,&ports[i],&ports[j])==allowed);
+  }
+  for(unsigned int i=0;i<5;i++){
+   assert(fe_switch_flow_ports_allowed(&fe,&ports[i],&pon)==!!(eligible&BIT(i)));
+   assert(fe_switch_flow_ports_allowed(&fe,&pon,&ports[i])==!!(eligible&BIT(i)));
+  }
  }
  /* Keep every online member in the route-policy snapshot, but replay and
   * prepare only the forwarding subset. Local MACs remain CPU reachable;
@@ -533,10 +574,14 @@ static void independent_port_policies(void){
   setup();online_ports=31;configured_states[blocked]=state;run();
   unsigned int expected=31&~BIT(blocked),count=3-(blocked==static_port)-(blocked==offline_port);
   assert(sw.active && sw.native_mask==expected && sw.offloaded==expected && sw.hw.ports==expected);
-  assert(sw.hw.learning_mask==expected && !sw.hw.isolated_mask && !sw.route_policy_allowed);
-  assert(!sw.flow_allowed && !fe.route_admitted && !sw.route_mask && !sw.armed_route_mask && sw.local_target==16);
+  assert(sw.hw.learning_mask==expected && !sw.hw.isolated_mask && sw.route_policy_allowed);
+  assert(sw.flow_allowed && fe.route_admitted && !sw.route_mask && !sw.armed_route_mask && sw.local_target==25);
+  assert(sw.native_route_policy_allowed && sw.armed_route_eligible_mask==expected);
+  assert(!fe_switch_flow_ports_allowed(&fe,&ports[blocked],&pon));
+  assert(!fe_switch_flow_ports_allowed(&fe,&pon,&ports[blocked]));
+  assert(!fe_switch_flow_ports_allowed(&fe,&ports[blocked],&ports[blocked]));
   assert(appends==3 && publish_successes==count && sw.published_count==count && offloads==4);
-  assert(installed[0].destination==16);
+  assert(installed[0].destination==25);
   for(unsigned int i=1;i<appends;i++)assert(installed[i].destination!=blocked);
   assert(installed[1].destination==(blocked==static_port?16U:static_port));
   assert(installed[2].destination==(blocked==offline_port?16U:offline_port));
@@ -546,12 +591,13 @@ static void independent_port_policies(void){
   if(restriction==0)configured_flags[0]=0;
   if(restriction==1)configured_flags[0]|=BR_ISOLATED;
   if(restriction==2)configured_states[0]=BR_STATE_BLOCKING;
-  run();assert(!sw.active && !sw.flow_allowed && !fe.route_admitted && !arms && !sw.route_mask);
+  run();assert(!sw.active && sw.flow_allowed && fe.route_admitted && arms==1 && sw.route_mask==30);
+  assert(sw.armed_route_eligible_mask==30);
  }
  setup();configured_states[1]=BR_STATE_BLOCKING;run();
- assert(sw.reason==FE_SWITCH_NO_BRIDGE && !arms && !offloads && !sw.active && !sw.flow_allowed);
+ assert(sw.reason==FE_SWITCH_NO_BRIDGE && arms==1 && !offloads && !sw.active && sw.flow_allowed && sw.armed_route_eligible_mask==29);
  setup();configured_states[1]=BR_STATE_BLOCKING+1;run();
- assert(sw.reason==FE_SWITCH_PORT_POLICY && !arms && !offloads && !sw.active && !sw.flow_allowed);
+ assert(sw.reason==FE_SWITCH_PORT_POLICY && arms==1 && !offloads && !sw.active && sw.flow_allowed && sw.armed_route_eligible_mask==29);
  /* ageing_time=0 is a supported static-only hardware bridge, not
   * infinite-lifetime dynamic learning. Every transition is rebuilt. */
  setup();run();assert(sw.hw.learning_mask==3);
@@ -560,6 +606,44 @@ static void independent_port_policies(void){
  assert(sw.rule_count==3 && sw.published_count==2 && bridge_owned_count()==2);
  ageing=15*HZ;sw.guard.generation++;run();
  assert(sw.active && sw.hw.learning_mask==3 && sw.published_count==2);
+}
+static void physical_route_permissions(void){
+ setup();run();assert(sw.armed_route_eligible_mask==31);
+ assert(fe_switch_flow_ports_allowed(&fe,&ports[0],&ports[0]));
+ assert(fe_switch_flow_ports_allowed(&fe,&pon,&ports[4]));
+ assert(!fe_switch_flow_ports_allowed(&fe,NULL,&pon));
+ assert(!fe_switch_flow_ports_allowed(&fe,&pon,NULL));
+ assert(!fe_switch_flow_ports_allowed(&fe,&foreign,&pon));
+ assert(!fe_switch_flow_ports_allowed(&fe,&pon,&foreign));
+ assert(!fe_switch_flow_ports_allowed(&fe,&internal,&pon));
+ assert(!fe_switch_flow_ports_allowed(&fe,&pon,&internal));
+ /* Same ifindex is not the same physical owner; an unregister cannot
+  * lend its permission to a different object before the next snapshot. */
+ foreign.index=ports[0].index;
+ assert(!fe_switch_flow_ports_allowed(&fe,&foreign,&pon));
+ sw.owned_devices[0]=NULL;
+ assert(!fe_switch_flow_ports_allowed(&fe,&ports[0],&pon));
+ sw.owned_devices[0]=&ports[0];
+ sw.owned_devices[32]=NULL;
+ assert(!fe_switch_flow_ports_allowed(&fe,&ports[1],&pon));
+ sw.owned_devices[32]=&pon;
+ /* Invalidation is synchronous, including between a snapshot and arm.
+  * A failed replacement must not resurrect the old per-port bitmap. */
+ rtl9617c_switch_guard_invalidate(&sw.guard);
+ assert(!sw.armed_route_eligible_mask && !fe_switch_flow_ports_allowed(&fe,&ports[0],&pon));
+ configured_flags[0]|=BR_ISOLATED;run();
+ assert(sw.armed_route_eligible_mask==30 && !sw.native_route_policy_allowed && sw.local_target==16);
+ assert(!fe_switch_flow_ports_allowed(&fe,&ports[0],&pon));
+ assert(!fe_switch_flow_ports_allowed(&fe,&pon,&ports[0]));
+ assert(fe_switch_flow_ports_allowed(&fe,&ports[1],&pon));
+ unsigned int flushed=route_flushes;
+ rtl9617c_switch_guard_invalidate(&sw.guard);arm_failure=true;run();
+ assert(route_flushes==flushed+1 && !sw.armed_route_eligible_mask && !sw.flow_allowed);
+ arm_failure=false;run();assert(sw.armed_route_eligible_mask==30);
+ additional_policy=true;rtl9617c_switch_guard_invalidate(&sw.guard);run();
+ assert(!sw.route_policy_allowed && !sw.armed_route_eligible_mask && !sw.flow_allowed);
+ assert(!fe_switch_flow_ports_allowed(&fe,&ports[1],&pon));
+ cases++;
 }
 static void static_feedback_ownership(void){
  for(unsigned int failure=1;failure<=2;failure++){
@@ -657,7 +741,8 @@ static void retry_classification(void){
  }
 }
 static void stable_owner_identity(void){
- setup();assert(!fe_switch_owns_device(&sw,&ports[0]));
+ setup();memset(sw.owned_devices,0,sizeof(sw.owned_devices));
+ assert(!fe_switch_owns_device(&sw,&ports[0]));
  const unsigned int destinations[]={0,4,32,63};
  for(unsigned int i=0;i<ARRAY_SIZE(destinations);i++){
   unsigned int destination=destinations[i];
@@ -716,9 +801,13 @@ static void multicast_publication_boundaries(void){
   run();assert(sw.active && !mdb_prepares && !mdb_steers);
  }
 }
-int main(void){success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();independent_port_policies();static_feedback_ownership();static_capacity_boundaries();retry_classification();stable_owner_identity();
- multicast_publication_boundaries();
- printf("Native switch production worker: %u policy/RCU/FDB-replay/rollback cases; forwarding-only native subsets, learning/isolation route gates, independent static-cookie journal and 4096/4128-row success/failure boundaries PASS\n",cases);return 0;}
+int main(void){
+ if(getenv("THOROS_FDB_AUTHORITY_ONLY")){
+  cpu_dynamic_native_fallback();printf("Native worker CPU authority: %u replay/fallback/re-enable cases PASS\n",cases);return 0;
+ }
+ success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();independent_port_policies();static_feedback_ownership();static_capacity_boundaries();retry_classification();stable_owner_identity();
+ multicast_publication_boundaries();physical_route_permissions();cpu_dynamic_native_fallback();
+ printf("Native switch production worker: %u policy/RCU/FDB-replay/rollback cases; forwarding-only native subsets, per-endpoint route permissions, independent static-cookie journal and 4096/4128-row success/failure boundaries PASS\n",cases);return 0;}
 '''
 
 definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
@@ -727,7 +816,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_scan_reset", "fe_switch_route_plan_validate", "fe_switch_plan_validate", "fe_switch_forwarding_ports", "fe_switch_flag_ports", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_vlan_find", "fe_switch_bridge_for_vid", "fe_switch_is_master", "fe_switch_age_ticks", "fe_switch_replay_fdb", "fe_switch_static_stage", "fe_switch_static_publish", "fe_switch_unoffload", "fe_switch_atomic_event",
+    "fe_switch_scan_reset", "fe_switch_route_plan_validate", "fe_switch_route_global_allowed", "fe_switch_route_eligible_ports", "fe_switch_plan_validate", "fe_switch_forwarding_ports", "fe_switch_flag_ports", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_vlan_find", "fe_switch_bridge_for_vid", "fe_switch_is_master", "fe_switch_age_ticks", "fe_switch_replay_fdb", "fe_switch_static_stage", "fe_switch_static_publish", "fe_switch_unoffload", "fe_switch_atomic_event", "fe_switch_flow_allowed", "fe_switch_flow_port_allowed", "fe_switch_flow_ports_allowed",
     "fe_switch_gate", "fe_switch_arm", "fe_switch_work",
 ])
 def replace_once(candidate, before, after):
@@ -737,7 +826,7 @@ def replace_once(candidate, before, after):
 
 
 route_assignment = ("\tsw->route_policy_allowed =\n"
-                    "\t\tfe_switch_route_plan_validate(&plan) == FE_SWITCH_OK;")
+                    "\t\tfe_switch_route_global_allowed(&plan);")
 early_native = replace_once(functions, "\tsw->native_mask = native_ports;\n", "")
 early_native = replace_once(
     early_native, "\tfor (i = 0; i < sw->rule_count; i++) {\n\t\tret = fe_switch_fdb_write",
@@ -746,6 +835,11 @@ early_native = replace_once(
 # rebuild. Removing only the worker's redundant reset is not a regression.
 assert functions.count("\tfe_switch_scan_reset(sw);") == 2
 mutants = {
+    "cpu_owned_dynamic_ignored": replace_once(functions, "\t\tif (cpu_port) {", "\t\tif (false && cpu_port) {"),
+    "cpu_fallback_disables_independent_routing": replace_once(
+        functions, "sw->reason == FE_SWITCH_SOFTWARE_FDB)", "(false && sw->reason == FE_SWITCH_SOFTWARE_FDB))"),
+    "cpu_fallback_churns_recovery": replace_once(
+        functions, "sw->reason != FE_SWITCH_SOFTWARE_FDB;", "true;"),
     "native_producer_opens_before_rx_provenance": replace_once(
         functions, "\tif (sw->native_mask)\n\t\tfe_mcast_arm(sw->fe, sw->route_generation);",
         "\tif (false && sw->native_mask)\n\t\tfe_mcast_arm(sw->fe, sw->route_generation);"),
@@ -759,12 +853,25 @@ mutants = {
         "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tret = 0;\n\t\tgoto unlock;", 1),
     "native_capability_disables_routing": replace_once(
         functions, route_assignment,
-        "\tsw->route_policy_allowed = fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK && sw->reason == FE_SWITCH_OK;"),
+        "\tsw->route_policy_allowed = fe_switch_route_global_allowed(&plan) && sw->reason == FE_SWITCH_OK;"),
     "capability_masks_real_policy": replace_once(
         functions, route_assignment,
-        "\tsw->route_policy_allowed = fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK ||\n"
-        "\t\tsw->reason == FE_SWITCH_MULTI_BRIDGE || sw->reason == FE_SWITCH_MIXED_PORTS ||\n"
-        "\t\tsw->reason == FE_SWITCH_VLAN_UNSUPPORTED;"),
+        "\tsw->route_policy_allowed = fe_switch_route_global_allowed(&plan) ||\n"
+        "\t\tplan.multi_bridge || plan.mixed || plan.vlan_filtering;"),
+    "one_port_policy_disables_unrelated_routes": replace_once(
+        functions, route_assignment,
+        "\tsw->route_policy_allowed = fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK;"),
+    "route_publisher_ignores_output_permission": replace_once(
+        functions, "fe_switch_flow_port_allowed(fe->bridge, output);",
+        "(output != NULL);"),
+    "route_publisher_ignores_input_permission": replace_once(
+        functions, "fe_switch_flow_port_allowed(fe->bridge, input) &&",
+        "(input != NULL) &&"),
+    "gate_retains_old_physical_permissions": replace_once(
+        functions, "\tWRITE_ONCE(sw->armed_route_eligible_mask, 0);", ""),
+    "local_native_trap_uses_global_route_permission": replace_once(
+        functions, "\tsw->local_target = sw->native_route_policy_allowed &&",
+        "\tsw->local_target = sw->route_policy_allowed &&"),
     "replay_uses_unpublished_native_mask": functions.replace(
         "!(sw->replay_ports & BIT(port))", "!(sw->native_mask & BIT(port))", 1),
     "native_mask_published_before_static_fdb": early_native,
@@ -817,8 +924,13 @@ mutants = {
 for name, mutated in mutants.items():
     if mutated == functions:
         raise SystemExit(f"Mutation anchor missing: {name}")
+if args.authority_only:
+    mutants = {name: body for name, body in mutants.items() if name in {
+        "cpu_owned_dynamic_ignored", "cpu_fallback_disables_independent_routing", "cpu_fallback_churns_recovery"}}
 environment = dict(os.environ)
 environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
+if args.authority_only:
+    environment["THOROS_FDB_AUTHORITY_ONLY"] = "1"
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 with tempfile.TemporaryDirectory(prefix="l2-switch-worker-") as directory:
     temporary = Path(directory)
@@ -835,6 +947,8 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-worker-") as directory:
             if result.returncode != -6 or "Assertion" not in result.stderr:
                 raise SystemExit(f"{name}: expected a contract assertion, got {result.returncode}: {result.stderr}")
             print(f"Runtime regression mutant rejected: {name}", flush=True)
+if args.authority_only:
+    raise SystemExit(0)
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-worker.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),

@@ -349,7 +349,7 @@ static void recipe(unsigned int ports, bool l3)
  }
  memcpy(expected, hw.filter, sizeof(expected)); rtl_l2_fdb_scan_filter(expected);
  for (unsigned int i = 0; i < 5; i++) assert(model.reg[(0x1c28-i*4)/4] == expected[i]);
- assert(fe_switch_hw_arm(&fe, &hw, ports, 0,true));
+ assert(fe_switch_hw_arm(&fe, &hw, ports, 0,true,true));
  assert(model.route_arms==(unsigned)l3);
  assert(model.reg[0x1c04/4] == ((3830U << 19) | 123U));
  assert(!(model.reg[0x1c00/4] & (BIT(22) | BIT(25) | BIT(29))));
@@ -396,7 +396,7 @@ static void cold_to_native(unsigned int ports, bool l3)
  fe.enabled=fe.prepared=l3;
  assert(!fe_switch_hw_prepare(&fe,&hw,ports,300,false,true));
  assert(hw.prepared && hw.drained && hw.globals_owned);
- assert(fe_switch_hw_arm(&fe,&hw,ports,0,true));
+ assert(fe_switch_hw_arm(&fe,&hw,ports,0,true,true));
  for(unsigned p=0;p<5;p++)
   assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28))==!!(ports&BIT(p)));
  assert(!rtl_fabric_check(&io,&fabric));
@@ -504,15 +504,15 @@ static void guards(void)
  assert(fe_switch_hw_drain(&fe,&hw)==-ETIMEDOUT && !hw.drained); cpu_only(); cases++;
  model.clear_after=5; model.pending_reads=0;
  assert(!fe_switch_hw_drain(&fe,&hw) && hw.drained); cases++;
- reset(); assert(!fe_switch_hw_arm(&fe,&hw,1,0,true));
- assert(!fe_switch_hw_arm(&fe,&hw,0,1,true)); fe.enabled=fe.prepared=true;
- assert(!fe_switch_hw_arm(&fe,&hw,1,1,true)); assert(fe_switch_hw_arm(&fe,&hw,0,31,true));
+ reset(); assert(!fe_switch_hw_arm(&fe,&hw,1,0,true,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,0,1,true,true)); fe.enabled=fe.prepared=true;
+ assert(!fe_switch_hw_arm(&fe,&hw,1,1,true,true)); assert(fe_switch_hw_arm(&fe,&hw,0,31,true,true));
  for(unsigned int p=0;p<5;p++)
   assert((model.reg[FE_LAN_RX_CTRL(p)/4]&(BIT(28)|(63U<<16)))==(BIT(28)|(25U<<16)));
  fe_switch_hw_gate(&fe,&hw); cpu_only(); cases++;
  reset();fe.enabled=fe.prepared=true;
  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));model.arm_failure=true;
- assert(!fe_switch_hw_arm(&fe,&hw,3,0,true)&&model.route_closed);cpu_only();cases++;
+ assert(!fe_switch_hw_arm(&fe,&hw,3,0,true,true)&&model.route_closed);cpu_only();cases++;
  /* The route-off mode may still have a published action whose age/cache
   * withdrawal timed out. Native L2 must demand a verified CPU gate in
   * BOTH modes; neither enabled=false nor the presence of L2 owners proves
@@ -521,7 +521,7 @@ static void guards(void)
   reset();fe.enabled=enabled;fe.prepared=true;fe.pending_withdrawals=1;
   assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));model.arm_failure=fail;
   unsigned before=model.native_writes;
-  assert(fe_switch_hw_arm(&fe,&hw,3,0,true)==!fail);
+  assert(fe_switch_hw_arm(&fe,&hw,3,0,true,true)==!fail);
   assert(model.route_arms==1 && model.route_closed);
   if(fail) {assert(model.native_writes==before);cpu_only();}
   else for(unsigned p=0;p<2;p++)assert(!(model.reg[FE_LAN_RX_CTRL(p)/4]&BIT(28)));
@@ -565,7 +565,7 @@ static void rollback_fixture(void)
 {
  reset();fe.enabled=fe.prepared=true;
  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
- assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
  assert(!fe_switch_hw_drain(&fe,&hw));
 }
 
@@ -581,8 +581,8 @@ static void retained_retry(unsigned int count, unsigned int limits)
  }
  unsigned int writes=model.writes;
  assert(fe_switch_hw_prepare(&fe,&hw,31,300,true,true)==-EALREADY);
- assert(!fe_switch_hw_arm(&fe,&hw,31,0,true));
- assert(!fe_switch_hw_arm(&fe,&hw,0,31,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,31,0,true,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,0,31,true,true));
  assert(model.writes==writes);cpu_only();
  model.ignore_write=false;model.ignore_limits=false;model.ignore_write_address=0;
  model.corrupt_read_address=0;
@@ -676,7 +676,7 @@ static void readback_faults(void)
  for(unsigned int level=0;level<2;level++) {
   reset();model.reg[0x1c00/4]|=level<<12;original.reg[0x1c00/4]|=level<<12;
   assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
-  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
   assert(!fe_switch_hw_drain(&fe,&hw));
   model.reg[0x1c00/4]^=BIT(12);original.reg[0x1c00/4]^=BIT(12);
   assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
@@ -701,7 +701,7 @@ static void admission_faults(void)
    * the close write. This is deliberately NOT asserted as CPU-only. */
   reset();fe.enabled=fe.prepared=true;
   assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
-  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
   assert(!hw.rx_gate_verified);
   unsigned int count=hw.count,commands=model.commands;
   model.ignore_write_address=address;
@@ -741,7 +741,7 @@ static void admission_faults(void)
    count=hw.count;unsigned int value=model.reg[address/4];
    if(corrupt) {model.corrupt_read_address=address;model.corrupt_read_value=~0U;}
    else model.ignore_write_address=address;
-   assert(!fe_switch_hw_arm(&fe,&hw,31,0,true));
+   assert(!fe_switch_hw_arm(&fe,&hw,31,0,true,true));
    assert(hw.globals_owned && hw.count==count && !hw.port_policy_ready);
    assert(hw.reason==FE_SW_HW_ADMISSION && model.reg[address/4]==value);
    assert(hw.rx_gate_verified==!corrupt);
@@ -800,7 +800,7 @@ static void admission_faults(void)
  /* A never-prepared native-only engine has no L3 gate dependency. */
  reset();model.arm_failure=true;
  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,true));
- assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
  assert(!fe_switch_hw_drain(&fe,&hw));
  assert(!fe_switch_hw_restore(&fe,&hw));restored();
  assert(!model.lpb_reads);cases++;
@@ -845,7 +845,7 @@ static void multicast_producers(void)
     assert(!!(model.rows[RTL_L2_TBL_CF_KEY][id+512][2]&BIT(16))==!removed);
    }
   }
-  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
   assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
  }
  /* Mixed L2/L3 multicast class removal would admit an unprogrammed DFT;
@@ -870,7 +870,7 @@ static void multicast_producers(void)
   }
   model.mc_fail_at=failure;model.mc_strict=true;
   assert(fe_switch_hw_mcast_groups(&fe,&hw,&groups)==-EIO);model.mc_strict=false;
-  assert(!hw.port_policy_ready && !fe_switch_hw_arm(&fe,&hw,31,0,true));cpu_only();
+  assert(!hw.port_policy_ready && !fe_switch_hw_arm(&fe,&hw,31,0,true,true));cpu_only();
   assert(model.mc_publications==failure);
   assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
  }
@@ -902,7 +902,7 @@ static void exact_mdb_steering(void)
   }
   slot+=5;
  }
- assert(fe_switch_hw_arm(&fe,&hw,21,10,true));
+ assert(fe_switch_hw_arm(&fe,&hw,21,10,true,true));
  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
  for(unsigned int failure=0;failure<5;failure++){
   reset();fe.enabled=fe.prepared=true;
@@ -920,7 +920,7 @@ static void exact_mdb_steering(void)
  model.ignore_write=true;model.ignore_write_table=RTL_L2_TBL_CF_FIB;
  assert(fe_switch_hw_mdb_steer(&fe,&hw,3)==-EIO);
  assert(!hw.port_policy_ready && !hw.mdb_ports && hw.journal.quarantined);
- assert(!fe_switch_hw_arm(&fe,&hw,3,28,true));cpu_only();
+ assert(!fe_switch_hw_arm(&fe,&hw,3,28,true,true));cpu_only();
  model.ignore_write=false;
  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
 }
@@ -976,7 +976,7 @@ static void sdk_oracle(void)
  L2FE_PLC_LRN_FWD_CTRL_1_t exceptions={.wrd=model.reg[0x140c/4]};
  assert(exceptions.bf.sa_limit_excd_fwd_ctrl==1 && exceptions.bf.sa_limit_excd_ldpid==16);
  assert(exceptions.bf.sa_hash_cllsn_fwd_ctrl==1 && exceptions.bf.sa_hash_cllsn_ldpid==16);
- assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,true,true));
  L2FE_L2E_CTRL_t control={.wrd=model.reg[0x1c00/4]};
  assert(!control.bf.lrn_dis && control.bf.lrn_mode==1 && control.bf.cpu_opt_mode);
  assert(!control.bf.hash_collision_overwrite && !control.bf.ovfl_entries_rcyc_en);

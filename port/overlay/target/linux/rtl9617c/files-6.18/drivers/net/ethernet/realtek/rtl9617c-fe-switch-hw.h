@@ -1238,7 +1238,8 @@ retained:
 
 static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			    unsigned int native, unsigned int route,
-			    bool route_policy_allowed)
+			    bool route_policy_allowed,
+			    bool native_route_policy_allowed)
 {
 	unsigned int port, value;
 	bool withdrawing = READ_ONCE(fe->pending_withdrawals);
@@ -1247,7 +1248,8 @@ static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	    (native | route) & ~FE_SW_LAN_MASK || (native & route) ||
 	    (native && (!READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
 			!READ_ONCE(hw->port_policy_ready) ||
-			hw->route_policy_allowed != route_policy_allowed ||
+			hw->route_policy_allowed != native_route_policy_allowed ||
+			(native_route_policy_allowed && !route_policy_allowed) ||
 			native != hw->ports)) ||
 	    (route && (!route_policy_allowed || !READ_ONCE(fe->enabled) ||
 		       !READ_ONCE(fe->prepared))))

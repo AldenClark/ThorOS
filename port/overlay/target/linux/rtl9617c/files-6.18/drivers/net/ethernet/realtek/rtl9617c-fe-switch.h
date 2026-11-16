@@ -50,6 +50,7 @@ enum fe_switch_reason {
 	FE_SWITCH_FDB_CAPACITY,
 	FE_SWITCH_HW_UNSUPPORTED,
 	FE_SWITCH_AGING_UNSUPPORTED,
+	FE_SWITCH_SOFTWARE_FDB,
 };
 
 struct fe_switch_plan {
@@ -93,6 +94,45 @@ fe_switch_route_plan_validate(const struct fe_switch_plan *plan)
 	return FE_SWITCH_OK;
 }
 
+/* Software/private policy is shared by the fabric. A bridge port's own
+ * STP/learning/isolation restriction is not: it excludes that physical
+ * ingress AND egress without withdrawing unrelated LAN/PON routes. Keep
+ * the strict per-port validator as the single source of that policy.
+ */
+static bool fe_switch_route_global_allowed(const struct fe_switch_plan *plan)
+{
+	struct fe_switch_plan global = *plan;
+
+	if (plan->ports & ~GENMASK(FE_LAN_PORTS - 1, 0))
+		return false;
+	global.ports = 0;
+	return fe_switch_route_plan_validate(&global) == FE_SWITCH_OK;
+}
+
+static u32 fe_switch_route_eligible_ports(const struct fe_switch_plan *plan,
+					 u32 candidates)
+{
+	struct fe_switch_plan single = *plan;
+	u32 ports;
+	unsigned int port;
+
+	if ((candidates & ~GENMASK(FE_LAN_PORTS - 1, 0)) ||
+	    !fe_switch_route_global_allowed(plan))
+		return 0;
+	/* Online non-bridge LANs retain their ordinary routed path. A bridge
+	 * port is admitted only after validating its own complete flag/state set.
+	 */
+	ports = candidates & ~plan->ports;
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(candidates & plan->ports & BIT(port)))
+			continue;
+		single.ports = BIT(port);
+		if (fe_switch_route_plan_validate(&single) == FE_SWITCH_OK)
+			ports |= BIT(port);
+	}
+	return ports;
+}
+
 static enum fe_switch_reason
 fe_switch_plan_validate(const struct fe_switch_plan *plan)
 {
@@ -131,9 +171,9 @@ fe_switch_plan_validate(const struct fe_switch_plan *plan)
 	return forwarding >= 2 ? FE_SWITCH_OK : FE_SWITCH_NO_BRIDGE;
 }
 
-/* Keep plan.ports as the complete online topology. In particular, hiding a
- * blocked member here would make the independent route-policy check forget
- * its restriction. Only the final native mask excludes STP-blocked ports. */
+/* Keep plan.ports as the complete online topology. A blocked member must
+ * still be removed from the routed ingress/egress permission mask. Only
+ * the final native forwarding mask excludes that member from L2 lookup. */
 static u32 fe_switch_forwarding_ports(const struct fe_switch_plan *plan)
 {
 	u32 ports = 0;
@@ -202,6 +242,11 @@ struct rtl_fe_bridge {
 	 * Updated at add/remove under FE mutex, never cleared by a snapshot. */
 	struct net_device *owned_devices[64];
 	u32 offloaded, native_mask, route_mask, armed_route_mask;
+	/* route_mask selects RX25 only; native ingress can also reach L3 via
+	 * an explicitly programmed local-MAC result. The separate permission
+	 * bitmap governs BOTH endpoints of every published routed action.
+	 */
+	u32 route_eligible_mask, armed_route_eligible_mask;
 	/* Synchronous switchdev replay belongs to the pending topology, not
 	 * the published datapath. native_mask stays zero until preparation and
 	 * every static FDB write have completed successfully. RTNL owns this
@@ -231,7 +276,7 @@ struct rtl_fe_bridge {
 	u64 scan_generation;
 	bool scan_running, scan_complete, scan_removed;
 	bool requested, stopping, active, replaying, domain_owned, flow_allowed;
-	bool route_generation_valid, route_policy_allowed;
+	bool route_generation_valid, route_policy_allowed, native_route_policy_allowed;
 	bool netdev_registered, atomic_registered, blocking_registered;
 	int replay_error, error;
 	enum fe_switch_reason reason;
@@ -266,7 +311,8 @@ static bool fe_switch_needs_recovery(struct rtl_fe *fe)
 	/* A repeated mode write may retry a failed transaction. Ordinary
 	 * capability/policy fallback is not an error requiring a global flush. */
 	return sw && sw->error && sw->reason != FE_SWITCH_HW_UNSUPPORTED &&
-	       sw->reason != FE_SWITCH_FOREIGN_FDB;
+	       sw->reason != FE_SWITCH_FOREIGN_FDB &&
+	       sw->reason != FE_SWITCH_SOFTWARE_FDB;
 }
 
 static void fe_switch_track_port_locked(struct rtl_fe *fe,
@@ -293,6 +339,7 @@ static void fe_switch_gate(void *private)
 	fe_mcast_revoke(sw->fe);
 	WRITE_ONCE(sw->active, false);
 	WRITE_ONCE(sw->armed_route_mask, 0);
+	WRITE_ONCE(sw->armed_route_eligible_mask, 0);
 	WRITE_ONCE(sw->flow_allowed, false);
 	fe_switch_hw_gate(sw->fe, &sw->hw);
 }
@@ -334,9 +381,12 @@ static bool fe_switch_arm(void *private)
 		fe_mcast_arm(sw->fe, sw->route_generation);
 	armed = fe_switch_hw_arm(sw->fe, &sw->hw,
 				sw->native_mask, sw->route_mask,
-				sw->route_policy_allowed);
+				sw->route_policy_allowed,
+				sw->native_route_policy_allowed);
 	WRITE_ONCE(sw->active, armed && sw->native_mask);
 	WRITE_ONCE(sw->armed_route_mask, armed ? sw->route_mask : 0);
+	WRITE_ONCE(sw->armed_route_eligible_mask,
+		   armed && sw->route_policy_allowed ? sw->route_eligible_mask : 0);
 	WRITE_ONCE(sw->flow_allowed, armed && sw->route_policy_allowed &&
 		   sw->fe->enabled &&
 		   READ_ONCE(sw->fe->route_admitted));
@@ -654,6 +704,39 @@ static bool fe_switch_flow_allowed(struct rtl_fe *fe)
 	       READ_ONCE(fe->route_admitted);
 }
 
+/* Caller holds FE mutex, as for the ordinary route publisher. The gate
+ * callback may revoke admission concurrently, but it never grants it;
+ * only the same mutex-protected worker may arm a new epoch. Compare owned
+ * physical identities, not cached bridge pointers or a reused ifindex.
+ */
+static bool fe_switch_flow_port_allowed(struct rtl_fe_bridge *sw,
+					const struct net_device *dev)
+{
+	unsigned int port;
+
+	if (!dev)
+		return false;
+	for (port = 0; port < FE_LAN_PORTS; port++)
+		if (READ_ONCE(sw->owned_devices[port]) == dev)
+			return !!(READ_ONCE(sw->armed_route_eligible_mask) & BIT(port));
+	/* PON/EPON endpoints remain independently owned. Internal connectors,
+	 * CPU destinations and an arbitrary netdevice are never route endpoints.
+	 */
+	for (port = 32; port < ARRAY_SIZE(sw->owned_devices); port++)
+		if (READ_ONCE(sw->owned_devices[port]) == dev)
+			return true;
+	return false;
+}
+
+static bool fe_switch_flow_ports_allowed(struct rtl_fe *fe,
+					 const struct net_device *input,
+					 const struct net_device *output)
+{
+	return fe_switch_flow_allowed(fe) &&
+	       fe_switch_flow_port_allowed(fe->bridge, input) &&
+	       fe_switch_flow_port_allowed(fe->bridge, output);
+}
+
 /* RTNL and FE mutex held. Each snapshot obtains current pointers afresh.
  * No device reference survives RTNL, so device unregister cannot wait on a
  * work item which needs RTNL. Atomic callbacks compare cached values only.
@@ -744,11 +827,32 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	int port = fe_switch_port_index(sw, info->info.dev);
 	bool trap;
 
-	if ((!sw->vlan_domain && info->vid) ||
-	    switchdev_fdb_is_dynamically_learned(info))
+	if (!sw->vlan_domain && info->vid)
 		return 0;
 	if (sw->vlan_domain && !fe_switch_vlan_replay_member(sw, info, port))
 		return 0;
+	if (switchdev_fdb_is_dynamically_learned(info)) {
+		struct net_device *master = fe_switch_bridge_for_vid(sw, info->vid);
+		struct net_device *cpu_port = NULL;
+
+		/* The existing bridge helper excludes EXT_LEARNED rows and keeps
+		 * CPU ownership distinct from the native polling mirror. A static
+		 * CPU16 DA trap alone is insufficient: its source can still move
+		 * on an autonomous port without a CPU observation. Until exact SA
+		 * trapping is owned too, keep this complete native domain on CPU.
+		 * This is L2 capability fallback, not a veto on nft-authorized L3.
+		 */
+		if (master) {
+			rcu_read_lock();
+			cpu_port = br_switchdev_fdb_find_port(master, info->addr, info->vid);
+			rcu_read_unlock();
+		}
+		if (cpu_port) {
+			sw->reason = FE_SWITCH_SOFTWARE_FDB;
+			return -EOPNOTSUPP;
+		}
+		return 0;
+	}
 	if (info->locked || (!info->is_local && port < 0) ||
 	    !is_valid_ether_addr(info->addr))
 		return -EOPNOTSUPP;
@@ -860,10 +964,10 @@ static int fe_switch_atomic_event(struct notifier_block *nb,
 	if (fe_switch_port_index(sw, info->dev) < 0 &&
 	    !fe_switch_is_master(sw, info->dev))
 		return NOTIFY_DONE;
-	/* New ordinary CPU-learned sources are not a configuration change.
-	 * Rebuilding for each such source would flush the hardware learning we
-	 * are trying to synchronize. The core guard already covers true MAC
-	 * moves and deletion before publication, including user FDB flushes.
+	/* The core guard already fences first CPU creation, ownership takeover,
+	 * moves and deletion before publication. Do not invalidate a second
+	 * time from its notification, or churn epochs on same-port refreshes.
+	 * Hardware feedback uses a separate ownership-checked publication path.
 	 */
 	if (switchdev_fdb_is_dynamically_learned(fdb))
 		return NOTIFY_DONE;
@@ -1072,8 +1176,17 @@ static void fe_switch_work(struct work_struct *work)
 	sw->reason = fe_switch_snapshot(sw, &plan);
 	sw->reason = fe_switch_vlan_snapshot(sw, &plan, sw->reason);
 	sw->route_policy_allowed =
-		fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK;
-	sw->local_target = sw->route_policy_allowed &&
+		fe_switch_route_global_allowed(&plan);
+	sw->route_eligible_mask = fe_switch_route_eligible_ports(&plan, sw->route_mask);
+	sw->route_mask = sw->route_eligible_mask;
+	native_ports = fe_switch_forwarding_ports(&plan);
+	/* A shared local-MAC/SPB result cannot distinguish native sources.
+	 * Keep it on CPU16 if even one native source lacks routed permission;
+	 * independent route-only LANs and PON are not disabled by that choice.
+	 */
+	sw->native_route_policy_allowed = sw->route_policy_allowed &&
+		!(native_ports & ~sw->route_eligible_mask);
+	sw->local_target = sw->native_route_policy_allowed &&
 		fe->enabled && fe->prepared ? 25 : 16;
 	/* A bridge port may be blocked or have software-only policy even when
 	 * native switching is not requested. Do not resurrect old L3 rules past
@@ -1081,9 +1194,8 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	if (!sw->route_policy_allowed) {
 		sw->route_mask = 0;
-		/* Native learning-off/isolation and a forwarding STP subset do
-		 * not authorize the L3 engine. Keep both its ingress profiles on
-		 * the verified CPU gate, including PON, while native L2 runs. */
+		/* A fabric-wide private/software veto still keeps BOTH shared
+		 * L3 ingress profiles on CPU, not just the five LAN selectors. */
 		if (sw->reason != FE_SWITCH_OK || !sw->requested)
 			goto unlock;
 	}
@@ -1139,7 +1251,6 @@ static void fe_switch_work(struct work_struct *work)
 		goto arm;
 	}
 	seconds = age_ticks / HZ;
-	native_ports = fe_switch_forwarding_ports(&plan);
 	sw->rule_count = 0;
 	sw->replay_error = 0;
 	sw->replay_ports = native_ports;
@@ -1178,7 +1289,7 @@ static void fe_switch_work(struct work_struct *work)
 	sw->hw.vlan_plan = sw->vlan_domain ? &sw->vlans : NULL;
 	ret = fe_switch_hw_prepare(fe, &sw->hw, native_ports, seconds,
 				   br_multicast_enabled(sw->master),
-				   sw->route_policy_allowed);
+				   sw->native_route_policy_allowed);
 	if (ret) {
 		if (ret == -EOPNOTSUPP)
 			sw->reason = FE_SWITCH_HW_UNSUPPORTED;
@@ -1215,7 +1326,7 @@ static void fe_switch_work(struct work_struct *work)
 		/* Until an independently gated classifier-only profile exists,
 		 * exact MDB uses the already-authorized routed engine. Native L2
 		 * isolation/learning-off may not reopen that engine by implication. */
-		if (sw->route_policy_allowed && fe->enabled && fe->prepared) {
+		if (sw->native_route_policy_allowed && fe->enabled && fe->prepared) {
 			mdb_ports = 0;
 			ret = fe_mdb_prepare(fe, &sw->guard, generation, sw->master,
 					     sw->ports, plan.flags, native_ports, &mdb_ports);
@@ -1267,7 +1378,8 @@ failure:
 	rtl9617c_switch_guard_quiesce(&sw->guard);
 	ret = fe_switch_restore_locked(sw);
 	if (!ret && (sw->reason == FE_SWITCH_FOREIGN_FDB ||
-		     sw->reason == FE_SWITCH_HW_UNSUPPORTED) &&
+		     sw->reason == FE_SWITCH_HW_UNSUPPORTED ||
+		     sw->reason == FE_SWITCH_SOFTWARE_FDB) &&
 	    !rtl9617c_switch_guard_try_arm(&sw->guard, generation)) {
 		/* A supported route-only fallback is not a successful fallback
 		 * until its gate actually arms. The same false return can mean a
@@ -1426,9 +1538,16 @@ static void fe_switch_scan(struct work_struct *work)
 			goto resume;
 		ret = fe_switch_feedback(sw, &sw->next[sw->scan_cursor], true, generation);
 		operations++;
-		if (ret)
+		if (ret && ret != -EALREADY)
 			goto failure;
-		sw->pending_count = ++sw->scan_cursor;
+		/* A CPU-owned row is not this mirror's lease. Do not rebuild for
+		 * a benign ownership refusal, and do not let its slot become part
+		 * of the published/rollback prefix. Compact accepted rows in place;
+		 * pending_count never passes the still-unconsumed scan cursor.
+		 */
+		if (!ret)
+			sw->next[sw->pending_count++] = sw->next[sw->scan_cursor];
+		sw->scan_cursor++;
 	}
 	/* An epoch can close immediately after the final feedback (or during a
 	 * delete-only round). Retain that prefix for withdrawal, not as a newly
@@ -1440,7 +1559,7 @@ static void fe_switch_scan(struct work_struct *work)
 	swap = sw->learned;
 	sw->learned = sw->next;
 	sw->next = swap;
-	sw->learned_count = sw->scan_count;
+	sw->learned_count = sw->pending_count;
 	sw->pending_count = 0;
 	fe_switch_scan_reset(sw);
 	sw->polls++;
@@ -1476,11 +1595,13 @@ static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe)
 	if (!sw)
 		return ERR_PTR(-ENOMEM);
 	sw->fe = fe;
-	/* The new silicon path has not yet passed board throughput/interop
-	 * acceptance. Keep upgrades on the existing software bridge baseline;
-	 * the separate runtime control explicitly opts into native switching.
+	/* A request is not admission. Probe starts with engine_ready=false,
+	 * empty port ownership and a closed guard; subsequent port/NI events
+	 * queue the ordinary snapshot, capability and transaction path. Native
+	 * switching is requested by default, with a boot-only escape hatch and
+	 * the existing runtime control. No unsupported topology is forced open.
 	 */
-	sw->requested = false;
+	sw->requested = native_l2;
 	sw->reason = FE_SWITCH_ENGINE_DOWN;
 	INIT_WORK(&sw->work, fe_switch_work);
 	INIT_DELAYED_WORK(&sw->scan_work, fe_switch_scan);
@@ -1626,6 +1747,7 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 		"l2_hw_reason=%u l2_hw_reason_name=%s "
 		"l2_error=%d l2_ports=%#x l2_route_ports=%#x l2_domain_owned=%u "
 		"l2_flow_allowed=%u l2_route_policy_allowed=%u "
+		"l2_route_eligible_ports=%#x l2_native_route_policy_allowed=%u "
 		"l2_static=%u l2_static_published=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
 		"l2_learn_adds=%llu l2_learn_deletes=%llu l2_scan_errors=%llu "
 		"l2_bum_hardware=%u l2_bum_classes=%#x l2_vlan_hardware=0 l2_mdb_hardware=%u "
@@ -1637,6 +1759,7 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 		sw->hw.reason, fe_switch_hw_reason_name(&sw->hw), sw->error, sw->native_mask,
 		READ_ONCE(sw->armed_route_mask), sw->domain_owned,
 		READ_ONCE(sw->flow_allowed), sw->route_policy_allowed,
+		READ_ONCE(sw->armed_route_eligible_mask), sw->native_route_policy_allowed,
 		READ_ONCE(sw->rule_count),
 		READ_ONCE(sw->published_count),
 		READ_ONCE(sw->learned_count), sw->rebuilds, sw->polls,
@@ -1721,6 +1844,16 @@ static bool fe_switch_flow_allowed(struct rtl_fe *fe)
 {
 	return fe->engine_ready && fe->enabled && fe->route_admitted &&
 	       !fe->shutting_down;
+}
+static bool fe_switch_flow_ports_allowed(struct rtl_fe *fe,
+	const struct net_device *input, const struct net_device *output)
+{
+	/* The bridge-unreachable build has no native topology snapshot. Keep
+	 * its existing route path, still restricted to actual live FE owners.
+	 */
+	return fe_switch_flow_allowed(fe) && input && output &&
+	       fe_port(fe, (struct net_device *)input) &&
+	       fe_port(fe, (struct net_device *)output);
 }
 static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw, char *buffer, size_t bytes)
 {

@@ -455,8 +455,9 @@ static inline int rtl_mdb_profile_check(const struct rtl_dq_io *io,
 }
 
 /* No reliance on undocumented tie-breaking between equal-priority keys.
- * Pure ASM or disjoint SSM sources are supported; overlapping *,G / S,G
- * entries must remain CPU until the bridge consumer can order/prove them.
+ * The bridge consumer folds equivalent ASM/SSM policies or keeps the
+ * wildcard on CPU while emitting disjoint exact sources. Any accidental
+ * overlap in its final hardware plan is still rejected here.
  */
 static inline int rtl_mdb_rules_overlap(const struct rtl_mdb_rule *a,
 	const struct rtl_mdb_rule *b)
