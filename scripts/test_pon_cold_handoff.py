@@ -84,6 +84,15 @@ def sdk_sources(directory):
             'AAL_GLB_REG_WRITE(0x205,GLOBAL_GPON_CNTL)',
             'AAL_GLB_REG_WRITE(0x305,GLOBAL_GPON_CNTL)',
         )),
+        ('aal_xgpon.c', 'aal_xgpon_xgpn_glb_ctrl_set', (
+            'xgpn_glb_ctrl.wrd=AAL_PON_REG_READ(XGPN_XGPN_GLB_CTRL)',
+            'xgpn_glb_ctrl.bf.mac_en=glb_ctrl_cfg->mac_en;',
+            'AAL_PON_REG_WRITE(xgpn_glb_ctrl.wrd,XGPN_XGPN_GLB_CTRL)',
+        )),
+        ('aal_xgpon.c', 'aal_xgpon_tcont_flush', (
+            'xgpn_glb_ctrl.flush_en=1;', 'if(!xgpn_glb_ctrl.flush_en)',
+        )),
+        ('aal_xgpon.c', 'aal_xgpon_clk_is_locked_ok', ('returnTRUE;',)),
         ('aal_psds.c', '__psds_eth_csr_reset', (
             'AAL_GLB_REG_WRITE(0x30000,GLOBAL_EPON_CNTL)',
             'AAL_GLB_REG_WRITE(0x30200,GLOBAL_EPON_CNTL)',
@@ -94,6 +103,10 @@ def sdk_sources(directory):
         ('aal_psds.c', 'aal_psds_init', (
             'AAL_GLB_REG_FIELD_WRITE(GLOBAL_PON_CNTL,epon_mode,0x1)',
             'AAL_GLB_REG_FIELD_WRITE(GLOBAL_PON_CNTL,epon_mode,0x0)',
+        )),
+        ('aal_psds.c', '__psds_sync', (
+            '.bf.CKRDY_RX=1,', '.bf.CKRDY_TX=1,', '.bf.CKRDY_MPCP=1,',
+            'status=AAL_PON_REG_READ(PSDS_RGB8)',
         )),
     )
     for name, symbol, snippets in contracts:
@@ -120,6 +133,7 @@ def sdk_oracle(path):
         'GLOBAL_PON_CNTL': (
             ('epon_mode', 'RTL_PON_COLD_EPON_MODE'),
             ('pdc_reset', 'RTL_PON_COLD_PDC_RELEASED'),
+            ('psds_reg_rst_n', 'RTL_PON_COLD_PSDS_CSR_RELEASED'),
         ),
         'GLOBAL_EPON_CNTL': (
             ('epon_rst_n', 'RTL_PON_COLD_EPON_RELEASED'),
@@ -135,7 +149,8 @@ def sdk_oracle(path):
         ),
     }
     output = ''
-    for name in [*(r[0] for r in gates.values()), *globals_, 'PDC_FIFO_STATUS']:
+    for name in [*(r[0] for r in gates.values()), *globals_, 'PDC_FIFO_STATUS',
+                 'PSDS_MODE', 'PSDS_RGB8', 'PSDS_GBOX_CTRL', 'PDC_CTRL']:
         start = re.search(r'^#define ' + name + r'\s+0x', source, re.M).start()
         end = source.index('#endif /* !__ASSEMBLER__ */', start)
         output += source[start:end] + '#endif\n'
@@ -146,7 +161,11 @@ def sdk_oracle(path):
         output += f'assert(word.wrd==~rtl_pon_cold_gates[RTL_PON_COLD_GATE_{name}].mask); }}\n'
     for register, fields in globals_.items():
         for field, mask in fields:
-            output += f'{{ {register}_t word={{.wrd=0}}; word.bf.{field}=1; assert(word.wrd=={mask}); }}\n'
+            assertion = f'{{ {register}_t word={{.wrd=0}}; word.bf.{field}=1; assert(word.wrd=={mask}); }}\n'
+            # Keep the optional historical-header run usable without
+            # weakening its original, required reset/mux field checks.
+            output += (f'#ifdef {mask}\n{assertion}#endif\n'
+                       if mask == 'RTL_PON_COLD_PSDS_CSR_RELEASED' else assertion)
     output += '''
  assert(RTL_PON_COLD_CONTROL==GLOBAL_PON_CNTL);
  assert(RTL_PON_COLD_EPON_CONTROL==GLOBAL_EPON_CNTL);
@@ -154,6 +173,18 @@ def sdk_oracle(path):
  PDC_FIFO_STATUS_t fifo={.wrd=~0U}; fifo.bf.depth=0;
  assert(RTL_PON_COLD_PDC_FIFO_STATUS==PDC_FIFO_STATUS-0xf5500000U);
  assert(fifo.wrd==~RTL_PON_COLD_PDC_FIFO_DEPTH);
+#ifdef RTL_PON_COLD_XGPON_COMMANDS
+ XGPN_XGPN_GLB_CTRL_t command={.wrd=0};
+ command.bf.flush_en=1;command.bf.sw_reset_pmac=1;
+ assert(command.wrd==RTL_PON_COLD_XGPON_COMMANDS);
+ assert(RTL_PON_COLD_PSDS_MODE==PSDS_MODE-0xf5500000U);
+ assert(RTL_PON_COLD_PSDS_STATUS==PSDS_RGB8-0xf5500000U);
+ assert(RTL_PON_COLD_PSDS_GBOX==PSDS_GBOX_CTRL-0xf5500000U);
+ assert(RTL_PON_COLD_PDC_CONTROL==PDC_CTRL-0xf5500000U);
+ PSDS_RGB8_t clocks={.wrd=0};
+ clocks.bf.CKRDY_RX=1;clocks.bf.CKRDY_TX=1;clocks.bf.CKRDY_MPCP=1;
+ assert(clocks.wrd==0x1c00U);
+#endif
 }
 '''
     return output
@@ -178,7 +209,7 @@ static const unsigned masks[]={1U,1U<<7,1U<<1,3U};
 static const unsigned global_regs[]={0xf4320094U,0xf4320074U,0xf432007cU};
 static unsigned allowed,mac_reads,writes,fifo_reads,busy_left,stuck_index,stuck_mask;
 static unsigned drift_index,drift_on_read,drift_mask,drift_on_wait;
-static unsigned drift_mac_index,drift_mac_read;
+static unsigned drift_mac_index,drift_mac_read,drift_fifo_read;
 static unsigned gate_reads[4],gate_writes[4],gate_delay[4],gate_due[4],gate_requested[4];
 static unsigned gate_pending,gate_waits,ones_index,ones_on_read,fifo_ones_on_read;
 static unsigned flicker_index,change_index,change_wait,change_mask;
@@ -214,6 +245,7 @@ static unsigned read_reg(void *ctx,unsigned reg) {
  if(reg==0x9010) {
   for(unsigned i=0;i<4;i++)if(allowed&(1U<<i))assert(!(regs[offsets[i]/4]&masks[i]));
   fifo_reads++;
+  if(fifo_reads==drift_fifo_read)global[drift_index]^=drift_mask;
   if(fifo_reads==fifo_ones_on_read)return ~0U;
   if(fifo_stuck || (verify_busy && fifo_reads>=4))return 0xc001;
   if(busy_left){busy_left--;return 0xc001;}
@@ -238,6 +270,7 @@ static void write_reg(void *ctx,unsigned reg,unsigned value) {
  assert(regs[reg/4]!=~0U);
  assert((value&~masks[i])==(saved[reg/4]&~masks[i]));
  assert(!(value&masks[i]));
+ assert(i!=3 || !(value&0xc0000000U)); /* Never reissue reset/flush. */
  writes++;gate_writes[i]++;gate_requested[i]=value;
  assert(gate_writes[i]==1); /* Settling is a read-only wait, never replay. */
  if(gate_delay[i]) { gate_pending|=1U<<i;gate_due[i]=gate_waits+gate_delay[i]; }
@@ -250,6 +283,7 @@ static void setup(unsigned control,unsigned epon,unsigned gpon,unsigned seed) {
  memcpy(initial,global,sizeof(global));memset(global_reads,0,sizeof(global_reads));
  for(unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);i++)regs[i]=(i*2654435761U)^seed;
  for(unsigned i=0;i<4;i++)regs[offsets[i]/4]|=masks[i];
+ regs[0x4004/4]&=~0xc0000000U; /* command-busy fixtures are separate. */
  memcpy(saved,regs,sizeof(regs));
  writes=mac_reads=fifo_reads=busy_left=waits=0;allowed=0;expected_error=0;
  memset(gate_reads,0,sizeof(gate_reads));memset(gate_writes,0,sizeof(gate_writes));
@@ -259,7 +293,7 @@ static void setup(unsigned control,unsigned epon,unsigned gpon,unsigned seed) {
  change_wait=change_mask=0;observed_snapshot_drift=0;
  fifo_stuck=fifo_flicker=verify_busy=0;stuck_index=4;stuck_mask=0;
  drift_index=3;drift_on_read=drift_on_wait=0;drift_mask=0;
- drift_mac_index=4;drift_mac_read=0;
+ drift_mac_index=4;drift_mac_read=drift_fifo_read=0;
  if(!(control&0x200))return;
  /* Independent contract oracle: raw numeric SDK fields, not driver macros. */
  if(control&1) {
@@ -290,11 +324,15 @@ static void valid_case(struct rtl_pon_cold_state *state) {
  assert(state->gate_sampled_mask==allowed && state->gate_written_mask==allowed);
  assert(state->gate_polls==(allowed?RTL_PON_COLD_GATE_STABLE:0));
  assert(state->gate_stable==(allowed?RTL_PON_COLD_GATE_STABLE:0));
+ assert(state->gate_closed_mask==allowed && !state->gate_reopened_mask);
+ assert(state->gate_changed_mask==allowed);
  for(unsigned i=0;i<4;i++) {
   assert(state->gate_before[i]==((allowed&(1U<<i))?saved[offsets[i]/4]:0));
   assert(state->gate_requested[i]==((allowed&(1U<<i))?(saved[offsets[i]/4]&~masks[i]):0));
   assert(state->gate_readback[i]==state->gate_requested[i]);
   assert(gate_writes[i]==!!(allowed&(1U<<i)));
+  assert(state->gate_changes[i]==!!(allowed&(1U<<i)));
+  assert(state->gate_first_closed_poll[i]==!!(allowed&(1U<<i)));
  }
  assert(state->pdc_active==!!(initial[0]&0x200));
  assert(state->fifo_polls==fifo_reads);
@@ -308,9 +346,118 @@ static void valid_case(struct rtl_pon_cold_state *state) {
 '''
 
 CASES = r'''
+/* Independent observer bus: only raw configuration/status words. Gate,
+ * FIFO, PM counters, interrupt and indirect-window reads abort. */
+static const unsigned observe_regs[]={
+ 0xf4320094U,0xf4320074U,0xf432007cU,0xa02c,0xa060,0xa064,0x9014,
+};
+static unsigned observe_values[7],observe_reads[7],observe_original[3];
+static unsigned observe_drift_on,observe_drift_target,observe_drift_bit,observe_ones;
+static unsigned observe_read(void *ctx,unsigned reg) {
+ (void)ctx;
+ for(unsigned i=0;i<7;i++)if(reg==observe_regs[i]) {
+  observe_reads[i]++;
+  if(i>=3) {
+   assert(observe_original[0]&0x200);
+   assert(i==6 || (observe_original[0]&4));
+   assert(!memcmp(observe_original,observe_values,sizeof(observe_original)));
+  }
+  unsigned value=i==observe_ones?~0U:observe_values[i];
+  if(i==observe_drift_on)observe_values[observe_drift_target]^=1U<<observe_drift_bit;
+  return value;
+ }
+ assert(!"unowned diagnostic register");return 0;
+}
+static const struct rtl_dq_io observe_io={.read=observe_read};
+static void observe_setup(unsigned control) {
+ const unsigned initial_values[]={0,0x30000,0x205,0x451,0x9c00,0x454,2};
+ memcpy(observe_values,initial_values,sizeof(observe_values));observe_values[0]=control;
+ memcpy(observe_original,observe_values,sizeof(observe_original));
+ memset(observe_reads,0,sizeof(observe_reads));
+ observe_drift_on=observe_ones=7;observe_drift_target=observe_drift_bit=0;
+}
+static unsigned snapshot_cases(void) {
+ struct rtl_pon_cold_snapshot snapshot;
+ unsigned cases=0;
+ for(unsigned pdc=0;pdc<2;pdc++)for(unsigned csr=0;csr<2;csr++) {
+  observe_setup((pdc<<9)|(csr<<2));
+  unsigned expected=7U|(pdc?0x40U:0)|(pdc&&csr?0x38U:0);
+  assert(!rtl_pon_cold_snapshot(&observe_io,&snapshot));
+  assert(snapshot.stable && !snapshot.error);
+  assert(snapshot.sampled_mask==expected && snapshot.valid_mask==expected);
+  for(unsigned i=0;i<7;i++) {
+   assert(!!observe_reads[i]==!!(expected&(1U<<i)));
+   assert(snapshot.value[i]==((expected&(1U<<i))?observe_values[i]:0));
+  }
+  cases++;
+ }
+ /* Clock bits are raw observations. Neither absent sync nor LOS blocks a
+  * snapshot or is promoted to an admission/DDR completion condition. */
+ for(unsigned status=0;status<32;status++) {
+  observe_setup(0x30e);observe_values[4]=(status<<10)|(status&1);
+  assert(!rtl_pon_cold_snapshot(&observe_io,&snapshot));
+  assert(snapshot.stable && snapshot.value[4]==observe_values[4]);cases++;
+ }
+ for(unsigned missing=0;missing<7;missing++) {
+  observe_setup(0x30e);observe_ones=missing;
+  assert(rtl_pon_cold_snapshot(&observe_io,&snapshot)==-EIO);
+  assert(!snapshot.stable && snapshot.refused_register==observe_regs[missing]);
+  assert(snapshot.refused_value==~0U && snapshot.value[missing]==~0U);
+  assert(snapshot.sampled_mask==(1U<<(missing+1))-1);
+  assert(snapshot.valid_mask==(1U<<missing)-1);
+  for(unsigned i=missing+1;i<7;i++)assert(!observe_reads[i]);
+  cases++;
+ }
+ /* Reset/mux changes during any selected-domain read, including the
+  * final PDC control read, invalidate the bracketed observation. */
+ for(unsigned domain=3;domain<7;domain++)for(unsigned target=0;target<3;target++)
+ for(unsigned bit=0;bit<32;bit++) {
+  observe_setup(0x30e);observe_drift_on=domain;observe_drift_target=target;observe_drift_bit=bit;
+  assert(rtl_pon_cold_snapshot(&observe_io,&snapshot)==-EAGAIN);
+  assert(!snapshot.stable && snapshot.refused_register==observe_regs[target]);
+  assert(snapshot.refused_value==(observe_original[target]^(1U<<bit)));
+  for(unsigned i=domain+1;i<7;i++)assert(!observe_reads[i]);
+  cases++;
+ }
+ struct rtl_dq_io bad={0};
+ assert(rtl_pon_cold_snapshot(NULL,&snapshot)==-EINVAL);
+ assert(rtl_pon_cold_snapshot(&bad,&snapshot)==-EINVAL);
+ assert(rtl_pon_cold_snapshot(&observe_io,NULL)==-EINVAL);
+ return cases;
+}
 int main(void) {
  struct rtl_pon_cold_state state={0};unsigned cases=0;
  sdk_oracle();
+ cases+=snapshot_cases();
+ /* R11 real failure values: a refused low-bit clear stays a failure, with
+  * no FIFO/fabric access and no fabricated retry or command completion. */
+ setup(0x30e,0x30000,0x205,0);
+ regs[0x4004/4]=saved[0x4004/4]=0x61;stuck_index=3;stuck_mask=1;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-ETIMEDOUT);
+ assert(state.gate_before[3]==0x61 && state.gate_requested[3]==0x60 && state.gate_readback[3]==0x61);
+ assert(state.gate_polls==1000 && !state.gate_closed_mask && !state.gate_changed_mask);
+ assert(!state.gate_reopened_mask && !state.gate_first_closed_poll[3] && !state.gate_changes[3]);
+ assert(gate_writes[3]==1 && !fifo_reads);cases++;
+ /* TCONT flush and PMAC reset occupy the same register as mac_en. A cold
+  * RMW must not replay either command, including with mac_en already zero. */
+ for(unsigned bits=1;bits<4;bits++)for(unsigned enabled=0;enabled<2;enabled++) {
+  setup(0x30e,0x30000,0x205,0);
+  regs[0x4004/4]=saved[0x4004/4]=0x60|enabled|(bits<<30);
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EBUSY);
+  assert(state.stage==RTL_PON_COLD_GATE && !state.ready && !writes && !fifo_reads);
+  assert(state.refused_register==0x4004 && state.refused_value==regs[0x4004/4]);cases++;
+ }
+ for(unsigned bit=30;bit<=31;bit++) {
+  setup(0x30e,0x30000,0x205,0);
+  change_index=3;change_wait=1;change_mask=1U<<bit;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EBUSY);
+  assert(state.stage==RTL_PON_COLD_READBACK && !state.ready && writes==1 && !fifo_reads);cases++;
+  setup(0x30e,0x30000,0x205,0);
+  assert(!rtl_pon_cold_quiesce(&io,&state));
+  regs[0x4004/4]|=1U<<bit;
+  assert(rtl_pon_cold_verify(&io,&state)==-EBUSY);
+  assert(state.stage==RTL_PON_COLD_VERIFY && !state.ready && writes==1 && fifo_reads==4);cases++;
+ }
  /* Synthetic XG admission word with unrelated fields 0xa0. The
   * backend deliberately acknowledges the ONE completed request after two
   * sleep intervals. This is an admissible robustness case, not a claim
@@ -385,6 +532,8 @@ int main(void) {
   setup(target<2?0x30f:0x30e,0xf,7,0);flicker_index=target;
   assert(!rtl_pon_cold_quiesce(&io,&state));
   assert(state.gate_polls==5 && gate_waits==4 && state.gate_stable==3);
+  assert(state.gate_reopened_mask==(1U<<target));
+  assert(state.gate_first_closed_poll[target]==1 && state.gate_changes[target]==3);
   assert(gate_writes[target]==1);unchanged_except_gates();cases++;
  }
  /* Already-disabled gates need observation, not gratuitous writes. */
@@ -399,7 +548,7 @@ int main(void) {
  /* Hardware may update unrelated fields during settling. The read-only
   * poll must retain that update and never replay the old full register. */
  for(unsigned target=0;target<4;target++)for(unsigned bit=0;bit<32;bit++)
- if(!(masks[target]&(1U<<bit))) {
+ if(!(masks[target]&(1U<<bit)) && !(target==3 && bit>=30)) {
   setup(target<2?0x30f:0x30e,0xf,7,0x12345678);
   gate_delay[target]=2;change_index=target;change_wait=1;change_mask=1U<<bit;
   assert(!rtl_pon_cold_quiesce(&io,&state));
@@ -421,6 +570,15 @@ int main(void) {
  setup(0x30e,0x30000,3,0);verify_busy=1;
  assert(rtl_pon_cold_quiesce(&io,&state)==-EBUSY);
  assert(!state.ready && state.stage==RTL_PON_COLD_VERIFY && fifo_reads==4);cases++;
+ /* The last verify FIFO sample must also be bracketed by the original
+  * reset/mux values; checking only before it missed this transition. */
+ for(unsigned target=0;target<3;target++)for(unsigned bit=0;bit<32;bit++) {
+  setup(0x30e,0x30000,0x205,0);
+  drift_fifo_read=4;drift_index=target;drift_mask=1U<<bit;
+  assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+  assert(!state.ready && state.stage==RTL_PON_COLD_VERIFY && fifo_reads==4);
+  assert(state.refused_register==global_regs[target]);cases++;
+ }
  for(unsigned target=0;target<4;target++)for(unsigned bit=0;bit<32;bit++)if(masks[target]&(1U<<bit)) {
   setup(target<2?0x30f:0x30e,0x300ef,0x307,0);
   stuck_index=target;stuck_mask=1U<<bit;
@@ -617,6 +775,13 @@ def variants(header):
          '#define RTL_PON_COLD_FIFO_STABLE 1U'),
         ('ignore_fifo_timeout', 'if (i == RTL_PON_COLD_FIFO_POLLS)',
          'if (0)'),
+        ('allow_xgpon_command_replay',
+         'if (gate == RTL_PON_COLD_GATE_XGPON && (value & RTL_PON_COLD_XGPON_COMMANDS))',
+         'if (0 && gate == RTL_PON_COLD_GATE_XGPON && (value & RTL_PON_COLD_XGPON_COMMANDS))'),
+        ('observe_held_reset_pdc', 'if (!(control & RTL_PON_COLD_PDC_RELEASED))',
+         'if (0 && !(control & RTL_PON_COLD_PDC_RELEASED))'),
+        ('observe_held_reset_psds', '!(control & RTL_PON_COLD_PSDS_CSR_RELEASED))',
+         '0 && !(control & RTL_PON_COLD_PSDS_CSR_RELEASED))'),
     )
     for name, old, new in mutations:
         yield name, change_once(header, old, new)
@@ -633,8 +798,8 @@ def variants(header):
         ('skip_post_fabric_mac_check', 'rtl_pon_cold_verify',
          'if (value & rtl_pon_cold_gates[i].mask)', 'if (0)'),
         ('immediate_readback_regression', 'rtl_pon_cold_wait_gates',
-         'if (value & rtl_pon_cold_gates[i].mask)\n\t\t\t\tclosed = 0;',
-         'if (value & rtl_pon_cold_gates[i].mask)\n'
+         'if (value & rtl_pon_cold_gates[i].mask) {\n\t\t\t\tclosed = 0;',
+         'if (value & rtl_pon_cold_gates[i].mask) {\n'
          '\t\t\t\treturn rtl_pon_cold_error(state, -EIO, rtl_pon_cold_gates[i].reg, value);'),
         ('ignore_missing_settling_gate', 'rtl_pon_cold_wait_gates',
          'if (value == ~0U)', 'if (0)'),
@@ -661,6 +826,12 @@ def variants(header):
         ('ignore_missing_verify_fifo', 'rtl_pon_cold_verify',
          'state->fifo_polls++;\n\t\tif (value == ~0U)',
          'state->fifo_polls++;\n\t\tif (0)'),
+        ('skip_verify_final_global_guard', 'rtl_pon_cold_verify',
+         'ret = rtl_pon_cold_globals_match(io, state);\n\tif (ret)\n\t\treturn ret;\n\tstate->stage = RTL_PON_COLD_READY;',
+         'state->stage = RTL_PON_COLD_READY;'),
+        ('skip_snapshot_final_global_guard', 'rtl_pon_cold_snapshot',
+         'for (j = 0; j < RTL_PON_COLD_SAMPLE_PSDS_MODE; j++) {\n\t\tvalue =',
+         'for (j = 0; j < RTL_PON_COLD_SAMPLE_PSDS_MODE && 0; j++) {\n\t\tvalue ='),
     )
     for name, symbol, old, new in scoped:
         yield name, change_function(header, symbol, old, new)
@@ -718,7 +889,8 @@ def main():
                 if (run.returncode != -signal.SIGABRT or 'assert' not in run.stderr.lower() or
                         'AddressSanitizer' in run.stderr or 'runtime error:' in run.stderr):
                     raise SystemExit(f'{name}: not rejected by a runtime assertion\n' + run.stderr)
-                if name == 'immediate_readback_regression' and '!rtl_pon_cold_quiesce(&io,&state)' not in run.stderr:
+                if name == 'immediate_readback_regression' and not any(marker in run.stderr for marker in (
+                        '!rtl_pon_cold_quiesce(&io,&state)', 'rtl_pon_cold_quiesce(&io,&state)==-ETIMEDOUT')):
                     raise SystemExit('Old readback did not fail the intended delayed-acknowledgement assertion\n' + run.stderr)
                 mutants += 1
     print(f'PASS: rejected {mutants} cold-handoff safety mutants by runtime assertions; ASan/UBSan enabled')

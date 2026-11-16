@@ -59,6 +59,12 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
     write(pon / 'identity', 'PRIVATE_PON_IDENTITY\n')
     write(ni / 'fe', 'WRONG_NI_FE_PATH\n')
     for name, value in {
+        'l3_admission': 'schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n'
+                        'requests=12 install_failed=1 install_collision=0 install_unsupported=1\n'
+                        'last_failure_stage=destination_mac last_failure_errno=-95 last_rollback_errno=0\n',
+        'l3_flows': 'schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 instance_ns=314159265\n'
+                    'lease=1 hash=42 input_hw=3 output_hw=7 counted=1 samples=4 age_hits=3 l3_bytes=1000 packets=10\n'
+                    'emitted=1 truncated=0\n',
         'cold_bootstrap': 'schema=1 cached=1 historical=1 requested=1 attempted=1 managed=1 result=0 provider_ready=1 engine_poisoned=0\n'
                           'pon_snapshot_ready=1 pon_stage=7 pon_error=0 pon_pdc_active=1 pon_gated_mask=0x4\n'
                           'pon_gate_written_mask=0x4 pon_gate_sampled_mask=0x4 pon_gate_polls=5 pon_gate_stable=3\n'
@@ -71,6 +77,10 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
                            'contract=partial tm_te_baseline_verified=0 wan_arb_readback=0\n',
         'l2_switch': '1\n',
         'l2_evidence': 'mce_ctl=0002f0ff cp_lspid_to_pol_id_en=1\n',
+        'l2_resources': 'schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0\n'
+                        'l2_owner_sealed=1 l2_owner_ready=0x1 l2_owner_quarantined=0\n'
+                        'mce_owner=1 mce_contract_ready=0 mce_missing_contracts=0x1f\n'
+                        'mdb_state=cold-mce-contract mdb_error=-95\n',
         'lan_mib_evidence': 'schema=1 cached=1 clock=boottime raw=1 reset_tracking=0 l2_attribution=0 atomic_hardware_snapshot=0 read_opcode=0 counter_mode_verified=0 capture_ns=5000000000 registered_mask=0x1\n'
                             'port=0 ifindex=3 registered=1 valid=1 error=0 seq=5 attempts=5 begin_ns=4000000000 end_ns=4000000001 rx_bytes=9999 tx_bytes=8888\n',
         'xram_state': 'base_ready=1 dma_exposed=1 engine_poisoned=0 host_active=1 reboot_required=0\n',
@@ -121,6 +131,14 @@ printf 'timeout %s\n' "$*" >> "$OBSERVER_CALLS"
 [ "$1" = -s ] && [ "$2" = KILL ] && [ "$3" = 3 ] || exit 98
 if [ -n "${OBSERVER_REAL_TIMEOUT:-}" ]; then exec "$OBSERVER_REAL_TIMEOUT" "$@"; fi
 shift 3
+case "$*" in
+  *"${OBSERVER_FAIL_ONCE_MATCH:-MATCH_NOT_PRESENT}"*)
+    if [ ! -f "$OBSERVER_FAIL_ONCE_STATE" ]; then
+      : > "$OBSERVER_FAIL_ONCE_STATE"
+      printf 'read_failed=source_read records=0 errno=Resource_temporarily_unavailable\n'
+      exit 74
+    fi ;;
+esac
 case "$*" in
   *"${OBSERVER_PARTIAL_FAIL_MATCH:-MATCH_NOT_PRESENT}"*)
     printf '%s' "$OBSERVER_PARTIAL_VALUE"
@@ -211,6 +229,13 @@ exit 0
     assert output.count('[fabric_sample]\nskipped=active_diagnostics_not_requested') == 2
     assert output.count('[dma_state]\nskipped=active_diagnostics_not_requested') == 2
     assert trace.count('sleep 1\n') == 1
+    assert output.count('[l3_admission]\nschema=1 available=1 cached=1') == 2
+    assert output.count('last_failure_stage=destination_mac') == 2
+    assert output.count('lease=1 hash=42 input_hw=3 output_hw=7') == 2
+    assert output.count('[l2_resources]\nschema=1 available=1 cached=1') == 2
+    assert output.count('mce_missing_contracts=0x1f') == 2
+    assert trace.count(str(ni / 'l2_resources')) == 2
+    assert 'ip_json_required=0 fractional_sleep_required=0' in output
     assert 'timeout -s KILL 3 sh ' not in trace
     assert all(path.read_bytes() == value for path, value in original_files.items())
 
@@ -257,8 +282,43 @@ exit 0
         assert f'skipped={reason}' in output and str(debug / 'flows') not in trace
     write(pon / 'fe', 'available=0\n')
     output, trace, _ = run('1', '--active-diagnostics')
+    assert 'skipped=flow_state_incomplete' in output and str(debug / 'flows') not in trace
+    write(pon / 'fe', 'available=1\n')
+    output, trace, _ = run('1', '--active-diagnostics')
     assert 'skipped=flow_count_unknown' in output and str(debug / 'flows') not in trace
     write(pon / 'fe', state)
+
+    # Cached state may start with a small valid flow count and then fail.
+    # Neither tuple opt-in nor repeated partial attempts admits a table walk.
+    for details in ((), ('--details',)):
+        for no_newline in ('0', '1'):
+            output, trace, _ = run('1', '--active-diagnostics', *details,
+                env=dict(environment, OBSERVER_PARTIAL_FAIL_MATCH=str(pon / 'fe'),
+                         OBSERVER_PARTIAL_VALUE='available=1 flows=3',
+                         OBSERVER_PARTIAL_NO_NEWLINE=no_newline))
+            assert output.count('skipped=flow_state_incomplete') == 2
+            assert output.count('read_retries=2') == 2
+            assert str(debug / 'flows') not in trace
+    for bad_state in (
+        'available=1 flows=3\nread_failed=source_read records=1 errno=unavailable\n',
+        'available=1 flows=3\nread_truncated=16384_bytes_1024_lines_4096_line_bytes\n',
+        'available=1 flows=3\nread_empty=1\n',
+        'available=0 flows=3\n',
+        'available=1 flows=3\nflows=3\n',
+        'available=1 flows=3\nflows=invalid\n',
+    ):
+        write(pon / 'fe', bad_state)
+        output, trace, _ = run('1', '--active-diagnostics')
+        assert output.count('skipped=flow_state_incomplete') == 2
+        assert str(debug / 'flows') not in trace
+    write(pon / 'fe', state)
+    # A clean final retry is usable and still performs only one active read.
+    output, trace, _ = run('1', '--active-diagnostics', env=dict(environment,
+        OBSERVER_FAIL_ONCE_MATCH=str(pon / 'fe'),
+        OBSERVER_FAIL_ONCE_STATE=str(base / 'fe-failed-once')))
+    assert output.count('read_retries=1') == 1
+    assert 'skipped=flow_state_incomplete' not in output
+    assert trace.count(str(debug / 'flows')) == 2
 
     # Probe failures are explicit and do not turn a partial capture into silence.
     failed_environment = dict(environment, OBSERVER_FAIL_MATCH='qm_state')
@@ -266,6 +326,70 @@ exit 0
     assert output.count('probe_failed=awk status=124') == 2 and '[snapshot_after]' in output
     output, _, _ = run('1', '--active-diagnostics', env=dict(environment, OBSERVER_FAIL_MATCH='/flows'))
     assert output.count('[fe_flow_counters]\nprobe_failed=awk status=124') == 2
+
+    # Real getline failure before the header must retain its errno instead
+    # of becoming "unsupported_flow_header". Active reads are not retried.
+    (debug / 'flows').unlink(); (debug / 'flows').mkdir()
+    output, trace, _ = run('1', '--active-diagnostics')
+    blocks = re.findall(r'\[fe_flow_counters\]\n([^\[]*)', output)
+    assert len(blocks) == 2
+    assert all(re.search(r'^read_failed=source_read records=0 errno=\S+\n', b, re.M)
+               and '\nprobe_failed=awk status=74\n' in b for b in blocks)
+    assert 'unsupported_flow_header' not in output
+    assert trace.count(str(debug / 'flows')) == 2 and 'read_retries=' not in output
+    (debug / 'flows').rmdir()
+    write(debug / 'flows', '')
+    output, trace, _ = run('1', '--active-diagnostics')
+    assert output.count('[fe_flow_counters]\nread_empty=1\n') == 2
+    assert trace.count(str(debug / 'flows')) == 2
+    write(debug / 'flows', flow_header + flow_body)
+    # Timeout after valid rows, including an unterminated final row, keeps
+    # an exact unpadded marker and cannot leak the original tuple columns.
+    for no_newline in ('0', '1'):
+        output, trace, _ = run('1', '--active-diagnostics', env=dict(environment,
+            OBSERVER_PARTIAL_FAIL_MATCH='/flows',
+            OBSERVER_PARTIAL_VALUE=(flow_header + flow_body).rstrip('\n'),
+            OBSERVER_PARTIAL_NO_NEWLINE=no_newline))
+        blocks = re.findall(r'\[fe_flow_counters\]\n([^\[]*)', output)
+        assert all('\nprobe_failed=awk status=124\n' in b for b in blocks)
+        assert trace.count(str(debug / 'flows')) == 2 and 'read_retries=' not in output
+        assert '192.0.2.12' not in output and '198.51.100.7' not in output
+    for marker in ('read_failed=source_read records=3 errno=Resource_temporarily_unavailable',
+                   'read_truncated=16384_bytes_1024_lines_4096_line_bytes'):
+        for prefix in ('', flow_header + flow_body):
+            write(debug / 'flows', prefix + marker + '\n')
+            output, trace, _ = run('1', '--active-diagnostics')
+            blocks = re.findall(r'\[fe_flow_counters\]\n([^\[]*)', output)
+            assert all(marker + '\n' in b and marker + ' ' not in b for b in blocks)
+            assert trace.count(str(debug / 'flows')) == 2
+    write(debug / 'flows', flow_header + flow_body)
+
+    # A cached read may transiently fail while the table owner is busy.
+    # Retry that endpoint, never a read-clear/active sampling trigger.
+    output, trace, _ = run('1', env=dict(environment,
+        OBSERVER_FAIL_ONCE_MATCH='/l3_admission', OBSERVER_FAIL_ONCE_STATE=str(base / 'failed-once')))
+    assert output.count('read_retries=1') == 1
+    assert output.count('last_failure_stage=destination_mac') == 2
+    assert 'read_failed=' not in output and 'probe_failed=' not in output
+    assert trace.count('sleep 1\n') == 2
+    output, trace, _ = run('1', env=dict(environment, OBSERVER_FAIL_MATCH='/l3_admission'))
+    assert output.count('read_retries=2') == 2
+    assert output.count('probe_failed=awk status=124') == 2
+    assert trace.count('sleep 1\n') == 5
+    output, trace, _ = run('1', '--active-diagnostics', env=dict(environment, OBSERVER_FAIL_MATCH='/fabric_sample'))
+    assert output.count('probe_failed=awk status=124') == 2
+    assert trace.count('sleep 1\n') == 1 and 'read_retries=' not in output
+    # Empty and failed file reads must remain distinguishable. A readable
+    # directory causes a real getline error, not a simulated command code.
+    saved_admission=(ni / 'l3_admission').read_text()
+    write(ni / 'l3_admission', '')
+    output, trace, _ = run('1')
+    assert output.count('[l3_admission]\nread_empty=1') == 2
+    (ni / 'l3_admission').unlink(); (ni / 'l3_admission').mkdir()
+    output, trace, _ = run('1')
+    assert output.count('read_failed=source_read records=0 errno=') == 2
+    assert output.count('read_retries=2') == 2
+    (ni / 'l3_admission').rmdir(); write(ni / 'l3_admission',saved_admission)
 
     # A reader may produce a plausible first line and then fail. The clock
     # filter must not discard that failure and publish a trustworthy timestamp.
@@ -378,7 +502,8 @@ exit 0
     assert 'x' * 5000 not in output
 
 print('Datapath observer: passive-by-default native NI/lifecycle/topology/identity, private exclusive output, '
-      'separate active/tuple opt-ins, bounded reads, missing debugfs/tools, real timeout, two snapshots and wrapper passed')
+      'separate active/tuple opt-ins, failed/partial admission fencing, exact read diagnostics, '
+      'cached-only retries, bounded reads, missing debugfs/tools, real timeout, two snapshots and wrapper passed')
 
 if args.busybox_ssh:
     # No remote uploads or fixture writes: feed literals through stdin to the
@@ -420,7 +545,7 @@ sample_clock sample
     result = subprocess.run(command, input=functions + exercise, text=True,
                             capture_output=True, timeout=15, check=True)
     assert result.stdout == expected, repr(result.stdout)
-    broken = functions.replace('gsub(/[^[:print:]\\t\\r]/,",")', 'gsub(/\\000/,",")')
+    broken = functions.replace('gsub(/[^[:print:]\\t\\r]/,",",line)', 'gsub(/\\000/,",",line)')
     assert broken != functions
     result = subprocess.run(command, input=broken + exercise, text=True,
                             capture_output=True, timeout=15, check=True)

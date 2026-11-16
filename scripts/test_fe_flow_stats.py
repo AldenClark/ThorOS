@@ -27,7 +27,7 @@ typedef uint64_t u64;typedef uint32_t u32;
 static unsigned long jiffies=100;
 struct rtl_fe_flow;
 struct rtl_fe {u64 bytes;u32 packets,non_uc;unsigned int age;struct rtl_fe_flow **hash_owners;};
-struct rtl_fe_flow {bool published,counted,installed,deleting,activity_cached;unsigned int counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
+struct rtl_fe_flow {bool published,counted,installed,deleting,activity_cached;unsigned int counter,hash_index,ethernet_bytes;u64 bytes,observed_bytes,observed_packets;u32 packets,observations,activity_hits;unsigned long lastused,observation_at;int observation_error;};
 struct flow_cls_offload {struct {u64 bytes,packets;unsigned long lastused;} stats;};
 struct rtl_dq_io {struct rtl_fe *fe;};
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}
@@ -50,9 +50,12 @@ int main(void){
  struct flow_cls_offload cls={};
  assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.packets==5 && cls.stats.bytes==285 && cls.stats.lastused==100);
+ assert(flow.observations==1 && flow.observed_bytes==285 && flow.observed_packets==5);
+ assert(flow.observation_at==100 && !flow.observation_error);
  assert(!flow.activity_cached); /* MIB activity must not slide the Hash row cache. */
  jiffies=120;assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.packets==5 && cls.stats.bytes==285 && cls.stats.lastused==100);
+ assert(flow.observations==2 && flow.observed_bytes==285 && flow.observed_packets==5);
  flow.packets=UINT32_MAX-2;fe.packets=2;flow.bytes=6000;fe.bytes=6355;
  assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.packets==10 && cls.stats.bytes==570 && cls.stats.lastused==120);
@@ -78,7 +81,23 @@ int main(void){
  flow.packets=UINT32_MAX-2;flow.bytes=6000;fe.packets=UINT32_MAX;fe.non_uc=3;fe.bytes=6415;
  assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.bytes==570 && cls.stats.packets==10);
+ /* A reset/decreasing byte total or a torn sample smaller than its L2
+  * headers must not credit 2^64 bogus bytes to conntrack or the report. */
+ u64 before_bytes=cls.stats.bytes,before_packets=cls.stats.packets;
+ u64 observed=flow.observed_bytes;unsigned int samples=flow.observations;
+ flow.bytes=5000;flow.packets=10;fe.bytes=20;fe.packets=11;fe.non_uc=0;
+ assert(fe_stats(&fe,&flow,&cls)==-ERANGE && flow.observation_error==-ERANGE);
+ assert(cls.stats.bytes==before_bytes && cls.stats.packets==before_packets);
+ assert(flow.observed_bytes==observed && flow.observations==samples);
+ assert(flow.bytes==20 && flow.packets==11);
+ fe.bytes=21;fe.packets=12;
+ assert(fe_stats(&fe,&flow,&cls)==-ERANGE);
+ assert(cls.stats.bytes==before_bytes && cls.stats.packets==before_packets);
+ fe.bytes=104;fe.packets=13;
+ assert(!fe_stats(&fe,&flow,&cls) && !flow.observation_error);
+ assert(cls.stats.bytes==before_bytes+57 && cls.stats.packets==before_packets+1);
  flow.published=false;assert(fe_stats(&fe,&flow,&cls)==-ENOENT);
+ assert(flow.observation_error==-ENOENT);
  puts("Native FE stats:wire355 bytes/five packets ->IP285 bytes;idle lastused unchanged;packet counter wrap passed");
 }
 '''

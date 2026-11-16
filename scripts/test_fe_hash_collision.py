@@ -23,6 +23,7 @@ fixture=r'''
 #include <assert.h>
 #include <errno.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-fe-observe.h"
 typedef unsigned char u8;typedef unsigned short u16;typedef unsigned long long u64;typedef unsigned int u32;typedef unsigned int __le32;
 #define BIT(n) (1U<<(n))
 #define GFP_KERNEL 0
@@ -48,7 +49,7 @@ struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;bool retired;};
 '''
 fixture+=flow+rule+r'''
-struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized,naptv6;const struct net_device *denied_port;int error;unsigned long installs;void *memory;struct rtl_fe_flow **hash_owners;struct list_head flows,retries;unsigned long hashes[65536/64];};
+struct rtl_fe {bool enabled,engine_ready,shutting_down,fabric_authorized,naptv6;const struct net_device *denied_port;int error;unsigned long installs;u64 next_flow_lease;struct rtl_fe_observe observe;void *memory;struct rtl_fe_flow **hash_owners;struct list_head flows,retries;unsigned long hashes[65536/64];};
 /* The actual epoch/identity policy is covered by the switch worker test.
  * Here the publisher must honor that policy BEFORE any allocation/MMIO. */
 static bool fe_switch_flow_ports_allowed(struct rtl_fe *f,const struct net_device *input,const struct net_device *output)
@@ -101,6 +102,7 @@ static void naptv6_publication(void)
    .port=65535,.destination=3,.check_mask=63}};
  unsigned int old_allocations=allocations,old_mmio=mmio;
  assert(fe_install(&p,rule,300)==-EOPNOTSUPP); /* Immutable NORMAL profile. */
+ assert(f.observe.stage==FE_INSTALL_FORMAT);
  f.naptv6=true;
  struct rtl_fe_rule bad=rule;bad.action.translate_ipv6=0;
  assert(fe_install(&p,bad,300)==-EOPNOTSUPP);
@@ -117,6 +119,7 @@ static void naptv6_publication(void)
  assert(!fe_install(&p,rule,300));
  struct rtl_fe_flow *flow=container_of(f.flows.next,struct rtl_fe_flow,list);
  assert(f.hash_owners[flow->hash_index]==flow && flow->published && flow->installed);
+ assert(flow->lease_id==1 && f.next_flow_lease==1);
  const unsigned int *action=(void *)((char *)f.memory+RTL_FE_ACTION_OFFSET+flow->hash_index*RTL_FE_ACTION_BYTES);
  assert(packed_bits(action,45,1) && packed_bits(action,46,1));
  assert(packed_bits(action,47,32)==rule.action.address);
@@ -146,8 +149,10 @@ int main(void){
   * A policy gate must also block PON-originated callbacks (ingress=7),
   * although their PDC still points at the L3 engine and enabled stays true. */
  assert(fe_install(&p,a,1)==-EAGAIN);
+ assert(f.observe.stage==FE_INSTALL_ENGINE);
  f.engine_ready=true;f.fabric_authorized=false;
  assert(fe_install(&p,a,1)==-EAGAIN);
+ assert(f.observe.stage==FE_INSTALL_POLICY);
  f.fabric_authorized=true;f.denied_port=&n;
  assert(fe_install(&p,a,1)==-EAGAIN);
  f.denied_port=&out;
@@ -187,6 +192,7 @@ int main(void){
  assert((action[207/32]>>(207%32))&1);
  assert(((action[208/32]>>(208%32))&15)==9);
  assert(ret==-EOPNOTSUPP && !ddr[16417]);
+ assert(f.observe.stage==FE_INSTALL_HASH_COLLISION && f.next_flow_lease==1);
  assert(!traversed); /* The ordinary insertion path must not scan all flows. */
  /* Once deletion has cleared the DDR key, a timed-out cache invalidation
   * may still retain it in hardware. Its retry owner must block reuse. */

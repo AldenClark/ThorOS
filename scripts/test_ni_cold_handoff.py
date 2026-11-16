@@ -163,6 +163,7 @@ static bool claimed[4],mapped[4];
 static int map_fault,map_fault_index,sysfs_result;
 static bool stuck_pon_gate,stuck_fifo,post_fabric_drift;
 static unsigned int map_calls,unmap_calls,pon_reads,pon_writes;
+static unsigned int pon_psds_reads,pon_pdc_control_reads;
 static unsigned int ni_reads,ni_writes,ni_init_writes;
 static unsigned int ni_ignored_register,ni_allones_register,registered_port_mask;
 static unsigned int mce_diagnostic_fault_register;
@@ -180,7 +181,7 @@ static void *kvcalloc(size_t count,size_t size,unsigned int flags){assert(!flags
 static void kvfree(void *memory){free(memory);}
 #define lockdep_assert_held(lock) do{(void)(lock);assert(held);}while(0)
 static unsigned int fe_read(void *context,unsigned int reg){
- if(mce_diagnostic_fault_register==reg){mce_diagnostic_fault_register=0;return ~0U;}
+ if(fe.mcast && mce_diagnostic_fault_register==reg){mce_diagnostic_fault_register=0;return ~0U;}
  return read_reg(context,reg);
 }
 static void mutex_lock(struct mutex *lock){
@@ -195,7 +196,8 @@ static struct rtl_dq_io fe_io(struct rtl_fe *unused){
  assert(!registrations && !sysfs_calls && !mib_calls && !platform.dev.data);
  assert(!pthread_mutex_lock(&gate));baseline_entered=true;assert(!pthread_cond_broadcast(&changed));
  while(block_baseline && !allow_baseline)assert(!pthread_cond_wait(&changed,&gate));
- assert(!pthread_mutex_unlock(&gate));return io;
+ assert(!pthread_mutex_unlock(&gate));
+ struct rtl_dq_io adapter=io;adapter.read=fe_read;return adapter;
 }
 static void rtl_ni_owner_expose(struct rtl_ni_owner *item){item->exposed=true;exposes++;}
 #define dev_warn(d,...) ((void)(d))
@@ -261,6 +263,10 @@ static u32 readl(void *address){
  }
  assert(at>=mac && at<mac+sizeof(pon_mac) && mapped[0]);
  unsigned int offset=at-mac;
+ if(offset==0xa02c || offset==0xa060 || offset==0xa064){
+  assert((pon_global[0]&0x204)==0x204);pon_psds_reads++;
+ }
+ if(offset==0x9014){assert(pon_global[0]&0x200);pon_pdc_control_reads++;}
  if(offset==RTL_PON_COLD_PDC_FIFO_STATUS && stuck_fifo)return 1;
  return *(u32 *)address;
 }
@@ -411,6 +417,7 @@ static void init(struct rtl_xram *priv,bool required){
  pon_global[2]=0;pon_mac[0x088c/4]=1;pon_mac[0x10b4/4]=1U<<7;
  map_fault=map_fault_index=sysfs_result=0;stuck_pon_gate=stuck_fifo=post_fabric_drift=false;
  map_calls=unmap_calls=pon_reads=pon_writes=registrations=sysfs_calls=mib_calls=exposes=opens=dma_starts=qm_starts=0;
+ pon_psds_reads=pon_pdc_control_reads=0;
  ni_reads=ni_writes=ni_init_writes=0;
  ni_ignored_register=ni_allones_register=0;registered_port_mask=1;expected_open_result=0;
  mce_diagnostic_fault_register=0;
@@ -456,6 +463,29 @@ static void cached_snapshot(struct rtl_xram *priv){
            "pon_gate%u_before=0x%08x pon_gate%u_requested=0x%08x pon_gate%u_readback=0x%08x\n",
            gate,cold->gate_before[gate],gate,cold->gate_requested[gate],gate,cold->gate_readback[gate]);
   const char *line=strstr(cached,expected);assert(line && !strstr(line+1,expected));
+  snprintf(expected,sizeof(expected),"pon_gate%u_first_closed_poll=%u pon_gate%u_changes=%u",
+           gate,cold->gate_first_closed_poll[gate],gate,cold->gate_changes[gate]);
+  assert(strstr(cached,expected));
+ }
+ snprintf(expected,sizeof(expected),
+          "pon_gate_closed_mask=0x%x pon_gate_reopened_mask=0x%x pon_gate_changed_mask=0x%x ",
+          cold->gate_closed_mask,cold->gate_reopened_mask,cold->gate_changed_mask);
+ assert(strstr(cached,expected));
+ assert(strstr(cached,"pon_clock_observation_only=1"));
+ for(unsigned phase=0;phase<2;phase++){
+  const char *name=phase?"after":"before";
+  const struct rtl_pon_cold_snapshot *snapshot=phase?&cold->after:&cold->before;
+  snprintf(expected,sizeof(expected),
+           "pon_%s_sampled=0x%x pon_%s_valid=0x%x pon_%s_stable=%u pon_%s_error=%d "
+           "pon_%s_refused_register=0x%x pon_%s_refused_value=0x%x\n",
+           name,snapshot->sampled_mask,name,snapshot->valid_mask,name,snapshot->stable,name,snapshot->error,
+           name,snapshot->refused_register,name,snapshot->refused_value);
+  assert(strstr(cached,expected));
+  const char *fields[]={"control","epon","gpon","psds_mode","psds_status","psds_gbox","pdc_control"};
+  for(unsigned field=0;field<RTL_PON_COLD_SAMPLE_COUNT;field++){
+   snprintf(expected,sizeof(expected),"pon_%s_%s=0x%08x",name,fields[field],snapshot->value[field]);
+   assert(strstr(cached,expected));
+  }
  }
  assert(pon_reads==old_reads && pon_writes==old_writes && map_calls==old_maps);
  assert(ni_reads==old_ni_reads && ni_writes==old_ni_writes);
@@ -511,10 +541,15 @@ int main(void){
   assert(priv.fabric_managed && fe.fabric.ready && !fe.fabric.poisoned);
   assert(fe.l2_owner && fe.l2_owner->sealed && fe.mcast);
   assert(fe.l2_owner->mc_error==-EOPNOTSUPP && !fe.mcast->state.contract_ready);
+  assert(fe.mcast->state.handoff.valid_mask==31 && fe.mcast->state.handoff.missing==31);
+  assert(fe.mcast->state.handoff.reads==5 && fe.mcast->state.cold_reads==5);
   assert(rtl_fabric_native_mtu_compatible(&fe.fabric));
   assert(m.vlan_writes==1 && m.frame_writes==1 && m.scans==1);
   assert(priv.native_groups_created==(sysfs_result==0));
   assert(pon_writes==(flavor==2?0U:2U));
+  assert(!pon_psds_reads && pon_pdc_control_reads==(flavor==2?0U:2U));
+  assert(priv.pon_cold.before.valid_mask==(flavor==2?7U:0x47U));
+  assert(priv.pon_cold.after.valid_mask==priv.pon_cold.before.valid_mask);
   unsigned int old_writes=m.writes,old_pon=pon_writes,old_maps=map_calls;
   unsigned int old_init=ni_init_writes;
   assert(!rtl_ni_cold_bootstrap(&priv,&platform));
@@ -528,7 +563,7 @@ int main(void){
   * lease. An all-ones result in each real FE preflight read must preserve
   * NI publication, first LAN open and the existing DMA/QM baseline. */
  {
-  const unsigned registers[]={0xaa28,0x3834,0x38a0};
+  const unsigned registers[]={0xaa28,0x3400,0x3834,0x38a0,0xaa60};
   for(unsigned reg=0;reg<ARRAY_SIZE(registers);reg++){
    init(&priv,true);mce_diagnostic_fault_register=registers[reg];
    assert(!probe_publication_tail(&platform));normal_lan(&priv);
@@ -537,7 +572,10 @@ int main(void){
    assert(fe.l2_owner && fe.l2_owner->sealed && !rtl_l2_owner_retained(fe.l2_owner));
    assert(!fe.l2_owner->error && !fe.l2_owner->failures && !mce_diagnostic_fault_register);
    assert(fe.l2_owner->mc_error==-EIO && fe.mcast->state.error==-EIO);
-   assert(fe.mcast->state.cold_register==registers[reg] && fe.mcast->state.cold_reads==reg+1);
+   assert(fe.mcast->state.cold_register==registers[reg] && fe.mcast->state.cold_reads==5);
+   assert(fe.mcast->state.handoff.reads==5 && fe.mcast->state.handoff.missing==31);
+   assert(fe.mcast->state.handoff.valid_mask==(31U^(1U<<reg)));
+   assert(fe.mcast->state.handoff.value[reg]==~0U);
    assert(!fe.mcast->state.contract_ready && !fe.mcast->state.fdb_filter_owned);
    assert(!fe.mcast->state.mce_control_owned && dma_starts==1 && qm_starts==1);
    done(&priv);cases++;
@@ -572,6 +610,17 @@ int main(void){
   priv.pon_cold.gate_before[gate]=0xf1234567U+gate;
   priv.pon_cold.gate_requested[gate]=0xe2345678U+gate;
   priv.pon_cold.gate_readback[gate]=0xd3456789U+gate;
+  priv.pon_cold.gate_first_closed_poll[gate]=~0U-gate;
+  priv.pon_cold.gate_changes[gate]=~0U-4-gate;
+ }
+ priv.pon_cold.gate_closed_mask=0x12345678;priv.pon_cold.gate_reopened_mask=0x87654321;
+ priv.pon_cold.gate_changed_mask=~0U;
+ for(unsigned phase=0;phase<2;phase++){
+  struct rtl_pon_cold_snapshot *snapshot=phase?&priv.pon_cold.after:&priv.pon_cold.before;
+  snapshot->sampled_mask=~0U-phase;snapshot->valid_mask=0x12345678U+phase;
+  snapshot->stable=1;snapshot->error=(-2147483647-1);
+  snapshot->refused_register=0xabcdef00U+phase;snapshot->refused_value=~0U-phase;
+  for(unsigned field=0;field<RTL_PON_COLD_SAMPLE_COUNT;field++)snapshot->value[field]=0xf1234567U+field+10*phase;
  }
  priv.pon_cold.gate_written_mask=0x80000001;priv.pon_cold.gate_sampled_mask=0xf000000f;
  priv.pon_cold.gate_polls=~0U;priv.pon_cold.gate_stable=~0U;
@@ -602,6 +651,21 @@ int main(void){
   unsigned int before=pon_writes;assert(!rtl_ni_cold_bootstrap(&priv,&platform));
   assert(before==pon_writes);done(&priv);cases++;
  }
+ /* R11's real XG-PON cold-word rejection remains a diagnosed refusal;
+  * raw clock evidence is retained, never a substitute for mac_en ACK. */
+ init(&priv,true);pon_global[0]=0x30e;pon_global[1]=0x30000;pon_global[2]=0x205;
+ pon_mac[0x4004/4]=0x61;pon_mac[0xa02c/4]=0x451;
+ pon_mac[0xa060/4]=0x9c00;pon_mac[0xa064/4]=0x454;pon_mac[0x9014/4]=2;
+ stuck_pon_gate=true;
+ assert(!probe_publication_tail(&platform));normal_lan(&priv);
+ assert(priv.fabric_error==-ETIMEDOUT && !priv.fabric_managed && !m.writes && !m.scans);
+ assert(priv.pon_cold.gate_before[3]==0x61 && priv.pon_cold.gate_requested[3]==0x60);
+ assert(priv.pon_cold.gate_readback[3]==0x61 && !priv.pon_cold.gate_closed_mask);
+ assert(pon_psds_reads==6 && pon_pdc_control_reads==2 && pon_writes==1);
+ assert(priv.pon_cold.before.valid_mask==0x7f && priv.pon_cold.after.valid_mask==0x7f);
+ assert(priv.pon_cold.before.stable && priv.pon_cold.after.stable);
+ assert(priv.pon_cold.before.value[4]==0x9c00 && priv.pon_cold.after.value[4]==0x9c00);
+ cached_snapshot(&priv);done(&priv);cases++;
  /* Actual FE adapter distinguishes verified refusal from ambiguous failure. */
  for(unsigned int kind=0;kind<7;kind++){
   init(&priv,true);

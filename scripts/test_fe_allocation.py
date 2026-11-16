@@ -39,6 +39,7 @@ struct rtl_fe {
  void *registers,*memory,*debug,*bridge;
  struct rtl_fe_flow **hash_owners;
  uintptr_t dma;
+ unsigned long long evidence_instance_ns;
  bool naptv6;
  unsigned int fdb_cmd_mode_saved,cache_target;
  int lock,route_lock;
@@ -50,6 +51,7 @@ static bool fail_map,fail_owner,fail_dma,fail_index,fail_bridge;
 static bool naptv6;
 static unsigned int allocations,releases,debug_created,debug_removed,reo_writes,boot_control;
 static unsigned int reo[64];
+static unsigned long long ktime_get_ns(void) {return 314159265ULL;}
 static int fe_counters_fops,fe_cache_target_fops,fe_cache_snapshot_fops;
 static void *allocate(size_t count,size_t size,bool fail) {
  if(fail)return NULL;
@@ -92,6 +94,7 @@ static void debugfs_create_file(const char *name,unsigned int mode,void *dir,voi
 static void debugfs_remove_recursive(void *dir) {assert(dir==(void *)1);debug_removed++;}
 static void *fe_bridge_start(struct rtl_fe *fe) {
  assert(fe->naptv6==naptv6); /* Mode is frozen before any bridge worker can run. */
+ assert(fe->evidence_instance_ns==314159265ULL);
  assert(fe->lock==1 && fe->route_lock==2 && fe->cleanup_work==fe_cleanup_work);
  assert(fe->ports.next==&fe->ports && fe->flows.next==&fe->flows);
  assert(fe->blocks.next==&fe->blocks && fe->retries.next==&fe->retries);

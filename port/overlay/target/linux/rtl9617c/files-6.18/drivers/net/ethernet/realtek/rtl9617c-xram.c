@@ -1565,6 +1565,33 @@ static ssize_t l2_state_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(l2_state);
 
+static ssize_t l2_resources_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_resource_state(priv->fe, buf);
+}
+static DEVICE_ATTR_RO(l2_resources);
+
+static ssize_t l3_admission_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_admission_state(priv->fe, buf);
+}
+static DEVICE_ATTR_RO(l3_admission);
+
+static ssize_t l3_flows_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_flow_evidence(priv->fe, buf);
+}
+static DEVICE_ATTR_RO(l3_flows);
+
 static ssize_t l2_evidence_show(struct device *dev, struct device_attribute *attr,
 			       char *buf)
 {
@@ -1591,7 +1618,18 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 		"pon_gate0_before=0x%08x pon_gate0_requested=0x%08x pon_gate0_readback=0x%08x\n"
 		"pon_gate1_before=0x%08x pon_gate1_requested=0x%08x pon_gate1_readback=0x%08x\n"
 		"pon_gate2_before=0x%08x pon_gate2_requested=0x%08x pon_gate2_readback=0x%08x\n"
-		"pon_gate3_before=0x%08x pon_gate3_requested=0x%08x pon_gate3_readback=0x%08x\n",
+		"pon_gate3_before=0x%08x pon_gate3_requested=0x%08x pon_gate3_readback=0x%08x\n"
+		"pon_gate_closed_mask=0x%x pon_gate_reopened_mask=0x%x pon_gate_changed_mask=0x%x "
+		"pon_gate0_first_closed_poll=%u pon_gate0_changes=%u pon_gate1_first_closed_poll=%u pon_gate1_changes=%u "
+		"pon_gate2_first_closed_poll=%u pon_gate2_changes=%u pon_gate3_first_closed_poll=%u pon_gate3_changes=%u\n"
+		"pon_observation_schema=1 pon_clock_observation_only=1 pon_before_sampled=0x%x pon_before_valid=0x%x pon_before_stable=%u "
+		"pon_before_error=%d pon_before_refused_register=0x%x pon_before_refused_value=0x%x\n"
+		"pon_before_control=0x%08x pon_before_epon=0x%08x pon_before_gpon=0x%08x "
+		"pon_before_psds_mode=0x%08x pon_before_psds_status=0x%08x pon_before_psds_gbox=0x%08x pon_before_pdc_control=0x%08x\n"
+		"pon_after_sampled=0x%x pon_after_valid=0x%x pon_after_stable=%u pon_after_error=%d "
+		"pon_after_refused_register=0x%x pon_after_refused_value=0x%x\n"
+		"pon_after_control=0x%08x pon_after_epon=0x%08x pon_after_gpon=0x%08x "
+		"pon_after_psds_mode=0x%08x pon_after_psds_status=0x%08x pon_after_psds_gbox=0x%08x pon_after_pdc_control=0x%08x\n",
 		priv->cold_handoff_required, priv->cold_attempted, priv->fabric_managed,
 		priv->fabric_error, READ_ONCE(priv->provider_ready), READ_ONCE(priv->engine_poisoned),
 		cold->ready, cold->stage, cold->error, cold->pdc_active, cold->gated_mask,
@@ -1602,7 +1640,20 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 		cold->gate_before[0], cold->gate_requested[0], cold->gate_readback[0],
 		cold->gate_before[1], cold->gate_requested[1], cold->gate_readback[1],
 		cold->gate_before[2], cold->gate_requested[2], cold->gate_readback[2],
-		cold->gate_before[3], cold->gate_requested[3], cold->gate_readback[3]);
+		cold->gate_before[3], cold->gate_requested[3], cold->gate_readback[3],
+		cold->gate_closed_mask, cold->gate_reopened_mask, cold->gate_changed_mask,
+		cold->gate_first_closed_poll[0], cold->gate_changes[0],
+		cold->gate_first_closed_poll[1], cold->gate_changes[1],
+		cold->gate_first_closed_poll[2], cold->gate_changes[2],
+		cold->gate_first_closed_poll[3], cold->gate_changes[3],
+		cold->before.sampled_mask, cold->before.valid_mask, cold->before.stable,
+		cold->before.error, cold->before.refused_register, cold->before.refused_value,
+		cold->before.value[0], cold->before.value[1], cold->before.value[2],
+		cold->before.value[3], cold->before.value[4], cold->before.value[5], cold->before.value[6],
+		cold->after.sampled_mask, cold->after.valid_mask, cold->after.stable,
+		cold->after.error, cold->after.refused_register, cold->after.refused_value,
+		cold->after.value[0], cold->after.value[1], cold->after.value[2],
+		cold->after.value[3], cold->after.value[4], cold->after.value[5], cold->after.value[6]);
 }
 static DEVICE_ATTR_RO(cold_bootstrap);
 
@@ -1785,6 +1836,9 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_rx_bypass.attr,
 	&dev_attr_l2_switch.attr,
 	&dev_attr_l2_state.attr,
+	&dev_attr_l3_admission.attr,
+	&dev_attr_l2_resources.attr,
+	&dev_attr_l3_flows.attr,
 	&dev_attr_l2_evidence.attr,
 	&dev_attr_cold_bootstrap.attr,
 	&dev_attr_lan_mib_evidence.attr,
@@ -1797,7 +1851,8 @@ static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, 
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(kobj_to_dev(kobj)));
 
 	if ((attr == &dev_attr_l2_switch.attr || attr == &dev_attr_l2_state.attr ||
-	     attr == &dev_attr_l2_evidence.attr) &&
+	     attr == &dev_attr_l2_evidence.attr || attr == &dev_attr_l3_admission.attr ||
+	     attr == &dev_attr_l3_flows.attr || attr == &dev_attr_l2_resources.attr) &&
 	    !priv->fe)
 		return 0;
 	if (!priv->qm_rx &&
@@ -1927,6 +1982,7 @@ static void rtl_ni_cold_write(void *context, unsigned int reg, unsigned int valu
 static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *pdev)
 {
 	struct rtl_ni_cold_maps maps = {};
+	struct rtl_pon_cold_snapshot before = {};
 	const struct rtl_dq_io io = {
 		.context = &maps, .read = rtl_ni_cold_read, .write = rtl_ni_cold_write,
 	};
@@ -1956,11 +2012,17 @@ static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *
 		priv->fabric_error = ret;
 		goto fallback;
 	}
+	/* Raw reset/mode/SerDes observations are independent of the admission
+	 * contract. Missing clocks are evidence, never a fabricated MAC ACK.
+	 * These run only inside the temporary lease, never from sysfs reads. */
+	rtl_pon_cold_snapshot(&io, &before);
 	ret = rtl_pon_cold_quiesce(&io, &priv->pon_cold);
+	priv->pon_cold.before = before;
 	if (ret) {
 		/* No SVL/MRU/table write was attempted. Closed PON MAC admission
 		 * stays closed until its normal owner initializes it. */
 		priv->fabric_error = ret;
+		rtl_pon_cold_snapshot(&io, &priv->pon_cold.after);
 		rtl_ni_cold_unmap(&maps);
 		goto fallback;
 	}
@@ -1980,6 +2042,7 @@ static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *
 		priv->fabric_managed = true;
 		rtl_ni_owner_expose(priv->owner);
 	}
+	rtl_pon_cold_snapshot(&io, &priv->pon_cold.after);
 	rtl_ni_cold_unmap(&maps);
 	if (!priv->fabric_managed)
 		goto fallback;
@@ -1987,6 +2050,7 @@ static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *
 		 RTL_NI_FRAME_WIRE_BYTES);
 	goto out;
 quarantine:
+	rtl_pon_cold_snapshot(&io, &priv->pon_cold.after);
 	rtl_ni_cold_unmap(&maps);
 	rtl_ni_owner_expose(priv->owner);
 	rtl_engine_poison(priv);

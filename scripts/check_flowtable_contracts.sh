@@ -14,6 +14,7 @@ cd "$project"
 mkdir -p artifacts logs
 python3 scripts/test_fe_flow_parser.py --kernel "$kernel" --mutants
 python3 scripts/test_l2_fdb_authority.py --kernel "$kernel" --mutants
+python3 scripts/test_l2_fdb_preflight.py --kernel "$kernel"
 for test in fe_cookie_index fe_pppoe_cleanup \
             flowtable_bridge_move flowtable_bridge_ageing flowtable_software_ageing \
             flowtable_work_lifetime flowtable_bridge_policy flowtable_partial_offload \

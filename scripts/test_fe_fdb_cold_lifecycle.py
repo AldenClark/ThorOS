@@ -140,7 +140,8 @@ static void lifetime(unsigned int boot,bool svl,bool learning,unsigned int nativ
  assert(fe.l2_owner && fe.l2_owner->sealed && !rtl_l2_owner_retained(fe.l2_owner));
  assert(fe.l2_owner->mc_error==-EOPNOTSUPP);
  assert(fe.mcast && fe.mcast->state.error==-EOPNOTSUPP);
- assert(!fe.mcast->state.contract_ready && fe.mcast->state.cold_reads==3);
+ assert(!fe.mcast->state.contract_ready && fe.mcast->state.cold_reads==5);
+ assert(fe.mcast->state.handoff.valid_mask==31);
  assert(model.commands==!svl && rtl_fabric_native_mtu_compatible(&fe.fabric));
  struct rtl_dq_io io=fe_io(&fe);assert(!rtl_fabric_check(&io,&fe.fabric));
  route_roundtrip(); /* Native L2 remains off: this was the missing cold dependency. */
@@ -184,7 +185,7 @@ static void allocation_refusal(void)
 static void inherited_admission(void)
 {
  struct rtl_fe_mcast multicast={0};
- const unsigned registers[]={0xaa28,0x3834,0x38a0};
+ const unsigned registers[]={0xaa28,0x3400,0x3834,0x38a0,0xaa60};
  reset();fe.mcast=&multicast;fe.lock=true;
  unsigned commands=model.commands,writes=model.writes;
  /* Even an all-zero hash/cache/base fixture is not a documented global
@@ -195,13 +196,14 @@ static void inherited_admission(void)
   model.corrupt_read_address=registers[i];model.corrupt_read_value=~0U;
   assert(fe_mcast_inherited_l3_check(&fe)==-EIO);
   assert(multicast.state.cold_register==registers[i]);
+  assert(multicast.state.handoff.reads==5 && multicast.state.handoff.valid_mask==(31U&~BIT(i)));
   assert(!multicast.state.contract_ready && model.commands==commands && model.writes==writes);
  }
  fe.mcast=NULL;fe.lock=false;
 }
 static void inherited_failure_baseline(void)
 {
- const unsigned registers[]={0xaa28,0x3834,0x38a0};
+ const unsigned registers[]={0xaa28,0x3400,0x3834,0x38a0,0xaa60};
  for(unsigned i=0;i<ARRAY_SIZE(registers);i++) {
   reset();allocation_calls=0;allocation_fail=0;
   model.reg[RTL_FABRIC_FRAME_LENGTH/4]=0x004023f1;
@@ -219,7 +221,9 @@ static void inherited_failure_baseline(void)
   assert(!fe.l2_owner->failures && !rtl_l2_owner_retained(fe.l2_owner));
   assert(!fe.l2_owner->ledger.quarantined && !fe.l2_owner->journal.quarantined);
   assert(fe.l2_owner->mc_error==-EIO && fe.mcast->state.error==-EIO);
-  assert(fe.mcast->state.cold_reads==i+1 && fe.mcast->state.cold_register==registers[i]);
+  /* All independent read-only samples are captured even if one fails. */
+  assert(fe.mcast->state.cold_reads==5 && fe.mcast->state.cold_register==registers[i]);
+  assert(fe.mcast->state.handoff.valid_mask==(31U&~BIT(i)));
   assert(!fe.mcast->state.contract_ready && !fe_mcast_available(&fe));
   assert(!fe_mcast_retained(&fe) && !model.pending);
   struct rtl_dq_io io=fe_io(&fe);assert(!rtl_fabric_check(&io,&fe.fabric));

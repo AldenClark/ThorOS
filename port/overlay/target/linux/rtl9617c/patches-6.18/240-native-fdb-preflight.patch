@@ -1,0 +1,49 @@
+From: ThorOS maintainers
+Subject: [PATCH] bridge: preflight CPU-authoritative FDB without offload replay
+
+Count exactly the dynamic CPU entries that native replay must not take over.
+Keep this read-only and VID-scoped; a generation-checked replay and arm still
+revalidate races. Do not create an offloaded bridge domain merely to discover
+the first CPU-owned row, and do not refresh, forget or extern-learn those rows.
+
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -313,6 +313,38 @@
+ }
+ EXPORT_SYMBOL_GPL(br_switchdev_fdb_find_port);
+ 
++int br_rtl9617c_fdb_cpu_count(const struct net_device *master, u16 vid,
++			    unsigned int *count)
++{
++	const struct net_bridge_fdb_entry *fdb;
++	const struct net_bridge *br;
++	unsigned int found = 0;
++
++	ASSERT_RTNL();
++	if (!master || !count || vid >= VLAN_VID_MASK ||
++	    !netif_is_bridge_master(master))
++		return -EINVAL;
++	br = netdev_priv(master);
++	/* Match dynamic replay plus br_switchdev_fdb_find_port(), not the
++	 * hardware-offloaded bit alone. A CPU row can retain that flag until
++	 * teardown; EXT_LEARNED is the authority marker. Keep even expired
++	 * rows until bridge GC actually withdraws them, matching replay. */
++	rcu_read_lock();
++	hlist_for_each_entry_rcu(fdb, &br->fdb_list, fdb_node) {
++		if (fdb->key.vlan_id != vid ||
++		    test_bit(BR_FDB_LOCAL, &fdb->flags) ||
++		    test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
++		    test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) ||
++		    !br_switchdev_fdb_notifies(fdb) || !READ_ONCE(fdb->dst))
++			continue;
++		found++;
++	}
++	rcu_read_unlock();
++	*count = found;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_cpu_count);
++
+ void
+ br_switchdev_fdb_notify(struct net_bridge *br,
+ 			const struct net_bridge_fdb_entry *fdb, int type)

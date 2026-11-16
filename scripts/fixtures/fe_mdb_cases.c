@@ -662,6 +662,12 @@ static void dynamic_and_coexistence(void)
 	unsigned steer;
 
 	for (unsigned ipv6 = 0; ipv6 <= CONFIG_IPV6; ipv6++) {
+		/* No router overrides the blocked PG in this independent control.
+		 * The focused suite must exercise the actual programmed LAN mask,
+		 * not only the blocked+router case whose result is unchanged. */
+		reset(); entry(ipv6, 1, 9, 6);
+		records[1].port.forward = false; records[1].port.blocked = true;
+		assert(!prepare(&steer)); expect_lookup(ipv6, 1, 9, 4);
 		for (unsigned pending = 0; pending < 2; pending++) {
 			reset(); entry(ipv6, 1, 9, 2); source_record(1, 2); router(ipv6, 4);
 			records[1].port.permanent = false; records[1].port.timer.pending = pending;
@@ -828,12 +834,17 @@ static void capacity_and_rollback(void)
 	 * removes only its CLS producer; it must not decrement that aggregate
 	 * MCE dependency while the DFT owner still needs it. */
 	reset(); entry(0, 1, 0, 2);
-	u16 bum;
+	u16 bum, tail;
 	assert(!fe_mcast_group(&fe, &bridge.guard, 19, 0, &ports[0], &master, 0, 2, &bum));
 	assert(!fe_mcast_publish(&fe, bum));
+	assert(!fe_mcast_group(&fe, &bridge.guard, 19, 4, &ports[4], &master, 0, 1, &tail));
+	unsigned tail_token = mcast.state.vector[tail].token;
+	assert(!mcast.state.vector[tail].published && !mcast.state.token[tail_token].published);
 	m.exhaust_after_valid = 2;
 	assert(prepare(&steer) == -ENOSPC && !steer); no_keys();
 	assert(mcast.state.vector[bum].active && owner.active[RTL_L2_SHARED_MC_VECTOR][bum] == 1);
+	assert(!mcast.state.vector[tail].allocated && !mcast.state.token[tail_token].allocated);
+	assert(mcast.state.unpublished_aborts == 1);
 	cases++;
 }
 

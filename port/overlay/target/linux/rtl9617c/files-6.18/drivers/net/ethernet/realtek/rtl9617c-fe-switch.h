@@ -211,6 +211,20 @@ struct fe_switch_published {
 	u64 cookie;
 };
 
+/* FE-mutex-protected result of a whole worker transaction, including its
+ * switchdev rollback. Live admission bits remain separately observable:
+ * an asynchronous guard may close them without changing this evidence. */
+struct fe_switch_completed {
+	u64 generation, serial;
+	struct fe_switch_hw_observed observed;
+	u32 native_ports, route_ports, route_eligible_ports;
+	unsigned int cpu_fdb_count, hw_reason;
+	int error, preflight_error;
+	enum fe_switch_reason reason;
+	bool valid, requested, enabled, prepared, engine_ready;
+	bool armed, preflight_done;
+};
+
 /* A populated 4K table must not monopolize RTNL or the shared FE mutex.
  * Count every MMIO scan/merge/feedback operation, and also yield on elapsed
  * time: a slow indirect command must not consume a whole batch unchecked.
@@ -282,6 +296,11 @@ struct rtl_fe_bridge {
 	enum fe_switch_reason reason;
 	u64 rebuilds, polls, learned_adds, learned_deletes, scan_errors;
 	u64 route_generation;
+	struct fe_switch_completed completed;
+	u64 worker_skips;
+	unsigned int cpu_fdb_count;
+	int preflight_error;
+	bool worker_busy, force_reconcile, preflight_done;
 };
 
 static void fe_switch_scan_reset(struct rtl_fe_bridge *sw)
@@ -646,8 +665,14 @@ static int fe_switch_quiesce_locked(struct rtl_fe *fe)
 
 static void fe_switch_reconcile_locked(struct rtl_fe *fe)
 {
-	if (fe->bridge)
+	if (fe->bridge) {
+		/* An FE lifecycle/withdrawal transition can close the routed gate
+		 * without changing the bridge epoch. This is not a redundant
+		 * switchdev notification: the last withdrawal must re-arm even
+		 * when a worker completed a valid, CPU-gated snapshot meanwhile. */
+		fe->bridge->force_reconcile = true;
 		fe_switch_queue(fe->bridge);
+	}
 }
 
 static bool fe_switch_request_current(struct rtl_fe *fe, bool requested)
@@ -686,6 +711,9 @@ static int fe_switch_request_locked(struct rtl_fe *fe, bool requested)
 		return -EOPNOTSUPP;
 	if (fe_switch_request_current(fe, requested))
 		return 0;
+	/* An explicit retry is distinct from a duplicate deferred notifier.
+	 * It may resample a repaired hardware baseline in the same epoch. */
+	fe->bridge->force_reconcile = true;
 	WRITE_ONCE(fe->bridge->requested, requested);
 	if (!requested)
 		ret = fe_switch_quiesce_locked(fe);
@@ -815,6 +843,81 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 }
 
 #include "rtl9617c-fe-switch-vlan.h"
+
+/* Read-only, before switchdev attaches a hardware domain or replays any
+ * static entry. The atomic replay guard remains the final race check. */
+static int fe_switch_cpu_fdb_preflight(struct rtl_fe_bridge *sw)
+{
+	struct net_device *master;
+	unsigned int i, count;
+	int ret;
+
+	sw->cpu_fdb_count = 0;
+	if (!sw->vlan_domain)
+		return br_rtl9617c_fdb_cpu_count(sw->master, 0, &sw->cpu_fdb_count);
+	for (i = 0; i < sw->vlans.count; i++) {
+		master = fe_switch_bridge_for_vid(sw, sw->vlans.vlans[i].vid);
+		if (!master)
+			return -ENODEV;
+		ret = br_rtl9617c_fdb_cpu_count(master, sw->vlans.vlans[i].vid, &count);
+		if (ret)
+			return ret;
+		sw->cpu_fdb_count += count;
+	}
+	return 0;
+}
+
+static bool fe_switch_rebuild_current(struct rtl_fe_bridge *sw, u64 generation)
+{
+	const struct fe_switch_completed *done = &sw->completed;
+	struct rtl_fe *fe = sw->fe;
+
+	/* Policy BEGIN closes armed before publishing a change, then queues
+	 * another epoch. A redundant blocking notification must not stop a
+	 * healthy routed path or destroy an in-progress bounded FDB scan.
+	 * Foreign-table retries and I/O failures deliberately remain real work. */
+	if (!done->valid || sw->worker_busy || sw->force_reconcile ||
+	    fe->error || fe->pending_withdrawals || sw->hw.journal.quarantined ||
+	    sw->hw.journal.restoring || !sw->guard.registered ||
+	    done->generation != generation || done->requested != sw->requested ||
+	    done->enabled != fe->enabled || done->prepared != fe->prepared ||
+	    done->engine_ready != fe->engine_ready || !fe->engine_ready ||
+	    !done->armed || !READ_ONCE(sw->guard.armed) ||
+	    rtl9617c_switch_guard_blocked(&sw->guard) ||
+	    sw->reason == FE_SWITCH_FOREIGN_FDB)
+		return false;
+	return !sw->error || ((sw->reason == FE_SWITCH_SOFTWARE_FDB ||
+			      sw->reason == FE_SWITCH_HW_UNSUPPORTED) &&
+			     sw->error == -EOPNOTSUPP);
+}
+
+static void fe_switch_complete(struct rtl_fe_bridge *sw, u64 generation)
+{
+	struct fe_switch_completed *done = &sw->completed;
+
+	done->generation = generation;
+	done->serial++;
+	done->reason = sw->reason;
+	done->error = sw->error;
+	done->hw_reason = sw->hw.reason;
+	done->native_ports = sw->native_mask;
+	done->route_ports = READ_ONCE(sw->armed_route_mask);
+	done->route_eligible_ports = READ_ONCE(sw->armed_route_eligible_mask);
+	done->cpu_fdb_count = sw->cpu_fdb_count;
+	done->preflight_done = sw->preflight_done;
+	done->preflight_error = sw->preflight_error;
+	if (sw->preflight_done)
+		done->observed = sw->hw.observed;
+	else
+		memset(&done->observed, 0, sizeof(done->observed));
+	done->requested = sw->requested;
+	done->enabled = sw->fe->enabled;
+	done->prepared = sw->fe->prepared;
+	done->engine_ready = sw->fe->engine_ready;
+	done->armed = READ_ONCE(sw->guard.armed);
+	done->valid = true;
+	sw->worker_busy = false;
+}
 
 /* Replay is synchronous and supplies our non-NULL ctx. Ordinary FDB events
  * never program a table in atomic context; they invalidate the snapshot.
@@ -1151,7 +1254,17 @@ static void fe_switch_work(struct work_struct *work)
 	rtnl_lock();
 	mutex_lock(&fe->lock);
 	if (sw->stopping || fe->shutting_down)
-		goto unlock;
+		goto idle;
+	generation = rtl9617c_switch_guard_generation(&sw->guard);
+	if (fe_switch_rebuild_current(sw, generation)) {
+		sw->worker_skips++;
+		goto idle;
+	}
+	sw->worker_busy = true;
+	sw->force_reconcile = false;
+	sw->cpu_fdb_count = 0;
+	sw->preflight_done = false;
+	sw->preflight_error = 0;
 	/* Rebuild can quiesce/re-arm without changing the policy generation.
 	 * Never resume a partial physical scan across that table replacement.
 	 */
@@ -1236,6 +1349,25 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	if (sw->reason != FE_SWITCH_OK)
 		goto arm;
+	ret = fe_switch_cpu_fdb_preflight(sw);
+	if (ret)
+		goto failure;
+	sw->hw.vlan_plan = sw->vlan_domain ? &sw->vlans : NULL;
+	sw->preflight_error = fe_switch_hw_preflight(fe, &sw->hw, native_ports);
+	sw->preflight_done = true;
+	/* Report both independent blockers. A CPU-authoritative row is not
+	 * permission to suppress the physical VLAN/hash/MRU evidence; neither
+	 * ineligibility is an I/O failure of the separately admitted L3 path. */
+	if (sw->preflight_error && sw->preflight_error != -EOPNOTSUPP) {
+		ret = sw->preflight_error;
+		goto failure;
+	}
+	if (sw->cpu_fdb_count || sw->preflight_error) {
+		sw->reason = sw->cpu_fdb_count ? FE_SWITCH_SOFTWARE_FDB :
+			FE_SWITCH_HW_UNSUPPORTED;
+		sw->error = -EOPNOTSUPP;
+		goto arm;
+	}
 	ret = fe_switch_age_ticks(sw, &age_ticks);
 	/* Read the actual FDB hold_time in jiffies, including topology-change
 	 * forward_delay. Hardware exposes whole 19-bit seconds. In particular,
@@ -1404,6 +1536,12 @@ unlock:
 	mutex_unlock(&fe->lock);
 	if (!sw->active)
 		fe_switch_unoffload(sw);
+	/* A stats reader may enter while switchdev cleanup drops FE mutex.
+	 * Publish only after that cleanup, never a half-replayed prefix. */
+	mutex_lock(&fe->lock);
+	fe_switch_complete(sw, generation);
+idle:
+	mutex_unlock(&fe->lock);
 	rtnl_unlock();
 }
 
@@ -1730,49 +1868,38 @@ static int fe_bridge_stop(struct rtl_fe_bridge *sw)
 	return 0;
 }
 
-static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
-			       char *buffer, size_t bytes)
+/* FE mutex held by the sysfs reader. Keep the extended transaction state
+ * in l2_evidence rather than exhausting the one-page l2_state summary. */
+static ssize_t fe_bridge_evidence(struct rtl_fe_bridge *sw,
+				  char *buffer, size_t bytes)
 {
+	const struct fe_switch_completed *done;
 	const struct fe_switch_hw_observed *observed;
-	unsigned int port, bum = 0;
 	ssize_t length;
 
 	if (!sw)
-		return scnprintf(buffer, bytes, "l2_supported=0 l2_requested=0 l2_active=0\n");
-	if (READ_ONCE(sw->active))
-		for (port = 0; port < FE_LAN_PORTS; port++)
-			bum |= sw->hw.bum_enabled[port];
+		return scnprintf(buffer, bytes, "l2_completed_valid=0\n");
+	done = &sw->completed;
 	length = scnprintf(buffer, bytes,
-		"l2_supported=1 l2_requested=%u l2_active=%u l2_reason=%u "
-		"l2_hw_reason=%u l2_hw_reason_name=%s "
-		"l2_error=%d l2_ports=%#x l2_route_ports=%#x l2_domain_owned=%u "
-		"l2_flow_allowed=%u l2_route_policy_allowed=%u "
-		"l2_route_eligible_ports=%#x l2_native_route_policy_allowed=%u "
-		"l2_static=%u l2_static_published=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
-		"l2_learn_adds=%llu l2_learn_deletes=%llu l2_scan_errors=%llu "
-		"l2_bum_hardware=%u l2_bum_classes=%#x l2_vlan_hardware=0 l2_mdb_hardware=%u "
-		"l2_multibridge_hardware=0 l2_local_target=%u l2_rx_gate_verified=%u "
-		"l2_learning_ports=%#x l2_isolated_ports=%#x "
-		"l2_journal_used=%u l2_journal_capacity=%u "
-		"l2_journal_quarantined=%u l2_retries=%u\n",
-		sw->requested, READ_ONCE(sw->active), sw->reason,
-		sw->hw.reason, fe_switch_hw_reason_name(&sw->hw), sw->error, sw->native_mask,
-		READ_ONCE(sw->armed_route_mask), sw->domain_owned,
-		READ_ONCE(sw->flow_allowed), sw->route_policy_allowed,
-		READ_ONCE(sw->armed_route_eligible_mask), sw->native_route_policy_allowed,
-		READ_ONCE(sw->rule_count),
-		READ_ONCE(sw->published_count),
-		READ_ONCE(sw->learned_count), sw->rebuilds, sw->polls,
-		READ_ONCE(sw->learned_adds), READ_ONCE(sw->learned_deletes),
-		sw->scan_errors, !!bum, bum, !!(READ_ONCE(sw->active) && sw->hw.mdb_ports),
-		sw->local_target, READ_ONCE(sw->hw.rx_gate_verified),
-		sw->hw.learning_mask,
-		sw->hw.isolated_mask, sw->hw.count, sw->hw.journal.capacity,
-		sw->hw.journal.quarantined, sw->retry_count);
-	/* Read-only preflight evidence, not packet/FDB dumps: these are fixed
-	 * hardware configuration values and physical-port IDs, never addresses
-	 * learned from users or WAN/OMCI credentials. */
-	observed = &sw->hw.observed;
+		"l2_completed_valid=%u l2_completed_serial=%llu "
+		"l2_completed_generation=%llu l2_current_generation=%llu "
+		"l2_completed_reason=%u l2_completed_error=%d l2_completed_hw_reason=%u "
+		"l2_completed_ports=%#x l2_completed_route_ports=%#x "
+		"l2_completed_route_eligible_ports=%#x l2_completed_armed=%u "
+		"l2_cpu_fdb_count=%u l2_preflight_done=%u l2_preflight_error=%d "
+		"l2_worker_busy=%u l2_worker_skips=%llu "
+		"l2_pending_reason=%u l2_pending_error=%d l2_pending_hw_reason=%s\n",
+		done->valid, done->serial, done->generation,
+		rtl9617c_switch_guard_generation(&sw->guard),
+		done->reason, done->error, done->hw_reason,
+		done->native_ports, done->route_ports, done->route_eligible_ports,
+		done->armed, done->cpu_fdb_count, done->preflight_done,
+		done->preflight_error, sw->worker_busy, sw->worker_skips,
+		sw->reason, sw->error, fe_switch_hw_reason_name(&sw->hw));
+	/* Fixed raw configuration from the SAME completed transaction, never
+	 * current in-progress values paired with an earlier completed verdict.
+	 * preflight_done distinguishes absent/partial observations from zero. */
+	observed = &done->observed;
 	length += scnprintf(buffer + length, bytes - length,
 		"l2_hw_vlan_mode=%#x l2_hw_hash_control=%#x l2_hw_aging=%#x "
 		"l2_hw_packet_length=%#x l2_hw_tpid0=%#x l2_hw_tpid1=%#x "
@@ -1787,12 +1914,63 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 	return length;
 }
 
+static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
+			       char *buffer, size_t bytes)
+{
+	unsigned int port, bum = 0, hw_reason;
+	ssize_t length;
+
+	if (!sw)
+		return scnprintf(buffer, bytes, "l2_supported=0 l2_requested=0 l2_active=0\n");
+	if (READ_ONCE(sw->active))
+		for (port = 0; port < FE_LAN_PORTS; port++)
+			bum |= sw->hw.bum_enabled[port];
+	hw_reason = sw->completed.valid ? sw->completed.hw_reason : sw->hw.reason;
+	length = scnprintf(buffer, bytes,
+		"l2_supported=1 l2_requested=%u l2_active=%u l2_reason=%u l2_worker_busy=%u "
+		"l2_hw_reason=%u l2_hw_reason_name=%s l2_hw_valid=%u "
+		"l2_error=%d l2_ports=%#x l2_route_ports=%#x l2_domain_owned=%u "
+		"l2_flow_allowed=%u l2_route_policy_allowed=%u "
+		"l2_route_eligible_ports=%#x l2_native_route_policy_allowed=%u "
+		"l2_static=%u l2_static_published=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
+		"l2_learn_adds=%llu l2_learn_deletes=%llu l2_scan_errors=%llu "
+		"l2_bum_hardware=%u l2_bum_classes=%#x l2_vlan_hardware=0 l2_mdb_hardware=%u "
+		"l2_multibridge_hardware=0 l2_local_target=%u l2_rx_gate_verified=%u "
+		"l2_learning_ports=%#x l2_isolated_ports=%#x "
+		"l2_journal_used=%u l2_journal_capacity=%u "
+		"l2_journal_quarantined=%u l2_retries=%u\n",
+		sw->requested, READ_ONCE(sw->active),
+		sw->completed.valid ? sw->completed.reason : sw->reason, sw->worker_busy,
+		hw_reason, !sw->completed.valid || !sw->completed.preflight_done ?
+		"not-sampled" : fe_switch_hw_reason_text(hw_reason),
+		sw->completed.valid && sw->completed.preflight_done,
+		sw->completed.valid ? sw->completed.error : sw->error, sw->native_mask,
+		READ_ONCE(sw->armed_route_mask), sw->domain_owned,
+		READ_ONCE(sw->flow_allowed), sw->route_policy_allowed,
+		READ_ONCE(sw->armed_route_eligible_mask), sw->native_route_policy_allowed,
+		READ_ONCE(sw->rule_count),
+		READ_ONCE(sw->published_count),
+		READ_ONCE(sw->learned_count), sw->rebuilds, sw->polls,
+		READ_ONCE(sw->learned_adds), READ_ONCE(sw->learned_deletes),
+		sw->scan_errors, !!bum, bum, !!(READ_ONCE(sw->active) && sw->hw.mdb_ports),
+		sw->local_target, READ_ONCE(sw->hw.rx_gate_verified),
+		sw->hw.learning_mask,
+		sw->hw.isolated_mask, sw->hw.count, sw->hw.journal.capacity,
+		sw->hw.journal.quarantined, sw->retry_count);
+	return length;
+}
+
 #else
 /* A built-in Ethernet driver must not refer to a modular bridge. Ordinary
  * management Ethernet remains usable; native hardware L2 is unavailable.
  */
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe) { return NULL; }
 static int fe_bridge_stop(struct rtl_fe_bridge *sw) { return 0; }
+static ssize_t fe_bridge_evidence(struct rtl_fe_bridge *sw,
+				  char *buffer, size_t bytes)
+{
+	return scnprintf(buffer, bytes, "l2_completed_valid=0\n");
+}
 static bool fe_switch_needs_recovery(struct rtl_fe *fe)
 {
 	return fe->enabled && !READ_ONCE(fe->route_admitted);

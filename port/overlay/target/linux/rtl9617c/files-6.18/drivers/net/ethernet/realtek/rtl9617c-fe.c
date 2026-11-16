@@ -61,6 +61,8 @@ static ssize_t fe_mdb_stats(struct rtl_fe *fe, char *buffer, size_t bytes);
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe);
 static int fe_bridge_stop(struct rtl_fe_bridge *bridge);
 static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes);
+static ssize_t fe_bridge_evidence(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes);
+static ssize_t fe_mcast_evidence(struct rtl_fe *fe, char *buffer, size_t bytes);
 static int fe_switch_quiesce_locked(struct rtl_fe *fe);
 static void fe_switch_reconcile_locked(struct rtl_fe *fe);
 static int fe_switch_request_locked(struct rtl_fe *fe, bool requested);
@@ -163,6 +165,12 @@ struct rtl_fe_flow {
  u8 destination[ETH_ALEN];
  u64 bytes;
  u32 packets;
+ /* Never expose cls->cookie (it may encode a kernel pointer). A new lease
+  * distinguishes reuse of a hash/MIB row within this FE lifetime. */
+ u64 lease_id, observed_bytes, observed_packets;
+ unsigned long observation_at;
+ u32 observations, activity_hits;
+ int observation_error;
 };
 static const unsigned int fe_registers[] = {
  0x3834,0x3838,0x383c,0x3840,0x3844,0x3848,0x384c,0x3850,
@@ -220,6 +228,7 @@ struct rtl_fe {
  unsigned int base_rejected_register, base_rejected_value;
  int error;
  u64 installs, deletes, misses;
+ u64 next_flow_lease, evidence_instance_ns;
  struct rtl_fe_observe observe;
  unsigned int saved[ARRAY_SIZE(fe_registers)], mask_saved[8];
  struct rtl_fe_cam_protocol protocol_cam[3];
@@ -1135,9 +1144,12 @@ static int fe_parse_bridge(struct rtl_fe_port *port,struct flow_rule *rule,struc
   struct flow_match_meta meta;
   data->reject_reason=FE_REJECT_META;
   flow_rule_match_meta(rule,&meta);
-  if(meta.mask->ingress_iftype || meta.mask->l2_miss || (meta.mask->ingress_ifindex &&
-     (meta.mask->ingress_ifindex!=-1 || meta.key->ingress_ifindex!=port->netdev->ifindex)))
+  if(meta.mask->ingress_iftype || meta.mask->l2_miss ||
+     (meta.mask->ingress_ifindex && meta.mask->ingress_ifindex!=-1))return -EOPNOTSUPP;
+  if(meta.mask->ingress_ifindex && meta.key->ingress_ifindex!=port->netdev->ifindex) {
+   data->reject_reason=FE_REJECT_OTHER_INGRESS;
    return -EOPNOTSUPP;
+  }
  }
  flow_rule_match_eth_addrs(rule,&ethernet);
  data->reject_reason=FE_REJECT_KEYS;
@@ -1263,8 +1275,12 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
     !flow_rule_match_key(rule,FLOW_DISSECTOR_KEY_PORTS))return -EOPNOTSUPP;
  flow_rule_match_meta(rule,&meta);
  data->reject_reason=FE_REJECT_META;
- if(meta.mask->ingress_ifindex!=-1 || meta.mask->ingress_iftype || meta.mask->l2_miss ||
-    meta.key->ingress_ifindex!=port->netdev->ifindex)return -EOPNOTSUPP;
+ if(meta.mask->ingress_ifindex!=-1 || meta.mask->ingress_iftype || meta.mask->l2_miss)
+  return -EOPNOTSUPP;
+ if(meta.key->ingress_ifindex!=port->netdev->ifindex) {
+  data->reject_reason=FE_REJECT_OTHER_INGRESS;
+  return -EOPNOTSUPP;
+ }
  data->reject_reason=FE_REJECT_PROTOCOL;
  flow_rule_match_basic(rule,&basic);
  protocol=basic.key->n_proto;
@@ -1663,13 +1679,16 @@ static int __maybe_unused fe_switch_flush_routes_locked(struct rtl_fe *fe)
 static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned long cookie)
 {
  struct rtl_fe *fe=port->fe;
+ struct rtl_fe_observe *observe=&fe->observe;
  struct rtl_dq_io io=fe_io(fe);
  struct rtl_fe_flow *flow;
  unsigned int words[23],action[RTL_FE_NAPTV6_ACTION_WORDS],crc32,index,start,counters[7],i;
  u16 crc16;
  int ret;
 
+ observe->stage=FE_INSTALL_PORT;
  if(port->retired || fe->shutting_down)return -ENODEV;
+ observe->stage=FE_INSTALL_FORMAT;
  /* No producer owns the old bridge hash templates. Native L2 uses FDB. */
  if(data.bridge)return -EOPNOTSUPP;
  /* A future producer cannot publish a mismatched format or turn on a
@@ -1680,6 +1699,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  /* Keep the publisher independently bounded even if a future caller
   * constructs a rule without the current nft parser. An exact-MDB miss
   * must not find a multicast IP route in the ordinary unicast hash. */
+ observe->stage=FE_INSTALL_UNICAST;
  if(!rtl_fe_routed_unicast(data.ipv6,
     data.ipv6?data.key6.source[0]:data.key.source,
     data.ipv6?data.key6.destination[0]:data.key.destination) ||
@@ -1687,10 +1707,14 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
      !rtl_fe_routed_unicast(data.ipv6,
       data.ipv6?data.action.address6_high[0]:data.action.address,
       data.ipv6?data.action.address6_high[0]:data.action.address)))return -EOPNOTSUPP;
- if(!fe->engine_ready || !fe->enabled ||
-    !fe_switch_flow_ports_allowed(fe,data.input->netdev,data.output->netdev) ||
-    !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
+ observe->stage=FE_INSTALL_ENGINE;
+ if(!fe->engine_ready || !fe->enabled)return -EAGAIN;
+ observe->stage=FE_INSTALL_POLICY;
+ if(!fe_switch_flow_ports_allowed(fe,data.input->netdev,data.output->netdev))return -EAGAIN;
+ observe->stage=FE_INSTALL_LINK;
+ if(!netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
+ observe->stage=FE_INSTALL_COOKIE;
  if(fe_flow(fe,cookie))return -EEXIST;
  if(data.bridge)rtl_fe_bridge_key(words,data.source,data.destination,data.ethernet_protocol,
   data.key.ingress,data.key.llid,data.key.mask);
@@ -1713,6 +1737,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
   * occupied DDR keys instead of walking every flow on each installation.
   * The retry list also covers an uncertain cache invalidation: deletion
   * clears DDR first, but a failed cache command can leave the old key live. */
+ observe->stage=FE_INSTALL_HASH_COLLISION;
  for(index=start;index<start+32;index++)
   if(test_bit(index,fe->hashes) &&
      le32_to_cpu(((__le32 *)fe->memory)[index])==crc32)return -EOPNOTSUPP;
@@ -1723,11 +1748,15 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
   * can select an empty cache row instead of this flow. Keep slot0 free.
   * SDK aal_hash.c (__hash_tbl_entry_add), ca-network-drivers commit
   * 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0, lines3777..3783. */
+ observe->stage=FE_INSTALL_HASH_CAPACITY;
  for(index=start+(!(crc16&0x1fff));index<start+32;index++)
   if(!test_bit(index,fe->hashes))break;
  if(index==start+32)return -ENOSPC;
+ observe->stage=FE_INSTALL_ALLOCATE;
+ if(fe->next_flow_lease==~0ULL)return -EOVERFLOW;
  flow=kzalloc(sizeof(*flow),GFP_KERNEL);
  if(!flow)return -ENOMEM;
+ flow->lease_id=++fe->next_flow_lease;
  flow->cookie=cookie;
  flow->hash_index=index;flow->crc16=crc16;flow->crc32=crc32;
  INIT_LIST_HEAD(&flow->retry);
@@ -1751,20 +1780,25 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  if(fe->hash_owners)fe->hash_owners[index]=flow;
  if(!data.bridge) {
   flow->source_mac=FE_SOURCE_MACS;
+  observe->stage=FE_INSTALL_SOURCE_MAC;
   ret=fe_source_get(fe,data.source,&flow->source_mac);
   flow->source_owned=flow->source_mac!=FE_SOURCE_MACS;
   if(ret)goto rollback;
+  observe->stage=FE_INSTALL_DESTINATION_MAC;
   ret=fe_destination_get(fe,flow,data.destination);
   if(ret)goto rollback;
+  observe->stage=FE_INSTALL_INTERFACE;
   ret=fe_interface_get(fe,flow);
   if(ret)goto rollback;
  } else ether_addr_copy(flow->destination,data.destination);
  if(data.mtu) {
+  observe->stage=FE_INSTALL_MTU;
   ret=fe_mtu_get(fe,flow,data.mtu);
   if(ret)goto rollback;
   data.action.mtu_set=1;data.action.mtu_index=flow->mtu_index;
  }
  if(flow->counted) {
+  observe->stage=FE_INSTALL_COUNTER;
   ret=rtl_fe_tx_counter_read(&io,flow->counter,counters);
   if(ret)goto rollback;
   flow->bytes=(u64)counters[1]<<32|counters[0];flow->packets=counters[2]+counters[3];
@@ -1777,6 +1811,7 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  memcpy(fe->memory+RTL_FE_ACTION_OFFSET+index*RTL_FE_ACTION_BYTES,action,sizeof(action));
  dma_wmb();
  flow->published=true;
+ observe->stage=FE_INSTALL_PUBLISH;
  ret=rtl_fe_main_age(&io,index,1); /* FC idle/valid; hardware hit raises age. */
  if(ret)goto rollback;
  flow->installed=true;
@@ -1784,7 +1819,8 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  return 0;
 rollback:
  /* Keep an incomplete release attached to its owners for the next callback. */
- if(fe_delete(fe,flow))fe->error=ret;
+ observe->rollback_error=fe_delete(fe,flow);
+ if(observe->rollback_error)fe->error=observe->rollback_error;
  return ret;
 }
 static int fe_replace(struct rtl_fe_port *port,struct flow_cls_offload *cls)
@@ -1795,11 +1831,14 @@ static int fe_replace(struct rtl_fe_port *port,struct flow_cls_offload *cls)
  int ret;
 
  observe->replace_requests++;
+ observe->stage=FE_INSTALL_NONE;
+ observe->rollback_error=0;
  /* A refresh carries the same immutable tuple cookie. Configuration
   * transactions retire existing owners before permitting new admission.
   * Do this lookup before EVTO equivalence enumeration or table MMIO. */
  existing=fe_flow(port->fe,cls->cookie);
  if(existing) {
+  observe->stage=FE_INSTALL_COOKIE;
   ret=existing->deleting?-EBUSY:-EEXIST;
   rtl_fe_observe_install(observe,ret);
   return ret;
@@ -1837,6 +1876,7 @@ static int fe_refresh_activity(struct rtl_fe *fe,struct rtl_fe_flow *flow)
    ret=rtl_fe_main_age(&io,flow->hash_index,1);
    if(ret)return ret;
    flow->lastused=now;
+   flow->activity_hits++;
   }
   return 0;
  }
@@ -1856,6 +1896,7 @@ static int fe_refresh_activity(struct rtl_fe *fe,struct rtl_fe_flow *flow)
   owner=fe->hash_owners[first+i];
   owner->lastused=now;
   owner->activity_cached=true;
+  owner->activity_hits++;
  }
  return 0;
 }
@@ -1869,26 +1910,42 @@ static int fe_stats(struct rtl_fe *fe,struct rtl_fe_flow *flow,struct flow_cls_o
  u32 packet_delta;
  int ret;
 
- if(!flow->published)return -ENOENT;
+ flow->observation_at=jiffies;
+ if(!flow->published){flow->observation_error=-ENOENT;return -ENOENT;}
  ret=fe_refresh_activity(fe,flow);
- if(ret)return ret;
+ if(ret){flow->observation_error=ret;return ret;}
  if(!flow->counted) {
   flow_stats_update(&cls->stats,0,0,0,flow->lastused,FLOW_ACTION_HW_STATS_DELAYED);
+  flow->observation_error=0;
+  flow->observations++;
   return 0;
  }
  ret=rtl_fe_tx_counter_read(&io,flow->counter,words);
- if(ret)return ret;
+ if(ret){flow->observation_error=ret;return ret;}
  bytes=(u64)words[1]<<32|words[0];packets=words[2]+words[3];
+ byte_delta=bytes-flow->bytes;packet_delta=packets-flow->packets;
+ /* An inconsistent/reset MIB sample cannot become a huge unsigned byte
+  * delta after subtracting Ethernet headers. Rebase the private owner,
+  * report the fault and do not credit conntrack or evidence with it. */
+ if(byte_delta<(u64)packet_delta*flow->ethernet_bytes ||
+    byte_delta>(u64)packet_delta*65535U) {
+  flow->bytes=bytes;flow->packets=packets;
+  flow->observation_error=-ERANGE;
+  return -ERANGE;
+ }
  if(bytes!=flow->bytes || packets!=flow->packets) {
   flow->lastused=jiffies;
   /* A MIB update is not a fresh sample of the shared Hash age row. */
   flow->activity_cached=false;
  }
- byte_delta=bytes-flow->bytes;packet_delta=packets-flow->packets;
  /* The PE MIB measures the output frame, including its VLAN headers. */
  flow_stats_update(&cls->stats,byte_delta-(u64)packet_delta*flow->ethernet_bytes,packet_delta,0,
                    flow->lastused,FLOW_ACTION_HW_STATS_DELAYED);
  flow->bytes=bytes;flow->packets=packets;
+ flow->observed_bytes+=byte_delta-(u64)packet_delta*flow->ethernet_bytes;
+ flow->observed_packets+=packet_delta;
+ flow->observations++;
+ flow->observation_error=0;
  return 0;
 }
 static int fe_block_callback(enum tc_setup_type type,void *data,void *private)
@@ -2189,6 +2246,7 @@ struct rtl_fe *rtl_fe_allocate(struct device *device,void __iomem *registers)
  fe=kzalloc(sizeof(*fe),GFP_KERNEL);
  if(!fe)return ERR_PTR(-ENOMEM);
  fe->device=device;fe->registers=registers;
+ fe->evidence_instance_ns=ktime_get_ns();
  fe->naptv6=naptv6;
  /* The shared fabric owns the command-mode bit across timeouts. A timed-out
   * FDB operation must not have its mode changed while ACCESS is busy. */
@@ -2767,6 +2825,79 @@ bool rtl_fe_free(struct rtl_fe *fe)
  kfree(fe);
  return true;
 }
+
+/* Cached diagnostics are separate from l2_state: that legacy one-page
+ * endpoint must not silently truncate the bridge verdict as counters grow.
+ * Neither read creates a hardware transaction nor refreshes an idle flow. */
+ssize_t rtl_fe_admission_state(struct rtl_fe *fe,char *buffer)
+{
+ struct rtl_fe_observe *o;
+ unsigned int i;
+ ssize_t length;
+
+ if(!fe)return sysfs_emit(buffer,"schema=1 available=0 reason=no_fe\n");
+ if(!mutex_trylock(&fe->lock))return sysfs_emit(buffer,"schema=1 available=0 reason=busy retryable=1\n");
+ o=&fe->observe;
+ length=sysfs_emit(buffer,
+  "schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n"
+  "requests=%llu parse_rejected=%llu install_succeeded=%llu install_failed=%llu\n"
+  "reject_meta=%llu reject_other_ingress=%llu\n"
+  "reject_unspecified=%llu reject_keys=%llu reject_control=%llu reject_protocol=%llu "
+  "reject_vlan=%llu reject_action=%llu reject_nat=%llu reject_port=%llu reject_pon=%llu\n"
+  "install_unavailable=%llu install_duplicate=%llu install_collision=%llu install_unsupported=%llu "
+  "install_no_space=%llu install_no_memory=%llu install_io=%llu install_other=%llu\n"
+  "last_failure_request=%llu last_failure_stage=%s last_failure_errno=%d last_rollback_errno=%d\n",
+  o->replace_requests,o->parse_rejected,o->install_succeeded,o->install_failed,
+  o->reason[FE_REJECT_META],o->reason[FE_REJECT_OTHER_INGRESS],
+  o->reason[FE_REJECT_UNSPECIFIED],o->reason[FE_REJECT_KEYS],
+  o->reason[FE_REJECT_CONTROL],o->reason[FE_REJECT_PROTOCOL],
+  o->reason[FE_REJECT_VLAN],o->reason[FE_REJECT_ACTION],o->reason[FE_REJECT_NAT],
+  o->reason[FE_REJECT_PORT],o->reason[FE_REJECT_PON],
+  o->install_unavailable,o->install_duplicate,o->install_collision,o->install_unsupported,
+  o->install_no_space,o->install_no_memory,o->install_io,o->install_other,
+  o->last_failure_request,rtl_fe_install_stage_name(o->last_failure_stage),
+  o->last_failure_error,o->last_rollback_error);
+ for(i=0;i<FE_INSTALL_STAGE_COUNT;i++)
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,"stage_%s_failed=%llu\n",
+   rtl_fe_install_stage_name(i),o->stage_failed[i]);
+ mutex_unlock(&fe->lock);
+ return length;
+}
+
+ssize_t rtl_fe_flow_evidence(struct rtl_fe *fe,char *buffer)
+{
+ struct rtl_fe_flow *flow;
+ unsigned int emitted=0;
+ bool truncated=false;
+ ssize_t length;
+
+ if(!fe)return sysfs_emit(buffer,"schema=1 available=0 reason=no_fe\n");
+ if(!mutex_trylock(&fe->lock))return sysfs_emit(buffer,"schema=1 available=0 reason=busy retryable=1\n");
+ length=sysfs_emit(buffer,
+  "schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 "
+  "identity=lease_since_fe_creation instance_ns=%llu max_records=16 sampled_by=flow_stats\n"
+  "note=age_hits_are_positive_samples_not_packets;uncounted_rows_have_no_packet_totals;compare_same_boot_instance_and_lease\n",
+  fe->evidence_instance_ns);
+ list_for_each_entry(flow,&fe->flows,list) {
+  /* Include pending withdrawal owners, but never dereference a retired
+   * port's netdev. Physical IDs remain owned until the flow is released. */
+  if(emitted==16 || PAGE_SIZE-length<400){truncated=true;break;}
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,
+   "lease=%llu hash=%u input_hw=%u output_hw=%u ipv6=%u protocol=%u installed=%u "
+   "published=%u deleting=%u counted=%u counter=%u samples=%u sample_age_ms=%u "
+   "sample_errno=%d age_hits=%u l3_bytes=%llu packets=%llu\n",
+   flow->lease_id,flow->hash_index,flow->input->source,flow->output->source,
+   flow->ipv6,flow->protocol,flow->installed,flow->published,flow->deleting,
+   flow->counted,flow->counter,flow->observations,
+   flow->observations?jiffies_to_msecs(jiffies-flow->observation_at):0,
+   flow->observation_error,flow->activity_hits,flow->observed_bytes,flow->observed_packets);
+  emitted++;
+ }
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,"emitted=%u truncated=%u\n",emitted,truncated);
+ mutex_unlock(&fe->lock);
+ return length;
+}
+
 ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
 {
  static const char * const names[] = {
@@ -2797,7 +2928,6 @@ ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
  rtl_l2_evidence_read(&io,&sample);
  spin_unlock_irqrestore(&fe->route_lock,flags);
  end=ktime_get_ns();
- mutex_unlock(&fe->lock);
  length=sysfs_emit(buffer,"schema=1 available=1 clock=monotonic begin_ns=%llu end_ns=%llu "
   "mmio_writes=0 atomic_snapshot=0 forwarding_proven=0 retirement_proven=0\n",
   begin,end);
@@ -2820,6 +2950,41 @@ ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
    "hw_port=%u rx_control=0x%08x bypass=%u bypass_destination=%u\n",
    i,sample.lan_rx[i],(sample.lan_rx[i]>>28)&1U,
    (sample.lan_rx[i]>>16)&63U);
+ length+=fe_bridge_evidence(fe->bridge,buffer+length,PAGE_SIZE-length);
+ length+=fe_mcast_evidence(fe,buffer+length,PAGE_SIZE-length);
+ mutex_unlock(&fe->lock);
+ return length;
+}
+
+/* Cached ownership/resource counters have their own page: their lifetime
+ * counters must not displace the admission verdict in the legacy summary. */
+ssize_t rtl_fe_resource_state(struct rtl_fe *fe,char *buffer)
+{
+ ssize_t length;
+ unsigned int i;
+
+ if(!fe)return sysfs_emit(buffer,"schema=1 available=0 reason=no_fe\n");
+ if(!mutex_trylock(&fe->lock))return sysfs_emit(buffer,"schema=1 available=0 reason=busy retryable=1\n");
+ length=sysfs_emit(buffer,"schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0\n");
+ if(fe->l2_owner) {
+  struct rtl_l2_owner *owner=fe->l2_owner;
+
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,
+   "l2_owner_sealed=%u l2_owner_ready=0x%x l2_owner_quarantined=%u l2_owner_error=%d "
+   "l2_owner_journal=%u/%u l2_owner_reads=%u l2_owner_publications=%u "
+   "l2_owner_withdrawals=%u l2_owner_aborts=%u l2_owner_failures=%u\n",
+   owner->sealed,owner->ready_mask,owner->ledger.quarantined || owner->journal.quarantined,
+   owner->error,owner->count,owner->journal.capacity,owner->scan_reads,
+   owner->publications,owner->withdrawals,owner->aborts,owner->failures);
+  for(i=0;i<RTL_L2_SHARED_COUNT;i++)
+   length+=scnprintf(buffer+length,PAGE_SIZE-length,
+    "l2_bank_%u_capacity=%u l2_bank_%u_leased=%u l2_bank_%u_verified_available=%u\n",
+    i,rtl_l2_shared_capacity(i),i,rtl_l2_shared_leased(&owner->ledger,i),
+    i,rtl_l2_shared_available(&owner->ledger,i));
+ } else length+=scnprintf(buffer+length,PAGE_SIZE-length,"l2_owner_unavailable=1\n");
+ length+=fe_mcast_stats(fe,buffer+length,PAGE_SIZE-length);
+ length+=fe_mdb_stats(fe,buffer+length,PAGE_SIZE-length);
+ mutex_unlock(&fe->lock);
  return length;
 }
 
@@ -2832,7 +2997,9 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  unsigned int recipes=0,retries=0,lan_pon=0,pon_lan=0,lan_lan=0;
 
  if(!fe)return sysfs_emit(buffer,"available=0\n");
- mutex_lock(&fe->lock);
+ /* Diagnostics must not queue behind a long ownership/recovery worker.
+  * The collector may retry this explicit busy result with a fixed bound. */
+ if(!mutex_trylock(&fe->lock))return sysfs_emit(buffer,"available=0 reason=busy retryable=1\n");
  list_for_each_entry(flow,&fe->flows,list)if(flow->published) {
   flows++;
   counted+=flow->counted;
@@ -2893,24 +3060,9 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fabric_cold_rx_gated=0x%x fabric_inherited_fdb_present=%u fabric_inherited_fdb_index=%u\n",
   fe->fabric.cold_rx_gated,fe->fabric.inherited_fdb_present,fe->fabric.inherited_fdb_index);
- if(fe->l2_owner) {
-  struct rtl_l2_owner *owner=fe->l2_owner;
-
-  length+=scnprintf(buffer+length,PAGE_SIZE-length,
-   "l2_owner_sealed=%u l2_owner_ready=0x%x l2_owner_quarantined=%u l2_owner_error=%d "
-   "l2_owner_journal=%u/%u l2_owner_reads=%u l2_owner_publications=%u "
-   "l2_owner_withdrawals=%u l2_owner_aborts=%u l2_owner_failures=%u\n",
-   owner->sealed,owner->ready_mask,owner->ledger.quarantined || owner->journal.quarantined,
-   owner->error,owner->count,owner->journal.capacity,owner->scan_reads,
-   owner->publications,owner->withdrawals,owner->aborts,owner->failures);
-  for(i=0;i<RTL_L2_SHARED_COUNT;i++)
-   length+=scnprintf(buffer+length,PAGE_SIZE-length,
-    "l2_bank_%u_capacity=%u l2_bank_%u_leased=%u l2_bank_%u_verified_available=%u\n",
-    i,rtl_l2_shared_capacity(i),i,rtl_l2_shared_leased(&owner->ledger,i),
-    i,rtl_l2_shared_available(&owner->ledger,i));
- }
- length+=fe_mcast_stats(fe,buffer+length,PAGE_SIZE-length);
- length+=fe_mdb_stats(fe,buffer+length,PAGE_SIZE-length);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "resource_detail=l2_resources mce_owner=%u mdb_owner=%u\n",
+  !!fe->mcast,!!fe->mdb);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
   RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);
@@ -2918,20 +3070,11 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
   "lan_admission_valid=%u lan_cpu_mask=%u lan_route_mask=%u lan_native_l2_mask=%u\n",
   fe->engine_ready && !fe->shutting_down,lan_cpu,lan_route,lan_l2);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
-  "admission_requests=%llu parse_rejected=%llu install_failed=%llu reject_unspecified=%llu reject_keys=%llu reject_meta=%llu reject_control=%llu reject_protocol=%llu reject_vlan=%llu reject_action=%llu reject_nat=%llu reject_port=%llu reject_pon=%llu\n",
-  fe->observe.replace_requests,fe->observe.parse_rejected,fe->observe.install_failed,
-  fe->observe.reason[FE_REJECT_UNSPECIFIED],fe->observe.reason[FE_REJECT_KEYS],
-  fe->observe.reason[FE_REJECT_META],fe->observe.reason[FE_REJECT_CONTROL],
-  fe->observe.reason[FE_REJECT_PROTOCOL],fe->observe.reason[FE_REJECT_VLAN],
-  fe->observe.reason[FE_REJECT_ACTION],fe->observe.reason[FE_REJECT_NAT],
-  fe->observe.reason[FE_REJECT_PORT],fe->observe.reason[FE_REJECT_PON]);
- length+=scnprintf(buffer+length,PAGE_SIZE-length,
-  "install_unavailable=%llu install_duplicate=%llu install_collision=%llu install_no_space=%llu install_no_memory=%llu install_io=%llu install_other=%llu\n",
-  fe->observe.install_unavailable,fe->observe.install_duplicate,fe->observe.install_collision,
-  fe->observe.install_no_space,fe->observe.install_no_memory,fe->observe.install_io,
-  fe->observe.install_other);
- mutex_unlock(&fe->lock);
+  "admission_requests=%llu parse_rejected=%llu install_failed=%llu "
+  "admission_detail=l3_admission flow_evidence=l3_flows preflight_detail=l2_evidence\n",
+  fe->observe.replace_requests,fe->observe.parse_rejected,fe->observe.install_failed);
  length+=fe_bridge_stats(fe->bridge,buffer+length,PAGE_SIZE-length);
+ mutex_unlock(&fe->lock);
  return length;
 }
 
@@ -2949,8 +3092,8 @@ static bool fe_mcast_available(struct rtl_fe *fe)
 static int fe_mcast_inherited_l3_check(struct rtl_fe *fe)
 {
  struct rtl_mcast_state *state=&fe->mcast->state;
- static const unsigned int registers[]={0xaa28,0x3834,0x38a0};
- unsigned int i,value;
+ struct rtl_dq_io io=fe_io(fe);
+ int ret;
 
  lockdep_assert_held(&fe->lock);
  /* Capture actual inherited XRAM/hash/cache configuration without taking
@@ -2959,13 +3102,10 @@ static int fe_mcast_inherited_l3_check(struct rtl_fe *fe)
   * HASH_INI.ht_size=0 is a 512-entry table; CACHE_INI.ct_size=0 disables
   * only the cache. Zero DMA addresses cannot prove disabled consumers.
   */
- for(i=0;i<ARRAY_SIZE(registers);i++) {
-  value=fe_read(fe,registers[i]);
-  state->cold_reads++;
-  state->cold_register=registers[i];
-  state->cold_value=value;
-  if(value==~0U)return -EIO;
- }
+ ret=rtl_mcast_handoff_probe(&state->handoff,&io);
+ state->cold_reads+=state->handoff.reads;
+ state->cold_register=state->handoff.bad_register;
+ state->cold_value=state->handoff.bad_value;
  /* The existing NI handoff proves LAN/PON ingress exclusion and the L2
   * stage drain. It does NOT hand over CPU XRAM/DMALSO injection, inherited
   * ICLS/L3 classifier/DDR roots, or an MCE packet-retirement completion.
@@ -2973,7 +3113,7 @@ static int fe_mcast_inherited_l3_check(struct rtl_fe *fe)
   * exists. Neither an idle command window, elapsed delay, equal counters,
   * nor the MCE flush request may manufacture a success branch here.
   */
- return -EOPNOTSUPP;
+ return ret;
 }
 
 static ssize_t fe_mcast_stats(struct rtl_fe *fe, char *buffer, size_t bytes)
@@ -2984,10 +3124,10 @@ static ssize_t fe_mcast_stats(struct rtl_fe *fe, char *buffer, size_t bytes)
  state=&fe->mcast->state;
  return scnprintf(buffer,bytes,
   "mce_owner=1 mce_contract_ready=%u mce_cold_handoff_verified=0 mce_error=%d "
-  "mce_cold_reads=%u mce_cold_register=0x%x mce_cold_value=0x%x "
+  "mce_missing_contracts=0x%x "
   "mce_groups=%u mce_tokens=%u mce_publications=%u mce_fallbacks=%u "
   "mce_rx_copies=%llu mce_rx_rejected=%llu mce_rx_no_memory=%llu\n",
-  state->contract_ready,state->error,state->cold_reads,state->cold_register,state->cold_value,
+  state->contract_ready,state->error,state->handoff.missing,
   state->groups,state->tokens,state->publications,state->fallbacks,
   READ_ONCE(state->rx_copies),READ_ONCE(state->rx_rejected),READ_ONCE(state->rx_no_memory));
 }

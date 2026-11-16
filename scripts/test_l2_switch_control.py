@@ -77,6 +77,7 @@ struct delayed_work {struct work_struct work;};
 #define INIT_WORK(work,fn) do{(work)->initialized=true;(work)->callback=(fn);}while(0)
 #define INIT_DELAYED_WORK(delayed,fn) INIT_WORK(&(delayed)->work,fn)
 struct rtl9617c_switch_guard {struct list_head list;bool registered,blocked;u64 generation;void *owner;};
+/* PRODUCTION_OBSERVED_DEFINITION */
 struct rtl_fe_switch_hw {
  bool owned,globals_owned,prepared;unsigned count;
  struct rtl_l2_snapshot *rows;struct rtl_l2_journal journal;
@@ -476,10 +477,14 @@ int main(void){construction_and_stop();notifier_and_replay();netdev_notification
  printf("Native switch production control: %u lifetime/replay/request scenarios; 2048 learning notifications and 200 healthy same-value requests do not rebuild; error/epoch/dirty ownership retries preserved PASS\n",cases);return 0;}
 '''
 
+COMMON = COMMON.replace("/* PRODUCTION_OBSERVED_DEFINITION */", re.search(
+    r"struct fe_switch_hw_observed \{.*?\n\};",
+    (DRIVERS / "rtl9617c-fe-switch-hw.h").read_text(), re.S)[0])
 definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"enum fe_switch_reason \{.*?\n\};",
     r"struct fe_switch_learned \{.*?\n\};",
     r"struct fe_switch_published \{.*?\n\};",
+    r"struct fe_switch_completed \{.*?\n\};",
     r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [

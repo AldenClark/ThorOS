@@ -925,12 +925,32 @@ static void exact_mdb_steering(void)
  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
 }
 
+static void preflight_readonly(void)
+{
+ /* This direct-CSR probe also runs when CPU FDB already blocks native
+  * ownership. It must not gate routes or issue an indirect command. */
+ const unsigned int modes[]={3,2,~0U};
+ const int result[]={0,-EOPNOTSUPP,-EIO};
+ for(unsigned int i=0;i<ARRAY_SIZE(modes);i++){
+  reset();model.reg[RTL_L2_VLAN_MODE_CONTROL/4]=modes[i];
+  unsigned int writes=model.writes,commands=model.commands,gates=model.route_gates;
+  assert(fe_switch_hw_preflight(&fe,&hw,3)==result[i]);
+  assert(model.writes==writes && model.commands==commands && model.route_gates==gates);
+  assert(!hw.globals_owned && !hw.prepared && !hw.count && hw.observed.vlan_mode==modes[i]);
+  if(i)assert(hw.reason==FE_SW_HW_VLAN_MODE);
+  assert(hw.observed.packet_length==((64U<<16)|1526U));cases++;
+ }
+ reset();struct rtl_l2_vlan_plan plan={0};hw.vlan_plan=&plan;
+ assert(fe_switch_hw_preflight(&fe,&hw,3)==-EOPNOTSUPP && hw.reason==FE_SW_HW_IVL_CONTRACT);
+ assert(!model.commands && !model.writes && !model.route_gates);cases++;
+}
+
 /*SDK_ORACLE*/
 int main(void)
 {
  for(unsigned int ports=1;ports<32;ports++) { recipe(ports,false); recipe(ports,true); }
  for(unsigned int ports=1;ports<32;ports++) { cold_to_native(ports,false); cold_to_native(ports,true); }
- guards(); faults();readback_faults();admission_faults();multicast_producers();exact_mdb_steering();
+ guards(); faults();readback_faults();admission_faults();multicast_producers();exact_mdb_steering();preflight_readonly();
  /*SDK_RUN*/
  printf("{\"recipe_cases\":%u,\"fault_cases\":%u,\"cold_to_native_cases\":%u,\"hardware_verified\":false}\n",cases,fault_cases,cold_cases);
  return 0;

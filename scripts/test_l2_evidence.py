@@ -69,7 +69,13 @@ typedef uint32_t ca_uint32_t;
 #define EPP_WRITE 0x7000
 #define EPP_READ 0x7100
 struct mutex { bool held, deny; };
-struct rtl_fe { struct mutex lock; bool engine_ready, shutting_down; int route_lock; };
+struct rtl_fe { struct mutex lock; bool engine_ready, shutting_down; int route_lock; void *bridge; };
+static ssize_t fe_bridge_evidence(void *bridge,char *buffer,size_t bytes) {
+ (void)bridge;(void)buffer;(void)bytes;return 0;
+}
+static ssize_t fe_mcast_evidence(struct rtl_fe *fe,char *buffer,size_t bytes) {
+ (void)fe;(void)buffer;(void)bytes;return 0;
+}
 struct rtl_qm_rx {
  void *ni; u64 memory_dma; u32 last_address,last_size,last_header[2];
  u64 voq_packets[8],voq_yields[8],poll_budget_hits,cpu_packets,cpu_bytes,ring_errors,buffer_errors;

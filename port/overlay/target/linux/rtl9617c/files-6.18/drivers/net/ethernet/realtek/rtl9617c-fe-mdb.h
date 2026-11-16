@@ -784,6 +784,15 @@ rollback:
 	fe_mdb_windows(fe);
 	fe_mdb_fail(fe, ret == -EAGAIN ? FE_MDB_EPOCH : FE_MDB_TRANSACTION, ret);
 	undo = fe_mdb_withdraw(fe);
+	/* A clean optional fallback must not strand a never-published MCE
+	 * tail until the next bridge epoch. This only aborts preparations;
+	 * previously exposed CLS/BUM vectors and their CPU tokens are sticky
+	 * and remain pinned even after withdrawal. Ambiguous command ownership
+	 * refuses this rollback and retains every reservation.
+	 */
+	if (!undo)
+		undo = rtl_mcast_abort_unpublished(&fe->mcast->state,
+				fe->l2_owner, &io);
 	if (undo)
 		ret = undo;
 	/* No EOPNOTSUPP/ENOSPC fallback is permitted with a live CLS prefix.

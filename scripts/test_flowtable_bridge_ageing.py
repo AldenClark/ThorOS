@@ -152,7 +152,14 @@ static void nf_ct_acct_add(struct nf_conn *ct,unsigned dir,u64 packets,u64 bytes
 }
 struct rtl_fe_flow;
 struct rtl_fe {unsigned age;struct rtl_fe_flow **hash_owners;};
-struct rtl_fe_flow {bool published,counted,installed,deleting,activity_cached;unsigned counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
+struct rtl_fe_flow {
+ bool published,counted,installed,deleting,activity_cached;
+ unsigned counter,hash_index,ethernet_bytes;
+ u64 bytes,observed_bytes,observed_packets;
+ u32 packets,observations,activity_hits;
+ unsigned long lastused,observation_at;
+ int observation_error;
+};
 struct flow_cls_offload {struct {u64 bytes,packets;unsigned long lastused;}stats;};
 struct rtl_dq_io {struct rtl_fe *fe;};
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}

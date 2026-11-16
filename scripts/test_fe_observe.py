@@ -37,7 +37,7 @@ static int fe_parse(struct rtl_fe_port *p,struct flow_cls_offload *c,struct rtl_
  (void)p;(void)c;r->reject_reason=reason;parses++;return parse_error;
 }
 static int fe_install(struct rtl_fe_port *p,struct rtl_fe_rule r,unsigned long cookie){
- (void)p;(void)r;(void)cookie;installs++;return install_error;
+ (void)r;(void)cookie;p->fe->observe.stage=FE_INSTALL_DESTINATION_MAC;installs++;return install_error;
 }
 '''
 test = r'''
@@ -57,7 +57,7 @@ int main(void){
  assert(fe.observe.replace_requests==FE_REJECT_COUNT+11);
  assert(fe.observe.install_failed==10 && installs==11);
  assert(fe.observe.install_unavailable==2 && fe.observe.install_duplicate==1);
- assert(fe.observe.install_collision==1 && fe.observe.install_no_space==1);
+ assert(!fe.observe.install_collision && fe.observe.install_unsupported==1 && fe.observe.install_no_space==1);
  assert(fe.observe.install_no_memory==1 && fe.observe.install_io==3 && fe.observe.install_other==1);
  struct rtl_fe_flow live={0};existing=&live;
  unsigned int before=parses,installed=installs;
@@ -69,6 +69,20 @@ int main(void){
  existing=NULL;parse_error=0;install_error=0;
  assert(!fe_replace(&port,&cls) && parses==before+1 && installs==installed+1);
  assert(fe.observe.install_duplicate==2 && fe.observe.install_io==4);
+ assert(fe.observe.stage_failed[FE_INSTALL_COOKIE]==2);
+ assert(fe.observe.stage_failed[FE_INSTALL_DESTINATION_MAC]==10);
+ assert(fe.observe.install_succeeded==2);
+ /* Identical errno from a destination-domain guard is NOT a collision.
+  * Only the actual CRC/bucket conflict site can classify it that way. */
+ fe.observe.stage=FE_INSTALL_HASH_COLLISION;
+ rtl_fe_observe_install(&fe.observe,-EOPNOTSUPP);
+ assert(fe.observe.install_collision==1 && fe.observe.install_unsupported==1);
+ assert(fe.observe.last_failure_stage==FE_INSTALL_HASH_COLLISION);
+ assert(fe.observe.last_failure_error==-EOPNOTSUPP);
+ fe.observe.stage=999;fe.observe.rollback_error=-ETIMEDOUT;
+ rtl_fe_observe_install(&fe.observe,-EIO);
+ assert(fe.observe.last_failure_stage==FE_INSTALL_NONE);
+ assert(fe.observe.last_rollback_error==-ETIMEDOUT);
  puts("FE admission: every unsupported predicate/PON rejection recorded; install errors classified separately; success is not a packet-hit claim");
 }
 '''

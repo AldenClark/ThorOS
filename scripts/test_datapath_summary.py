@@ -24,7 +24,8 @@ topology = ('dev=lan1 ifindex=3 iflink=3 mtu=1500 operstate=up carrier=1 speed=1
 
 def capture(*, after_boot=boot, times=('10.00', '11.00', '21.00', '22.00'),
             q_before='9007199254740993', q_after='9007199254741193',
-            ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None, cold=None):
+            ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None, cold=None,
+            admission=None, flow=None, completed=None, resources=None):
     result = 'schema=tyfza1-datapath-v3 mode=passive interval_seconds=10 details=0 active_diagnostics=0\n'
     for index, which in enumerate(('before', 'after') if after else ('before',)):
         identity = boot if index == 0 else after_boot
@@ -37,6 +38,14 @@ boot_id={identity}
 [fe]
 l2_requested=1 l2_active=1 l2_bum_hardware=0 l2_vlan_hardware=0 lan_admission_valid=1 lan_native_l2_mask=3
 PRIVATE_TUPLE=192.0.2.1:1234
+[l2_resources]
+{resources[index] if resources else 'unavailable'}
+[l2_evidence]
+{completed[index] if completed else 'unavailable'}
+[l3_admission]
+{admission[index] if admission else 'unavailable'}
+[l3_flows]
+{flow[index] if flow else 'unavailable'}
 [xram_state]
 {state if index == 0 else ni_after}
 [cold_bootstrap]
@@ -210,6 +219,206 @@ for reason, name in (('0', 'requires-existing-svl'), ('99', 'ok'), ('-1', 'ok'),
 text = capture().replace('l2_requested=1', 'l2_hw_reason=1 l2_hw_reason_name=requires-existing-svl l2_hw_reason_name=ok l2_requested=1')
 assert not module.summarize(text)['states']['after']['fe']['l2_hw_reason_name_valid']
 
+for code in (0, 1):
+    text = capture().replace('l2_requested=1',
+        f'l2_hw_reason={code} l2_hw_reason_name=not-sampled l2_hw_valid=0 l2_requested=1')
+    parsed = module.summarize(text)['states']['after']['fe']
+    assert parsed['l2_hw_reason_name_valid'] and parsed['l2_hw_reason_name'] == 'not-sampled'
+    assert parsed['l2_hw_valid'] == '0'
+for flag, label in (('0', 'ok'), ('1', 'not-sampled'), ('2', 'ok'), ('1 l2_hw_valid=0', 'ok')):
+    text = capture().replace('l2_requested=1',
+        f'l2_hw_reason=0 l2_hw_reason_name={label} l2_hw_valid={flag} l2_requested=1')
+    assert not module.summarize(text)['states']['after']['fe']['l2_hw_reason_name_valid']
+
+# Parse the real enum names and a complete production-shaped R12 record.
+observe = (root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-fe-observe.h').read_text()
+names = re.search(r'static const char \*const names\[\]=\{(.*?)\};', observe, re.S).group(1)
+assert tuple(re.findall(r'"([^"]+)"', names)) == module.INSTALL_STAGES
+admission_values = dict.fromkeys(module.ADMISSION_COUNTERS, 0)
+admission_values.update(requests=10, parse_rejected=3, install_succeeded=5, install_failed=2,
+    reject_meta=1, reject_other_ingress=2, install_unsupported=1, install_collision=1,
+    stage_format_failed=1, stage_hash_collision_failed=1)
+admission = ('schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n' +
+    ' '.join(f'{key}={value}' for key, value in admission_values.items()) + '\n' +
+    'last_failure_request=10 last_failure_stage=hash_collision last_failure_errno=-95 last_rollback_errno=0')
+parsed = module.summarize(capture(admission=(admission, admission)))['l3_admission']['after']
+assert parsed['valid'] and not parsed['counts_are_packets'] and not parsed['hardware_forwarding_proven']
+assert parsed['counters']['install_collision'] == 1 and parsed['counters']['install_unsupported'] == 1
+assert parsed['counters']['stage_hash_collision_failed'] == 1
+assert parsed['last_failure'] == {'request': 10, 'stage': 'hash_collision', 'errno': -95, 'rollback_errno': 0}
+assert not module.summarize(capture())['l3_admission']['after']['valid']
+for old, new in (('mmio_reads=0', 'mmio_reads=1'), ('counts_are_packets=0', 'counts_are_packets=1'),
+                 ('install_unsupported=1', 'install_unsupported=0'),
+                 ('reject_pon=0', 'reject_pon=1'),
+                 ('stage_format_failed=1', 'stage_format_failed=2'),
+                 ('requests=10', 'requests=18446744073709551616'),
+                 ('last_failure_request=10', 'last_failure_request=11'),
+                 ('last_failure_errno=-95', 'last_failure_errno=1'),
+                 ('last_failure_errno=-95', 'last_failure_errno=-2147483649'),
+                 ('last_failure_stage=hash_collision', 'last_failure_stage=PRIVATE_192.0.2.1')):
+    result = module.admission_sample({'l3_admission': admission.replace(old, new).splitlines()})
+    assert not result['valid'] and 'PRIVATE' not in json.dumps(result), result
+for key in (*module.ADMISSION_COUNTERS, 'last_failure_stage', 'last_failure_errno'):
+    result = module.admission_sample({'l3_admission': [admission, f'{key}=']})
+    assert not result['valid'], key
+assert module.admission_sample({'l3_admission': ['schema=1 available=0 reason=busy retryable=1']})['reason'] == 'L3_admission_busy'
+for reason in module.ADMISSION_REJECTIONS:
+    values = dict.fromkeys(module.ADMISSION_COUNTERS, 0)
+    values.update(requests=1, parse_rejected=1)
+    values[reason] = 1
+    record = ('schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n' +
+        ' '.join(f'{key}={value}' for key, value in values.items()) + '\n' +
+        'last_failure_request=0 last_failure_stage=none last_failure_errno=0 last_rollback_errno=0')
+    parsed = module.admission_sample({'l3_admission': record.splitlines()})
+    assert parsed['valid'] and parsed['counters'][reason] == 1
+
+
+def flow_record(*, lease=1, hash=42, counter=3, counted=1, samples=4, age=50,
+                error=0, hits=2, byte_count=1000, packets=10, deleting=0):
+    return (f'lease={lease} hash={hash} input_hw=0 output_hw=7 ipv6=0 protocol=6 installed=1 '
+            f'published=1 deleting={deleting} counted={counted} counter={counter} samples={samples} '
+            f'sample_age_ms={age} sample_errno={error} age_hits={hits} l3_bytes={byte_count} packets={packets}')
+
+
+def flow_export(rows, *, instance=123456789, truncated=0):
+    return (f'schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 '
+            f'identity=lease_since_fe_creation instance_ns={instance} max_records=16 sampled_by=flow_stats\n'
+            'note=age_hits_are_positive_samples_not_packets;uncounted_rows_have_no_packet_totals;compare_same_boot_instance_and_lease\n' +
+            ''.join(row + '\n' for row in rows) + f'emitted={len(rows)} truncated={truncated}')
+
+
+fb, fa = flow_record(), flow_record(samples=7, age=25, hits=4, byte_count=1500, packets=15)
+flows = (flow_export([fb]), flow_export([fa]))
+
+
+def flow_summary(before=flows[0], after=flows[1], **kwargs):
+    return module.summarize(capture(flow=(before, after), **kwargs))['l3_flows_cached']
+
+
+parsed = flow_summary()
+assert parsed['valid'] and parsed['coverage_complete'] and not parsed['rates_available']
+assert not parsed['hardware_forwarding_proven']
+lease = parsed['leases']['1']
+assert lease['valid'] and lease['observed_increments'] == {'l3_bytes': 500, 'packets': 5}
+assert lease['successful_samples'] == 3 and lease['positive_activity_samples'] == 2
+assert lease['sample_age_ms'] == {'before': 50, 'after': 25} and not lease['sample_times_verified']
+assert 'per_second' not in json.dumps(parsed)
+assert flow_summary(after=flow_export([fa], truncated=1))['reason'] == 'cached_flow_observations_partial_coverage'
+assert not flow_summary(after=flow_export([fa], truncated=1))['coverage_complete']
+assert flow_summary(after=flow_export([fa], truncated=1))['leases']['1']['valid']
+assert flow_summary(after=flow_export([fa], instance=987654321))['reason'] == 'FE_instance_changed_no_cross_instance_comparison'
+assert not flow_summary(after_boot=other_boot)['valid']
+assert not flow_summary(ni_after=state.replace('host_active=1', 'host_active=0'))['valid']
+assert not flow_summary(after='unavailable')['valid']
+assert not module.summarize(capture())['l3_flows_cached']['valid']
+# Same numeric hash/counter slot under a new lease must never join the rows.
+reused = flow_summary(after=flow_export([fa.replace('lease=1', 'lease=2')]))
+assert set(reused['leases']) == {'1', '2'}
+assert all(not row['valid'] and row['reason'] == 'lease_not_observed_in_both_snapshots'
+           for row in reused['leases'].values())
+for old, new, reason in (
+    ('samples=7', 'samples=4', 'successful_sample_not_advanced_or_reset'),
+    ('samples=7', 'samples=1', 'successful_sample_not_advanced_or_reset'),
+    ('sample_errno=0', 'sample_errno=-110', 'stats_attempt_failed_old_cache_not_reused'),
+    ('l3_bytes=1500', 'l3_bytes=500', 'cached_counter_decreased_reset_or_wrap_not_guessed'),
+    ('packets=15', 'packets=5', 'cached_counter_decreased_reset_or_wrap_not_guessed'),
+    ('age_hits=4', 'age_hits=1', 'cached_counter_decreased_reset_or_wrap_not_guessed'),
+    ('counter=3', 'counter=4', 'lease_resource_identity_changed'),
+    ('hash=42', 'hash=43', 'lease_resource_identity_changed'),
+    ('deleting=0', 'deleting=1', 'lease_not_live_at_both_endpoints')):
+    result = flow_summary(after=flow_export([fa.replace(old, new)]))
+    assert result['leases']['1']['reason'] == reason, result
+for key in (*module.FLOW_NUMBERS, 'sample_errno'):
+    result = flow_summary(after=flow_export([fa + f' {key}=']))
+    assert not result['valid'], key
+for row in (fa.replace('lease=1', 'lease=0'), fa.replace('sample_errno=0', 'sample_errno=1'),
+            fa.replace('samples=7', 'samples=4294967296'), fa.replace('counter=3', 'counter=32'),
+            fa.replace('hash=42', 'hash=65536'), fa.replace('l3_bytes=1500', 'l3_bytes=PRIVATE_192.0.2.1'),
+            fa + ' instance_ns=123456789'):
+    result = flow_summary(after=flow_export([row]))
+    assert not result['valid'] and 'PRIVATE' not in json.dumps(result), result
+assert not flow_summary(after=flow_export([fa, fa]))['valid']
+for old, new in (('emitted=1', 'emitted=2'), ('truncated=0', 'truncated=2'),
+                 ('emitted=1', 'emitted=1 emitted=1'), ('truncated=0', 'truncated=0 truncated=0'),
+                 ('emitted=1', 'unavailable emitted=1'),
+                 ('cached=1', 'cached=1 cached=1'), ('instance_ns=123456789', 'instance_ns=0'),
+                 ('max_records=16', 'max_records=17'), ('sampled_by=flow_stats', 'sampled_by=unknown')):
+    assert not flow_summary(after=flows[1].replace(old, new))['valid']
+for marker in ('probe_failed=awk', 'read_failed=sysfs', 'read_empty=sysfs',
+               'read_truncated=16384_bytes', 'truncated=max_lines'):
+    for separator in ('\n', '', ' '):
+        assert not flow_summary(after=flows[1] + separator + marker)['valid']
+# No successful observation: sample_age_ms=0 is an absence sentinel, not proof
+# of freshness. Uncounted activity records must never acquire packet totals.
+empty_observation = flow_record(samples=0, age=0, hits=0, byte_count=0, packets=0)
+assert not flow_summary(before=flow_export([empty_observation]))['leases']['1']['valid']
+uncounted = tuple(flow_export([flow_record(counted=0, samples=5+i, hits=2+i, byte_count=0, packets=0)])
+                  for i in range(2))
+un = flow_summary(*uncounted)['leases']['1']
+assert un['valid'] and not un['packet_totals_available'] and 'observed_increments' not in un
+assert not flow_summary(after=flow_export([fa.replace('counted=1', 'counted=0')]))['valid']
+empty = flow_summary(before=flow_export([]), after=flow_export([]))
+assert empty['valid'] and empty['coverage_complete'] and not empty['leases']
+assert 'PRIVATE' not in json.dumps(flow_summary(after=flow_export([fa + ' private=PRIVATE_192.0.2.1'])))
+assert module.flow_sample({'l3_flows': ['schema=1 available=0 reason=busy retryable=1']})['reason'] == 'L3_flow_evidence_busy'
+
+completed_values = dict.fromkeys(module.L2_COMPLETED_NUMBERS + module.L2_COMPLETED_MASKS + module.L2_COMPLETED_ERRORS, 0)
+completed_values.update(l2_completed_valid=1, l2_completed_serial=4, l2_completed_generation=20,
+    l2_current_generation=20, l2_completed_reason=16, l2_completed_error=-95,
+    l2_completed_hw_reason=1, l2_completed_route_ports=31, l2_completed_route_eligible_ports=31,
+    l2_completed_armed=1, l2_cpu_fdb_count=5, l2_preflight_done=1, l2_preflight_error=-95)
+completed = ' '.join(f'{key}={value}' for key, value in completed_values.items()) + '\n' + \
+    ' '.join(f'{key}=0x0' for key in module.L2_HW_RAW)
+parsed = module.summarize(capture(completed=(completed, completed)))['l2_completed']['after']
+assert parsed['valid'] and parsed['completed'] and parsed['current_epoch']
+assert parsed['hw_reason_name'] == 'requires-existing-svl' and not parsed['hardware_forwarding_proven']
+assert parsed['raw_configuration']['valid'] and parsed['raw_configuration']['sampled']
+not_sampled = module.l2_completed_sample({'l2_evidence': completed.replace('l2_preflight_done=1', 'l2_preflight_done=0').splitlines()})
+assert not_sampled['hw_reason_name'] == 'not-sampled' and not not_sampled['raw_configuration']['sampled']
+assert not module.l2_completed_sample({'l2_evidence': [completed.replace('l2_current_generation=20', 'l2_current_generation=21')]})['current_epoch']
+assert module.l2_completed_sample({'l2_evidence': ['l2_completed_valid=0']})['hw_reason_name'] == 'not-sampled'
+for key in module.L2_COMPLETED_NUMBERS + module.L2_COMPLETED_MASKS + module.L2_COMPLETED_ERRORS:
+    assert not module.l2_completed_sample({'l2_evidence': [completed, f'{key}=']})['valid'], key
+assert not module.l2_completed_sample({'l2_evidence': [completed + ' l2_hw_vlan_mode=0']})['raw_configuration']['valid']
+
+resource_header = 'schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0\n'
+resources = resource_header + 'mdb_cpu_entries=2 mce_owner=1 mce_error=-95 mce_missing_contracts=0x1f l2_bank_2_leased=0'
+parsed = module.summarize(capture(resources=(resources, resources)))['states']['after']['fe']
+assert parsed['mdb_cpu_entries'] == '2' and parsed['mce_error'] == '-95' and parsed['l2_bank_2_leased'] == '0'
+for suffix in (' mdb_cpu_entries=', ' mdb_cpu_entries=PRIVATE_192.0.2.1'):
+    result = module.summarize(capture(resources=(resources, resources + suffix)))
+    assert 'mdb_cpu_entries' not in result['states']['after']['fe'] and 'PRIVATE' not in json.dumps(result)
+text = capture(resources=(resources, resources)).replace('l2_requested=1', 'mdb_cpu_entries=3 l2_requested=1')
+assert 'mdb_cpu_entries' not in module.summarize(text)['states']['after']['fe']
+assert 'mce_error' not in module.summarize(capture(resources=(resources, resources.replace('cached=1', 'cached=0'))))['states']['after']['fe']
+for unavailable in ('available=0 reason=busy retryable=1', 'available=0 reason=no_fe',
+                    'available=1 available=0', 'available=INVALID'):
+    text = capture(resources=(resources, resources)).replace('l2_requested=1', unavailable + ' l2_requested=1')
+    parsed = module.summarize(text)['states']['after']['fe']
+    assert not parsed['fe_state_available'] and 'l2_requested' not in parsed and 'l2_active' not in parsed
+    assert parsed['mce_error'] == '-95'  # independently valid cached resources
+    assert 'INVALID' not in json.dumps(parsed)
+    assert parsed['fe_state_reason'] == ('busy' if unavailable.endswith('retryable=1') else 'unavailable_or_invalid')
+
+mce = ('mce_preflight=cached mce_cold_handoff_verified=0 mce_missing_contracts=0x1f mce_sample_valid=0x1f '
+       'mce_cold_reads=5 mce_cold_register=0 mce_cold_value=0 mce_xram_cfg=0 mce_stg0_ctrl=0 '
+       'mce_hash_ini=0 mce_cache_ini=0 mce_cold_control=0 mce_capacity_fallbacks=0 mce_unpublished_aborts=0')
+parsed = module.mce_sample({'l2_evidence': [mce]})
+assert parsed['valid'] and parsed['all_registers_sampled'] and not parsed['handoff_verified']
+assert not parsed['hardware_forwarding_proven']
+assert not module.mce_sample({'l2_evidence': [mce.replace('mce_sample_valid=0x1f', 'mce_sample_valid=0x7')]})['all_registers_sampled']
+assert not module.mce_sample({'l2_evidence': [mce + ' mce_cold_control=']})['valid']
+assert not module.mce_sample({'l2_evidence': [mce.replace('mce_cold_handoff_verified=0', 'mce_cold_handoff_verified=1')]})['valid']
+# Actual combined getter layout contains direct live and historical cached
+# control words. They must not collide or be silently mixed into one value.
+combined = ('schema=1 available=1 clock=monotonic begin_ns=10 end_ns=20 mmio_writes=0 '
+            'atomic_snapshot=0 forwarding_proven=0 retirement_proven=0\n'
+            'mce_control=0x12345678\n' + completed + '\n' + mce.replace('mce_cold_control=0', 'mce_cold_control=0xabcdef01'))
+parsed = module.summarize(capture(completed=(combined, combined)))
+assert parsed['l2_completed']['after']['valid'] and parsed['mce_cached']['after']['valid']
+assert parsed['mce_cached']['after']['record']['mce_cold_control'] == 0xabcdef01
+assert 'mce_control' not in parsed['mce_cached']['after']['record']
+
 # Policy/capacity state is diagnostic evidence, never a packet hit counter or
 # proof that all bridge capabilities are implemented. Preserve integers and
 # reject malformed/duplicate fields without echoing arbitrary payloads.
@@ -333,6 +542,38 @@ assert 'PRIVATE_' not in json.dumps(module.cold_sample({'cold_bootstrap': [cold_
 for suffix in ('requested=', 'pon_error=', 'schema=', 'pon_stage='):
     assert not module.cold_sample({'cold_bootstrap': (cold_old + suffix).splitlines()})['valid']
 assert module.fields(['value=1 value=']) == {'value': None}
+
+pon_observations = {'pon_observation_schema': 1, 'pon_clock_observation_only': 1,
+                    'pon_gate_closed_mask': 0, 'pon_gate_reopened_mask': 0,
+                    'pon_gate_changed_mask': 0}
+for index in range(4):
+    pon_observations[f'pon_gate{index}_first_closed_poll'] = 0
+    pon_observations[f'pon_gate{index}_changes'] = 0
+for when in ('before', 'after'):
+    for name in ('sampled', 'valid', 'stable', 'error', 'refused_register', 'refused_value',
+                 'control', 'epon', 'gpon', 'psds_mode', 'psds_status', 'psds_gbox', 'pdc_control'):
+        pon_observations[f'pon_{when}_{name}'] = 0
+    pon_observations.update({f'pon_{when}_sampled': 127, f'pon_{when}_valid': 127,
+                             f'pon_{when}_stable': 1, f'pon_{when}_control': 0x30e,
+                             f'pon_{when}_gpon': 0x205})
+pon_text = '\n' + ' '.join(f'{key}={value}' for key, value in pon_observations.items())
+parsed = module.cold_sample({'cold_bootstrap': (cold_new + pon_text).splitlines()})
+assert parsed['valid'] and parsed['pon_cached_observations']['valid']
+assert not parsed['pon_cached_observations']['clock_ready_proven']
+assert parsed['pon_cached_observations']['register_observations']['pon_before_control'] == 0x30e
+for key in pon_observations:
+    parsed = module.cold_sample({'cold_bootstrap': (cold_new + pon_text + f' {key}=').splitlines()})
+    assert parsed['valid'] and not parsed['pon_cached_observations']['valid'], key
+assert not module.cold_sample({'cold_bootstrap': cold_new.splitlines()})['pon_cached_observations']['valid']
+# An inherited reset/flush command is refused before making an RMW request;
+# requested=0 and written=0 are real R12 evidence, not a malformed gate.
+command_refused = (cold_new.replace('result=-110', 'result=-16').replace('pon_error=-110', 'pon_error=-16')
+    .replace('pon_stage=4', 'pon_stage=3').replace('pon_gate_written_mask=0x8', 'pon_gate_written_mask=0x0')
+    .replace('pon_gate_polls=1000', 'pon_gate_polls=0').replace('pon_gate3_before=0xa2', 'pon_gate3_before=0x800000a2')
+    .replace('pon_gate3_readback=0xa2', 'pon_gate3_readback=0x800000a2')
+    .replace('pon_gate3_requested=0xa0', 'pon_gate3_requested=0x0').replace('pon_refused_value=0xa2', 'pon_refused_value=0x800000a2'))
+assert module.cold_sample({'cold_bootstrap': command_refused.splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': command_refused.replace('pon_error=-16', 'pon_error=-5').splitlines()})['valid']
 
 for reason, text in (
     ('boot_changed', capture(after_boot=other_boot)),
@@ -498,4 +739,6 @@ with tempfile.TemporaryDirectory(prefix='datapath-summary-') as temporary:
 
 print('Datapath summary: exact host/QM deltas, quantized clock bounds, cached MAC raw-only evidence, '
       'historical cold failure/gate evidence, FE hardware-reason enum, '
+      'R12 completed L2/resources/MCE, admission stages, boot-instance-lease flow observations, '
+      'coverage truncation versus read failure, PON cached snapshots/command refusal, '
       'mode/boot/reset/wrap/link/policy/lifecycle/partial refusal, privacy, bounded parser and CLI passed')

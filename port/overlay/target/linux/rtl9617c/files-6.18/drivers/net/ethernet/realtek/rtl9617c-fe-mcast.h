@@ -14,6 +14,34 @@ struct rtl_fe_mcast {
 
 static int fe_mcast_inherited_l3_check(struct rtl_fe *fe);
 
+/* Cached preflight/resource evidence, separate from the crowded legacy
+ * l2_state page. The caller holds fe->lock; this performs no MMIO at all.
+ * A missing owner/sample is unavailable, never a zero-valued success. */
+static ssize_t fe_mcast_evidence(struct rtl_fe *fe, char *buffer, size_t bytes)
+{
+	const struct rtl_mcast_state *state;
+
+	if (!fe->mcast)
+		return scnprintf(buffer, bytes,
+			"mce_preflight=not-attempted mce_sample_valid=0x0\n");
+	state = &fe->mcast->state;
+	return scnprintf(buffer, bytes,
+		"mce_preflight=cached mce_cold_handoff_verified=0 "
+		"mce_missing_contracts=0x%x mce_sample_valid=0x%x "
+		"mce_cold_reads=%u mce_cold_register=0x%x mce_cold_value=0x%x "
+		"mce_xram_cfg=0x%x mce_stg0_ctrl=0x%x mce_hash_ini=0x%x "
+		"mce_cache_ini=0x%x mce_cold_control=0x%x "
+		"mce_capacity_fallbacks=%u mce_unpublished_aborts=%u\n",
+		state->handoff.missing, state->handoff.valid_mask,
+		state->cold_reads, state->cold_register, state->cold_value,
+		state->handoff.value[RTL_MCAST_HANDOFF_XRAM],
+		state->handoff.value[RTL_MCAST_HANDOFF_STG0],
+		state->handoff.value[RTL_MCAST_HANDOFF_HASH],
+		state->handoff.value[RTL_MCAST_HANDOFF_CACHE],
+		state->handoff.value[RTL_MCAST_HANDOFF_MCE],
+		state->capacity_fallbacks, state->unpublished_aborts);
+}
+
 static int fe_mcast_cold_prepare(struct rtl_fe *fe)
 {
 	struct rtl_dq_io io = fe_io(fe);

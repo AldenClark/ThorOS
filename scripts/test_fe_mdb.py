@@ -140,6 +140,9 @@ def main():
             "fe->mdb->tcam.exposed || fe->mdb->tcam.prepared ||\n\t\tfe->mdb->tcam.poisoned || fe->mdb->tcam.active ||\n\t\tfe->mdb->tcam.guard_exposed ||",
             "fe->mdb->tcam.poisoned || fe->mdb->tcam.active ||"),
         "no-prefix-withdraw": ("undo = fe_mdb_withdraw(fe);", "undo = 0;"),
+        "strand-unpublished-mce-tail": (
+            "undo = rtl_mcast_abort_unpublished(&fe->mcast->state,\n\t\t\t\tfe->l2_owner, &io);",
+            "undo = 0;"),
         "drop-window-lease": ("fe->mdb->window_retained = true;", "fe->mdb->window_retained = false;"),
         "publish-new-policy-without-drain": ("if (mdb->tcam.exposed && mdb->generation != generation)",
                                               "if (0 && mdb->tcam.exposed && mdb->generation != generation)"),

@@ -40,6 +40,7 @@
 #define RTL_PON_COLD_EPON_CONTROL 0xf4320074U
 #define RTL_PON_COLD_GPON_CONTROL 0xf432007cU
 #define RTL_PON_COLD_EPON_MODE (1U << 0)
+#define RTL_PON_COLD_PSDS_CSR_RELEASED (1U << 2)
 /* Despite its name, SDK pdc_reset=0 asserts reset; 1 releases it. */
 #define RTL_PON_COLD_PDC_RELEASED (1U << 9)
 #define RTL_PON_COLD_EPON_RELEASED (1U << 0)
@@ -53,6 +54,13 @@
 
 #define RTL_PON_COLD_PDC_FIFO_STATUS 0x9010U
 #define RTL_PON_COLD_PDC_FIFO_DEPTH 31U
+#define RTL_PON_COLD_PDC_CONTROL 0x9014U
+#define RTL_PON_COLD_PSDS_MODE 0xa02cU
+#define RTL_PON_COLD_PSDS_STATUS 0xa060U
+#define RTL_PON_COLD_PSDS_GBOX 0xa064U
+/* These are commands, NOT mac_en acknowledgement bits. A full-word RMW
+ * must not replay an inherited TCONT flush or a PMAC software reset. */
+#define RTL_PON_COLD_XGPON_COMMANDS ((1U << 30) | (1U << 31))
 #define RTL_PON_COLD_GATE_POLLS 1000U
 #define RTL_PON_COLD_GATE_STABLE 3U
 #define RTL_PON_COLD_FIFO_POLLS 1000U
@@ -76,6 +84,24 @@ enum rtl_pon_cold_stage {
 	RTL_PON_COLD_READY,
 };
 
+enum rtl_pon_cold_sample_id {
+	RTL_PON_COLD_SAMPLE_CONTROL,
+	RTL_PON_COLD_SAMPLE_EPON,
+	RTL_PON_COLD_SAMPLE_GPON,
+	RTL_PON_COLD_SAMPLE_PSDS_MODE,
+	RTL_PON_COLD_SAMPLE_PSDS_STATUS,
+	RTL_PON_COLD_SAMPLE_PSDS_GBOX,
+	RTL_PON_COLD_SAMPLE_PDC_CONTROL,
+	RTL_PON_COLD_SAMPLE_COUNT,
+};
+
+struct rtl_pon_cold_snapshot {
+	unsigned int value[RTL_PON_COLD_SAMPLE_COUNT];
+	unsigned int sampled_mask, valid_mask, refused_register, refused_value;
+	int error;
+	unsigned char stable;
+};
+
 struct rtl_pon_cold_state {
 	unsigned int control, epon_control, gpon_control;
 	unsigned int gated_mask, fifo_status, fifo_polls;
@@ -84,7 +110,13 @@ struct rtl_pon_cold_state {
 	unsigned int gate_readback[RTL_PON_COLD_GATE_COUNT];
 	unsigned int gate_written_mask, gate_sampled_mask;
 	unsigned int gate_polls, gate_stable;
+	/* Closed/reopened are cumulative; changes/first_closed_poll describe
+	 * the bounded readback window, not a live hardware event counter. */
+	unsigned int gate_closed_mask, gate_reopened_mask, gate_changed_mask;
+	unsigned int gate_first_closed_poll[RTL_PON_COLD_GATE_COUNT];
+	unsigned int gate_changes[RTL_PON_COLD_GATE_COUNT];
 	unsigned int refused_register, refused_value;
+	struct rtl_pon_cold_snapshot before, after;
 	int error;
 	unsigned char pdc_active, stage, ready;
 };
@@ -96,6 +128,68 @@ static const struct {
 	RTL_PON_COLD_RX_GATES(RTL_PON_COLD_GATE_ENTRY)
 #undef RTL_PON_COLD_GATE_ENTRY
 };
+
+/* Observations only. In particular PSDS CKRDY is not an APB write-ACK or
+ * NI/DDR drain indication. The SDK aal_xgpon_clk_is_locked_ok() is a stub;
+ * use the actual PSDS_RGB8 bits as raw evidence instead. Do not touch an
+ * inactive/reset-held domain, an indirect window, interrupt or PM counter.
+ * A failed observation never manufactures permission for the cold owner.
+ */
+static inline int rtl_pon_cold_snapshot(const struct rtl_dq_io *io,
+				       struct rtl_pon_cold_snapshot *snapshot)
+{
+	static const unsigned int registers[] = {
+		RTL_PON_COLD_CONTROL, RTL_PON_COLD_EPON_CONTROL,
+		RTL_PON_COLD_GPON_CONTROL, RTL_PON_COLD_PSDS_MODE,
+		RTL_PON_COLD_PSDS_STATUS, RTL_PON_COLD_PSDS_GBOX,
+		RTL_PON_COLD_PDC_CONTROL,
+	};
+	unsigned int i, j, value, control;
+
+	if (!io || !io->read || !snapshot)
+		return -EINVAL;
+	*snapshot = (struct rtl_pon_cold_snapshot){ 0 };
+	for (i = 0; i < RTL_PON_COLD_SAMPLE_COUNT; i++) {
+		if (i >= RTL_PON_COLD_SAMPLE_PSDS_MODE) {
+			control = snapshot->value[RTL_PON_COLD_SAMPLE_CONTROL];
+			if (!(control & RTL_PON_COLD_PDC_RELEASED))
+				continue;
+			if (i != RTL_PON_COLD_SAMPLE_PDC_CONTROL &&
+			    !(control & RTL_PON_COLD_PSDS_CSR_RELEASED))
+				continue;
+			/* Check selection immediately before every domain read. */
+			for (j = 0; j < RTL_PON_COLD_SAMPLE_PSDS_MODE; j++) {
+				value = io->read(io->context, registers[j]);
+				if (value != snapshot->value[j])
+					goto drift;
+			}
+		}
+		value = io->read(io->context, registers[i]);
+		snapshot->sampled_mask |= 1U << i;
+		snapshot->value[i] = value;
+		if (value == ~0U) {
+			snapshot->error = -EIO;
+			snapshot->refused_register = registers[i];
+			snapshot->refused_value = value;
+			return snapshot->error;
+		}
+		snapshot->valid_mask |= 1U << i;
+	}
+	/* Also bracket the last read: a reset changing during that read is
+	 * an unstable snapshot, not zero clocks or a usable new mode. */
+	for (j = 0; j < RTL_PON_COLD_SAMPLE_PSDS_MODE; j++) {
+		value = io->read(io->context, registers[j]);
+		if (value != snapshot->value[j])
+			goto drift;
+	}
+	snapshot->stable = 1;
+	return 0;
+drift:
+	snapshot->error = value == ~0U ? -EIO : -EAGAIN;
+	snapshot->refused_register = registers[j];
+	snapshot->refused_value = value;
+	return snapshot->error;
+}
 
 static inline int rtl_pon_cold_error(struct rtl_pon_cold_state *state,
 				    int error, unsigned int reg,
@@ -122,6 +216,14 @@ static inline int rtl_pon_cold_globals_match(const struct rtl_dq_io *io,
 	RTL_PON_COLD_VERIFY_GLOBAL(RTL_PON_COLD_EPON_CONTROL, epon_control);
 	RTL_PON_COLD_VERIFY_GLOBAL(RTL_PON_COLD_GPON_CONTROL, gpon_control);
 #undef RTL_PON_COLD_VERIFY_GLOBAL
+	return 0;
+}
+
+static inline int rtl_pon_cold_gate_command_check(struct rtl_pon_cold_state *state,
+						  unsigned int gate, unsigned int value)
+{
+	if (gate == RTL_PON_COLD_GATE_XGPON && (value & RTL_PON_COLD_XGPON_COMMANDS))
+		return rtl_pon_cold_error(state, -EBUSY, rtl_pon_cold_gates[gate].reg, value);
 	return 0;
 }
 
@@ -152,12 +254,26 @@ static inline int rtl_pon_cold_wait_gates(const struct rtl_dq_io *io,
 			if (ret)
 				return ret;
 			value = io->read(io->context, rtl_pon_cold_gates[i].reg);
+			if (value != state->gate_readback[i]) {
+				state->gate_changed_mask |= 1U << i;
+				state->gate_changes[i]++;
+			}
 			state->gate_readback[i] = value;
 			if (value == ~0U)
 				return rtl_pon_cold_error(state, -EIO,
 					rtl_pon_cold_gates[i].reg, value);
-			if (value & rtl_pon_cold_gates[i].mask)
+			ret = rtl_pon_cold_gate_command_check(state, i, value);
+			if (ret)
+				return ret;
+			if (value & rtl_pon_cold_gates[i].mask) {
 				closed = 0;
+				if (state->gate_closed_mask & (1U << i))
+					state->gate_reopened_mask |= 1U << i;
+			} else {
+				if (!(state->gate_closed_mask & (1U << i)))
+					state->gate_first_closed_poll[i] = poll + 1;
+				state->gate_closed_mask |= 1U << i;
+			}
 		}
 		state->gate_stable = closed ? state->gate_stable + 1 : 0;
 		if (state->gate_stable == RTL_PON_COLD_GATE_STABLE)
@@ -208,9 +324,17 @@ static inline int rtl_pon_cold_verify(const struct rtl_dq_io *io,
 			return ret;
 		value = io->read(io->context, rtl_pon_cold_gates[i].reg);
 		state->gate_readback[i] = value;
-		if (value & rtl_pon_cold_gates[i].mask)
+		if (value == ~0U)
 			return rtl_pon_cold_error(state, -EIO,
 						  rtl_pon_cold_gates[i].reg, value);
+		ret = rtl_pon_cold_gate_command_check(state, i, value);
+		if (ret)
+			return ret;
+		if (value & rtl_pon_cold_gates[i].mask) {
+			state->gate_reopened_mask |= 1U << i;
+			return rtl_pon_cold_error(state, -EIO,
+						  rtl_pon_cold_gates[i].reg, value);
+		}
 	}
 	if (state->pdc_active) {
 		ret = rtl_pon_cold_globals_match(io, state);
@@ -226,6 +350,9 @@ static inline int rtl_pon_cold_verify(const struct rtl_dq_io *io,
 			return rtl_pon_cold_error(state, -EBUSY,
 						  RTL_PON_COLD_PDC_FIFO_STATUS, value);
 	}
+	ret = rtl_pon_cold_globals_match(io, state);
+	if (ret)
+		return ret;
 	state->stage = RTL_PON_COLD_READY;
 	state->error = 0;
 	return 0;
@@ -313,6 +440,9 @@ static inline int rtl_pon_cold_quiesce(const struct rtl_dq_io *io,
 		if (value == ~0U)
 			return rtl_pon_cold_error(state, -EIO,
 						  rtl_pon_cold_gates[i].reg, value);
+		ret = rtl_pon_cold_gate_command_check(state, i, value);
+		if (ret)
+			return ret;
 		state->gate_requested[i] = value & ~rtl_pon_cold_gates[i].mask;
 		if (value & rtl_pon_cold_gates[i].mask) {
 			ret = rtl_pon_cold_globals_match(io, state);

@@ -65,11 +65,34 @@
 
 ## 诊断和故障处理
 
+- `l2_state` 保留一页内的简要状态；详细资源、准入和逐流证据分别位于只读 `l2_resources`、`l3_admission`、`l3_flows`。完整状态采集必须同时读取这些接口，不能继续依赖旧版 `l2_state` 的全部字段。格式上界回归按满宽计数器验证，避免长时间运行后尾部拒绝原因被截断。
+- `l2_resources` 输出共享表容量、租约、日志、MCE 与 MDB 状态；`cached=1` 表示仅读取驱动缓存，不触发表扫描。`l2_state` 中的 owner 存在并不表示资源已接管或复制引擎已启用。
+- `l2_evidence` 区分上一笔完整事务的 `l2_completed_*` 与当前 `l2_worker_busy` / `l2_pending_*`。原始 preflight 字段与 completed 原因来自同一事务；`l2_preflight_done=0`、`l2_hw_valid=0` 或 `not-sampled` 不是硬件检查通过。direct-CSR preflight 即使遇到 CPU-owned FDB 拒绝也会运行，不创建表项或接管 PON。
+- `l3_admission` 按解析原因、安装阶段及实际 errno 计数。其他物理入口的回调单列为 `reject_other_ingress`，非哈希阶段的 `-EOPNOTSUPP` 单列为 unsupported；不能再把所有该 errno 都解释为哈希冲突。请求数、安装数和失败数都是规则操作计数，不是包数或硬件命中数。
+- `l3_flows` 最多输出 16 条有界、无地址的缓存观测。身份由同一 boot、FE `instance_ns` 与不复用的 `lease` 共同确定；不能仅按可复用的 hash/counter 槽相减。`truncated=1` 明确表示不是全表；`age_hits` 是正的老化采样次数，不是包数；`sample_age_ms` 是最近一次 stats 尝试的年龄，不是最近一次包转发时间。安装成功也不是数据面验收通过。
 - `l2_route_eligible_ports` 是逐端口路由许可；`l2_native_route_policy_allowed` 是 native 共享策略许可。二者不能互相替代。
 - `mdb_cpu_entries`、`mdb_folded_entries`、`mdb_overlap_cpu`、`mdb_capacity_cpu`、`mdb_dynamic_rows` 表示有界控制面结果，不是硬件命中或已经完成冷接管的证明。
 - `naptv6_configured`、`action_bits`、`cache_entries` 和 `cache_action_bits` 显示当前所有者选择的动作/缓存模式。
 - `cache_snapshot` 是有截止时间的主动只读诊断，不是转发控制。扩展缓存可观察的签名缺少完整 CRC16 身份信息；稳定候选返回 `identity_ambiguous`、`complete=0` 和 `candidate_*` 差异，不将其报告成目标流命中或失配。普通缓存模式沿用已验证的 set 索引规则。
 - 不支持的业务正常留在 Linux；无法确认的共享硬件写入、命令完成或回滚进入隔离状态。此时可能需要设备重启，不支持强制驱动卸载再绑定恢复。
+
+### 冷接管、重试与资源失败路径
+
+CPU 动态 FDB 在 bridge offload/replay 之前只读预检。没有策略、代数、引擎或恢复状态变化的已完成事务，不重复撤销和重放；显式 FE 生命周期变化及最后一笔延迟撤销完成会强制重新协调，不会被普通重复通知去重吞掉。
+
+MCE 在获取 lease 或进行 MMIO 前检查完整组所需的 vector/POL token 容量。部分发布失败时，未曾对硬件公开的尾部资源可以立即撤销；曾经公开的依赖仍受退役契约保护。回滚保留真实的超时或 I/O 错误，不能将其降为普通不支持并重新开放入口。
+
+PON 冷阶段不在 RMW 中重放继承的 PMAC reset/TCONT flush 命令位。接收门禁读回、FIFO 排空和最终 GLOBAL 状态均需核验；PSDS/PDC 与门禁变化的新增缓存快照用于定位拒绝，不是新的写权限或排空 ACK。XGPON 接收门无法关闭时仍应拒绝接管，不能用经验延时或更大缓冲代替证明。
+
+MCE 继承状态诊断给出逐寄存器有效位与 `missing_contracts`：CPU XRAM、DMALSO、继承 classifier roots、DDR retirement、MCE packet retirement 分别占 bit 0–4。配置可读、flush 请求已置位或计数暂时不变，均不证明这些消费者已停止。当前缺失的物理契约仍保持阻断。
+
+流量计数发现字节/包差分不相容时，记录 `-ERANGE` 并重建私有采样基线，不把无符号下溢后的巨量字节记到 conntrack。该处理不重置硬件表或改变流的转发授权。
+
+### 实机采集工具
+
+兼容镜像包含 `ip-full` 与 `ip-bridge`，用于获得完整的链路、FDB、MDB 和 VLAN 控制面证据。采集脚本仍兼容工具缺失，使用整数秒等待，保留原始失败、空读取与截断标记；只对明确列出的只读缓存/direct-CSR 接口进行有界重试，主动表读取不重复执行。读取失败的半截 FE 状态不得授权后续主动流表遍历。
+
+离线摘要始终保留 `hardware_forwarding_proven=false`。它可定位控制面变化与缓存观测增量，但不会自动把这些诊断解释为六项硬件能力已通过实机验收。
 
 ## 验证要求
 
