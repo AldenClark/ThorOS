@@ -23,6 +23,8 @@ TOKEN = re.compile(r"(?<!\S)([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]*)")
 LIFECYCLE = ("base_ready", "dma_exposed", "engine_poisoned", "host_active", "reboot_required")
 MIB_COUNTERS = ("rx_bytes", "tx_bytes", "rx_uc", "rx_mc", "rx_bc", "tx_uc", "tx_mc", "tx_bc")
 MAX_MIB_AGE_NS = 3_000_000_000
+QM_EQ_GAUGES = ("pending", "peak")
+QM_EQ_COUNTERS = ("retries", "returned", "full_stalls")
 TM_CONFIGS = ('tm_clear_control', 'bm_control', 'buffer_config', 'eq_config', 'private_config',
               'es_control', 'es_lan0', 'es_lan1', 'es_lan2', 'es_lan3', 'es_lan4',
               'es_l3wan10', 'es_oam12', 'es_l3lan13', 'te_control', 'fc_control',
@@ -163,6 +165,34 @@ def delta(before, after, window):
     return {"valid": True, "delta": difference,
             "per_second_min": difference / window["max_seconds"],
             "per_second_max": difference / window["min_seconds"]}
+
+
+def qm_buffer_pressure(before, after, window):
+    """New passive EQ4/5 return pressure; no register writes or ASIC claims.
+
+    Old firmware omits this extension entirely. Partially captured extensions
+    are invalid. Pending and high-water are gauges, not drop counters/rates.
+    """
+    keys = [f"refill_eq{eq}_{name}" for eq in (4, 5)
+            for name in QM_EQ_GAUGES + QM_EQ_COUNTERS]
+    if not any(key in before or key in after for key in keys):
+        return {"valid": False, "reason": "per_EQ_refill_evidence_unavailable"}
+    if any(number(before.get(key)) is None or number(after.get(key)) is None for key in keys):
+        return {"valid": False, "reason": "per_EQ_refill_evidence_incomplete"}
+    result = {"valid": True, "eq": {}}
+    for eq in (4, 5):
+        prefix = f"refill_eq{eq}_"
+        gauges = {name: {"before": int(before[prefix + name]),
+                         "after": int(after[prefix + name])} for name in QM_EQ_GAUGES}
+        if any(gauges[name][which] > 512 for name in QM_EQ_GAUGES
+               for which in ("before", "after")):
+            return {"valid": False, "reason": "refill_pool_capacity_exceeded"}
+        counters = {name: delta(before[prefix + name], after[prefix + name], window)
+                    for name in QM_EQ_COUNTERS}
+        if not all(value["valid"] for value in counters.values()):
+            return {"valid": False, "reason": "per_EQ_refill_counter_reset_or_invalid"}
+        result["eq"][f"eq{eq}"] = {"gauges": gauges, "counters": counters}
+    return result
 
 
 def netdev(lines):
@@ -577,7 +607,7 @@ def summarize(text):
                         "FE rows are not differenced without a stable per-flow/counter generation.",
                         "MAC raw observations have unverified counter mode; no MAC delta or rate is calculated.",
                         "Cold-bootstrap records are historical, not proof of a new power cycle or current RX gates."],
-              "states": {}, "qm_cpu": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
+              "states": {}, "qm_cpu": {}, "qm_buffer": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
               "cold_bootstrap_history": {}}
     fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
@@ -598,6 +628,7 @@ def summarize(text):
         result['cold_bootstrap_history'][which] = cold_sample(snapshot)
     if not window["valid"]:
         result["qm_cpu"] = {"valid": False, "reason": "invalid_clock_window"}
+        result["qm_buffer"] = {"valid": False, "reason": "invalid_clock_window"}
         result["netdev_host"] = {"valid": False, "reason": "invalid_clock_window"}
         result["physical_mac_cached"] = {"valid": False, "reason": "invalid_clock_window"}
         result["fabric_cached"] = {"valid": False, "reason": "invalid_clock_window"}
@@ -611,12 +642,15 @@ def summarize(text):
                                                mode == 'active_diagnostics')
     if ni_before != expected or ni_after != expected:
         result["qm_cpu"] = {"valid": False, "reason": "NI_lifecycle_not_stable_ready_at_endpoints"}
+        result["qm_buffer"] = {"valid": False, "reason": "NI_lifecycle_not_stable_ready_at_endpoints"}
     elif any(faulty(snapshot.get("qm_voqs", [])) for snapshot in (before, after)):
         result["qm_cpu"] = {"valid": False, "reason": "QM_sample_incomplete"}
+        result["qm_buffer"] = {"valid": False, "reason": "QM_sample_incomplete"}
     else:
         qb, qa = (fields(snapshot.get("qm_voqs", [])) for snapshot in (before, after))
         result["qm_cpu"] = {key: delta(qb.get(key), qa.get(key), window) for key in
                             ("cpu_bytes", "cpu_packets", "ring_errors", "buffer_errors", "budget_hits")}
+        result["qm_buffer"] = qm_buffer_pressure(qb, qa, window)
 
     lb, la = (links(snapshot.get("wired_link_state", [])) for snapshot in (before, after))
     nb, na = (netdev(snapshot.get("netdev_counters", [])) for snapshot in (before, after))

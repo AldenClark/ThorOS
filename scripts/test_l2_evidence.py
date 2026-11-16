@@ -70,7 +70,12 @@ struct mutex { bool held, deny; };
 struct rtl_fe { struct mutex lock; bool engine_ready, shutting_down; int route_lock; };
 struct rtl_qm_rx {
  void *ni; u64 memory_dma; u32 last_address,last_size,last_header[2];
- struct {unsigned pending,retries,returned,peak;} refill;
+ u64 voq_packets[8],poll_budget_hits,cpu_packets,cpu_bytes,ring_errors,buffer_errors;
+ unsigned rx_prefetch,pppoe_rx_checksum;
+ struct {
+  unsigned pending,retries,returned,peak;
+  unsigned count[2],eq_peak[2],eq_retries[2],eq_returned[2],eq_full_stalls[2];
+ } refill;
 };
 static u32 registers[0x10000 / 4], before[0x10000 / 4];
 static unsigned int reads, writes, locks, unlocks, fake_time;
@@ -173,12 +178,27 @@ int main(void) {
   assert(strstr(output,"retirement_proven=0") && strstr(output,"hw_port=4"));
  }
  struct rtl_qm_rx qm={.ni=registers};
+ qm.refill.count[0]=3;qm.refill.count[1]=5;
+ qm.refill.eq_peak[0]=7;qm.refill.eq_peak[1]=11;
+ qm.refill.eq_retries[0]=13;qm.refill.eq_retries[1]=17;
+ qm.refill.eq_returned[0]=19;qm.refill.eq_returned[1]=23;
+ qm.refill.eq_full_stalls[0]=29;qm.refill.eq_full_stalls[1]=31;
  for(unsigned i=0;i<32;i++) {
   setup(i);strict=false;registers[0x105c/4]=1U<<i;
   memcpy(before,registers,sizeof(before));
   assert(rtl_qm_rx_state(&qm,output)>0);
   assert(strstr(output,"monitor_selector=") && strstr(output,"monitor_atomic=0"));
+  assert(strstr(output,"refill_eq4_pending=3 refill_eq5_pending=5"));
+  assert(strstr(output,"refill_eq4_peak=7 refill_eq5_peak=11"));
+  assert(strstr(output,"refill_eq4_retries=13 refill_eq5_retries=17"));
+  assert(strstr(output,"refill_eq4_returned=19 refill_eq5_returned=23"));
+  assert(strstr(output,"refill_eq4_full_stalls=29 refill_eq5_full_stalls=31"));
   assert(!writes && !memcmp(before,registers,sizeof(before)));
+  unsigned int reads_before=reads;
+  assert(rtl_qm_rx_voq_state(&qm,output)>0);
+  assert(strstr(output,"refill_eq4_pending=3 refill_eq5_pending=5"));
+  assert(strstr(output,"refill_eq4_full_stalls=29 refill_eq5_full_stalls=31"));
+  assert(!writes && reads==reads_before && !memcmp(before,registers,sizeof(before)));
  }
  puts("PASS: passive L2: 32 field bits, 128 baseline combinations, 64 live snapshots, no-FE/down/shutdown/busy; QM 32 selectors unchanged");
 }
@@ -233,7 +253,9 @@ def main():
     parser.add_argument("--registers", type=Path)
     args = parser.parse_args()
     fe = function((DRIVER / "rtl9617c-fe.c").read_text(), "rtl_fe_l2_evidence")
-    qm = function((DRIVER / "rtl9617c-qm.c").read_text(), "rtl_qm_rx_state")
+    qm_source = (DRIVER / "rtl9617c-qm.c").read_text()
+    qm = (function(qm_source, "rtl_qm_rx_state") +
+          function(qm_source, "rtl_qm_rx_voq_state"))
     header = (DRIVER / "rtl9617c-l2-evidence.h").read_text()
 
     def change_once(text, old, new):

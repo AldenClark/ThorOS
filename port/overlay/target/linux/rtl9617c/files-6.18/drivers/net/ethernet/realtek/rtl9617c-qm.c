@@ -600,8 +600,13 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				offset /
 				(RTL_QM_BUFFERS_PER_EQ * RTL_QM_BUFFER_BYTES);
 			if (valid_buffer &&
-			    rx->refill.count[(command & 15) - EQ_ID] >= RTL_QM_REFILL_SIZE)
+			    rx->refill.count[(command & 15) - EQ_ID] >= RTL_QM_REFILL_SIZE) {
+				/* This EPP still owns its payload. Do not retire it or
+				 * overwrite a full deferred-return ring just to continue
+				 * polling. The existing 1ms pending-refill timer retries. */
+				rx->refill.eq_full_stalls[(command & 15) - EQ_ID]++;
 				break;
+			}
 			rx->last_address = command;
 			rx->last_size = length_word;
 			count++;
@@ -712,7 +717,7 @@ consume:
 
 ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 {
-	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u cpu_packets=%llu cpu_bytes=%llu ring_errors=%llu buffer_errors=%llu\n",
+	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u cpu_packets=%llu cpu_bytes=%llu ring_errors=%llu buffer_errors=%llu refill_eq4_pending=%u refill_eq5_pending=%u refill_eq4_peak=%u refill_eq5_peak=%u refill_eq4_retries=%u refill_eq5_retries=%u refill_eq4_returned=%u refill_eq5_returned=%u refill_eq4_full_stalls=%u refill_eq5_full_stalls=%u\n",
 		READ_ONCE(rx->voq_packets[7]), READ_ONCE(rx->voq_packets[6]),
 		READ_ONCE(rx->voq_packets[5]), READ_ONCE(rx->voq_packets[4]),
 		READ_ONCE(rx->voq_packets[3]), READ_ONCE(rx->voq_packets[2]),
@@ -720,7 +725,13 @@ ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 		READ_ONCE(rx->poll_budget_hits), READ_ONCE(rx->rx_prefetch),
 		READ_ONCE(rx->pppoe_rx_checksum), READ_ONCE(rx->cpu_packets),
 		READ_ONCE(rx->cpu_bytes), READ_ONCE(rx->ring_errors),
-		READ_ONCE(rx->buffer_errors));
+		READ_ONCE(rx->buffer_errors),
+		READ_ONCE(rx->refill.count[0]), READ_ONCE(rx->refill.count[1]),
+		READ_ONCE(rx->refill.eq_peak[0]), READ_ONCE(rx->refill.eq_peak[1]),
+		READ_ONCE(rx->refill.eq_retries[0]), READ_ONCE(rx->refill.eq_retries[1]),
+		READ_ONCE(rx->refill.eq_returned[0]), READ_ONCE(rx->refill.eq_returned[1]),
+		READ_ONCE(rx->refill.eq_full_stalls[0]),
+		READ_ONCE(rx->refill.eq_full_stalls[1]));
 }
 
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
@@ -730,7 +741,7 @@ ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 	 * selector. The returned bus sample is labeled with the observed selector,
 	 * not silently interpreted as the formerly forced bus 0x82. */
 	u32 monitor_selector = readl(rx->ni + 0x105c);
-	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
+	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u refill_eq4_pending=%u refill_eq5_pending=%u refill_eq4_peak=%u refill_eq5_peak=%u refill_eq4_retries=%u refill_eq5_retries=%u refill_eq4_returned=%u refill_eq5_returned=%u refill_eq4_full_stalls=%u refill_eq5_full_stalls=%u\n",
 		&rx->memory_dma, readl(rx->ni + RMU_CTRL), readl(rx->ni + ES_CTRL),
 		readl(rx->ni + 0x6850), readl(rx->ni + 0x6328 + EQ_ID * 4),
 		readl(rx->ni + CPU_READY), readl(rx->ni + 0x659c),
@@ -742,7 +753,12 @@ ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 		readl(rx->ni + 0x6824), readl(rx->ni + 0x2d60), readl(rx->ni + 0x2d64),
 		readl(rx->ni + 0x2d78), readl(rx->ni + 0x9004),
 		readl(rx->ni + 0x9710), readl(rx->ni + 0x971c), READ_ONCE(rx->refill.pending),
-		rx->refill.retries, rx->refill.returned, rx->refill.peak);
+		rx->refill.retries, rx->refill.returned, rx->refill.peak,
+		READ_ONCE(rx->refill.count[0]), READ_ONCE(rx->refill.count[1]),
+		rx->refill.eq_peak[0], rx->refill.eq_peak[1],
+		rx->refill.eq_retries[0], rx->refill.eq_retries[1],
+		rx->refill.eq_returned[0], rx->refill.eq_returned[1],
+		rx->refill.eq_full_stalls[0], rx->refill.eq_full_stalls[1]);
 }
 
 ssize_t rtl_qm_deepq_state(struct rtl_qm_rx *rx, char *buf)

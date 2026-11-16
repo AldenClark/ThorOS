@@ -157,11 +157,13 @@ int main(void) {
   assert(!rtl_qm_rx_poll(&rx,&napi,64));
   assert(!retired && !payload_syncs && !pushes && !delivered && !rx.read[1]);
   assert(rx.refill.count[0]==512+extra);
+  assert(rx.refill.eq_full_stalls[0]==1 && rx.refill.eq_full_stalls[1]==0);
   if(!extra) {
    command(&rx,0,0,rx.memory_dma+RTL_QM_PAYLOAD_OFFSET+512*2048,5,512);
    assert(rtl_qm_rx_poll(&rx,&napi,64)==1);
    assert(retired==1 && payload_syncs==1 && !pushes && delivered==1);
    assert(rx.refill.count[0]==512 && rx.refill.count[1]==1 && rx.refill.pending==513);
+   assert(rx.refill.eq_peak[1]==1 && rx.refill.eq_full_stalls[0]==2);
    assert(!rx.read[1] && rx.read[0]==8);
   }
   cleanup(&rx);cases++;

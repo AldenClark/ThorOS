@@ -72,8 +72,46 @@ assert result['netdev_host']['lan1']['rx_bytes']['delta'] == 300
 assert result['netdev_host']['lan1']['tx_bytes']['delta'] == 600
 assert result['hardware_forwarding_proven'] is False
 assert result['states']['after']['fe']['l2_active'] == '1'
+assert result['qm_buffer']['reason'] == 'per_EQ_refill_evidence_unavailable'
 serialized = json.dumps(result)
 assert '192.0.2.1' not in serialized and '198.51.100.1' not in serialized and 'PRIVATE' not in serialized
+
+
+def pressure_record(pending4, pending5, peak4, peak5, retries4, retries5,
+                    returned4, returned5, stalls4, stalls5):
+    fields = (('pending', pending4, pending5), ('peak', peak4, peak5),
+              ('retries', retries4, retries5), ('returned', returned4, returned5),
+              ('full_stalls', stalls4, stalls5))
+    return ' '.join(f'refill_eq{eq}_{key}={value}' for key, v4, v5 in fields
+                    for eq, value in ((4, v4), (5, v5)))
+
+
+def pressure_capture(before, after):
+    text = capture()
+    for index, record in enumerate((before, after)):
+        text = text.replace(f'buffer_errors=0 budget_hits={index}',
+                            f'buffer_errors=0 budget_hits={index} {record}', 1)
+    return text
+
+
+pressure_before = pressure_record(4, 0, 12, 5, 2, 3, 6, 9, 1, 0)
+pressure_after = pressure_record(8, 2, 20, 7, 4, 6, 10, 15, 3, 1)
+pressure = module.summarize(pressure_capture(pressure_before, pressure_after))['qm_buffer']
+assert pressure['valid']
+assert pressure['eq']['eq4']['gauges']['pending'] == {'before': 4, 'after': 8}
+assert pressure['eq']['eq5']['gauges']['peak'] == {'before': 5, 'after': 7}
+assert pressure['eq']['eq4']['counters']['retries']['delta'] == 2
+assert pressure['eq']['eq5']['counters']['returned']['delta'] == 6
+assert pressure['eq']['eq4']['counters']['full_stalls']['delta'] == 2
+assert 'delta' not in pressure['eq']['eq4']['gauges']['peak']
+assert module.summarize(pressure_capture(pressure_before, ''))['qm_buffer']['reason'] == \
+    'per_EQ_refill_evidence_incomplete'
+assert module.summarize(pressure_capture(pressure_before,
+    pressure_after.replace('refill_eq4_peak=20', 'refill_eq4_peak=513')))['qm_buffer']['reason'] == \
+    'refill_pool_capacity_exceeded'
+assert module.summarize(pressure_capture(pressure_before,
+    pressure_after.replace('refill_eq5_retries=6', 'refill_eq5_retries=1')))['qm_buffer']['reason'] == \
+    'per_EQ_refill_counter_reset_or_invalid'
 
 # Match the real driver's numeric enum/name table, not a separately invented
 # textual l2_reason (the generic l2_reason itself remains numeric).

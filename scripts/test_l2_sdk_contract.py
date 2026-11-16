@@ -166,6 +166,7 @@ COMMON = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-l2-table.h"
+#include "rtl9617c-l2-domain.h"
 #include "rtl9617c-fe-pipeline.h"
 typedef uint32_t ca_uint32_t;
 typedef uint8_t ca_uint8_t;
@@ -640,13 +641,57 @@ static void check_constants(void)
   assert((((uint64_t)high.bf.mc_vec<<32)|low.bf.mc_vec)==bitmap);
  }
 }
+static void check_domain_recipes(void)
+{
+ for(unsigned int portmask=1;portmask<32;portmask++)
+  for(unsigned int untag=0;untag<32;untag++) {
+   if(untag & ~portmask)continue;
+   struct rtl_l2_vlan_spec spec={
+    .vid=100,.bridge=1,.members=portmask,.untagged=untag,
+    .pvid=untag,.forwarding=portmask,.learning=portmask,
+   };
+   unsigned int initial[2]={0xaaaa55aaU,0x01010a55U},out[2];
+   assert(!rtl_l2_vlan_fib_build(&spec,portmask,initial,out));
+   L2FE_VE_VL_FIB_DATA0_t data={.wrd=initial[0]};
+   L2FE_VE_VL_FIB_DATA1_t extra={.wrd=initial[1]};
+   data.bf.wan_svl_fib_egress_top_untag_bm=untag;
+   data.bf.wan_svl_fib_membership_bm=portmask;
+   extra.bf.wan_svl_fib_vl_group_id=portmask;
+   assert(out[0]==data.wrd && out[1]==extra.wrd);
+  }
+ for(unsigned int fib=0;fib<128;fib++)for(unsigned int valid=0;valid<2;valid++) {
+  unsigned int out;
+  L2FE_VE_LAN_VL_IDX_DATA_t reg={.wrd=0xfffff000U};
+  reg.bf.lan_vl_idx_entry_vld=valid;
+  reg.bf.lan_vl_idx_fib_idx=fib;
+  assert(!rtl_l2_vlan_index_build(fib,valid,0xfffff000U,&out));
+  assert(out==reg.wrd);
+ }
+ for(unsigned int dest=0;dest<64;dest++)for(unsigned int keep=0;keep<2;keep++) {
+  unsigned int out[3];
+  assert(!rtl_l2_mc_noedit_build(dest,keep,56,1,out));
+  L2FE_ARB_MC_FIB_TBL_DATA0_t c={.wrd=out[0]};
+  L2FE_ARB_MC_FIB_TBL_DATA1_t s={.wrd=out[1]};
+  L2FE_ARB_MC_FIB_TBL_DATA2_t policy={.wrd=out[2]};
+  assert(c.bf.pol_id==56 && s.bf.ldpid==dest && s.bf.cos_cmd==MCFIB_COS_CMD_DIS);
+  assert(policy.bf.keep_o_lspid==keep && !policy.bf.mac_sa_cmd && !policy.bf.ip_ttl_dec_cmd);
+ }
+ for(unsigned int vector=0;vector<256;vector++) {
+  unsigned int out;
+  L2FE_PLE_DFT_FWD_DATA_t reg={.wrd=0xaaa00000U};
+  reg.bf.dft_fwd_deny=0;reg.bf.dft_fwd_mc_group_id=vector;
+  reg.bf.dft_fwd_redir_en=0;reg.bf.dft_fwd_mc_group_id_valid=1;
+  assert(!rtl_l2_dft_flood_build(vector,0xaaa00000U,&out));
+  assert(out==reg.wrd);
+ }
+}
 int main(void)
 {
  check_fields();check_tables();check_fdb();check_cf();check_constants();check_limit();check_classifier_gate();
- check_special_priority();
+ check_special_priority();check_domain_recipes();
  printf("Pinned RTL77C L2 SDK oracle: %u fields, %u windows, 16384 FDB vectors, "
    "48 MAC bits, 448 PONCLE keys, 512 SDK MAC-limit/scan-toggle traces, CLS CPU-original gate, SPKTP bounds, "
-   "fixed/user TPID bitmap decoder, SCAN filters and 64-bit MC/port bitmap contracts PASS (model only)\n",
+   "fixed/user TPID decoder, VLAN/FIB/MCE recipe unions, SCAN filters and 64-bit MC/port bitmap contracts PASS (model only)\n",
    RTL_L2_FIELD_COUNT,RTL_L2_TBL_COUNT);
  return 0;
 }

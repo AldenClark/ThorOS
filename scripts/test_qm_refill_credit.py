@@ -59,11 +59,15 @@ int main(void) {
   rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
   assert(pushed[0]<=c0&&pushed[1]<=c1&&pushed[0]+pushed[1]<=64);
   assert(rx.refill.pending+rx.refill.returned==128);
+  assert(rx.refill.eq_peak[0]==64 && rx.refill.eq_peak[1]==64);
+  assert(rx.refill.eq_returned[0]==pushed[0] && rx.refill.eq_returned[1]==pushed[1]);
+  assert(rx.refill.eq_retries[0]+rx.refill.eq_retries[1]==rx.refill.retries);
   assert(rx.refill.count[0]+pushed[0]==64&&rx.refill.count[1]+pushed[1]==64);
   /* Each later poll takes fresh credit; all retained suffixes drain once. */
   credit[0]=credit[1]=64;ready=1;stop_after=~0U;
   while(rx.refill.pending)rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
   assert(pushed[0]==64&&pushed[1]==64&&rx.refill.returned==128);count++;
+  assert(rx.refill.eq_returned[0]==64&&rx.refill.eq_returned[1]==64);
  }
  setup(&rx,64,0,64,0);rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
  unsigned full_reads=reads[0];assert(pushed[0]==64&&fifo_reads==64);
@@ -86,6 +90,7 @@ int main(void) {
   for(unsigned e=0;e<2;e++)for(unsigned i=0;i<512;i++)
    rtl_qm_refill_add(&rx.refill,(0x4000000+e*0x100000+i*2048)|(e+4));
   assert(rx.refill.pending==1024 && rx.refill.peak==1024);
+  assert(rx.refill.eq_peak[0]==512 && rx.refill.eq_peak[1]==512);
   rtl_qm_refill_drain(&rx.refill,&rx,rtl_qm_try_push,64);
   assert(!pushed[0] && !pushed[1] && rx.refill.pending==1024);
   credit[0]=credit[1]=512;

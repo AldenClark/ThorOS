@@ -27,6 +27,7 @@ python3 scripts/test_fe_window_idle.py
 python3 scripts/test_ni_oam_owner.py
 python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_resources.py --mutants --sanitize
+python3 scripts/test_l2_domain.py --mutants --sanitize
 python3 scripts/test_l2_hardware_recipe.py
 python3 scripts/test_l2_port_policy.py
 python3 scripts/test_l2qm_baseline.py
