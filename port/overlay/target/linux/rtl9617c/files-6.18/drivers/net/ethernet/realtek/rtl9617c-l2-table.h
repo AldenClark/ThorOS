@@ -16,20 +16,65 @@ static inline int rtl_l2_io_valid(const struct rtl_dq_io *io)
 	return io && io->read && io->write && io->indirect;
 }
 
-/* FDB and MAC limit windows share cpu_opt_mode. Learning is stopped by the
- * fabric owner for this mode lease. No mode or DATA write is allowed while
- * either window is busy, including a different late-completing operation.
+/* FDB and MAC limit windows share cpu_opt_mode. Return one validated live
+ * control word, rather than checking a read and then trusting a second one.
+ * info_ff_init has no supported takeover/completion contract; do not replay
+ * it through a configuration RMW. sw_age_entry_scan is different: the SDK
+ * triggers it by XOR, so BOTH steady levels are valid and must be preserved.
  */
-static inline int rtl_l2_fdb_mode_idle(const struct rtl_dq_io *io)
+static inline int rtl_l2_fdb_control_read(const struct rtl_dq_io *io,
+					unsigned int *control)
 {
-	if (!rtl_l2_io_valid(io))
+	unsigned int value;
+
+	if (!rtl_l2_io_valid(io) || !control)
 		return -EINVAL;
 	if ((io->read(io->context, RTL_L2_FDB_ACCESS) |
 	     io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)
 		return -EBUSY;
-	if (!(io->read(io->context, RTL_L2_FDB_CONTROL) & RTL_L2_FDB_LEARN_DISABLE))
+	value = io->read(io->context, RTL_L2_FDB_CONTROL);
+	if (value == ~0U)
+		return -EIO;
+	if (value & RTL_L2_FDB_INFO_INIT)
+		return -EOPNOTSUPP;
+	*control = value;
+	return 0;
+}
+
+/* Only mode changes require learning stopped. Ordinary FDB scans keep
+ * using CMD mode while autonomous learning is enabled. */
+static inline int rtl_l2_fdb_mode_control(const struct rtl_dq_io *io,
+					unsigned int *control)
+{
+	int ret = rtl_l2_fdb_control_read(io, control);
+
+	if (ret)
+		return ret;
+	if (!(*control & RTL_L2_FDB_LEARN_DISABLE))
 		return -EBUSY;
 	return 0;
+}
+
+static inline int rtl_l2_fdb_mode_idle(const struct rtl_dq_io *io)
+{
+	unsigned int control;
+
+	return rtl_l2_fdb_mode_control(io, &control);
+}
+
+/* A posted write is not proof of a mode change. Check both windows, the
+ * learning-stop lease and every stable control bit before touching DATA or
+ * exposing a result. The software scan trigger is edge/toggle state, not a
+ * busy bit or a persistent setting to restore from an earlier snapshot. */
+static inline int rtl_l2_fdb_mode_verify(const struct rtl_dq_io *io,
+					unsigned int expected)
+{
+	unsigned int control;
+	int ret = rtl_l2_fdb_mode_control(io, &control);
+
+	if (ret)
+		return ret;
+	return ((control ^ expected) & ~RTL_L2_FDB_SW_AGE_SCAN) ? -EIO : 0;
 }
 
 /* Owner-only recovery after an ambiguous limit command. The caller retains
@@ -39,14 +84,14 @@ static inline int rtl_l2_fdb_mode_idle(const struct rtl_dq_io *io)
 static inline int rtl_l2_fdb_command_mode(const struct rtl_dq_io *io)
 {
 	unsigned int control;
-	int ret = rtl_l2_fdb_mode_idle(io);
+	int ret = rtl_l2_fdb_mode_control(io, &control);
 
 	if (ret)
 		return ret;
-	control = io->read(io->context, RTL_L2_FDB_CONTROL);
+	if (control & RTL_L2_FDB_CMD_MODE)
+		return 0;
 	io->write(io->context, RTL_L2_FDB_CONTROL, control | RTL_L2_FDB_CMD_MODE);
-	io->read(io->context, RTL_L2_FDB_CONTROL);
-	return 0;
+	return rtl_l2_fdb_mode_verify(io, control | RTL_L2_FDB_CMD_MODE);
 }
 
 static inline int rtl_l2_port_limit_access(const struct rtl_dq_io *io,
@@ -58,14 +103,15 @@ static inline int rtl_l2_port_limit_access(const struct rtl_dq_io *io,
 
 	if (!word || port >= RTL_L2_LOGICAL_PORTS || write > 1)
 		return -EINVAL;
-	ret = rtl_l2_fdb_mode_idle(io);
+	ret = rtl_l2_fdb_mode_control(io, &control);
 	if (ret)
 		return ret;
-	control = io->read(io->context, RTL_L2_FDB_CONTROL);
 	if (!(control & RTL_L2_FDB_CMD_MODE))
 		return -EOPNOTSUPP;
 	io->write(io->context, RTL_L2_FDB_CONTROL, control & ~RTL_L2_FDB_CMD_MODE);
-	io->read(io->context, RTL_L2_FDB_CONTROL);
+	ret = rtl_l2_fdb_mode_verify(io, control & ~RTL_L2_FDB_CMD_MODE);
+	if (ret)
+		return ret;
 	request = RTL_L2_ACCESS_BUSY | RTL_L2_FDB_LIMIT_SELECT | port;
 	if (write) {
 		io->write(io->context, RTL_L2_FDB_LIMIT_DATA, *word);
@@ -74,13 +120,25 @@ static inline int rtl_l2_port_limit_access(const struct rtl_dq_io *io,
 	ret = io->indirect(io->context, RTL_L2_FDB_LIMIT_ACCESS, request);
 	if (ret)
 		return ret; /* mode0 retained: timeout is not cancellation. */
-	if (!write)
-		result = io->read(io->context, RTL_L2_FDB_LIMIT_DATA);
-	ret = rtl_l2_fdb_mode_idle(io);
+	ret = rtl_l2_fdb_mode_control(io, &control);
 	if (ret)
 		return ret;
-	io->write(io->context, RTL_L2_FDB_CONTROL, control);
-	io->read(io->context, RTL_L2_FDB_CONTROL);
+	if (control & RTL_L2_FDB_CMD_MODE)
+		return -EIO;
+	if (!write)
+		result = io->read(io->context, RTL_L2_FDB_LIMIT_DATA);
+	/* Another producer may have toggled the software scan edge while the
+	 * command completed. Restore only CMD in the newly observed live word,
+	 * never replay the pre-lease control snapshot or clear a trigger bit. */
+	ret = rtl_l2_fdb_mode_control(io, &control);
+	if (ret)
+		return ret;
+	if (control & RTL_L2_FDB_CMD_MODE)
+		return -EIO;
+	io->write(io->context, RTL_L2_FDB_CONTROL, control | RTL_L2_FDB_CMD_MODE);
+	ret = rtl_l2_fdb_mode_verify(io, control | RTL_L2_FDB_CMD_MODE);
+	if (ret)
+		return ret;
 	if (!write)
 		*word = result;
 	return 0;
@@ -189,7 +247,7 @@ static inline int rtl_l2_fdb_command(const struct rtl_dq_io *io,
 				     struct rtl_l2_fdb_result *result)
 {
 	struct rtl_l2_fdb_result next = { 0 };
-	unsigned int request = RTL_L2_ACCESS_BUSY | command, i;
+	unsigned int request = RTL_L2_ACCESS_BUSY | command, control, i;
 	int ret;
 
 	if (!rtl_l2_io_valid(io) || !result)
@@ -209,14 +267,14 @@ static inline int rtl_l2_fdb_command(const struct rtl_dq_io *io,
 	default:
 		return -EOPNOTSUPP;
 	}
-	if ((io->read(io->context, RTL_L2_FDB_ACCESS) |
-	     io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)
-		return -EBUSY;
+	ret = rtl_l2_fdb_control_read(io, &control);
+	if (ret)
+		return ret;
 	/* Mode is owned for the entire L2/FE lifetime. Changing it back while a
  	 * timed-out FDB/limit command is busy would change that transaction.
 	 * Scans may run with hardware learning enabled; only mode changes need
 	 * the stronger rtl_l2_fdb_mode_idle() learning-stop condition. */
-	if (!(io->read(io->context, RTL_L2_FDB_CONTROL) & RTL_L2_FDB_CMD_MODE))
+	if (!(control & RTL_L2_FDB_CMD_MODE))
 		return -EOPNOTSUPP;
 	io->write(io->context, RTL_L2_FDB_RETURN, 0);
 	for (i = 0; i < RTL_L2_FDB_WORDS; i++)
@@ -225,6 +283,11 @@ static inline int rtl_l2_fdb_command(const struct rtl_dq_io *io,
 	ret = io->indirect(io->context, RTL_L2_FDB_ACCESS, request);
 	if (ret)
 		return ret;
+	ret = rtl_l2_fdb_control_read(io, &control);
+	if (ret)
+		return ret;
+	if (!(control & RTL_L2_FDB_CMD_MODE))
+		return -EIO;
 	next.raw = io->read(io->context, RTL_L2_FDB_RETURN);
 	next.status = next.raw & 15U;
 	next.index = (next.raw >> 4) & 8191U;

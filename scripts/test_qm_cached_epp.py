@@ -9,48 +9,49 @@ args=parser.parse_args()
 source=(args.source or root/'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-qm.c').read_text()
 tree=ast.parse((root/'scripts/fixtures/qm_cached_epp_model.py').read_text())
 common=next(ast.literal_eval(n.value) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='common' for t in n.targets))
-common=common.replace('static bool seen[129];', 'static bool seen[129];static u8 hardware_ring[8192];static unsigned syncs;')
-common=common.replace('void *entry=active->ring_memory+(producer%128)*8;', 'void *entry=hardware_ring+(producer%128)*8;')
+common=common.replace('static bool seen[RTL_QM_RING_COMMANDS+1];', 'static bool seen[RTL_QM_RING_COMMANDS+1];static u8 hardware_ring[RTL_QM_RING_MEMORY_BYTES];static unsigned syncs;')
+common=common.replace('void *entry=active->ring_memory+(producer%RTL_QM_RING_COMMANDS)*8;', 'void *entry=hardware_ring+(producer%RTL_QM_RING_COMMANDS)*8;')
 a=common.index('static void dma_sync_single_for_cpu(');b=common.index('static int rtl_qm_try_push',a)
 common=common[:a]+r"""
 static void dma_sync_single_for_cpu(void *d,dma_addr_t a,unsigned n,int direction){
  assert(d==active->device&&direction==DMA_FROM_DEVICE);
- if(a>=active->ring_dma&&a<active->ring_dma+8192){
-  unsigned off=a-active->ring_dma;assert(n&&!(off%64)&&!(n%64)&&off+n<=8192);
+ if(a>=active->ring_dma&&a<active->ring_dma+RTL_QM_RING_MEMORY_BYTES){
+  unsigned off=a-active->ring_dma;assert(n&&!(off%64)&&!(n%64)&&off+n<=RTL_QM_RING_MEMORY_BYTES);
   memcpy(active->ring_memory+off,hardware_ring+off,n);syncs++;
- }else assert(n==2048&&a>=active->memory_dma+8192);
+ }else assert(n==2048&&a>=active->memory_dma+RTL_QM_PAYLOAD_OFFSET);
 }
 """+common[b:]
 a=common.index('static int rtl_qm_try_push');b=common.index('static bool rtl_rx_checksum_valid',a)
 common=common[:a]+r"""
 static int rtl_qm_try_push(void *ctx,unsigned address,unsigned eq){
- struct rtl_qm_rx *rx=ctx;unsigned id=(address-(u32)rx->memory_dma-8192)/2048;
- assert(eq==4&&id<129);return 0;
+ struct rtl_qm_rx *rx=ctx;unsigned id=(address-(u32)rx->memory_dma-RTL_QM_PAYLOAD_OFFSET)/2048;
+ assert(eq==4&&id<=RTL_QM_RING_COMMANDS);return 0;
 }
 """+common[b:]
 a=common.index('static void received(');b=common.index('static void napi_gro_receive',a)
 common=common[:a]+r"""
 static void received(struct sk_buff*s){u8 expected[64];unsigned skip=kind==0?14:0;
- unsigned id=get_unaligned_be32(s->data+42-skip);assert(id<129&&!seen[id]);
+ unsigned id=get_unaligned_be32(s->data+42-skip);assert(id<=RTL_QM_RING_COMMANDS&&!seen[id]);
  packet_bytes(id,expected);assert(!memcmp(s->data,expected+skip,64-skip));seen[id]=true;delivered++;free(s);
 }
 """+common[b:]
 a=source.index('static void rtl_qm_rx_retire(');b=source.index('\nssize_t rtl_qm_rx_state(',a)
 cases=r"""
 int main(void){unsigned cases=0;
- const unsigned starts[]={0,1,7,63,64,127},lens[]={1,2,8,63,64,65,127},budgets[]={1,8,64};
- for(unsigned a=0;a<6;a++)for(unsigned b=0;b<7;b++)for(unsigned c=0;c<3;c++){
+ const unsigned starts[]={0,1,7,63,64,127,128,255},lens[]={1,2,8,63,64,65,127,128,129,255},budgets[]={1,8,64};
+ assert(RTL_QM_RING_COMMANDS==256 && RTL_QM_BUFFERS_PER_EQ==512);
+ for(unsigned a=0;a<ARRAY_SIZE(starts);a++)for(unsigned b=0;b<ARRAY_SIZE(lens);b++)for(unsigned c=0;c<ARRAY_SIZE(budgets);c++){
   unsigned start=starts[a],len=lens[b],budget=budgets[c];
   struct net_device owner={.running=true},input={.running=true};struct napi_struct napi={.dev=&owner};
   struct rtl_qm_rx rx={.memory_dma=0x4000000,.ring_dma=0x6000000,.device=&owner};
   rx.lan[0]=&input;rx.rx_prefetch=(cases&1)==0;
-  rx.memory=calloc(1,RTL_QM_MEMORY_BYTES);rx.ring_memory=malloc(8192);memset(rx.ring_memory,0xcc,8192);rx.ni=calloc(1,65536);active=&rx;
+  rx.memory=calloc(1,RTL_QM_MEMORY_BYTES);rx.ring_memory=malloc(RTL_QM_RING_MEMORY_BYTES);memset(rx.ring_memory,0xcc,RTL_QM_RING_MEMORY_BYTES);rx.ni=calloc(1,65536);active=&rx;
   producer=consumer=start;rx.read[0]=start*8;delivered=drops=syncs=kind=0;memset(seen,0,sizeof(seen));
   for(unsigned i=0;i<len;i++)enqueue(i);
-  for(unsigned i=0;consumer!=producer&&i<128;i++)rtl_qm_rx_poll(&rx,&napi,budget);
+  for(unsigned i=0;consumer!=producer&&i<RTL_QM_RING_COMMANDS;i++)rtl_qm_rx_poll(&rx,&napi,budget);
   assert(delivered==len&&rx.refill.returned==len&&!drops&&syncs);
   /* Hardware writes the next entry in a line already present in CPU cache. */
-  enqueue(128);assert(rtl_qm_rx_poll(&rx,&napi,budget)==1&&seen[128]);
+  enqueue(RTL_QM_RING_COMMANDS);assert(rtl_qm_rx_poll(&rx,&napi,budget)==1&&seen[RTL_QM_RING_COMMANDS]);
   assert(rx.voq_packets[0]==len+1);
   free(rx.memory);free(rx.ring_memory);free(rx.ni);cases++;
  }
@@ -66,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='cached-epp-', dir=root/'artifacts') as 
 
 # Execute the native stop and ring reinitialization across repeated opens.
 start=source.index('\t/* Hardware write pointers survive ndo_stop/open;')
-end=source.index('\n\trx->trace_count = 0;', start)+len('\n\trx->trace_count = 0;')
+end=source.index('\n\trx->next_voq = RTL_QM_VOQS - 1;', start)+len('\n\trx->next_voq = RTL_QM_VOQS - 1;')
 stop=source.index('void rtl_qm_rx_stop(')
 stop_end=source.index('\nvoid rtl_qm_rx_free(', stop)
 lifecycle=r'''
@@ -75,45 +76,47 @@ lifecycle=r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 typedef uint32_t u32;
+#define __iomem
 #define BIT(n) (1U<<(n))
-#define RTL_QM_RING_BYTES 1024
-#define RTL_QM_VOQS 8
-#define RTL_QM_MEMORY_BYTES 16384
+#include "rtl9617c-qm-resources.h"
 #define DMA_FROM_DEVICE 2
 #define EPP_WRITE 0x7000
 #define EPP_READ 0x7100
 #define CB_CTRL 0x950c
 #define RMU_CTRL 0x6104
 #define ES_CTRL 0x6108
-struct rtl_qm_rx {void *ni,*device,*ring_memory,*memory;unsigned ring_dma,memory_dma,read[8],trace_count;bool deepq_configured;};
-static unsigned char registers[65536],cpu[8192],hardware[8192];
+struct rtl_qm_rx {void *ni,*device,*ring_memory,*memory;unsigned ring_dma,memory_dma,read[8],trace_count,next_voq;bool deepq_configured;};
+static unsigned char registers[65536],cpu[RTL_QM_RING_MEMORY_BYTES],hardware[RTL_QM_RING_MEMORY_BYTES];
 static unsigned synced,retired,reordered;
 static u32 readl(void *p){u32 v;memcpy(&v,p,4);return v;}
 static void writel(u32 v,void *p){memcpy(p,&v,4);if(p>=((void *)registers+EPP_READ)&&p<((void *)registers+EPP_READ+32))retired++;}
 static void rtl_qm_axi_reorder(struct rtl_qm_rx *rx){(void)rx;assert(retired==8);reordered++;}
 static void dma_sync_single_for_device(void *d,unsigned address,unsigned bytes,int direction){
  (void)d;assert(direction==DMA_FROM_DEVICE&&reordered==1);
- if(address==0x6000000){assert(bytes==8192);for(unsigned i=0;i<bytes;i++)assert(cpu[i]==0);memcpy(hardware,cpu,bytes);synced++;}
+ if(address==0x6000000){assert(bytes==RTL_QM_RING_MEMORY_BYTES);for(unsigned i=0;i<bytes;i++)assert(cpu[i]==0);memcpy(hardware,cpu,bytes);synced++;}
  else assert(address==0x4000000&&bytes==RTL_QM_MEMORY_BYTES);
 }
 '''
-lifecycle+=source[stop:stop_end]
+rmw_start=source.index('static int rtl_qm_rmw(')
+rmw_end=source.index('\nstatic int rtl_qm_window_idle(', rmw_start)
+lifecycle+=source[rmw_start:rmw_end]+source[stop:stop_end]
 # This low-level test covers independent cold-start pointer/cache states,
 # not ordinary NI reopen. test_ni_owner_lifetime proves warm reopen must not
 # execute this reset/republish sequence against an already-exposed owner.
-lifecycle+='static void cold_prepare(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;\n'+source[start:end]+'\n}\n'
+lifecycle+='static int cold_prepare(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;u32 value;\n'+source[start:end]+'\nreturn 0;}\n'
 lifecycle+=r'''
 int main(void){
  struct rtl_qm_rx rx={.ni=registers,.ring_memory=cpu,.ring_dma=0x6000000,.memory_dma=0x4000000};
  for(unsigned epoch=0;epoch<4;epoch++){
   memset(cpu,0xcc+epoch,sizeof(cpu));memset(hardware,0x55+epoch,sizeof(hardware));
-  for(unsigned i=0;i<8;i++){writel((epoch*31+i*13)%128*8,registers+EPP_WRITE+i*4);rx.read[i]=0;}
-  writel(~0U,registers+CB_CTRL);writel(~0U,registers+RMU_CTRL);writel(~0U,registers+ES_CTRL);writel(~0U,registers+0x610c);
+  for(unsigned i=0;i<8;i++){writel((epoch*79+i*47)%RTL_QM_RING_COMMANDS*8,registers+EPP_WRITE+i*4);rx.read[i]=0;}
+  writel(0x8fff1234U,registers+CB_CTRL);writel(0x8fff1234U,registers+RMU_CTRL);writel(0x8fff1234U,registers+ES_CTRL);writel(0xa5a5ffffU,registers+0x610c);
   rx.deepq_configured=true;rtl_qm_rx_stop(&rx);
   assert(!rx.deepq_configured&&!(readl(registers+CB_CTRL)&BIT(31))&&!(readl(registers+RMU_CTRL)&BIT(31))&&!(readl(registers+ES_CTRL)&BIT(31))&&!(readl(registers+0x610c)&0xffff));
-  synced=retired=reordered=0;rx.trace_count=99;cold_prepare(&rx);
-  assert(synced==1&&rx.trace_count==0);
+  synced=retired=reordered=0;rx.trace_count=99;assert(!cold_prepare(&rx));
+  assert(synced==1&&rx.trace_count==0&&rx.next_voq==7);
   for(unsigned i=0;i<8;i++)assert(rx.read[i]==readl(registers+EPP_WRITE+i*4)&&rx.read[i]==readl(registers+EPP_READ+i*4));
   for(unsigned i=0;i<sizeof(hardware);i++)assert(hardware[i]==0);
  }
@@ -122,5 +125,5 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(prefix='cached-epp-reopen-', dir=root/'artifacts') as work:
  p=Path(work);(p/'test.c').write_text(lifecycle)
- subprocess.run(['cc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined',str(p/'test.c'),'-o',str(p/'test')],check=True)
+ subprocess.run(['cc','-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(drivers),str(p/'test.c'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)

@@ -7,6 +7,8 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
+#include <linux/rcupdate.h>
+#include <linux/rtl9617c-switch.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-pon.h"
 
@@ -78,19 +80,57 @@ static u32 rtl_pon_llid_mask(struct rtl9617c_pon *pon)
 	return GENMASK(pon->llid_count - 1, 0);
 }
 
+/* All LLIDs share one fabric owner. A synchronous scope on the immutable
+ * data endpoint closes admission before control-plane identity changes;
+ * END only queues generation-checked route withdrawal/rebuild. The IRQ is
+ * threaded and every caller holds the PON state mutex, never RTNL or FE.
+ * RCU protects the endpoint identity during concurrent resize/removal; do
+ * not keep it, or an RCU read-side section, across sleeping LLID commands.
+ */
+void rtl_pon_policy_begin(struct rtl9617c_pon *pon, struct net **policy)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&pon->lock);
+	if (*policy)
+		return;
+	rcu_read_lock();
+	/* Resize removes low indices first. A concurrent final removal can
+	 * already have retired LLID0 while another endpoint still owns FE. */
+	for (i = 0; i < ARRAY_SIZE(pon->data_devices) && !*policy; i++)
+		*policy = rtl9617c_switch_policy_begin(rcu_dereference(pon->data_devices[i]));
+	rcu_read_unlock();
+}
+
 int rtl_pon_llid_update(struct rtl9617c_pon *pon, bool add, unsigned int index,
 			 unsigned int mac, u16 llid, bool multicast)
 {
 	u32 status;
 	int ret;
 
+	/* A timed-out command still owns the DATA window. The PON mutex
+	 * serializes callers, but cannot cancel a late hardware transaction. */
+	status = readl(pon->mac + LLID_ACCESS);
+	if (status == ~0U) {
+		ret = -EIO;
+		goto uncertain;
+	}
+	if (status & BIT(0)) {
+		ret = -EBUSY;
+		goto uncertain;
+	}
 	writel(llid | (index << 16) | ((u32)multicast << 22) |
 	       ((u32)add << 23) | (mac << 24), pon->mac + LLID_DATA);
 	writel(BIT(0), pon->mac + LLID_ACCESS);
 	ret = readl_poll_timeout(pon->mac + LLID_ACCESS, status, !(status & BIT(0)), 1, 100000);
 	if (ret)
-		return ret;
-	status = readl(pon->mac + LLID_RESULT) & 7;
+		goto uncertain;
+	status = readl(pon->mac + LLID_RESULT);
+	if (status == ~0U) {
+		ret = -EIO;
+		goto uncertain;
+	}
+	status &= 7;
 	if (add && (status == 6 || status == 7))
 		return 0;
 	if (!add && status == 5)
@@ -99,7 +139,18 @@ int rtl_pon_llid_update(struct rtl9617c_pon *pon, bool add, unsigned int index,
 		return -ENOSPC;
 	if (status == 2)
 		return -ENOENT;
-	return -EIO;
+	ret = -EIO;
+uncertain:
+	/* END of the caller's guard is not cancellation of an LLID command.
+	 * Retire the business mapping and carrier before that scope ends. The
+	 * FE worker first withdraws the old generation, and fe_install rejects
+	 * either carrier-down endpoint. A later poll or successful single LLID
+	 * command cannot recover this state: only a complete PDC reconstruction
+	 * against an idle, readable and stable LLID table can do so. */
+	pon->pdc_error = ret;
+	pon->pdc_configured = false;
+	rtl_pon_oam_carrier(pon);
+	return ret;
 }
 
 static int rtl_mpcp_remove_mac(struct rtl9617c_pon *pon, unsigned int mac)
@@ -136,21 +187,30 @@ static void rtl_mpcp_registration_event(struct rtl9617c_pon *pon, u32 registered
 	dev_info(pon->dev, "MPCP registered LLIDs: %08x -> %08x\n", pon->registered, registered);
 }
 
+struct rtl_mpcp_policy_io {
+	struct rtl9617c_pon *pon;
+	struct net **policy;
+};
+
 static unsigned int rtl_mpcp_read(void *context, unsigned int reg)
 {
-	struct rtl9617c_pon *pon = context;
+	struct rtl_mpcp_policy_io *io = context;
 
-	return readl(pon->mac + reg);
+	return readl(io->pon->mac + reg);
 }
 
 static void rtl_mpcp_write(void *context, unsigned int reg, unsigned int value)
 {
-	struct rtl9617c_pon *pon = context;
+	struct rtl_mpcp_policy_io *io = context;
 
-	writel(value, pon->mac + reg);
+	/* The backoff engine writes only for a real NACK. Gate at the write,
+	 * not from a second PKT_FLAG sample which could race new hardware IRQs. */
+	rtl_pon_policy_begin(io->pon, io->policy);
+	writel(value, io->pon->mac + reg);
 }
 
-static u32 rtl_mpcp_holdover(struct rtl9617c_pon *pon, u32 registered)
+static u32 rtl_mpcp_holdover(struct rtl9617c_pon *pon, u32 registered,
+			   struct net **policy)
 {
 	u32 status = readl(pon->mac + 0x10);
 	bool synced = !(status & BIT(0)) &&
@@ -187,6 +247,7 @@ static u32 rtl_mpcp_holdover(struct rtl9617c_pon *pon, u32 registered)
 		}
 		/* Stock Holdover expiry reaches llid_entry_set(enable=0), whose
 		 * AAL asserts this per-MAC offline bit before deleting the LLID. */
+		rtl_pon_policy_begin(pon, policy);
 		rtl_pon_update(pon->mac + OFFLINE, BIT(channel), BIT(channel));
 		ret = readl_poll_timeout(pon->mac + REGISTER_STATUS, status,
 			!(status & BIT(channel)), 1, 10000);
@@ -207,14 +268,17 @@ static u32 rtl_mpcp_holdover(struct rtl9617c_pon *pon, u32 registered)
 
 static void rtl_mpcp_refresh(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
 	u32 flags = readl(pon->mac + MPCP_IRQ) & MPCP_EVENT_MASK;
 	u32 registered;
 	unsigned int i;
-	const struct rtl_mpcp_io io = {pon, rtl_mpcp_read, rtl_mpcp_write};
+	struct rtl_mpcp_policy_io policy_io = {pon, &policy};
+	const struct rtl_mpcp_io io = {&policy_io, rtl_mpcp_read, rtl_mpcp_write};
 
 	pon->last_mpcp_irq = flags;
 	if ((flags & BIT(3)) && pon->mode != RTL_PON_EPON_1G && pon->epon_crypto_llids) {
 		/* aal_epon_mpcp_gate_timeout_handler resets the active RX core. */
+		rtl_pon_policy_begin(pon, &policy);
 		rtl_pon_update(pon->mac + 0x14c0, BIT(7), BIT(7));
 		rtl_pon_update(pon->mac + 0x14c0, BIT(7), 0);
 	}
@@ -232,7 +296,9 @@ static void rtl_mpcp_refresh(struct rtl9617c_pon *pon)
 	if (flags)
 		writel(flags, pon->mac + MPCP_IRQ);
 	registered = readl(pon->mac + REGISTER_STATUS) & rtl_pon_llid_mask(pon);
-	registered = rtl_mpcp_holdover(pon, registered);
+	if (registered != pon->registered || pon->epon_llid_cleanup)
+		rtl_pon_policy_begin(pon, &policy);
+	registered = rtl_mpcp_holdover(pon, registered, &policy);
 	pon->epon_llid_cleanup |= pon->registered & ~registered;
 	pon->epon_llid_cleanup_error = 0;
 	for (i = 0; i < pon->llid_count; i++) {
@@ -248,15 +314,18 @@ static void rtl_mpcp_refresh(struct rtl9617c_pon *pon)
 			pon->epon_llid_cleanup &= ~BIT(i);
 		}
 	}
-	if ((pon->epon_crypto_llids & ~registered) &&
-	    rtl_pon_epon_crypto_forget(pon, pon->epon_crypto_llids & ~registered))
-		dev_err_ratelimited(pon->dev, "EPON decryption cleanup failed: %d\n", pon->epon_crypto_error);
+	if (pon->epon_crypto_llids & ~registered) {
+		rtl_pon_policy_begin(pon, &policy);
+		if (rtl_pon_epon_crypto_forget(pon, pon->epon_crypto_llids & ~registered))
+			dev_err_ratelimited(pon->dev, "EPON decryption cleanup failed: %d\n", pon->epon_crypto_error);
+	}
 	if (registered != pon->registered)
 		rtl_mpcp_registration_event(pon, registered);
 	pon->registered = registered;
 	pon->waiting = rtl_pon_llid_mask(pon) & ~registered;
 	rtl_pon_pdc_refresh(pon);
 	rtl_pon_oam_carrier(pon);
+	rtl9617c_switch_policy_end(policy);
 }
 
 static void rtl_mpcp_holdover_work(struct work_struct *work)
@@ -418,6 +487,7 @@ int rtl_pon_mpcp_init(struct rtl9617c_pon *pon, int irq)
 
 int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
 	unsigned int channel;
 	int ret;
 
@@ -425,6 +495,8 @@ int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 	cancel_delayed_work_sync(&pon->mpcp_work);
 	cancel_delayed_work_sync(&pon->epon_tx_work);
 	mutex_lock(&pon->lock);
+	if (pon->mpcp_enabled || pon->registered)
+		rtl_pon_policy_begin(pon, &policy);
 	pon->epon_tx_action = 0;
 	if (pon->mpcp_enabled) {
 		pon->epon_epoch++;
@@ -436,6 +508,7 @@ int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 	pon->epon_holdover_pending = 0;
 	pon->backoff.active = 0;
 	if (!rtl_pon_mode_is_epon(pon->mode)) {
+		rtl9617c_switch_policy_end(policy);
 		mutex_unlock(&pon->lock);
 		cancel_delayed_work_sync(&pon->epon_holdover_work);
 		return 0;
@@ -454,6 +527,7 @@ int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 	pon->mpcp_configured = false;
 	ret = rtl_pon_epon_crypto_forget(pon, pon->epon_crypto_llids);
 	rtl_pon_oam_carrier(pon);
+	rtl9617c_switch_policy_end(policy);
 	mutex_unlock(&pon->lock);
 	cancel_delayed_work_sync(&pon->epon_holdover_work);
 	/* Finish queued IRQ threads before changing modes or freeing the OAM netdev. */
@@ -463,6 +537,7 @@ int rtl_pon_mpcp_stop_locked(struct rtl9617c_pon *pon)
 
 int rtl_pon_mpcp_configure_locked(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
 	u32 sync;
 	unsigned int channel;
 	int ret = 0;
@@ -479,6 +554,7 @@ int rtl_pon_mpcp_configure_locked(struct rtl9617c_pon *pon)
 	}
 	if (pon->mpcp_enabled)
 		goto unlock;
+	rtl_pon_policy_begin(pon, &policy);
 	ret = rtl_pon_epon_crypto_forget(pon, pon->epon_crypto_llids);
 	if (ret)
 		goto unlock;
@@ -527,6 +603,7 @@ int rtl_pon_mpcp_configure_locked(struct rtl9617c_pon *pon)
 	schedule_delayed_work(&pon->mpcp_work, HZ);
 	dev_info(pon->dev, "native MPCP configured: ONU %pM, %u LLIDs\n", pon->onu_mac, pon->llid_count);
 unlock:
+	rtl9617c_switch_policy_end(policy);
 	mutex_unlock(&pon->lock);
 	return ret;
 }

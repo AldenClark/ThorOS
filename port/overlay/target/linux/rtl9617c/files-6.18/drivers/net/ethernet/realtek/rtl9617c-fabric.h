@@ -35,6 +35,13 @@ struct rtl_fabric {
 	unsigned char ready, poisoned, changed, refusal, inherited_fdb_present;
 };
 
+/* Selected once during the provider's cold, externally fenced handoff.
+ * Values deliberately match the SVL bit, not an arbitrary runtime knob. */
+enum rtl_fabric_vlan_mode {
+	RTL_FABRIC_VLAN_IVL = 0,
+	RTL_FABRIC_VLAN_SVL = RTL_L2_VLAN_MODE_SVL,
+};
+
 static inline int rtl_fabric_match(const struct rtl_dq_io *io,
 		struct rtl_fabric *fabric, unsigned int reg, unsigned int mask,
 		unsigned int expected)
@@ -53,14 +60,20 @@ static inline int rtl_fabric_match(const struct rtl_dq_io *io,
 static inline int rtl_fabric_check(const struct rtl_dq_io *io,
 				   struct rtl_fabric *fabric)
 {
-	unsigned int i;
+	unsigned int i, control;
 	int ret;
 
 	if (!rtl_l2_io_valid(io) || !fabric)
 		return -EINVAL;
 	if (!fabric->ready || fabric->poisoned)
 		return -EIO;
-	ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, 0x1fU,
+	/* Native L2 may enable autonomous learning, but the FE lifetime keeps
+	 * CMD mode. Never recover a late MAC-limit lease from a warm observer. */
+	ret = rtl_l2_fdb_control_read(io, &control);
+	if (!ret && !(control & RTL_L2_FDB_CMD_MODE))
+		ret = -EOPNOTSUPP;
+	if (!ret)
+		ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, 0x1fU,
 			       fabric->vlan_mode);
 	if (!ret)
 		ret = rtl_fabric_match(io, fabric, RTL_FABRIC_FRAME_LENGTH,
@@ -127,12 +140,15 @@ static inline int rtl_fabric_restore_command(const struct rtl_dq_io *io,
 					    struct rtl_fabric *fabric,
 					    unsigned int control)
 {
-	unsigned int i;
+	unsigned int i, live;
+	unsigned int owned = RTL_L2_FDB_CMD_MODE | RTL_L2_FDB_LEARN_DISABLE;
 	int ret;
 
-	ret = rtl_l2_fdb_mode_idle(io);
+	ret = rtl_l2_fdb_mode_control(io, &live);
 	if (ret)
 		return ret;
+	if ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))
+		return -EIO;
 	for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++) {
 		unsigned int reg = RTL_L2_FDB_FILTER_WORD0 - i * 4;
 
@@ -142,27 +158,56 @@ static inline int rtl_fabric_restore_command(const struct rtl_dq_io *io,
 		if (ret)
 			return ret;
 	}
+	/* The SDK toggles sw_age_entry_scan to request a scan. It is live edge
+	 * state, not a setting to replay from the pre-lease snapshot. Recheck
+	 * after restoring filters and only return the CMD/learning bits owned
+	 * by this transaction; unrelated stable control drift is not repairable
+	 * by overwriting the whole register with an old value. */
+	ret = rtl_l2_fdb_mode_control(io, &live);
+	if (ret)
+		return ret;
+	if ((live ^ control) & ~(owned | RTL_L2_FDB_SW_AGE_SCAN))
+		return -EIO;
+	control = (live & ~owned) | (control & owned);
 	io->write(io->context, RTL_L2_FDB_CONTROL, control);
-	return rtl_fabric_match(io, fabric, RTL_L2_FDB_CONTROL, ~0U,
-				 control);
+	/* A failed acquisition may restore learning enabled, so use the idle
+	 * control reader rather than demanding a stopped-learning lease here. */
+	ret = rtl_l2_fdb_control_read(io, &live);
+	if (ret)
+		return ret;
+	if ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {
+		if (!fabric->rejected_register) {
+			fabric->rejected_register = RTL_L2_FDB_CONTROL;
+			fabric->rejected_value = live;
+		}
+		return -EIO;
+	}
+	return 0;
 }
 
-static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
-					 struct rtl_fabric *fabric)
+static inline int rtl_fabric_cold_prepare_mode(const struct rtl_dq_io *io,
+					      struct rtl_fabric *fabric,
+					      enum rtl_fabric_vlan_mode mode)
 {
-	struct rtl_l2_fdb_result row;
-	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, i, minimum, maximum;
+	struct rtl_l2_fdb_result row = { 0 };
+	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, live, i, minimum, maximum;
 	unsigned int vlan_written = 0, frame_written = 0, oversize_written = 0;
 	unsigned int selector_changed = 0;
 	unsigned int lease = 0;
 	int ret, cleanup;
 
-	if (!rtl_l2_io_valid(io) || !fabric)
+	if (!rtl_l2_io_valid(io) || !fabric ||
+	    (mode != RTL_FABRIC_VLAN_IVL && mode != RTL_FABRIC_VLAN_SVL))
 		return -EINVAL;
 	if (fabric->poisoned)
 		return -EIO;
-	if (fabric->ready)
+	if (fabric->ready) {
+		/* A warm caller cannot reinterpret live native rows or L3 DMAC
+		 * pins. Even a failed request must not alter the owned baseline. */
+		if ((fabric->vlan_mode & RTL_L2_VLAN_MODE_SVL) != (unsigned int)mode)
+			return -EBUSY;
 		return rtl_fabric_check(io, fabric);
+	}
 	fabric->refusal = 0;
 	fabric->changed = 0;
 	fabric->cold_rx_gated = 0;
@@ -240,10 +285,21 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 			goto refuse;
 		}
 	}
-	fabric->saved_control = control;
 	for (i = 0; i < RTL_L2_FDB_FILTER_WORDS; i++)
 		fabric->saved_filter[i] = io->read(io->context,
 			RTL_L2_FDB_FILTER_WORD0 - i * 4);
+	/* RX gating and filter snapshots may span a software age-scan toggle.
+	 * Refresh that edge before the first CTRL write, without accepting stable policy
+	 * changes or a newly busy command window as part of our old snapshot. */
+	ret = rtl_l2_fdb_control_read(io, &live);
+	if (ret)
+		goto refuse;
+	if ((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN) {
+		ret = -EIO;
+		goto refuse;
+	}
+	control = live;
+	fabric->saved_control = control;
 	/* Claim before the first global write, so partial setup is accounted for. */
 	lease = 1;
 	io->write(io->context, RTL_L2_FDB_CONTROL,
@@ -252,13 +308,12 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		RTL_L2_FDB_LEARN_DISABLE, RTL_L2_FDB_LEARN_DISABLE);
 	if (ret) {
 		/* An ignored first write has not acquired the shared command lease.
-		 * If the original control is still exact and both windows idle,
+		 * If the original stable control and both idle windows are intact,
 		 * there is nothing to restore and no ambiguous command to retire.
 		 * Requiring a stopped-learning lease to restore this unchanged state
 		 * would turn an optional native failure into a dead management LAN. */
-		if (io->read(io->context, RTL_L2_FDB_CONTROL) == control &&
-		    !((io->read(io->context, RTL_L2_FDB_ACCESS) |
-		       io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)) {
+		cleanup = rtl_l2_fdb_control_read(io, &live);
+		if (!cleanup && !((live ^ control) & ~RTL_L2_FDB_SW_AGE_SCAN)) {
 			lease = 0;
 			goto refuse;
 		}
@@ -267,7 +322,7 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 	ret = rtl_fabric_drain(io);
 	if (ret)
 		goto restore;
-	if (!(fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL)) {
+	if ((fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL) != (unsigned int)mode) {
 		ret = rtl_l2_fdb_command_mode(io);
 		if (ret)
 			goto restore;
@@ -282,8 +337,9 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 			if (ret)
 				goto restore;
 		}
-		/* Every inherited valid row vetoes reinterpretation, including a
-		 * static or multicast IVL key. A complete all-valid MISS proves empty. */
+		/* Either direction of mode change reinterprets inherited keys.
+		 * Every valid row vetoes it, including static/multicast entries.
+		 * Only a complete all-valid MISS proves this FDB namespace empty. */
 		ret = rtl_l2_fdb_scan(io, 0, &row);
 		if (ret > 0) {
 			fabric->inherited_fdb_present = 1;
@@ -303,9 +359,9 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		}
 		vlan_written = 1;
 		io->write(io->context, RTL_L2_VLAN_MODE_CONTROL,
-			fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);
+			(fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode);
 		ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,
-			fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);
+			(fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode);
 		if (ret)
 			goto restore;
 	}
@@ -385,11 +441,15 @@ restore:
 		if (cleanup)
 			fabric->poisoned = 1;
 	}
-	/* A successful shared baseline keeps learning stopped. The native
-	 * owner may later enable only its prepared ports; software-only paths
-	 * remain on CPU bypass. Failed acquisition restores inherited policy. */
+	/* Successful cold handoff belongs to the FE lifetime, including route-
+	 * only configurations which never prepare native L2. Keep CMD leased
+	 * while learning is stopped and both windows are idle. Native L2 takes
+	 * its later snapshot from this CMD baseline and returns to it on exit.
+	 * Only final, proven-unexposed FE release may return the boot CMD bit.
+	 * Failed acquisition still restores inherited policy, not the new lease. */
 	if (lease && !fabric->poisoned && rtl_fabric_restore_command(io, fabric, ret ?
-		fabric->saved_control : fabric->saved_control | RTL_L2_FDB_LEARN_DISABLE))
+		fabric->saved_control : fabric->saved_control |
+		RTL_L2_FDB_LEARN_DISABLE | RTL_L2_FDB_CMD_MODE))
 		fabric->poisoned = 1;
 	if (fabric->poisoned) {
 		fabric->error = ret ? ret : -EIO;
@@ -397,10 +457,11 @@ restore:
 	}
 	if (ret)
 		goto refuse;
-	fabric->vlan_mode = fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL;
+	fabric->vlan_mode = (fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode;
 	fabric->ready = 1;
 	fabric->changed = !!(vlan_written || frame_written || oversize_written ||
-		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE));
+		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE) ||
+		!(fabric->saved_control & RTL_L2_FDB_CMD_MODE));
 	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++)
 		fabric->changed |= !!(fabric->original_mac_rx[i] & RTL_FABRIC_RX_MAC_ENABLE);
 	fabric->error = 0;
@@ -409,6 +470,14 @@ refuse:
 	fabric->refusal = !fabric->poisoned;
 	fabric->error = ret;
 	return ret;
+}
+
+/* Existing default remains SVL. Opt-in IVL is only available to the same
+ * cold owner through the explicit mode entry point above. */
+static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
+					 struct rtl_fabric *fabric)
+{
+	return rtl_fabric_cold_prepare_mode(io, fabric, RTL_FABRIC_VLAN_SVL);
 }
 
 #endif

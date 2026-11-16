@@ -94,14 +94,18 @@ int main(void) {
  assert(!rtl_fe_cam_protocol_put(&io,&binding) && !binding.created);
  assert(m.commands==commands+1);
 
- /* cpu_opt_mode is part of the outstanding FDB transaction, not merely a
-  * wrapper convenience. A timeout must not switch it back to indirect mode.
-  * The fabric lifecycle owner, not a later stateless command, restores the
-  * original mode once every operation has drained. */
+ /* Only the shared fabric owner may establish CMD mode. An ordinary L3
+  * call never flips the global mode, including when a command times out.
+  * Mode0 is rejected without touching DATA or trying to lease it. */
  for(unsigned int initial_mode=0;initial_mode<2;initial_mode++) {
   memset(&m,0,sizeof(m));m.leave_busy=true;
   unsigned int control=0x12345U|(initial_mode<<31);
   m.registers[0x1c00/4]=control;result=0x12345678;
+  if(!initial_mode) {
+   assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EOPNOTSUPP);
+   assert(m.registers[0x1c00/4]==control && result==0x12345678);
+   untouched(&m);continue;
+  }
   assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-ETIMEDOUT);
   assert(m.registers[0x1c00/4]==(control|0x80000000U) && result==0x12345678);
   writes=m.writes;commands=m.commands;
@@ -112,11 +116,10 @@ int main(void) {
   m.registers[0x1ca0/4]=0;m.leave_busy=false;
   assert(!rtl_fe_fdb_command(&io,0x85,fdb,&result));
   assert(m.registers[0x1c00/4]==(control|0x80000000U));
-  /* Only an external owner holding the original snapshot may restore it. */
-  write_reg(&m,0x1c00,control);
   assert(m.registers[0x1c00/4]==control);
  }
  memset(&m,0,sizeof(m));m.leave_busy=true;m.false_success=true;
+ m.registers[0x1c00/4]=RTL_L2_FDB_CMD_MODE;
  assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EBUSY);
  assert(m.registers[0x1c00/4]&0x80000000U);
 
@@ -145,14 +148,16 @@ int main(void) {
  /* Even a reported-success FDB command is not permission to restore mode
   * when the shared limit window is busy. No writes occur after the check. */
  memset(&m,0,sizeof(m));m.limit_busy_after_fdb=true;
+ m.registers[0x1c00/4]=RTL_L2_FDB_CMD_MODE;
  result=0x12345678;
  unsigned int fdb_before[4];memcpy(fdb_before,fdb,sizeof(fdb_before));
  assert(rtl_fe_fdb_command(&io,0x45,fdb,&result)==-EBUSY);
- assert(m.writes==6 && m.commands==1);
+ assert(m.writes==5 && m.commands==1);
  assert(m.registers[0x1c00/4]&RTL_L2_FDB_CMD_MODE);
  assert(result==0x12345678 && !memcmp(fdb,fdb_before,sizeof(fdb_before)));
 
  memset(&m,0,sizeof(m));
+ m.registers[0x1c00/4]=RTL_L2_FDB_CMD_MODE;
  assert(!rtl_fe_mask_write(&io,63,words) && m.commands==2);
  assert(!rtl_fe_classifier_write(&io,1024,words) && m.commands==3);
  assert(!rtl_fe_source_mac_write(&io,3,words) && m.commands==4);

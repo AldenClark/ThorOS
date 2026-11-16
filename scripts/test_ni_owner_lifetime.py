@@ -38,6 +38,7 @@ def function(text, name):
 
 
 names = ('rtl_ni_owner_claim', 'rtl_ni_owner_expose', 'rtl_ni_owner_release',
+         'rtl_mib_read', 'rtl_mib_write',
          'rtl_pon_host_gate',
          'rtl_engine_poison', 'rtl_engine_prepare', 'rtl_engine_start',
          'rtl_engine_stop', 'rtl_engine_get', 'rtl_engine_put',
@@ -47,7 +48,8 @@ functions = '\n'.join(function(source, name) for name in names)
 dma_functions = '\n'.join(function(dma_source, name) for name in
                           ('rtl_dma_vp', 'rtl_dma_tx_quiesce'))
 qm_start = function(qm_source, 'rtl_qm_rx_start')
-qm_tail = ('static int rtl_qm_start_admission_tail(struct rtl_qm_rx *rx,void *ni) {\n' +
+qm_tail = (function(qm_source, 'rtl_qm_rmw') + '\n' +
+           'static int rtl_qm_start_admission_tail(struct rtl_qm_rx *rx,void *ni) { int ret;u32 value;\n' +
            qm_start[qm_start.index('\t/* Stock aal_l3_te_init'):])
 # These publication/removal boundaries are not replaced by a test-only API.
 probe = function(source, 'rtl_probe')
@@ -72,6 +74,8 @@ common = r'''
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include "rtl9617c-l2qm.h"
+#include "rtl9617c-l2-es.h"
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 typedef int netdev_tx_t;
@@ -472,8 +476,8 @@ if args.mutants:
         ('clear_tombstone', text.replace('if (!owner || READ_ONCE(owner->exposed))', 'if (!owner)', 1), False),
         ('cold_gate_override', text.replace('rx->deepq_configured = true;',
             'writel(readl(ni+0x610c)|0xffffU,ni+0x610c); rx->deepq_configured = true;', 1), False),
-        ('ignore_reset_gate', text.replace('writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);',
-            '(void)ni;', 1), False),
+        ('ignore_reset_gate', text.replace('ret = rtl_qm_rmw(ni + 0x610c, 0xffffU, 0);',
+            'ret = 0;', 1), False),
     ])
 with tempfile.TemporaryDirectory(prefix='ni-owner-lifetime-') as directory:
     directory = Path(directory)
@@ -482,7 +486,8 @@ with tempfile.TemporaryDirectory(prefix='ni-owner-lifetime-') as directory:
         cfile.write_text(unit)
         subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                         '-Wno-misleading-indentation', '-O1', '-g', '-pthread',
-                        '-fsanitize=address,undefined', str(cfile), '-o', str(binary)], check=True)
+                        '-fsanitize=address,undefined', '-I', str(driver),
+                        str(cfile), '-o', str(binary)], check=True)
         run = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20)
         if expected:
             print(run.stdout + run.stderr, end='')

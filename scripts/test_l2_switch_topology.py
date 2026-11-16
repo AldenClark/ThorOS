@@ -38,6 +38,7 @@ COMMON = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-l2-format.h"
+#include "rtl9617c-l2-domain.h"
 typedef uint32_t u32;typedef uint8_t u8;
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
@@ -58,8 +59,10 @@ typedef uint32_t u32;typedef uint8_t u8;
 #define BR_MCAST_FLOOD BIT(11)
 #define BR_BCAST_FLOOD BIT(14)
 #define BR_BPDU_FILTER BIT(24)
+#define BR_ISOLATED BIT(16)
 #define BR_STATE_DISABLED 0
 #define BR_STATE_FORWARDING 3
+#define BR_STATE_BLOCKING 4
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 struct list_head {struct list_head *next,*prev;};
 static void init_list(struct list_head *h){h->next=h->prev=h;}
@@ -87,13 +90,21 @@ struct rtl_fe_port {
 struct rtl_fe {struct list_head ports;bool enabled;};
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask,replay_ports;
+ bool vlan_domain;
  unsigned int local_target,rule_count,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
+ unsigned int replay_traps[(RTL_L2_FDB_ENTRIES+31)/32];
 };
 struct switchdev_notifier_info {struct net_device *dev;};
 struct switchdev_notifier_fdb_info {
  struct switchdev_notifier_info info;unsigned int vid;bool locked,is_local,added_by_user;
  const u8 *addr;
 };
+/* The VID-aware replay/member contract has its own production helper test.
+ * This fixture intentionally keeps the existing SVL topology unchanged. */
+static bool fe_switch_vlan_replay_member(struct rtl_fe_bridge *sw,
+ const struct switchdev_notifier_fdb_info *info,int port){
+ (void)info;(void)port;assert(!sw->vlan_domain);return false;
+}
 static bool netif_running(const struct net_device *dev){return dev->running;}
 static bool netif_carrier_ok(const struct net_device *dev){return dev->carrier;}
 static struct net_device *netdev_master_upper_dev_get(struct net_device *dev){return dev->master;}
@@ -160,13 +171,21 @@ static void online_matrix(void){
 static void topology_and_policy(void){
  /* A single active bridge member still has a valid routed HW ingress. */
  setup(31,1);expect(FE_SWITCH_NO_BRIDGE,1,1);assert(plan.state[0]==BR_STATE_FORWARDING);
- /* A live STP restriction is never treated as an unplugged port. */
+ /* A live STP restriction stays in plan.ports for route-policy veto,
+  * while the other forwarding ports can retain native LAN switching. */
  for(unsigned int state=0;state<=4;state++)if(state!=BR_STATE_FORWARDING){
-  setup(31,31);lan[2].state=state;expect(FE_SWITCH_PORT_POLICY,31,31);
+  setup(31,31);lan[2].state=state;expect(FE_SWITCH_OK,31,31);
+  assert(fe_switch_route_plan_validate(&plan)==FE_SWITCH_PORT_POLICY);
+  assert(fe_switch_forwarding_ports(&plan)==27);
  }
  setup(31,1);lan[4].bridge_flags=BIT(16);lan[4].port_eligible=false;
  expect(FE_SWITCH_NO_BRIDGE,1,1);assert(!lan[4].port_reads);
- setup(31,3);lan[1].bridge_flags|=BIT(16);expect(FE_SWITCH_PORT_POLICY,3,3);
+ setup(31,3);lan[1].bridge_flags|=BR_ISOLATED;expect(FE_SWITCH_OK,3,3);
+ assert(fe_switch_route_plan_validate(&plan)==FE_SWITCH_PORT_POLICY);
+ setup(31,3);lan[1].bridge_flags&=~BR_LEARNING;expect(FE_SWITCH_OK,3,3);
+ assert(fe_switch_route_plan_validate(&plan)==FE_SWITCH_PORT_POLICY);
+ setup(31,3);lan[1].state=BR_STATE_BLOCKING;expect(FE_SWITCH_NO_BRIDGE,3,3);
+ assert(fe_switch_forwarding_ports(&plan)==1);
  setup(31,3);lan[1].port_eligible=false;expect(FE_SWITCH_PRIVATE_POLICY,3,3);
  setup(31,1);lan[4].policy=true;expect(FE_SWITCH_GUARDED,1,1);
  /* PPP has channels, not a netdev lower/upper edge. A namespace policy
@@ -212,28 +231,33 @@ static void replay_mask(void){
   setup(31,5);expect(FE_SWITCH_OK,5,5);sw.replay_ports=plan.ports;
   u8 mac[6]={2,0,0,0,0,(u8)(port+1)};
   struct switchdev_notifier_fdb_info info={.info={.dev=&lan[port]},.added_by_user=true,.addr=mac};
-  assert(!fe_switch_replay_fdb(&sw,&info));assert(sw.rule_count==!!(5&BIT(port)));
-  if(sw.rule_count){rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==port);}
+  assert(!fe_switch_replay_fdb(&sw,&info));assert(sw.rule_count==1);
+  rtl_l2_fdb_decode(sw.rules[0],&decoded);
+  assert(decoded.destination==((5&BIT(port))?port:16));
+  assert(decoded.valid && decoded.is_static);
+  assert(!!(sw.replay_traps[0]&1)==!(5&BIT(port)));
   /* A local address remains CPU-owned even when its physical member is
    * offline; omitting it could instead make it a hardware UC destination. */
   sw.rule_count=0;info.is_local=true;assert(!fe_switch_replay_fdb(&sw,&info));
-  assert(sw.rule_count==1);rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==25);cases++;
+  assert(sw.rule_count==1 && !(sw.replay_traps[0]&1));
+  rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==25);cases++;
  }
  setup(31,1);expect(FE_SWITCH_NO_BRIDGE,1,1);sw.replay_ports=0;
  u8 mac[6]={2,0,0,0,0,1};
  struct switchdev_notifier_fdb_info info={.info={.dev=&lan[0]},.added_by_user=true,.addr=mac};
- assert(!fe_switch_replay_fdb(&sw,&info) && !sw.rule_count);
+ assert(!fe_switch_replay_fdb(&sw,&info) && sw.rule_count==1);
+ rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==16 && (sw.replay_traps[0]&1));
  info.info.dev=&foreign;assert(fe_switch_replay_fdb(&sw,&info)==-EOPNOTSUPP);
  info.info.dev=&lan[0];info.is_local=true;assert(!fe_switch_replay_fdb(&sw,&info) && sw.rule_count==1);cases++;
 }
 int main(void){online_matrix();topology_and_policy();replay_mask();
- printf("Production L2 topology: %u snapshots/replay cases; online membership, all bridge policies, live STP rejection and offline FDB exclusion passed\n",cases);return 0;}
+ printf("Production L2 topology: %u snapshots/replay cases; online membership, STP forwarding subset, independent route veto and offline static-key CPU protection passed\n",cases);return 0;}
 '''
 
 declarations = re.search(r"enum fe_switch_reason \{.*?\n\};", source, re.S).group()
 declarations += "\n" + re.search(r"struct fe_switch_plan \{.*?\n\};", source, re.S).group()
 production = "\n".join(function(name) for name in (
-    "fe_switch_port_index", "fe_switch_route_plan_validate", "fe_switch_plan_validate",
+    "fe_switch_port_index", "fe_switch_route_plan_validate", "fe_switch_plan_validate", "fe_switch_forwarding_ports",
     "fe_switch_snapshot", "fe_switch_replay_fdb"))
 environment = os.environ.copy()
 environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")

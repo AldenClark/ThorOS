@@ -41,7 +41,7 @@ def function(source, name):
 
 source = read('rtl9617c-qm.c')
 production = ''.join(function(source, name) for name in (
-    'rtl_qm_window_idle', 'rtl_qm_indirect', 'rtl_qm_attribute',
+    'rtl_qm_rmw', 'rtl_qm_window_idle', 'rtl_qm_indirect', 'rtl_qm_attribute',
     'rtl_qm_pon_destination_map', 'rtl_qm_ingress', 'rtl_qm_cpu_credits',
     'rtl_dq_read', 'rtl_dq_write', 'rtl_dq_indirect'))
 start = source.index('\t/* The vendor credit table marks counter MSBs valid')
@@ -56,10 +56,9 @@ fixture = r'''
 #include <string.h>
 #include <errno.h>
 typedef uint32_t u32;
+#define __iomem
 #define BIT(n) (1U<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
-#define RTL_QM_BUFFERS_PER_EQ 256
-#define RTL_QM_VOQS 8
 #define EQ_ID 4
 #include "rtl9617c-qm-deepq.h"
 struct rtl_qm_rx {void *ni;};
@@ -133,6 +132,15 @@ int main(void) {
 with tempfile.TemporaryDirectory(prefix='qm-staging-', dir=root / 'artifacts') as temp:
     path = Path(temp)
     (path / 'rtl9617c-qm-deepq.h').write_text(read('rtl9617c-qm-deepq.h'))
+    if 'rtl9617c-qm-resources.h' in read('rtl9617c-qm-deepq.h'):
+        (path / 'rtl9617c-qm-resources.h').write_text(read('rtl9617c-qm-resources.h'))
+    else:
+        fixture = '#define RTL_QM_BUFFERS_PER_EQ 256\n#define RTL_QM_VOQS 8\n' + fixture
+    # Keep --revision self-contained: older code used the literal credit
+    # word and did not yet have this allocation-contract header.
+    if 'RTL_L2QM_PORT_FREE_CREDIT' in production:
+        (path / 'rtl9617c-l2qm.h').write_text(read('rtl9617c-l2qm.h'))
+        fixture = '#include "rtl9617c-l2qm.h"\n' + fixture
     c, exe = path / 'test.c', path / 'test'
     c.write_text(fixture + production + cases)
     subprocess.run(['cc', '-O1', '-g', '-Wall', '-Wextra', '-Werror',

@@ -1,0 +1,391 @@
+From: ThorOS maintainers
+Subject: [PATCH] bridge: own native static FDB offload marks by publication cookie
+
+Only publish hardware state for a current static-sticky or local FDB entry
+under hash_lock followed by the native policy generation guard.  Record the
+owner and a monotonically allocated, saturating cookie on the actual entry;
+cleanup must not clear another driver's mark or an identical-key replacement.
+Initialize slab-reused entries, revoke native marks on policy replacement,
+and hand ownership back to generic switchdev feedback without deleting FDBs.
+
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -287,24 +287,30 @@
+ 	mac_addr addr;
+ 	u16 vlan_id;
+ };
+ 
+ struct net_bridge_fdb_entry {
+ 	struct rhash_head		rhnode;
+ 	struct net_bridge_port		*dst;
+ 
+ 	struct net_bridge_fdb_key	key;
+ 	struct hlist_node		fdb_node;
+ 	unsigned long			flags;
+ 
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	/* hash_lock protects ownership of this exact OFFLOADED publication. */
++	struct rtl9617c_switch_guard	*rtl9617c_offload_owner;
++	u64				rtl9617c_offload_cookie;
++#endif
++
+ 	/* write-heavy members should not affect lookups */
+ 	unsigned long			updated ____cacheline_aligned_in_smp;
+ 	unsigned long			used;
+ 
+ 	struct rcu_head			rcu;
+ };
+ 
+ struct net_bridge_fdb_flush_desc {
+ 	unsigned long			flags;
+ 	unsigned long			flags_mask;
+ 	int				port_ifindex;
+ 	u16				vlan_id;
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -422,58 +422,82 @@
+ 	if (test_bit(BR_FDB_STATIC, &f->flags))
+ 		fdb_del_hw_addr(br, f->key.addr.addr);
+ 
+ 	hlist_del_init_rcu(&f->fdb_node);
+ 	rhashtable_remove_fast(&br->fdb_hash_tbl, &f->rhnode,
+ 			       br_fdb_rht_params);
+ 	if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &f->flags))
+ 		atomic_dec(&br->fdb_n_learned);
+ 	fdb_notify(br, f, RTM_DELNEIGH, swdev_notify);
+ 	kfree_rcu(f, rcu);
+ }
+ 
++/* Generic switchdev feedback transfers the mark to its caller.  The opaque
++ * owner pointer is never dereferenced; a globally unique cookie also protects
++ * against a later guard allocation reusing the same address. */
++static void br_rtl9617c_fdb_owner_clear(struct net_bridge_fdb_entry *fdb)
++{
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	fdb->rtl9617c_offload_owner = NULL;
++	fdb->rtl9617c_offload_cookie = 0;
++#endif
++}
++
++static bool br_rtl9617c_fdb_owner_invalidate(struct net_bridge_fdb_entry *fdb)
++{
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	if (fdb->rtl9617c_offload_owner) {
++		br_rtl9617c_fdb_owner_clear(fdb);
++		return test_and_clear_bit(BR_FDB_OFFLOADED, &fdb->flags);
++	}
++#endif
++	return false;
++}
++
+ /* Delete a local entry if no other port had the same address.
+  *
+  * This function should only be called on entries with BR_FDB_LOCAL set,
+  * so even with BR_FDB_ADDED_BY_USER cleared we never need to increase
+  * the accounting for dynamically learned entries again.
+  */
+ static void fdb_delete_local(struct net_bridge *br,
+ 			     const struct net_bridge_port *p,
+ 			     struct net_bridge_fdb_entry *f)
+ {
+ 	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	const unsigned char *addr = f->key.addr.addr;
+ 	struct net_bridge_vlan_group *vg;
+ 	const struct net_bridge_vlan *v;
+ 	struct net_bridge_port *op;
+ 	u16 vid = f->key.vlan_id;
+ 
+ 	/* Maybe another port has same hw addr? */
+ 	list_for_each_entry(op, &br->port_list, list) {
+ 		vg = nbp_vlan_group(op);
+ 		if (op != p && ether_addr_equal(op->dev->dev_addr, addr) &&
+ 		    (!vid || br_vlan_find(vg, vid))) {
++			br_rtl9617c_fdb_owner_invalidate(f);
+ 			WRITE_ONCE(f->dst, op);
+ 			clear_bit(BR_FDB_ADDED_BY_USER, &f->flags);
+ 			return;
+ 		}
+ 	}
+ 
+ 	vg = br_vlan_group(br);
+ 	v = br_vlan_find(vg, vid);
+ 	/* Maybe bridge device has same hw addr? */
+ 	if (p && ether_addr_equal(br->dev->dev_addr, addr) &&
+ 	    (!vid || (v && br_vlan_should_use(v)))) {
++		br_rtl9617c_fdb_owner_invalidate(f);
+ 		WRITE_ONCE(f->dst, NULL);
+ 		clear_bit(BR_FDB_ADDED_BY_USER, &f->flags);
+ 		return;
+ 	}
+ 
+ 	fdb_delete(br, f, true);
+ }
+ 
+ void br_fdb_find_delete_local(struct net_bridge *br,
+ 			      const struct net_bridge_port *p,
+ 			      const unsigned char *addr, u16 vid)
+ {
+@@ -506,24 +530,26 @@
+ 			return NULL;
+ 		__set_bit(BR_FDB_DYNAMIC_LEARNED, &flags);
+ 	}
+ 
+ 	fdb = kmem_cache_alloc(br_fdb_cache, GFP_ATOMIC);
+ 	if (!fdb)
+ 		return NULL;
+ 
+ 	memcpy(fdb->key.addr.addr, addr, ETH_ALEN);
+ 	WRITE_ONCE(fdb->dst, source);
+ 	fdb->key.vlan_id = vid;
+ 	fdb->flags = flags;
++	/* slab reuse must not inherit a deleted entry's publication cookie. */
++	br_rtl9617c_fdb_owner_clear(fdb);
+ 	fdb->updated = fdb->used = jiffies;
+ 	err = rhashtable_lookup_insert_fast(&br->fdb_hash_tbl, &fdb->rhnode,
+ 					    br_fdb_rht_params);
+ 	if (err) {
+ 		kmem_cache_free(br_fdb_cache, fdb);
+ 		return NULL;
+ 	}
+ 
+ 	if (likely(learned))
+ 		atomic_inc(&br->fdb_n_learned);
+ 
+ 	hlist_add_head_rcu(&fdb->fdb_node, &br->fdb_list);
+@@ -1329,24 +1355,27 @@
+ 			return -ENOENT;
+ 
+ 		fdb = fdb_create(br, source, addr, vid,
+ 				 BIT(BR_FDB_ADDED_BY_USER));
+ 		if (!fdb)
+ 			return -ENOMEM;
+ 
+ 		modified = true;
+ 	} else {
+ 		if (flags & NLM_F_EXCL)
+ 			return -EEXIST;
+ 
++		/* A successful userspace replacement revokes only our old mark,
++		 * even when key, destination and row type happen to be unchanged. */
++		modified |= br_rtl9617c_fdb_owner_invalidate(fdb);
+ 		if (READ_ONCE(fdb->dst) != source) {
+ 			WRITE_ONCE(fdb->dst, source);
+ 			modified = true;
+ 		}
+ 
+ 		set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+ 		if (test_and_clear_bit(BR_FDB_DYNAMIC_LEARNED, &fdb->flags))
+ 			atomic_dec(&br->fdb_n_learned);
+ 	}
+ 
+ 	if (fdb_to_nud(br, fdb) != state) {
+ 		if (state & NUD_PERMANENT) {
+@@ -1686,24 +1715,25 @@
+ 			err = -ENOMEM;
+ 			goto err_unlock;
+ 		}
+ 		fdb_notify(br, fdb, RTM_NEWNEIGH, swdev_notify);
+ 	} else {
+ 		if (locked &&
+ 		    (!test_bit(BR_FDB_LOCKED, &fdb->flags) ||
+ 		     READ_ONCE(fdb->dst) != p)) {
+ 			err = -EINVAL;
+ 			goto err_unlock;
+ 		}
+ 
++		modified |= br_rtl9617c_fdb_owner_invalidate(fdb);
+ 		WRITE_ONCE(fdb->updated, jiffies);
+ 
+ 		if (READ_ONCE(fdb->dst) != p) {
+ 			WRITE_ONCE(fdb->dst, p);
+ 			modified = true;
+ 		}
+ 
+ 		if (test_and_set_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags)) {
+ 			/* Refresh entry */
+ 			WRITE_ONCE(fdb->used, jiffies);
+ 		} else {
+ 			modified = true;
+@@ -1840,45 +1870,177 @@
+ 	    !test_bit(BR_FDB_STATIC, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_STICKY, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_LOCKED, &fdb->flags) &&
+ 	    !test_bit(BR_FDB_LOCAL, &fdb->flags)) {
+ 		fdb_delete(p->br, fdb, false);
+ 		removed = true;
+ 	}
+ 	spin_unlock_bh(&p->br->hash_lock);
+ 	return removed;
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_forget);
+ 
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++static atomic64_t br_rtl9617c_fdb_cookie = ATOMIC64_INIT(0);
++
++struct br_rtl9617c_offload_ctx {
++	struct net_bridge *br;
++	struct net_bridge_port *port;
++	struct net_bridge_fdb_entry *fdb;
++	struct rtl9617c_switch_guard *guard;
++	const unsigned char *addr;
++	u64 cookie;
++	u16 vid;
++	bool local, changed;
++};
++
++/* hash_lock -> policy gate lock, as for dynamic learning feedback.  No
++ * notifications or driver callbacks until guard_publish releases its lock. */
++static int br_rtl9617c_fdb_offload_publish(void *context)
++{
++	struct br_rtl9617c_offload_ctx *ctx = context;
++	struct net_bridge_fdb_entry *fdb;
++	struct net_bridge_port *dst;
++	s64 previous;
++
++	fdb = br_fdb_find(ctx->br, ctx->addr, ctx->vid);
++	if (!fdb)
++		return -ENOENT;
++	dst = READ_ONCE(fdb->dst);
++	if (test_bit(BR_FDB_LOCKED, &fdb->flags) ||
++	    !!test_bit(BR_FDB_LOCAL, &fdb->flags) != ctx->local)
++		return -ESTALE;
++	if (ctx->local) {
++		/* Port-owned local MACs and bridge-owned local MACs both terminate
++		 * on the CPU.  They need not have the same fdb->dst representation. */
++		if (dst && dst->br != ctx->br)
++			return -ESTALE;
++	} else if (dst != ctx->port ||
++		   !test_bit(BR_FDB_STATIC, &fdb->flags) ||
++		   !test_bit(BR_FDB_STICKY, &fdb->flags)) {
++		return -ESTALE;
++	}
++	if ((fdb->rtl9617c_offload_owner &&
++	     fdb->rtl9617c_offload_owner != ctx->guard) ||
++	    (test_bit(BR_FDB_OFFLOADED, &fdb->flags) &&
++	     fdb->rtl9617c_offload_owner != ctx->guard))
++		return -EEXIST;
++	/* Saturation is permanent.  Never wrap to an old cookie, even after a
++	 * driver reload, identical-key recreation or same-generation rebuild. */
++	previous = atomic64_fetch_add_unless(&br_rtl9617c_fdb_cookie, 1, S64_MAX);
++	if (previous == S64_MAX)
++		return -EOVERFLOW;
++	ctx->cookie = previous + 1;
++	fdb->rtl9617c_offload_owner = ctx->guard;
++	fdb->rtl9617c_offload_cookie = ctx->cookie;
++	ctx->changed = !test_and_set_bit(BR_FDB_OFFLOADED, &fdb->flags);
++	ctx->fdb = fdb;
++	return 0;
++}
++
++int br_rtl9617c_fdb_offload(const struct net_device *master,
++			   const struct net_device *dev,
++			   const unsigned char *addr, u16 vid, bool local,
++			   struct rtl9617c_switch_guard *guard, u64 generation,
++			   u64 *cookie)
++{
++	struct br_rtl9617c_offload_ctx ctx = {
++		.guard = guard, .addr = addr, .vid = vid, .local = local,
++	};
++	int ret;
++
++	ASSERT_RTNL();
++	if (!master || !netif_is_bridge_master(master) || !guard || !cookie ||
++	    !addr || !is_valid_ether_addr(addr) || vid >= VLAN_VID_MASK ||
++	    (local ? !!dev : !dev))
++		return -EINVAL;
++	if (guard->net != dev_net(master))
++		return -EXDEV;
++	ctx.br = netdev_priv(master);
++	if (dev) {
++		ctx.port = br_port_get_rtnl(dev);
++		if (!ctx.port || ctx.port->br != ctx.br)
++			return -ENODEV;
++	}
++	spin_lock_bh(&ctx.br->hash_lock);
++	ret = rtl9617c_switch_guard_publish(guard, generation,
++					    br_rtl9617c_fdb_offload_publish, &ctx);
++	if (!ret) {
++		*cookie = ctx.cookie;
++		if (ctx.changed)
++			fdb_notify(ctx.br, ctx.fdb, RTM_NEWNEIGH, false);
++	}
++	spin_unlock_bh(&ctx.br->hash_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_offload);
++
++bool br_rtl9617c_fdb_unoffload(const struct net_device *master,
++			      const unsigned char *addr, u16 vid,
++			      struct rtl9617c_switch_guard *guard, u64 cookie)
++{
++	struct net_bridge_fdb_entry *fdb;
++	struct net_bridge *br;
++	bool removed = false;
++
++	ASSERT_RTNL();
++	if (!master || !netif_is_bridge_master(master) || !guard || !cookie ||
++	    !addr || vid >= VLAN_VID_MASK)
++		return false;
++	br = netdev_priv(master);
++	spin_lock_bh(&br->hash_lock);
++	fdb = br_fdb_find(br, addr, vid);
++	/* Do not use current policy generation: cleanup must work after a policy
++	 * change.  Key/dst/type alone cannot distinguish a replacement entry. */
++	if (fdb && fdb->rtl9617c_offload_owner == guard &&
++	    fdb->rtl9617c_offload_cookie == cookie) {
++		br_rtl9617c_fdb_owner_clear(fdb);
++		removed = true;
++		if (test_and_clear_bit(BR_FDB_OFFLOADED, &fdb->flags))
++			fdb_notify(br, fdb, RTM_NEWNEIGH, false);
++	}
++	spin_unlock_bh(&br->hash_lock);
++	return removed;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_unoffload);
++#endif
++
+ void br_fdb_offloaded_set(struct net_bridge *br, struct net_bridge_port *p,
+ 			  const unsigned char *addr, u16 vid, bool offloaded)
+ {
+ 	struct net_bridge_fdb_entry *fdb;
+ 
+ 	spin_lock_bh(&br->hash_lock);
+ 
+ 	fdb = br_fdb_find(br, addr, vid);
+-	if (fdb && offloaded != test_bit(BR_FDB_OFFLOADED, &fdb->flags))
+-		change_bit(BR_FDB_OFFLOADED, &fdb->flags);
++	if (fdb) {
++		/* Generic feedback belongs to its sender even if the bit was
++		 * already set.  Old native cleanup must not clear its new mark. */
++		br_rtl9617c_fdb_owner_clear(fdb);
++		if (offloaded != test_bit(BR_FDB_OFFLOADED, &fdb->flags))
++			change_bit(BR_FDB_OFFLOADED, &fdb->flags);
++	}
+ 
+ 	spin_unlock_bh(&br->hash_lock);
+ }
+ 
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid)
+ {
+ 	struct net_bridge_fdb_entry *f;
+ 	struct net_bridge_port *p;
+ 
+ 	ASSERT_RTNL();
+ 
+ 	p = br_port_get_rtnl(dev);
+ 	if (!p)
+ 		return;
+ 
+ 	spin_lock_bh(&p->br->hash_lock);
+ 	hlist_for_each_entry(f, &p->br->fdb_list, fdb_node) {
+-		if (READ_ONCE(f->dst) == p && f->key.vlan_id == vid)
++		if (READ_ONCE(f->dst) == p && f->key.vlan_id == vid) {
++			br_rtl9617c_fdb_owner_clear(f);
+ 			clear_bit(BR_FDB_OFFLOADED, &f->flags);
++		}
+ 	}
+ 	spin_unlock_bh(&p->br->hash_lock);
+ }
+ EXPORT_SYMBOL_GPL(br_fdb_clear_offload);
+

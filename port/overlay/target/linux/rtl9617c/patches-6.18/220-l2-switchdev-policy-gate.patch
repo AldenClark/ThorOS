@@ -193,7 +193,7 @@ diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
  	struct net_bridge_fdb_entry *fdb;
  	bool modified = false;
  	int err = 0;
-@@ -1734,6 +1754,101 @@
+@@ -1734,6 +1754,108 @@
  	return err;
  }
  
@@ -212,6 +212,13 @@ diff --git a/net/bridge/br_fdb.c b/net/bridge/br_fdb.c
 +	struct br_rtl9617c_learn_ctx *ctx = context;
 +	struct net_bridge *br = ctx->port->br;
 +	struct net_bridge_fdb_entry *fdb;
++
++	/* A current generation does not authorize learning on every member.
++	 * Recheck under both locks, including refreshes and port moves, before
++	 * any FDB mutation. Native learning admits forwarding ports only. */
++	if (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING ||
++	    !(READ_ONCE(ctx->port->flags) & BR_LEARNING))
++		return -EOPNOTSUPP;
 +
 +	fdb = br_fdb_find(br, ctx->addr, 0);
 +	if (fdb && (test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
@@ -461,7 +468,7 @@ diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
 diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
 --- a/net/bridge/br_switchdev.c
 +++ b/net/bridge/br_switchdev.c
-@@ -11,6 +11,73 @@
+@@ -11,6 +11,74 @@
  
  static struct static_key_false br_switchdev_tx_fwd_offload;
  
@@ -514,7 +521,8 @@ diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
 +{
 +	const unsigned long allowed = BR_LEARNING | BR_LEARNING_SYNC | BR_FLOOD |
 +		BR_MCAST_FLOOD | BR_BCAST_FLOOD | BR_PROMISC | BR_BPDU_GUARD |
-+		BR_ROOT_BLOCK | BR_ADMIN_COST | BR_MULTICAST_FAST_LEAVE | BR_BPDU_FILTER;
++		BR_ROOT_BLOCK | BR_ADMIN_COST | BR_MULTICAST_FAST_LEAVE |
++		BR_BPDU_FILTER | BR_ISOLATED;
 +	const struct net_bridge_port *p;
 +
 +	ASSERT_RTNL();

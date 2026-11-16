@@ -65,7 +65,8 @@ static bool warn_once(bool value){assert(!value);return value;}
 #define EXPORT_SYMBOL_GPL(n)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 struct net {unsigned id;};
-struct net_device {unsigned ifindex,type,ppp_channel_generation;struct net *net;u8 dev_addr[6];};
+#define smp_load_acquire(p) (*(p))
+struct net_device {unsigned ifindex,type,ppp_channel_generation;struct net *net;u8 dev_addr[6];bool moving_ns;};
 struct dst_entry {struct net_device *dev;u32 cookie;bool valid;unsigned references;};
 struct nf_conn {struct net *net;bool dying,offloaded;};
 struct flow_offload_tuple {
@@ -201,6 +202,7 @@ with tempfile.TemporaryDirectory(prefix='flowtable-roam-') as directory:
         has_ppp_policy = 'ppp_flow_policy_allows(' in (kernel / 'drivers/net/ppp/ppp_generic.c').read_text()
         later = []
         for marker, source, name in [
+            ('netdev_ppp_path_advance(', 'include/linux/netdevice.h', '235-ppp-flow-namespace-fence.patch'),
             ('try_cmpxchg(&flow->timeout', 'net/netfilter/nf_flow_table_core.c', '230-flowtable-refresh-timeout-order.patch'),
             ('NF_FLOW_INITIALIZING', 'include/net/netfilter/nf_flow_table.h', '229-flowtable-initial-publication.patch'),
             ('try_cmpxchg(&offload->flow->timeout', 'net/netfilter/nf_flow_table_offload.c', '228-flowtable-stats-timeout-wrap.patch'),

@@ -48,7 +48,8 @@ typedef uint32_t u32;
  * atomic storage and barriers modeled rather than accepting all PPP paths. */
 #define atomic_read(p) (*(p))
 #define smp_rmb() __asm__ __volatile__("" ::: "memory")
-struct net_device {unsigned ppp_channel_generation;};
+#define smp_load_acquire(p) (*(p))
+struct net_device {unsigned ppp_channel_generation;bool moving_ns;};
 static unsigned long long visits, deleted, stats, replaces;
 /* Count list-node visits without replacing the production loop itself. */
 #undef list_for_each_entry

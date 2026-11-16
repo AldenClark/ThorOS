@@ -1,0 +1,136 @@
+From: ThorOS maintainers <noreply@thoros.local>
+Subject: [PATCH] net: fence PPP paths across network namespace moves
+
+PPP keeps its channel namespace when the netdevice moves.  Its software
+path scrubs cross-namespace packets; a direct flow recipe must not bypass
+that boundary.  There is no netdevice adjacency to make the channel's
+original fabric see the moved PPP device.
+
+Invalidate old path cookies before namespace publication and reject path
+capture or late hardware ADD while moving.  Advance by two on a move so
+an overlapping PPP writer keeps its odd/even generation state.  Use one
+full-barrier CAS helper for both writers: zero after wrap is permanent,
+including a namespace move racing a channel/policy change.  Reject a
+moved-away PPP path, but allow a fresh path after a move back.
+
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2398,7 +2398,8 @@ struct net_device {
+ 
+ 	u8 reg_state;
+ 	/* PPP channel writers serialize with ppp_lock(). Odd means changing;
+-	 * zero is permanently invalid after wrap. Readers use the helpers below. */
++	 * namespace moves advance by two and preserve that parity. Zero is
++	 * permanently invalid after wrap. Readers use the helpers below. */
+ 	atomic_t ppp_channel_generation;
+ 
+ 	bool dismantle;
+@@ -2593,20 +2594,43 @@ struct net_device {
+ } ____cacheline_aligned;
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
++static inline void netdev_ppp_path_advance(struct net_device *dev, u32 step)
++{
++	int old = atomic_read(&dev->ppp_channel_generation);
++	u32 next;
++
++	/* PPP writers use one before/after publication; namespace moves use
++	 * two so a concurrent writer stays odd until its own completion.
++	 * A full-barrier CAS also orders moving_ns before the new generation.
++	 * Never let a raced increment revive zero after an unsigned wrap.
++	 */
++	while (old) {
++		next = (u32)old + step;
++		if (next < (u32)old)
++			next = 0;
++		if (atomic_try_cmpxchg(&dev->ppp_channel_generation, &old,
++				       (int)next))
++			return;
++	}
++}
++
+ static inline u32 netdev_ppp_path_cookie(const struct net_device *dev)
+ {
+ 	u32 cookie = (u32)atomic_read(&dev->ppp_channel_generation);
+ 
+ 	/* Pair the two reads around forward-path decoding with the writer's
+-	 * full-barrier atomic increments before/after channel publication. */
++	 * full-barrier CAS before/after channel publication. Reading moving_ns
++	 * after the generation also excludes the new cookie during a move.
++	 */
+ 	smp_rmb();
+-	return cookie;
++	return smp_load_acquire(&dev->moving_ns) ? 0 : cookie;
+ }
+ 
+ static inline bool netdev_ppp_path_valid(const struct net_device *dev, u32 cookie)
+ {
+ 	smp_rmb();
+-	return cookie && !(cookie & 1) &&
++	return cookie && !(cookie & 1) &&
++		!smp_load_acquire(&dev->moving_ns) &&
+ 		cookie == (u32)atomic_read(&dev->ppp_channel_generation);
+ }
+ 
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -1651,6 +1651,13 @@ static bool ppp_flow_policy_allows(const struct ppp *ppp, __be16 protocol)
+ {
+ 	int index;
+ 
++	/* The channel namespace does not follow a moved PPP netdevice.
++	 * Preserve the software path's cross-netns scrub and policy boundary.
++	 */
++	if (smp_load_acquire(&ppp->dev->moving_ns) ||
++	    !net_eq(ppp->ppp_net, dev_net(ppp->dev)))
++		return false;
++
+ 	/* CCP_OPEN alone is negotiation, not a data-plane transformation.
+ 	 * A configured compressor is different: even before CCP_UP its state
+ 	 * can start tracking plain packets after CONFACK. Do not bypass it.
+@@ -3123,8 +3130,7 @@ static struct net *ppp_flow_change_begin(struct ppp *ppp)
+ 	lockdep_assert_held(&ppp->wlock);
+ 	lockdep_assert_held(&ppp->rlock);
+ 	policy = rtl9617c_switch_policy_begin(ppp->dev);
+-	if (atomic_read(&ppp->dev->ppp_channel_generation))
+-		atomic_inc_return(&ppp->dev->ppp_channel_generation);
++	netdev_ppp_path_advance(ppp->dev, 1);
+ 	return policy;
+ }
+ 
+@@ -3133,8 +3139,7 @@ static void ppp_flow_change_end(struct ppp *ppp, struct net *policy)
+ 	lockdep_assert_held(&ppp->wlock);
+ 	lockdep_assert_held(&ppp->rlock);
+ 	/* Zero after wrap is permanent: never authorize an old cookie again. */
+-	if (atomic_read(&ppp->dev->ppp_channel_generation))
+-		atomic_inc_return(&ppp->dev->ppp_channel_generation);
++	netdev_ppp_path_advance(ppp->dev, 1);
+ 	rtl9617c_switch_policy_end(policy);
+ }
+ 
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -12606,7 +12606,12 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
+ 
+ 	if (!netdev_need_ops_lock(dev))
+ 		netdev_lock(dev);
+-	dev->moving_ns = true;
++	WRITE_ONCE(dev->moving_ns, true);
++	/* A PPP channel remains in its original namespace. Invalidate queued
++	 * direct-path recipes even if the device later moves back. Preserve
++	 * a simultaneous channel/policy writer's odd generation.
++	 */
++	netdev_ppp_path_advance(dev, 2);
+ 	netdev_unlock(dev);
+ 
+ 	synchronize_net();
+@@ -12677,7 +12682,8 @@ int __dev_change_net_namespace(struct net_device *dev, struct net *net,
+ 	WARN_ON(err);
+ 
+ 	netdev_lock(dev);
+-	dev->moving_ns = false;
++	/* Publish the destination namespace before lockless path readers. */
++	smp_store_release(&dev->moving_ns, false);
+ 	if (!netdev_need_ops_lock(dev))
+ 		netdev_unlock(dev);
+ 

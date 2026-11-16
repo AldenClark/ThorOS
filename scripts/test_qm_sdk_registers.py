@@ -28,6 +28,8 @@ for path, expected in (
 root = Path(__file__).resolve().parents[1]
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 sdk = args.sdk_header.read_text()
+sdk_qm = args.sdk_qm.read_text()
+assert int(re.search(r'^#define\s+AAL_L3QM_MAX_BID\s+(\d+)\s*$', sdk_qm, re.M)[1]) == 16384
 source = (drivers / 'rtl9617c-qm.c').read_text()
 
 
@@ -54,6 +56,7 @@ names = [f'QM_QM_CFG{i}_EQ0_t' for i in range(5)] + [
     'QM_QM_UPPER_LDPID_MAP_t', 'QM_QM_CPU_EPP_FIFO_CFG_profile0_t',
     'QM_QM_CPU_EPP_FIFO0_0_CFG_t', 'QM_QM_AXI_ATTRIBUTE_DATA0_t',
     'QM_QM_AXI_ATTRIBUTE_DATA1_t', 'QM_QM_AXI_ATTRIBUTE_ACCESS_t',
+    'QM_QM_EQM_PA_REQ0_t', 'QM_QM_CPU_PUSH_RDY0_t',
     'TE_CB_PORT_THRSH_PROFILE0_t', 'TE_CB_PORT_FREECNT_MEM_DATA_t',
     'TE_CB_VOQ_THRSH_PROFILE_MEM_DATA0_t',
     'TE_CB_VOQ_THRSH_PROFILE_MEM_DATA1_t',
@@ -65,6 +68,8 @@ addresses = {
     'QM_QM_CPU_EPP_FIFO_CFG_profile0': 0x657c, 'QM_QM_CPU_EPP_FIFO0_0_CFG': 0x65a4,
     'QM_QM_AXI_ATTRIBUTE_ACCESS': 0x66a4, 'QM_QM_AXI_ATTRIBUTE_DATA1': 0x66a8,
     'QM_QM_AXI_ATTRIBUTE_DATA0': 0x66ac,
+    'QM_QM_EQM_PA_REQ0': 0x6328, 'QM_QM_CPU_PUSH_RDY0': 0x6368,
+    'QM_QM_CPU_PUSH_PADDR0': 0x636c,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_WRPTR': 0x7000,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_RDPTR': 0x7100,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_PADDR_START': 0x7200,
@@ -88,10 +93,7 @@ typedef uint8_t ca_uint8_t;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
 #define printk(...) ((void)0)
-#define RTL_QM_RING_BYTES 1024
-#define RTL_QM_VOQS 8
-#define RTL_QM_BUFFERS_PER_EQ 256
-#define EQ_ID 4
+#define EQ_ID RTL_QM_CPU_EQ_FIRST
 #define EQ_CFG (0x61e8 + EQ_ID * 20)
 #define EQ_PROFILE (0x6128 + EQ_ID * 4)
 #define EPP_BASE 0x7200
@@ -117,18 +119,24 @@ static void writel(u32 v,void *p){
 production = ''.join(function(source, name) for name in (
     'rtl_qm_window_idle', 'rtl_qm_indirect', 'rtl_qm_attribute',
     'rtl_qm_cpu_credits', 'rtl_dq_read', 'rtl_dq_write', 'rtl_dq_indirect'))
-production += function(args.sdk_qm.read_text(), 'aal_l3qm_get_buffer_size_index')
+production += function(sdk_qm, 'aal_l3qm_get_buffer_size_index')
 eq_start = source.index('\t/* Distinct EQ4/EQ5:')
 eq_end = source.index('\tret = rtl_qm_deepq_prepare(', eq_start)
 epp_start = source.index('\twritel(0, ni + 0x6558);')
 epp_end = source.index('\tfor (i = 0; i < RTL_QM_BUFFERS; i++)', epp_start)
-production += 'static void cpu_setup(struct rtl_qm_rx *rx) { void *ni=rx->ni;unsigned i;\n'
-production += source[eq_start:eq_end] + source[epp_start:epp_end] + '}\n'
+production += 'static int cpu_setup(struct rtl_qm_rx *rx) { void *ni=rx->ni;unsigned i;u32 value;\n'
+production += source[eq_start:eq_end] + source[epp_start:epp_end] + 'return 0;}\n'
 cases = r'''
 int main(void) {
  struct rtl_qm_rx rx={.ni=regs,.ring_dma=0x06000000};
  const struct rtl_dq_io io={&rx,rtl_dq_read,rtl_dq_write,rtl_dq_indirect};
- regs[0x68b0/4]=~0U;regs[0x610c/4]=~0U;
+ for(unsigned bit=0;bit<32;bit++) {
+  QM_QM_EQM_PA_REQ0_t request={.wrd=1U<<bit};
+  QM_QM_CPU_PUSH_RDY0_t ready={.wrd=1U<<bit};
+  assert(request.bf.inactive_bid_cntr==(bit<14?1U<<bit:0));
+  assert(request.bf.req==(bit==31) && ready.bf.rdy==(bit==31));
+ }
+ regs[0x68b0/4]=0xc8000000U;regs[0x610c/4]=0xa5a5ffffU;
  assert(!rtl_qm_deepq_prepare(&io,0x12000000));
  assert(!(regs[0x610c/4]&0xffff));
  for(unsigned pool=0;pool<2;pool++) {
@@ -138,8 +146,8 @@ int main(void) {
   QM_QM_CFG2_EQ0_t c={.wrd=regs[cfg+2]};
   QM_QM_CFG3_EQ0_t d={.wrd=regs[cfg+3]};
   QM_QM_CFG4_EQ0_t e={.wrd=regs[cfg+4]};
-  assert(a.bf.eq_en && ((unsigned)a.bf.phy_addr_start<<7)==0x12000000U+pool*512*2048);
-  assert(b.bf.bid_start==512+pool*512 && b.bf.total_buffer_num==512);
+  assert(a.bf.eq_en && ((unsigned)a.bf.phy_addr_start<<7)==0x12000000U+pool*1024*2048);
+  assert(b.bf.bid_start==1024+pool*1024 && b.bf.total_buffer_num==1024);
   assert(c.bf.buffer_size==aal_l3qm_get_buffer_size_index(2048) && !c.bf.cpu_eq && !c.bf.refill_en);
   assert(d.bf.cache==6 && d.bf.domain==2 && !d.bf.snoop && d.bf.acd_cmd && d.bf.cache_eos==6);
   assert(e.bf.axi_top_bit==2);
@@ -150,35 +158,47 @@ int main(void) {
  TE_CB_PORT_THRSH_PROFILE0_t port={.wrd=regs[0x958c/4]};
  assert(profile.bf.eqp0==1 && profile.bf.eqp1==2 && !profile.bf.rule);
  assert(map.bf.pon_en && map.bf.pon_offset==2 && !buffer.bf.jumbo_buffer_en && !buffer.bf.alternate_eq_en);
- assert(port.bf.lth==512*2/3 && port.bf.hth==(512*2/3)*2);
+ assert(port.bf.lth==1024*2/3 && port.bf.hth==(1024*2/3)*2);
  TE_CB_VOQ_THRSH_PROFILE_MEM_DATA0_t th0={.wrd=profiles[3][0]};
  TE_CB_VOQ_THRSH_PROFILE_MEM_DATA1_t th1={.wrd=profiles[3][1]};
  TE_CB_VOQ_THRSH_PROFILE_MEM_DATA2_t th2={.wrd=profiles[3][2]};
- assert(th0.bf.lth==512*2/3 && th0.bf.hth==512);
+ assert(th0.bf.lth==1024*2/3 && th0.bf.hth==1024);
  assert((th1.bf.grplth<<4|th0.bf.grplth)==16383 && th1.bf.grphth==16383);
  assert((th2.bf.prvt<<8|th1.bf.prvt)==25);
  for(unsigned p=16;p<32;p++) {
   QM_QM_DEST_PORT0_EQ_CFG_t dest={.wrd=regs[(0x6148+p*4)/4]};
   TE_CB_PORT_FREECNT_MEM_DATA_t credit={.wrd=credits[p]};
-  assert(dest.bf.profile_sel==1 && credit.bf.cnt0==512 && credit.bf.cnt1==512 && credit.bf.cnt0_msb && credit.bf.cnt1_msb);
+  assert(dest.bf.profile_sel==1 && credit.bf.cnt0==1024 && credit.bf.cnt1==1024 && credit.bf.cnt0_msb && credit.bf.cnt1_msb);
   for(unsigned q=p*8;q<p*8+8;q++)assert(voq[q]==3);
  }
- regs[(0x657c+4*4)/4]=0xe0008001;cpu_setup(&rx);
+ regs[(0x657c+4*4)/4]=0xe0008001;assert(!cpu_setup(&rx));
  for(unsigned pool=0;pool<2;pool++) {
   unsigned cfg=(0x61e8+(pool+4)*20)/4;
   QM_QM_CFG1_EQ0_t b={.wrd=regs[cfg+1]};QM_QM_CFG2_EQ0_t c={.wrd=regs[cfg+2]};
-  assert(b.bf.bid_start==pool*256 && b.bf.total_buffer_num==256 && c.bf.cpu_eq);
-  assert(c.bf.buffer_size==aal_l3qm_get_buffer_size_index(2048) && !c.bf.refill_en && c.bf.refill_ths==24);
+  assert(b.bf.bid_start==pool*512 && b.bf.total_buffer_num==512 && c.bf.cpu_eq);
+  assert(c.bf.buffer_size==aal_l3qm_get_buffer_size_index(2048) && !c.bf.refill_en && c.bf.refill_ths==(512-64)/8);
  }
  QM_QM_CPU_EPP_FIFO_CFG_profile0_t fifo={.wrd=regs[(0x657c+4*4)/4]};
- assert(fifo.bf.size*16==1024 && fifo.bf.high_ths==2 && fifo.bf.timer_ths==15 && fifo.bf.max_buf_cnt_per_pkt==7);
+ assert(fifo.bf.size*16==2048 && fifo.bf.high_ths==2 && fifo.bf.timer_ths==15 && fifo.bf.max_buf_cnt_per_pkt==7);
  for(unsigned q=0;q<8;q++) {
   QM_QM_CPU_EPP_FIFO0_0_CFG_t config={.wrd=regs[(0x65a4+q*4)/4]};
-  assert(config.bf.profile_sel==4 && regs[(0x7200+q*4)/4]==0x06000000+q*1024);
+  assert(config.bf.profile_sel==4 && regs[(0x7200+q*4)/4]==0x06000000+q*2048);
  }
  assert(!rtl_qm_cpu_credits(&rx));
- port.wrd=regs[0x9580/4];assert(port.bf.lth==4 && port.bf.hth==32);
- th0.wrd=profiles[0][0];assert(th0.bf.lth==192 && th0.bf.hth==224);
+ port.wrd=regs[0x9580/4];assert(port.bf.lth==8 && port.bf.hth==64);
+ th0.wrd=profiles[0][0];assert(th0.bf.lth==384 && th0.bf.hth==448);
+ /* Decode every enabled range independently: a private CPU pool must not
+  * alias either WAN pool, even if the total fits the global BID table. */
+ unsigned owned[16384]={0};
+ for(unsigned eq=0;eq<16;eq++) {
+  QM_QM_CFG0_EQ0_t cfg0={.wrd=regs[(0x61e8+eq*20)/4]};
+  QM_QM_CFG1_EQ0_t cfg1={.wrd=regs[(0x61ec+eq*20)/4]};
+  if(!cfg0.bf.eq_en)continue;
+  assert(cfg1.bf.total_buffer_num && cfg1.bf.bid_start+cfg1.bf.total_buffer_num<=16384);
+  for(unsigned bid=cfg1.bf.bid_start;bid<cfg1.bf.bid_start+cfg1.bf.total_buffer_num;bid++)
+   assert(!owned[bid]++);
+ }
+ for(unsigned bid=0;bid<16384;bid++)assert(owned[bid]==(bid<3072));
  for(unsigned q=0;q<8;q++)assert(voq[q]==0);
  /* Dirty upper DATA1 bits must not leak into an otherwise correct 0x02 alias. */
  regs[0x66a8/4]=3;assert(!rtl_qm_attribute(&rx,48,0x0a008060));

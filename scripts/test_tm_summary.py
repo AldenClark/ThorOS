@@ -46,6 +46,10 @@ def result(*args, **kwargs):
     return module.summarize(capture(*args, **kwargs))['fabric_cached']
 
 
+def buffer_extension():
+    return '\n' + ' '.join(f'{key}=0x1' for key in (*module.TM_BUFFER_CONFIGS, *module.TM_BUFFER_STATUSES)) + '\n'
+
+
 for clear in (0, 1):
     r = result(evidence(0, clear), evidence(1, clear))
     assert r['valid'] and r['raw_observations_valid'] and not r['rates_available']
@@ -53,6 +57,42 @@ for clear in (0, 1):
     assert not r['hardware_drop_attribution'] and not r['hardware_reset_verified']
     assert r['after']['counters']['te_tail_drop'] == {'raw': 999, 'mode': 'unknown'}
     assert not any(word in json.dumps(r) for word in ('per_second', 'Mbps', 'hit_ratio'))
+
+# Old schema-1 snapshots are still accepted; new buffer fields are a complete
+# optional group. Never omit configuration drift from the epoch comparison.
+extended = (evidence(0) + buffer_extension(), evidence(1) + buffer_extension())
+r = result(*extended)
+assert r['valid'] and all(r['after']['configuration'][key] == 1 for key in module.TM_BUFFER_CONFIGS)
+assert all(r['after']['status'][key] == 1 for key in module.TM_BUFFER_STATUSES)
+for key in module.TM_BUFFER_CONFIGS:
+    r = result(extended[0], extended[1].replace(f'{key}=0x1', f'{key}=0x2'))
+    assert not r['valid'] and r['reason'] == 'fabric_configuration_changed', (key, r)
+for key in module.TM_BUFFER_STATUSES:
+    for value in (0, 7):
+        r = result(extended[0], extended[1].replace(f'{key}=0x1', f'{key}={value}'))
+        assert r['valid'] and r['after']['status'][key] == value
+        assert not r['hardware_drop_attribution'] and not r['rates_available']
+        assert 'delta' not in json.dumps(r['after']['status'])
+for key in (*module.TM_BUFFER_CONFIGS, *module.TM_BUFFER_STATUSES):
+    for replacement in ('', f'{key}=bad', f'{key}=0x1 {key}=0x1', f'{key}=0x1 {key}='):
+        r = result(extended[0], extended[1].replace(f'{key}=0x1', replacement))
+        assert not r['valid'] and r['reason'] == 'fabric_buffer_extension_partial_or_invalid', (key, r)
+assert result(evidence(0), extended[1])['reason'] == 'fabric_configuration_changed'
+assert result(extended[0], evidence(1))['reason'] == 'fabric_configuration_changed'
+for suffix in ('valid=0', 'valid=', 'schema=1', 'schema=', 'epoch=', 'seq=2'):
+    r = result(extended[0], extended[1] + suffix + '\n')
+    assert not r['valid'] and 'bm_observed_increments' not in r, (suffix, r)
+    r = result(extended[0], extended[1].replace('counter=bm_rx', suffix + ' counter=bm_rx'))
+    assert not r['valid'] and 'bm_observed_increments' not in r, (suffix, r)
+    r = result(extended[0], extended[1].replace('counter=bm_rx', 'counter=bm_rx ' + suffix))
+    assert not r['valid'] and r['reason'] == 'fabric_counter_shadows_metadata', (suffix, r)
+# A whole optional extension misplaced into a counter line must not disappear
+# into the legacy-firmware path and conceal before/after configuration drift.
+misplaced = tuple(evidence(i).replace('counter=bm_rx', 'counter=bm_rx ' +
+                  ' '.join(f'{key}={i + 1}' for key in (*module.TM_BUFFER_CONFIGS, *module.TM_BUFFER_STATUSES)))
+                  for i in range(2))
+r = result(*misplaced)
+assert not r['valid'] and r['reason'] == 'fabric_counter_shadows_metadata'
 
 for old, new, reason in (
     ('valid=1 delta_valid', 'valid=0 delta_valid', 'unsupported_or_invalid_fabric_cache'),

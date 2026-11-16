@@ -51,10 +51,18 @@ fixture = fixture.replace(' case 0x612c:', ''' case 0x9020:
 model = r'''
 static unsigned int cpu_calls;
 static int cpu_failure;
+struct net {unsigned int unused;};
 static void mutex_lock(int *lock){assert(!*lock);*lock=1;}
 static void mutex_unlock(int *lock){assert(*lock);*lock=0;}
 #define lockdep_assert_held(lock) assert(*(lock))
 #define dev_info(...) ((void)0)
+/* The extracted common PDC function contains EPON-only publication paths.
+ * ITU configuration must neither enter them nor acquire a non-NULL scope. */
+static void rtl_pon_policy_begin(struct rtl9617c_pon *pon,struct net **policy)
+{assert(pon->lock && rtl_pon_mode_is_epon(pon->mode));*policy=NULL;}
+static void rtl_pon_oam_carrier(struct rtl9617c_pon *pon)
+{assert(pon->lock && rtl_pon_mode_is_epon(pon->mode));}
+static void rtl9617c_switch_policy_end(struct net *policy){assert(!policy);}
 static int rtl9617c_ni_fe_cpu_path(void *dev){(void)dev;cpu_calls++;if(cpu_failure)return cpu_failure;ni_ready=true;return 0;}
 static unsigned int rtl_pon_data_source(unsigned int index,unsigned int word){(void)word;return index+32;}
 static int rtl_pdc_access(struct rtl9617c_pon *pon,unsigned int index,bool write){return path_access(pon,0x9020,BIT(31)|(write?BIT(30):0)|index);}

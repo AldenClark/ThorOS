@@ -47,6 +47,13 @@ struct napi_struct {};
 struct rtl9617c_pon;
 struct rtl_oam_port {struct rtl9617c_pon *pon;unsigned int llid;bool control;};
 struct net_device {struct rtl_oam_port port;bool running,carrier,stopped,registered;struct {unsigned int tx_dropped,rx_dropped,rx_packets,rx_bytes;} stats;};
+struct net {unsigned int unused;};
+static struct net policy_net;
+static unsigned int policy_depth;
+static struct net *rtl9617c_switch_policy_begin(struct net_device *dev)
+{assert(dev);policy_depth++;return &policy_net;}
+static void rtl9617c_switch_policy_end(struct net *policy)
+{if(policy){assert(policy==&policy_net && policy_depth);policy_depth--;}}
 struct rtl9617c_ni_endpoint {struct net_device *netdev;};
 struct rtl9617c_ni_frame {u32 header_high,header_low;const u8 *prefix;unsigned int prefix_length;};
 struct rtl9617c_pon {
@@ -87,8 +94,10 @@ static int netif_running(struct net_device *dev) {return dev->running;}
 static int netif_carrier_ok(struct net_device *dev) {return dev->carrier;}
 static int netif_queue_stopped(struct net_device *dev) {return dev->stopped;}
 static void netif_wake_queue(struct net_device *dev) {dev->stopped=false;woken++;}
-static void netif_carrier_on(struct net_device *dev) {dev->carrier=true;}
-static void netif_carrier_off(struct net_device *dev) {dev->carrier=false;}
+static void netif_carrier_on(struct net_device *dev)
+{if(!dev->port.control && !dev->carrier)assert(policy_depth);dev->carrier=true;}
+static void netif_carrier_off(struct net_device *dev)
+{if(!dev->port.control && dev->carrier)assert(policy_depth);dev->carrier=false;}
 static void dev_kfree_skb_any(struct sk_buff *skb) {free(skb->allocation);free(skb);retired++;}
 static netdev_tx_t rtl_pon_itu_data_transmit(struct rtl9617c_pon *pon,struct sk_buff *skb,struct net_device *dev)
 {(void)pon;(void)skb;(void)dev;assert(0);return NETDEV_TX_OK;}

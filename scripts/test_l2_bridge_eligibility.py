@@ -4,12 +4,15 @@
 The new functions are extracted verbatim from the production kernel patch,
 not reimplemented as a Python model.  --kernel additionally checks that an
 applied Linux source tree contains the identical functions before compiling.
+Compilable mutants must fail the runtime assertions, including an adversarial
+policy change at the guarded publication boundary.
 This is a control-plane regression, not a hardware forwarding benchmark.
 """
 import argparse
 import os
 from pathlib import Path
 import re
+import resource
 import subprocess
 import tempfile
 
@@ -83,6 +86,8 @@ STUBS = r'''
 #define BR_PORT_MAB BIT(22)
 #define BR_NEIGH_VLAN_SUPPRESS BIT(23)
 #define BR_BPDU_FILTER BIT(24)
+enum { BR_STATE_DISABLED, BR_STATE_LISTENING, BR_STATE_LEARNING,
+       BR_STATE_FORWARDING, BR_STATE_BLOCKING };
 enum {
  BROPT_VLAN_ENABLED, BROPT_VLAN_STATS_ENABLED, BROPT_NF_CALL_IPTABLES,
  BROPT_NF_CALL_IP6TABLES, BROPT_NF_CALL_ARPTABLES, BROPT_GROUP_ADDR_SET,
@@ -100,6 +105,7 @@ enum { BR_FDB_LOCAL, BR_FDB_STATIC, BR_FDB_ADDED_BY_USER,
 struct net_bridge;
 struct net_bridge_port {
  unsigned long flags;
+ unsigned char state;
  struct net_bridge_port *backup_port;
  unsigned int backup_nhid;
  struct net_bridge *br;
@@ -137,6 +143,9 @@ static struct net_bridge_port *br_port_get_rtnl(const struct net_device *dev)
 { return dev->port; }
 static int rcu_depth, deletes, notifies, publishing;
 static bool allocation_fails;
+static struct net_bridge_port *publication_port;
+static unsigned long publication_flags;
+static unsigned char publication_state;
 static unsigned long jiffies = 456;
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -208,6 +217,12 @@ static int rtl9617c_switch_guard_publish(struct rtl9617c_switch_guard *guard,
  if (guard->blocked || generation != guard->generation) return -EAGAIN;
  assert(!publishing);
  publishing = 1;
+ /* Exercise the point of use, not only a pre-publication wrapper check. */
+ if (publication_port) {
+  assert(publication_port->br->hash_lock);
+  publication_port->state = publication_state;
+  publication_port->flags = publication_flags;
+ }
  ret = publish(context);
  publishing = 0;
  return ret;
@@ -238,19 +253,21 @@ int main(void)
  struct net_device master = { .master = true, .priv = &br, .mtu = ETH_DATA_LEN };
  struct net_bridge_port p = {
   .flags = BR_LEARNING | BR_FLOOD | BR_MCAST_FLOOD | BR_BCAST_FLOOD,
+  .state = BR_STATE_FORWARDING,
   .br = &br,
  };
- struct net_bridge_port other_port = { .br = &br };
+ struct net_bridge_port other_port = { .br = &br, .flags = BR_LEARNING,
+  .state = BR_STATE_FORWARDING };
  struct net_device port = { .port = &p, .mtu = ETH_DATA_LEN };
  const unsigned int forbidden_opts[] = { BROPT_MRP_ENABLED, BROPT_CFM_ENABLED,
   BROPT_MST_ENABLED, BROPT_NEIGH_SUPPRESS_ENABLED, BROPT_NO_LL_LEARN,
   BROPT_VLAN_STATS_ENABLED };
  const unsigned long allowed_flags[] = { BR_LEARNING, BR_LEARNING_SYNC,
   BR_FLOOD, BR_MCAST_FLOOD, BR_BCAST_FLOOD, BR_BPDU_GUARD, BR_ROOT_BLOCK,
-  BR_ADMIN_COST, BR_MULTICAST_FAST_LEAVE, BR_BPDU_FILTER };
+  BR_ADMIN_COST, BR_MULTICAST_FAST_LEAVE, BR_BPDU_FILTER, BR_ISOLATED };
  const unsigned long forbidden_flags[] = { BR_HAIRPIN_MODE, BR_PROXYARP,
   BR_PROXYARP_WIFI, BR_MULTICAST_TO_UNICAST, BR_VLAN_TUNNEL,
-  BR_NEIGH_SUPPRESS, BR_ISOLATED, BR_MRP_AWARE, BR_MRP_LOST_CONT,
+  BR_NEIGH_SUPPRESS, BR_MRP_AWARE, BR_MRP_LOST_CONT,
   BR_MRP_LOST_IN_CONT, BR_TX_FWD_OFFLOAD, BR_PORT_LOCKED, BR_PORT_MAB,
   BR_NEIGH_VLAN_SUPPRESS, BIT(31) };
  unsigned int i, mask, passed = 0;
@@ -305,9 +322,9 @@ int main(void)
 
  /* All combinations of supported flags remain eligible, not just one
   * magic default mask.  The driver must implement learning/flood bits. */
- for (mask = 0; mask < (1U << 10); ++mask) {
+ for (mask = 0; mask < (1U << (sizeof(allowed_flags)/sizeof(*allowed_flags))); ++mask) {
   p.flags = 0;
-  for (i = 0; i < 10; ++i)
+  for (i = 0; i < sizeof(allowed_flags)/sizeof(*allowed_flags); ++i)
    if (mask & (1U << i)) p.flags |= allowed_flags[i];
   assert(br_rtl9617c_l2_port_eligible(&port));
   p.flags |= BR_PROMISC;
@@ -356,6 +373,38 @@ int main(void)
  assert(deletes == 1 && !br.fdb_list.first);
  assert(!br_rtl9617c_fdb_forget(&port, address));
 
+ /* Every non-forwarding state and a learning-disabled forwarding member
+  * reject creation even with the current, unblocked policy generation.
+  * Eligibility of static forwarding does not authorize dynamic learning. */
+ for (i = BR_STATE_DISABLED; i <= BR_STATE_BLOCKING; ++i) {
+  p.state = i;
+  p.flags = BR_LEARNING | BR_FLOOD;
+  assert(br_rtl9617c_l2_port_eligible(&port));
+  if (i == BR_STATE_FORWARDING) continue;
+  assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+  assert(!br.fdb_list.first && !notifies && !br.hash_lock && !publishing);
+ }
+ p.state = BR_STATE_FORWARDING;
+ p.flags = BR_FLOOD | BR_ISOLATED;
+ assert(br_rtl9617c_l2_port_eligible(&port));
+ assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+ assert(!br.fdb_list.first && !notifies);
+ p.flags = BR_LEARNING | BR_FLOOD;
+ /* A state change at the guarded publication boundary must also reject.
+  * Testing only a check before guard_publish() would miss this race. */
+ publication_port = &p;
+ publication_state = BR_STATE_FORWARDING;
+ publication_flags = BR_FLOOD;
+ assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+ assert(!br.fdb_list.first && !notifies);
+ p.flags = BR_LEARNING | BR_FLOOD;
+ publication_state = BR_STATE_BLOCKING;
+ publication_flags = p.flags;
+ assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+ assert(!br.fdb_list.first && !notifies);
+ publication_port = NULL;
+ p.state = BR_STATE_FORWARDING;
+
  /* New/refresh/move feedback writes under both guards, then notifies after
   * the core lock is released.  Stale snapshots cannot overwrite a CPU move. */
  allocation_fails = true;
@@ -370,6 +419,27 @@ int main(void)
  assert(test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &br.fdb_list.first->flags));
  assert(test_bit(BR_FDB_OFFLOADED, &br.fdb_list.first->flags));
  jiffies++;
+ assert(!br_rtl9617c_fdb_learn(&port, address, &guard, 123));
+ assert(notifies == 1 && br.fdb_list.first->updated == jiffies);
+ /* Denied refresh/move must leave destination, flags and age untouched;
+  * merely preventing allocation is not sufficient. Isolation itself does
+  * not disable source learning on an otherwise eligible native member. */
+ for (i = 0; i < 2; ++i) {
+  struct net_bridge_fdb_entry before = *br.fdb_list.first;
+  p.flags = i ? BR_LEARNING : 0;
+  p.state = i ? BR_STATE_BLOCKING : BR_STATE_FORWARDING;
+  jiffies++;
+  assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+  assert(!memcmp(&before, br.fdb_list.first, sizeof(before)) && notifies == 1);
+  other_port.flags = p.flags;
+  other_port.state = p.state;
+  port.port = &other_port;
+  assert(br_rtl9617c_fdb_learn(&port, address, &guard, 123) == -EOPNOTSUPP);
+  assert(!memcmp(&before, br.fdb_list.first, sizeof(before)) && notifies == 1);
+  port.port = &p;
+ }
+ p.state = other_port.state = BR_STATE_FORWARDING;
+ p.flags = other_port.flags = BR_LEARNING | BR_ISOLATED;
  assert(!br_rtl9617c_fdb_learn(&port, address, &guard, 123));
  assert(notifies == 1 && br.fdb_list.first->updated == jiffies);
  port.port = &other_port;
@@ -454,6 +524,42 @@ int main(void)
 '''
 
 
+def replace_once(source: str, before: str, after: str) -> str:
+    assert source.count(before) == 1, "mutation anchor is missing or ambiguous"
+    return source.replace(before, after, 1)
+
+
+def mutants(source: str) -> dict[str, str]:
+    check = ("\tif (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING ||\n"
+             "\t    !(READ_ONCE(ctx->port->flags) & BR_LEARNING))\n"
+             "\t\treturn -EOPNOTSUPP;\n")
+    relocated = replace_once(source, check, "")
+    relocated = replace_once(
+        relocated, "\tspin_lock_bh(&ctx.port->br->hash_lock);",
+        check.replace("ctx->port", "ctx.port")
+        + "\tspin_lock_bh(&ctx.port->br->hash_lock);")
+    return {
+        "ignore-learning-disabled": replace_once(
+            source, check,
+            "\tif (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING)\n"
+            "\t\treturn -EOPNOTSUPP;\n"),
+        "ignore-blocked-port": replace_once(
+            source, check,
+            "\tif (!(READ_ONCE(ctx->port->flags) & BR_LEARNING))\n"
+            "\t\treturn -EOPNOTSUPP;\n"),
+        "admit-learning-state": replace_once(
+            source, check,
+            "\tif ((READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING &&\n"
+            "\t     READ_ONCE(ctx->port->state) != BR_STATE_LEARNING) ||\n"
+            "\t    !(READ_ONCE(ctx->port->flags) & BR_LEARNING))\n"
+            "\t\treturn -EOPNOTSUPP;\n"),
+        "check-outside-publication-lock": relocated,
+        "reject-supported-isolated-port": replace_once(
+            source, "\t\tBR_BPDU_FILTER | BR_ISOLATED;",
+            "\t\tBR_BPDU_FILTER;"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", type=Path)
@@ -476,17 +582,31 @@ def main() -> None:
             assert actual == source, f"stale/mismatched applied kernel: {name}"
             source = actual
         functions.append(source)
+    production = "\n\n".join(functions)
+    variants = {"production": production, **mutants(production)}
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     with tempfile.TemporaryDirectory(prefix="l2-bridge-eligibility-") as directory:
         directory = Path(directory)
-        cfile, binary = directory / "test.c", directory / "test"
-        cfile.write_text(prefix + STUBS + "\n" + "\n\n".join(functions) + "\n" + TESTS)
-        subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
-                        "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
-                        "-fno-sanitize-recover=all", "-fno-omit-frame-pointer",
-                        str(cfile), "-o", str(binary)], check=True)
         env = os.environ.copy()
         env.setdefault("ASAN_OPTIONS", "detect_leaks=0")
-        subprocess.run([str(binary)], env=env, check=True)
+        for name, source in variants.items():
+            cfile, binary = directory / (name + ".c"), directory / name
+            cfile.write_text(prefix + STUBS + "\n" + source + "\n" + TESTS)
+            subprocess.run([os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g",
+                            "-Wall", "-Wextra", "-Werror", "-fsanitize=address,undefined",
+                            "-fno-sanitize-recover=all", "-fno-omit-frame-pointer",
+                            str(cfile), "-o", str(binary)], check=True)
+            result = subprocess.run([str(binary)], env=env, capture_output=True, text=True)
+            if name == "production":
+                if result.returncode:
+                    raise AssertionError(result.stdout + result.stderr)
+                print(result.stdout, end="")
+            else:
+                assert result.returncode != 0, f"regression mutant survived: {name}"
+                assert "assertion" in result.stderr.lower(), (
+                    f"mutant failed outside the runtime assertions: {name}\n"
+                    + result.stdout + result.stderr)
+                print(f"Runtime regression mutant rejected: {name}")
 
 
 if __name__ == "__main__":

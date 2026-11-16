@@ -45,6 +45,9 @@ if args.before:
     assert ip.count('flow_offload_refresh_bridge(flow, dir, jiffies);') == 2
     ip = ip.replace('flow_offload_refresh_bridge(flow, dir, jiffies);', '')
 model = r'''
+/* This forwarding fixture advances jiffies in seconds. The imported FE
+ * fixture may use a different stats-cache clock; do not inherit that HZ. */
+#undef HZ
 #define HZ 1
 #define likely(x) (x)
 #define unlikely(x) (x)

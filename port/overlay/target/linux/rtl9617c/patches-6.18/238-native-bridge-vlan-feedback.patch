@@ -1,0 +1,189 @@
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@ -1886,6 +1886,129 @@
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_forget);
+ 
++struct br_rtl9617c_vlan_learn_ctx {
++	struct net_bridge_port *port;
++	struct net_bridge_fdb_entry *fdb;
++	const unsigned char *addr;
++	u16 vid;
++	bool changed;
++};
++
++/* hash_lock and the publication guard are held, and the caller owns RTNL.
++ * Revalidate the actual (port, VID) membership here: a same-MAC row in
++ * another VLAN must never be refreshed, moved or removed by this snapshot.
++ */
++static int br_rtl9617c_fdb_learn_vid_publish(void *context)
++{
++#if IS_ENABLED(CONFIG_BRIDGE_VLAN_FILTERING)
++	struct br_rtl9617c_vlan_learn_ctx *ctx = context;
++	struct net_bridge *br = ctx->port->br;
++	struct net_bridge_fdb_entry *fdb;
++	struct net_bridge_vlan *v;
++
++	if (READ_ONCE(ctx->port->state) != BR_STATE_FORWARDING ||
++	    !(READ_ONCE(ctx->port->flags) & BR_LEARNING) ||
++	    !br_opt_get(br, BROPT_VLAN_ENABLED) ||
++	    br->vlan_proto != htons(ETH_P_8021Q))
++		return -EOPNOTSUPP;
++	v = br_vlan_find(nbp_vlan_group(ctx->port), ctx->vid);
++	if (!v || !br_vlan_should_use(v) ||
++	    br_vlan_get_state(v) != BR_STATE_FORWARDING ||
++	    !v->brvlan || READ_ONCE(v->brvlan->msti) ||
++	    br_vlan_get_state(v->brvlan) != BR_STATE_FORWARDING ||
++	    (v->priv_flags & BR_VLFLAG_NEIGH_SUPPRESS_ENABLED))
++		return -EOPNOTSUPP;
++	fdb = br_fdb_find(br, ctx->addr, ctx->vid);
++	if (fdb && (test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) ||
++		    test_bit(BR_FDB_STATIC, &fdb->flags) ||
++		    test_bit(BR_FDB_LOCAL, &fdb->flags) ||
++		    test_bit(BR_FDB_STICKY, &fdb->flags) ||
++		    test_bit(BR_FDB_LOCKED, &fdb->flags)))
++		return -EEXIST;
++	if (!fdb) {
++		fdb = fdb_create(br, ctx->port, ctx->addr, ctx->vid,
++				 BIT(BR_FDB_ADDED_BY_EXT_LEARN) | BIT(BR_FDB_OFFLOADED));
++		if (!fdb)
++			return -ENOMEM;
++		ctx->changed = true;
++	} else {
++		ctx->changed = READ_ONCE(fdb->dst) != ctx->port ||
++			!test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++		WRITE_ONCE(fdb->dst, ctx->port);
++		set_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags);
++		set_bit(BR_FDB_OFFLOADED, &fdb->flags);
++		WRITE_ONCE(fdb->updated, jiffies);
++		WRITE_ONCE(fdb->used, jiffies);
++	}
++	ctx->fdb = fdb;
++	return 0;
++#else
++	return -EOPNOTSUPP;
++#endif
++}
++
++int br_rtl9617c_fdb_learn_vid(const struct net_device *dev,
++			     const unsigned char *addr, u16 vid,
++			     struct rtl9617c_switch_guard *guard, u64 generation)
++{
++	struct br_rtl9617c_vlan_learn_ctx ctx = { .addr = addr, .vid = vid };
++	int ret;
++
++	ASSERT_RTNL();
++	if (!guard || vid >= VLAN_VID_MASK)
++		return -EINVAL;
++	ctx.port = br_port_get_rtnl(dev);
++	if (!ctx.port)
++		return -ENODEV;
++	if (!vid) {
++		if (br_opt_get(ctx.port->br, BROPT_VLAN_ENABLED))
++			return -EOPNOTSUPP;
++		return br_rtl9617c_fdb_learn(dev, addr, guard, generation);
++	}
++	spin_lock_bh(&ctx.port->br->hash_lock);
++	ret = rtl9617c_switch_guard_publish(guard, generation,
++					    br_rtl9617c_fdb_learn_vid_publish, &ctx);
++	if (!ret && ctx.changed)
++		fdb_notify(ctx.port->br, ctx.fdb, RTM_NEWNEIGH, false);
++	spin_unlock_bh(&ctx.port->br->hash_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_learn_vid);
++
++bool br_rtl9617c_fdb_forget_vid(const struct net_device *dev,
++			      const unsigned char *addr, u16 vid)
++{
++	struct net_bridge_fdb_entry *fdb;
++	struct net_bridge_port *p;
++	bool removed = false;
++
++	ASSERT_RTNL();
++	if (vid >= VLAN_VID_MASK)
++		return false;
++	if (!vid)
++		return br_rtl9617c_fdb_forget(dev, addr);
++	p = br_port_get_rtnl(dev);
++	if (!p)
++		return false;
++	/* Membership can already be gone during VLAN removal.  Only the
++	 * exact old key and still-external owner authorize this cleanup. */
++	spin_lock_bh(&p->br->hash_lock);
++	fdb = br_fdb_find(p->br, addr, vid);
++	if (fdb && READ_ONCE(fdb->dst) == p &&
++	    test_bit(BR_FDB_ADDED_BY_EXT_LEARN, &fdb->flags) &&
++	    !test_bit(BR_FDB_ADDED_BY_USER, &fdb->flags) &&
++	    !test_bit(BR_FDB_STATIC, &fdb->flags) &&
++	    !test_bit(BR_FDB_STICKY, &fdb->flags) &&
++	    !test_bit(BR_FDB_LOCKED, &fdb->flags) &&
++	    !test_bit(BR_FDB_LOCAL, &fdb->flags)) {
++		fdb_delete(p->br, fdb, false);
++		removed = true;
++	}
++	spin_unlock_bh(&p->br->hash_lock);
++	return removed;
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_fdb_forget_vid);
++
+ #if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
+ static atomic64_t br_rtl9617c_fdb_cookie = ATOMIC64_INIT(0);
+ 
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -79,6 +79,54 @@
+ }
+ EXPORT_SYMBOL_GPL(br_rtl9617c_l2_port_eligible);
+ 
++/* The first IVL backend preserves a single C tag byte-for-byte.  PVID
++ * insertion, priority-tag translation and egress untag are separate packet
++ * editing contracts, not consequences of finding a VLAN membership row.
++ * RTNL owns VLAN lifetimes; the switch guard fences lockless state changes.
++ */
++bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *dev)
++{
++#if IS_ENABLED(CONFIG_BRIDGE_VLAN_FILTERING)
++	const struct net_bridge_vlan_group *vg;
++	const struct net_bridge_vlan *v;
++	const struct net_bridge_port *p;
++	bool member = false;
++
++	ASSERT_RTNL();
++	if (!br_rtl9617c_l2_port_eligible(dev))
++		return false;
++	p = br_port_get_rtnl(dev);
++	if (!br_opt_get(p->br, BROPT_VLAN_ENABLED) ||
++	    p->br->vlan_proto != htons(ETH_P_8021Q))
++		return false;
++	vg = nbp_vlan_group(p);
++	if (!vg || br_get_pvid(vg))
++		return false;
++	list_for_each_entry(v, &vg->vlan_list, vlist) {
++		const struct net_bridge_vlan *global;
++
++		if (!br_vlan_should_use(v))
++			continue;
++		global = v->brvlan;
++		if (!v->vid || v->vid >= VLAN_VID_MASK ||
++		    (v->flags & (BRIDGE_VLAN_INFO_UNTAGGED | BRIDGE_VLAN_INFO_PVID)) ||
++		    br_vlan_get_state(v) != BR_STATE_FORWARDING ||
++		    (v->priv_flags & BR_VLFLAG_NEIGH_SUPPRESS_ENABLED) ||
++		    rcu_access_pointer(v->tinfo.tunnel_dst) || v->tinfo.tunnel_id ||
++		    !global || READ_ONCE(global->msti) ||
++		    br_vlan_get_state(global) != BR_STATE_FORWARDING)
++			return false;
++		/* A global context need not have BRENTRY: that flag authorizes
++		 * host participation, not transit between member bridge ports. */
++		member = true;
++	}
++	return member;
++#else
++	return false;
++#endif
++}
++EXPORT_SYMBOL_GPL(br_rtl9617c_l2_vlan_port_eligible);
++
+ static bool nbp_switchdev_can_offload_tx_fwd(const struct net_bridge_port *p,
+ 					     const struct sk_buff *skb)
+ {

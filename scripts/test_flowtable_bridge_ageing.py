@@ -40,6 +40,7 @@ if args.before and "flow_offload_refresh_bridge" in offload:
         has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
         later = []
         for marker, source, name in [
+            ("netdev_ppp_path_advance(", "include/linux/netdevice.h", "235-ppp-flow-namespace-fence.patch"),
             ("try_cmpxchg(&flow->timeout", "net/netfilter/nf_flow_table_core.c", "230-flowtable-refresh-timeout-order.patch"),
             ("NF_FLOW_INITIALIZING", "include/net/netfilter/nf_flow_table.h", "229-flowtable-initial-publication.patch"),
             ("try_cmpxchg(&offload->flow->timeout", "net/netfilter/nf_flow_table_offload.c", "228-flowtable-stats-timeout-wrap.patch"),
@@ -82,6 +83,9 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef int32_t __s
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define time_before_eq(a,b) ((long)((a)-(b))<=0)
 #define time_after(a,b) ((long)((b)-(a))<0)
+#define time_before(a,b) ((long)((a)-(b))<0)
+#define HZ 100UL
+#define RTL_FE_HASH_ENTRIES 65536
 static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return true;}*old=*p;return false;}
 #define FLOW_ACTION_HW_STATS_DELAYED 1
 #define EXPORT_SYMBOL_GPL(n)
@@ -146,13 +150,19 @@ static unsigned flow_offload_get_timeout(struct flow_offload *flow){(void)flow;r
 static void nf_ct_acct_add(struct nf_conn *ct,unsigned dir,u64 packets,u64 bytes){
  (void)ct;(void)dir;(void)packets;(void)bytes;assert(false);
 }
-struct rtl_fe {unsigned age;};
-struct rtl_fe_flow {bool published,counted;unsigned counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
+struct rtl_fe_flow;
+struct rtl_fe {unsigned age;struct rtl_fe_flow **hash_owners;};
+struct rtl_fe_flow {bool published,counted,installed,deleting,activity_cached;unsigned counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
 struct flow_cls_offload {struct {u64 bytes,packets;unsigned long lastused;}stats;};
 struct rtl_dq_io {struct rtl_fe *fe;};
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}
 static int rtl_fe_main_age_read(struct rtl_dq_io *io,unsigned index,unsigned *age){(void)index;*age=io->fe->age;return 0;}
 static int rtl_fe_main_age(struct rtl_dq_io *io,unsigned index,unsigned age){(void)index;io->fe->age=age;return 0;}
+/* No-index fallback here; the indexed production MMIO and positive-only
+ * neighbor cache are exercised independently by test_fe_activity_cache. */
+static int rtl_fe_main_age_batch(struct rtl_dq_io *io,unsigned first,unsigned owned,unsigned probe,unsigned *hits){
+ (void)io;(void)first;(void)owned;(void)probe;(void)hits;assert(false);return -EOPNOTSUPP;
+}
 static int rtl_fe_tx_counter_read(struct rtl_dq_io *io,unsigned counter,unsigned *words){(void)io;(void)counter;(void)words;assert(false);return 0;}
 #define flow_stats_update(s,b,p,d,u,h) do{(s)->bytes+=(b);(s)->packets+=(p);(s)->lastused=(u);}while(0)
 '''
@@ -161,7 +171,7 @@ if not args.before:
     parts += [function(fdb, "br_fdb_refresh_offload_rcu"),
               function(offload, "flow_offload_refresh_bridge")]
 parts += [function(offload, "flow_offload_work_stats"),
-          function(core, "nf_flow_bridge_changed"), function(fe, "fe_stats")]
+          function(core, "nf_flow_bridge_changed"), function(fe, "fe_refresh_activity"), function(fe, "fe_stats")]
 parts.append(r'''
 static void activity(struct flow_offload *flow,unsigned dir,unsigned long when){
  struct nf_flowtable table={};

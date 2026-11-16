@@ -88,11 +88,15 @@ common = r'''
 #include <stdarg.h>
 #include <sys/types.h>
 #include "rtl9617c-pon-cold.h"
+#include "rtl9617c-l2qm.h"
+#include "rtl9617c-l2-es.h"
+#include "rtl9617c-mcast-cold.h"
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 #define __iomem
 #define EPROBE_DEFER 517
 #define HZ 100
+#define PAGE_SIZE 4096
 #define IORESOURCE_MEM 0
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
@@ -115,6 +119,7 @@ typedef uint64_t resource_size_t;
 #define RTL_XRAM_TX_END 1024
 #define RTL_XRAM_TX_START 512
 #define HRTIMER_MODE_REL 0
+#define GFP_KERNEL 0
 struct mutex {pthread_mutex_t native;};
 struct device {void *data;int kobj;};
 struct device_attribute {int unused;};
@@ -125,6 +130,7 @@ struct rtl_lan {struct rtl_xram *shared;unsigned int port;};
 struct net_device {void *priv;unsigned char dev_addr[6];void *phydev;};
 struct rtl_fe {
  struct mutex lock;struct rtl_fabric fabric;
+ struct rtl_l2_owner *l2_owner;struct rtl_fe_mcast *mcast;int error;
  bool engine_ready,prepared,dma_exposed,shutting_down;
 };
 struct rtl_ni_owner {bool exposed;};
@@ -157,12 +163,26 @@ static bool claimed[4],mapped[4];
 static int map_fault,map_fault_index,sysfs_result;
 static bool stuck_pon_gate,stuck_fifo,post_fabric_drift;
 static unsigned int map_calls,unmap_calls,pon_reads,pon_writes;
+static unsigned int ni_reads,ni_writes,ni_init_writes;
+static unsigned int ni_ignored_register,ni_allones_register,registered_port_mask;
+static unsigned int mce_diagnostic_fault_register;
+static unsigned int ni_fault_reads,ni_allones_read;
+static int expected_open_result;
 static unsigned int registrations,sysfs_calls,mib_calls,exposes,opens,dma_starts,qm_starts;
 static pthread_mutex_t gate=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static _Thread_local unsigned int held,role;
 static bool block_baseline,baseline_entered,allow_baseline,second_attempted;
 static bool rtnl;
+static bool native_l2_ivl;
+static void *kvzalloc(size_t size,unsigned int flags){assert(!flags);return calloc(1,size);}
+static void *kvcalloc(size_t count,size_t size,unsigned int flags){assert(!flags);return calloc(count,size);}
+static void kvfree(void *memory){free(memory);}
+#define lockdep_assert_held(lock) do{(void)(lock);assert(held);}while(0)
+static unsigned int fe_read(void *context,unsigned int reg){
+ if(mce_diagnostic_fault_register==reg){mce_diagnostic_fault_register=0;return ~0U;}
+ return read_reg(context,reg);
+}
 static void mutex_lock(struct mutex *lock){
  assert(!pthread_mutex_lock(&gate));
  if(role==2)second_attempted=true;
@@ -185,7 +205,7 @@ static void rtl_ni_owner_expose(struct rtl_ni_owner *item){item->exposed=true;ex
 static void *netdev_priv(struct net_device *dev){return dev->priv;}
 static void *dev_get_drvdata(struct device *dev){return dev->data;}
 static int sysfs_emit(char *buffer,const char *format,...){
- va_list args;va_start(args,format);int result=vsnprintf(buffer,4096,format,args);va_end(args);return result;
+ va_list args;va_start(args,format);int result=vsnprintf(buffer,PAGE_SIZE,format,args);va_end(args);return result;
 }
 static unsigned int resource_index(resource_size_t start){
  for(unsigned int i=0;i<4;i++)if(resources[i].start==start)return i;
@@ -228,7 +248,11 @@ static bool leases_empty(void){
 }
 static u32 readl(void *address){
  uintptr_t at=(uintptr_t)address,ni=(uintptr_t)m.reg,mac=(uintptr_t)pon_mac,global=(uintptr_t)pon_global;
- if(at>=ni && at<ni+sizeof(m.reg))return *(u32 *)address;
+ if(at>=ni && at<ni+sizeof(m.reg)){
+  ni_reads++;
+  if(ni_allones_register && at-ni==ni_allones_register && ++ni_fault_reads>=ni_allones_read)return ~0U;
+  return *(u32 *)address;
+ }
  assert(!current->provider_ready && !platform.dev.data);pon_reads++;
  if(at>=global && at<global+sizeof(pon_global)){
   unsigned int i=(at-global)/4;assert(mapped[i+1]);
@@ -243,12 +267,18 @@ static u32 readl(void *address){
 static void writel(u32 value,void *address){
  uintptr_t at=(uintptr_t)address,ni=(uintptr_t)m.reg,mac=(uintptr_t)pon_mac;
  if(at>=ni && at<ni+sizeof(m.reg)){
+  ni_writes++;
   unsigned int offset=at-ni;
+  if(offset==0x2208 || offset==0x2218 || offset==0x2210 ||
+     offset==0x2228 || offset==0x222c || offset==0x2300)ni_init_writes++;
+  for(unsigned int port=0;port<5;port++)if(offset==0x2304+12*port)ni_init_writes++;
+  if(offset==0x2304+12*14)ni_init_writes++;
   /* NI startup may configure queues/open MACs, never redo SVL/MRU. */
   assert(offset!=RTL_L2_VLAN_MODE_CONTROL && offset!=RTL_FABRIC_FRAME_LENGTH && offset!=RTL_FABRIC_STORAGE_LENGTH);
   for(unsigned int i=0;i<5;i++)if(offset==RTL_FABRIC_RX_MAC(i) && (value&RTL_FABRIC_RX_MAC_ENABLE))
    assert(current->host_active && current->base_ready && current->provider_ready);
-  *(u32 *)address=value;return;
+  if(offset!=ni_ignored_register)*(u32 *)address=value;
+  return;
  }
  assert(!current->provider_ready && !platform.dev.data && mapped[0]);
  assert(at>=mac && at<mac+sizeof(pon_mac));pon_writes++;
@@ -322,10 +352,12 @@ static void rtl_register_lans(struct rtl_xram *priv,struct device *dev){
   * path. Here execute its ACTUAL publication tail, including ready/RTNL,
   * and verify an external early NI user defers while work is not queued. */
  rtnl_lock();assert(rtl_engine_get(priv)==-EPROBE_DEFER);
- priv->ports[0]=priv->netdev;priv->lan4_phy=0;
+ for(unsigned int port=0;port<5;port++)if(registered_port_mask&BIT(port))priv->ports[port]=priv->netdev;
+ priv->lan4_phy=0;
  /* NI_REGISTRATION_TAIL */
- rtnl=true;assert(!rtl_open(priv->netdev));rtnl=false;
- assert(priv->engine_users==1);
+ rtnl=true;int ret=rtl_open(priv->netdev);rtnl=false;
+ assert(ret==expected_open_result);
+ assert(priv->engine_users==(ret?0U:1U));
 }
 static const int rtl_native_groups[1];
 static int sysfs_create_groups(int *kobj,const int *groups){
@@ -338,9 +370,16 @@ static void schedule_delayed_work(int *work,int delay){
 common = common.replace('/* NI_REGISTRATION_TAIL */', registration_tail)
 
 map_struct = re.search(r'struct rtl_ni_cold_maps \{.*?\n\};', source, re.S).group()
-functions = '\n'.join(function(fe_source, name) for name in (
+multicast_source = (DRIVERS / 'rtl9617c-fe-mcast.h').read_text()
+functions = re.search(r'struct rtl_fe_mcast \{.*?\n\};', multicast_source, re.S).group() + '\n'
+functions += function(fe_source, 'fe_mcast_inherited_l3_check') + '\n'
+functions += '\n'.join(function(multicast_source, name) for name in (
+    'fe_mcast_cold_prepare', 'fe_mcast_free')) + '\n'
+functions += '\n'.join(function(fe_source, name) for name in (
+    'fe_l2_owner_allocate', 'fe_l2_owner_free',
     'rtl_fe_fabric_cold_prepare', 'rtl_fe_fabric_cold_abort'))
 functions += '\n' + map_struct + '\n' + '\n'.join(function(source, name) for name in (
+    'rtl_mib_read', 'rtl_mib_write',
     'rtl_ni_cold_unmap', 'rtl_ni_cold_map', 'rtl_ni_cold_read', 'rtl_ni_cold_write',
     'rtl_pon_host_gate', 'rtl_engine_poison', 'rtl_engine_prepare', 'rtl_engine_start',
     'rtl_engine_stop', 'rtl_engine_get', 'rtl_engine_put', 'rtl_open',
@@ -372,11 +411,56 @@ static void init(struct rtl_xram *priv,bool required){
  pon_global[2]=0;pon_mac[0x088c/4]=1;pon_mac[0x10b4/4]=1U<<7;
  map_fault=map_fault_index=sysfs_result=0;stuck_pon_gate=stuck_fifo=post_fabric_drift=false;
  map_calls=unmap_calls=pon_reads=pon_writes=registrations=sysfs_calls=mib_calls=exposes=opens=dma_starts=qm_starts=0;
+ ni_reads=ni_writes=ni_init_writes=0;
+ ni_ignored_register=ni_allones_register=0;registered_port_mask=1;expected_open_result=0;
+ mce_diagnostic_fault_register=0;
+ ni_fault_reads=0;ni_allones_read=1;
  block_baseline=baseline_entered=allow_baseline=second_attempted=false;rtnl=false;
 }
 static void done(struct rtl_xram *priv){
  assert(leases_empty() && !held);
+ /* Test teardown only: each independent fixture ends all modeled hardware
+  * activity. Production retained-owner release has its separate oracle. */
+ fe_mcast_free(&fe);fe_l2_owner_free(&fe);
  assert(!pthread_mutex_destroy(&priv->fabric_lock.native));assert(!pthread_mutex_destroy(&fe.lock.native));
+}
+static void cached_snapshot(struct rtl_xram *priv){
+ unsigned int old_reads=pon_reads,old_writes=pon_writes,old_maps=map_calls;
+ unsigned int old_ni_reads=ni_reads,old_ni_writes=ni_writes;
+ unsigned int old_fabric_reads=m.reads,old_fabric_writes=m.writes;
+ struct rtl_pon_cold_state before=priv->pon_cold;
+ const struct rtl_pon_cold_state *cold=&priv->pon_cold;
+ char cached[PAGE_SIZE],expected[PAGE_SIZE];
+ memset(cached,0xa5,sizeof(cached));
+ int length=cold_bootstrap_show(&platform.dev,NULL,cached);
+ assert(length>0 && length<PAGE_SIZE && cached[length]=='\0');
+ assert((size_t)length==strlen(cached) && cached[length-1]=='\n');
+ assert(strstr(cached,"cached=1 historical=1") && strstr(cached,"attempted=1"));
+ snprintf(expected,sizeof(expected),
+          "requested=%u attempted=%u managed=%u result=%d provider_ready=%u engine_poisoned=%u\n",
+          priv->cold_handoff_required,priv->cold_attempted,priv->fabric_managed,priv->fabric_error,
+          priv->provider_ready,priv->engine_poisoned);
+ assert(strstr(cached,expected));
+ snprintf(expected,sizeof(expected),
+          "pon_snapshot_ready=%u pon_stage=%u pon_error=%d pon_pdc_active=%u pon_gated_mask=0x%x pon_fifo=0x%x pon_fifo_polls=%u "
+          "pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n",
+          cold->ready,cold->stage,cold->error,cold->pdc_active,cold->gated_mask,cold->fifo_status,cold->fifo_polls,
+          cold->control,cold->epon_control,cold->gpon_control,cold->refused_register,cold->refused_value);
+ assert(strstr(cached,expected));
+ snprintf(expected,sizeof(expected),
+          "pon_gate_written_mask=0x%x pon_gate_sampled_mask=0x%x pon_gate_polls=%u pon_gate_stable=%u\n",
+          cold->gate_written_mask,cold->gate_sampled_mask,cold->gate_polls,cold->gate_stable);
+ assert(strstr(cached,expected));
+ for(unsigned int gate=0;gate<RTL_PON_COLD_GATE_COUNT;gate++){
+  snprintf(expected,sizeof(expected),
+           "pon_gate%u_before=0x%08x pon_gate%u_requested=0x%08x pon_gate%u_readback=0x%08x\n",
+           gate,cold->gate_before[gate],gate,cold->gate_requested[gate],gate,cold->gate_readback[gate]);
+  const char *line=strstr(cached,expected);assert(line && !strstr(line+1,expected));
+ }
+ assert(pon_reads==old_reads && pon_writes==old_writes && map_calls==old_maps);
+ assert(ni_reads==old_ni_reads && ni_writes==old_ni_writes);
+ assert(m.reads==old_fabric_reads && m.writes==old_fabric_writes);
+ assert(!memcmp(&before,&priv->pon_cold,sizeof(before)));
 }
 static void normal_lan(struct rtl_xram *priv){
  assert(priv->cold_attempted && priv->provider_ready && !priv->engine_poisoned);
@@ -384,14 +468,31 @@ static void normal_lan(struct rtl_xram *priv){
  assert(sysfs_calls==1 && mib_calls==1 && priv->base_ready && priv->host_active);
  assert(m.reg[RTL_FABRIC_RX_MAC(0)/4]&RTL_FABRIC_RX_MAC_ENABLE);
  assert(leases_empty());
- unsigned int old_reads=pon_reads,old_writes=pon_writes,old_maps=map_calls,old_fabric=m.writes;
- char cached[4096];assert(cold_bootstrap_show(&platform.dev,NULL,cached)>0);
- assert(strstr(cached,"cached=1 historical=1") && strstr(cached,"attempted=1"));
- assert(pon_reads==old_reads && pon_writes==old_writes && map_calls==old_maps && m.writes==old_fabric);
+ cached_snapshot(priv);
 }
 static void no_publication(struct rtl_xram *priv){
  assert(!priv->provider_ready && !platform.dev.data && !registrations && !opens && !sysfs_calls && !mib_calls);
  assert(!dma_starts && !qm_starts && leases_empty());
+}
+static void failed_owner_start(struct rtl_xram *priv){
+ /* The probe/registration succeeded before the first ndo_open. Preserve
+  * that distinction: the device exists, but a failed baseline must not
+  * publish an active host, start queues, or replay ownership on retry. */
+ assert(priv->cold_attempted && priv->provider_ready && registrations==1);
+ assert(platform.dev.data==priv->netdev && sysfs_calls==1 && mib_calls==1);
+ assert(priv->engine_poisoned && priv->dma_exposed && owner.exposed);
+ assert(!priv->base_ready && !priv->host_active && !priv->rx_active);
+ assert(!priv->engine_users && !opens && !priv->napi.active && !priv->timer);
+ assert(!dma_starts && !qm_starts && !priv->dma.active && !priv->qm.active);
+ assert(!(m.reg[0x610c/4]&0xffffU) && leases_empty());
+ unsigned old_reads=ni_reads,old_writes=ni_writes,old_init=ni_init_writes;
+ unsigned old_fabric_reads=m.reads,old_fabric_writes=m.writes;
+ unsigned old_pon_reads=pon_reads,old_pon_writes=pon_writes,old_maps=map_calls;
+ rtnl=true;assert(rtl_open(priv->netdev)==-EIO);rtnl=false;
+ assert(ni_reads==old_reads && ni_writes==old_writes && ni_init_writes==old_init);
+ assert(m.reads==old_fabric_reads && m.writes==old_fabric_writes);
+ assert(pon_reads==old_pon_reads && pon_writes==old_pon_writes && map_calls==old_maps);
+ cached_snapshot(priv);
 }
 static void *bootstrap_thread(void *context){
  role=(unsigned int)(uintptr_t)context;
@@ -408,20 +509,74 @@ int main(void){
   if(flavor==2)pon_global[0]=0; /* PDC reset: no speculative MAC/FIFO access. */
   assert(!probe_publication_tail(&platform));normal_lan(&priv);
   assert(priv.fabric_managed && fe.fabric.ready && !fe.fabric.poisoned);
+  assert(fe.l2_owner && fe.l2_owner->sealed && fe.mcast);
+  assert(fe.l2_owner->mc_error==-EOPNOTSUPP && !fe.mcast->state.contract_ready);
   assert(rtl_fabric_native_mtu_compatible(&fe.fabric));
   assert(m.vlan_writes==1 && m.frame_writes==1 && m.scans==1);
   assert(priv.native_groups_created==(sysfs_result==0));
   assert(pon_writes==(flavor==2?0U:2U));
   unsigned int old_writes=m.writes,old_pon=pon_writes,old_maps=map_calls;
+  unsigned int old_init=ni_init_writes;
   assert(!rtl_ni_cold_bootstrap(&priv,&platform));
   rtnl=true;rtl_engine_put(&priv);assert(!rtl_open(priv.netdev));rtnl=false;
   assert(m.writes==old_writes && pon_writes==old_pon && map_calls==old_maps);
+  assert(ni_init_writes==old_init); /* No repeated L2QM/ES setup on warm opens. */
   assert(dma_starts==1 && qm_starts==1 && priv.fabric_managed);
   done(&priv);cases++;
+ }
+ /* Optional MCE diagnostic reads have not acquired any shared hardware
+  * lease. An all-ones result in each real FE preflight read must preserve
+  * NI publication, first LAN open and the existing DMA/QM baseline. */
+ {
+  const unsigned registers[]={0xaa28,0x3834,0x38a0};
+  for(unsigned reg=0;reg<ARRAY_SIZE(registers);reg++){
+   init(&priv,true);mce_diagnostic_fault_register=registers[reg];
+   assert(!probe_publication_tail(&platform));normal_lan(&priv);
+   assert(priv.fabric_managed && !priv.fabric_error && !priv.engine_poisoned);
+   assert(fe.fabric.ready && !fe.fabric.poisoned && !fe.fabric.error);
+   assert(fe.l2_owner && fe.l2_owner->sealed && !rtl_l2_owner_retained(fe.l2_owner));
+   assert(!fe.l2_owner->error && !fe.l2_owner->failures && !mce_diagnostic_fault_register);
+   assert(fe.l2_owner->mc_error==-EIO && fe.mcast->state.error==-EIO);
+   assert(fe.mcast->state.cold_register==registers[reg] && fe.mcast->state.cold_reads==reg+1);
+   assert(!fe.mcast->state.contract_ready && !fe.mcast->state.fdb_filter_owned);
+   assert(!fe.mcast->state.mce_control_owned && dma_starts==1 && qm_starts==1);
+   done(&priv);cases++;
+  }
  }
  /* Legacy/unflagged bring-up still boots; this is not the shipping default. */
  init(&priv,false);assert(!probe_publication_tail(&platform));normal_lan(&priv);
  assert(!priv.fabric_managed && !map_calls && !pon_reads && !m.writes);done(&priv);cases++;
+ /* Execute direct-register faults through the actual engine start/open
+  * callers, not only the isolated setup helpers. Selectors begin dirty so
+  * an ignored write cannot accidentally resemble their desired value. */
+ {
+  static const unsigned registers[]={0x2208,0x2218,0x2228,0x222c,0x2210,
+   0x2304,0x2310,0x231c,0x2328,0x2334,0x23ac,0x2300};
+  for(unsigned fault=0;fault<3;fault++)for(unsigned reg=0;reg<ARRAY_SIZE(registers);reg++){
+   init(&priv,true);registered_port_mask=0x1f;expected_open_result=-EIO;
+   unsigned es_control_before=m.reg[0x2300/4];
+   m.reg[0x2228/4]=0x76543210;m.reg[0x222c/4]=0x12345671;
+   if(fault){ni_allones_register=registers[reg];ni_allones_read=fault;}
+   else ni_ignored_register=registers[reg];
+   assert(!probe_publication_tail(&platform));failed_owner_start(&priv);
+   /* A failed ES control pre-read must not enable foreign schedulers. */
+   if(fault==1 && registers[reg]==0x2300)assert(m.reg[0x2300/4]==es_control_before);
+   done(&priv);cases++;
+  }
+ }
+ /* Formatting-only fixture: independent, distinct full-width values in
+  * every historical gate slot expose wrong-slot, swapped-field and omitted
+  * output regressions. This is not a valid hardware snapshot. */
+ init(&priv,false);assert(!probe_publication_tail(&platform));
+ for(unsigned int gate=0;gate<RTL_PON_COLD_GATE_COUNT;gate++){
+  priv.pon_cold.gate_before[gate]=0xf1234567U+gate;
+  priv.pon_cold.gate_requested[gate]=0xe2345678U+gate;
+  priv.pon_cold.gate_readback[gate]=0xd3456789U+gate;
+ }
+ priv.pon_cold.gate_written_mask=0x80000001;priv.pon_cold.gate_sampled_mask=0xf000000f;
+ priv.pon_cold.gate_polls=~0U;priv.pon_cold.gate_stable=~0U;
+ priv.pon_cold.error=priv.fabric_error=(-2147483647-1);
+ cached_snapshot(&priv);done(&priv);cases++;
  /* A bring-up image without FE/QM still has its original XRAM LAN path. */
  init(&priv,true);priv.fe=NULL;priv.dma_tx=priv.qm_rx=false;
  assert(!probe_publication_tail(&platform));normal_lan(&priv);
@@ -535,6 +690,33 @@ if args.mutants:
          '!rtl_ni_cold_bootstrap(&priv,&platform)'),
         ('leak_cold_resource', unit.replace('if (maps->claimed[i])', 'if (false)', 1),
          'leases_empty()'),
+        ('cached_getter_wrong_gate_slot', unit.replace(
+            'cold->gate_before[3], cold->gate_requested[3], cold->gate_readback[3]',
+            'cold->gate_before[2], cold->gate_requested[2], cold->gate_readback[2]', 1),
+         'line && !strstr'),
+        ('cached_getter_swapped_gate_masks', unit.replace(
+            'cold->gate_written_mask, cold->gate_sampled_mask, cold->gate_polls,',
+            'cold->gate_sampled_mask, cold->gate_written_mask, cold->gate_polls,', 1),
+         'strstr(cached,expected)'),
+        ('cached_getter_performs_mmio', unit.replace('return sysfs_emit(buf,',
+                                                   'readl(priv->ni);\n\treturn sysfs_emit(buf,', 1),
+         'ni_reads==old_ni_reads'),
+        ('ignore_l2qm_baseline_error', unit.replace(
+            'ret = rtl_l2qm_prepare(&l2qm);\n\t\tif (ret)\n\t\t\treturn ret;',
+            'ret = rtl_l2qm_prepare(&l2qm);\n\t\t(void)ret;', 1),
+         'ret==expected_open_result'),
+        ('ignore_es_configuration_error', unit.replace(
+            'ret = rtl_l2_es_cold_prepare(&es, es_ports);\n\t\tif (ret)\n\t\t\treturn ret;',
+            'ret = rtl_l2_es_cold_prepare(&es, es_ports);\n\t\t(void)ret;', 1),
+         'ret==expected_open_result'),
+        ('ignore_es_enable_readback', unit.replace(
+            'if (config == ~0U ||\n\t\t    (config & (BIT(31) | es_ports)) != (BIT(31) | es_ports))',
+            'if (false)', 1),
+         'ret==expected_open_result'),
+        ('reflect_failed_es_read_into_foreign_ports', unit.replace(
+            'if (config == ~0U)\n\t\t\treturn -EIO;',
+            'if (false)\n\t\t\treturn -EIO;', 1),
+         'm.reg[0x2300/4]==es_control_before'),
     ]
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 with tempfile.TemporaryDirectory(prefix='ni-cold-startup-') as directory:

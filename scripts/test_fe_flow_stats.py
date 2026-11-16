@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from test_fe_age_batch import function
 
 root=Path(__file__).resolve().parents[1]
 source=(root/'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek/rtl9617c-fe.c').read_text()
@@ -20,14 +21,23 @@ common=r'''
 typedef uint64_t u64;typedef uint32_t u32;
 #define ETH_HLEN 14
 #define FLOW_ACTION_HW_STATS_DELAYED 1
+#define RTL_FE_HASH_ENTRIES 65536
+#define HZ 100UL
+#define time_before(a,b) ((long)((a)-(b))<0)
 static unsigned long jiffies=100;
-struct rtl_fe {u64 bytes;u32 packets,non_uc;unsigned int age;};
-struct rtl_fe_flow {bool published,counted;unsigned int counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
+struct rtl_fe_flow;
+struct rtl_fe {u64 bytes;u32 packets,non_uc;unsigned int age;struct rtl_fe_flow **hash_owners;};
+struct rtl_fe_flow {bool published,counted,installed,deleting,activity_cached;unsigned int counter,hash_index,ethernet_bytes;u64 bytes;u32 packets;unsigned long lastused;};
 struct flow_cls_offload {struct {u64 bytes,packets;unsigned long lastused;} stats;};
 struct rtl_dq_io {struct rtl_fe *fe;};
 static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe};}
 static int rtl_fe_main_age_read(struct rtl_dq_io *io,unsigned int index,unsigned int *age){(void)index;*age=io->fe->age;return 0;}
 static int rtl_fe_main_age(struct rtl_dq_io *io,unsigned int index,unsigned int age){(void)index;io->fe->age=age;return 0;}
+/* This MIB fixture deliberately exercises the no-index path. Actual row
+ * ownership/caching uses production MMIO in test_fe_activity_cache. */
+static int rtl_fe_main_age_batch(struct rtl_dq_io *io,unsigned int first,unsigned int owned,unsigned int probe,unsigned int *hits){
+ (void)io;(void)first;(void)owned;(void)probe;(void)hits;assert(!"unexpected indexed path in MIB fixture");return -EOPNOTSUPP;
+}
 static int rtl_fe_tx_counter_read(struct rtl_dq_io *io,unsigned int counter,unsigned int *words){
  assert(counter==31);words[0]=io->fe->bytes;words[1]=io->fe->bytes>>32;words[2]=io->fe->packets;words[3]=io->fe->non_uc;return 0;
 }
@@ -36,10 +46,11 @@ static int rtl_fe_tx_counter_read(struct rtl_dq_io *io,unsigned int counter,unsi
 test=r'''
 int main(void){
  struct rtl_fe fe={.bytes=5355,.packets=22,.age=1};
- struct rtl_fe_flow flow={.published=true,.counted=true,.counter=31,.ethernet_bytes=14,.bytes=5000,.packets=17,.lastused=80};
+ struct rtl_fe_flow flow={.published=true,.counted=true,.activity_cached=true,.counter=31,.ethernet_bytes=14,.bytes=5000,.packets=17,.lastused=80};
  struct flow_cls_offload cls={};
  assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.packets==5 && cls.stats.bytes==285 && cls.stats.lastused==100);
+ assert(!flow.activity_cached); /* MIB activity must not slide the Hash row cache. */
  jiffies=120;assert(!fe_stats(&fe,&flow,&cls));
  assert(cls.stats.packets==5 && cls.stats.bytes==285 && cls.stats.lastused==100);
  flow.packets=UINT32_MAX-2;fe.packets=2;flow.bytes=6000;fe.bytes=6355;
@@ -73,6 +84,6 @@ int main(void){
 '''
 with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-stats-') as work:
     path=Path(work)/'stats.c';binary=Path(work)/'stats'
-    path.write_text(common+source[start:end]+test)
+    path.write_text(common+function(source,'fe_refresh_activity')+source[start:end]+test)
     subprocess.run(['cc','-fsanitize=address,undefined','-g',str(path),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)

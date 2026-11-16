@@ -34,6 +34,8 @@
 #define RTL_L2_FDB_FILTER_WORD0 0x1c28U
 #define RTL_L2_FDB_FILTER_WORDS 5
 #define RTL_L2_FDB_CMD_MODE 0x80000000U
+#define RTL_L2_FDB_SW_AGE_SCAN (1U << 12)
+#define RTL_L2_FDB_INFO_INIT (1U << 30)
 #define RTL_L2_FDB_LEARN_DISABLE (1U << 22)
 #define RTL_L2_FDB_LEARN_MODE_MASK (3U << 23)
 #define RTL_L2_FDB_LEARN_HW (1U << 23)
@@ -80,6 +82,9 @@ enum rtl_l2_table {
 	RTL_L2_TBL_CF_FIB,
 	RTL_L2_TBL_IPPB,
 	RTL_L2_TBL_SPECIAL_PRIORITY,
+	/* All three VID maps reference the SAME 128-row VLAN_FIB bank. */
+	RTL_L2_TBL_VLAN_WAN_S_INDEX,
+	RTL_L2_TBL_VLAN_WAN_C_INDEX,
 	RTL_L2_TBL_COUNT,
 };
 
@@ -109,6 +114,8 @@ static inline int rtl_l2_table_layout(enum rtl_l2_table table,
 		/* SDK aal_l2_specpkt_pri_get only admits priorities 0..30,
 		 * although the access address field can represent index31. */
 		[RTL_L2_TBL_SPECIAL_PRIORITY] = { 0x1204, 0x1208, RTL_L2_SPECIAL_PRIORITIES, 1 },
+		[RTL_L2_TBL_VLAN_WAN_S_INDEX] = { 0x1a04, 0x1a08, 4096, 1 },
+		[RTL_L2_TBL_VLAN_WAN_C_INDEX] = { 0x1a18, 0x1a1c, 4096, 1 },
 	};
 
 	if (!layout || (unsigned int)table >= RTL_L2_TBL_COUNT)

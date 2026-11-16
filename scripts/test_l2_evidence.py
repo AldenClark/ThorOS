@@ -60,17 +60,26 @@ typedef uint32_t u32;
 typedef uint32_t ca_uint32_t;
 #define PAGE_SIZE 4096
 #define READ_ONCE(v) (v)
+#define WRITE_ONCE(x,v) ((x)=(v))
+#include "rtl9617c-mcast-observe.h"
 #define RMU_CTRL 0x6104
 #define ES_CTRL 0x6108
 #define EQ_ID 4
-#define CPU_READY 0x67f8
+#define CPU_READY 0x6368
 #define EPP_WRITE 0x7000
 #define EPP_READ 0x7100
 struct mutex { bool held, deny; };
 struct rtl_fe { struct mutex lock; bool engine_ready, shutting_down; int route_lock; };
 struct rtl_qm_rx {
  void *ni; u64 memory_dma; u32 last_address,last_size,last_header[2];
- struct {unsigned pending,retries,returned,peak;} refill;
+ u64 voq_packets[8],voq_yields[8],poll_budget_hits,cpu_packets,cpu_bytes,ring_errors,buffer_errors;
+ unsigned rx_prefetch,pppoe_rx_checksum,next_voq;
+ struct rtl_mcast_observe mcast_observe;
+ struct {
+  unsigned pending,peak,count[2],eq_peak[2];
+  u64 retries,returned,eq_retries[2],eq_returned[2],eq_full_stalls[2];
+  u64 eq_bad_credit[2],eq_bad_ready[2];
+ } refill;
 };
 static u32 registers[0x10000 / 4], before[0x10000 / 4];
 static unsigned int reads, writes, locks, unlocks, fake_time;
@@ -157,6 +166,25 @@ int main(void) {
    assert(!memcmp(before,registers,sizeof(before)));
    assert(!rtl_l2_evidence_read(&io,&sample));sdk_oracle(&sample);
   }
+ /* A failure of either baseline read must not make that prerequisite
+  * compatible. Keep the healthy peer independent and the raw failed word
+  * visible; observation still performs exactly the same 17 reads. */
+ const unsigned failed_baseline[]={0x1414,0x1400};
+ for(unsigned i=0;i<2;i++) {
+  setup(i);registers[0x1414/4]=3;registers[0x1400/4]=0;
+  registers[failed_baseline[i]/4]=~0U;memcpy(before,registers,sizeof(before));
+  assert(rtl_fe_l2_evidence(&fe,output)>0);
+  assert(strstr(output,i?"native_l2_svl_compatible=1 ":"native_l2_svl_compatible=0 "));
+  assert(strstr(output,i?"native_l2_priority_key_compatible=0 ":"native_l2_priority_key_compatible=1 "));
+  assert(strstr(output,i?"hash_control=0xffffffff\n":"vlan_mode=0xffffffff\n"));
+  assert(strstr(output,"native_l2_prerequisites_complete=0"));
+  assert(reads==17 && !writes && locks==1 && unlocks==1 && !in_spin);
+  for(unsigned j=0;j<17;j++)assert(seen[expected_offsets[j]/4]==1);
+  assert(!memcmp(before,registers,sizeof(before)));
+  assert(!rtl_l2_evidence_read(&io,&sample));
+  assert(sample.words[i?RTL_L2_EVIDENCE_HASH_CONTROL:RTL_L2_EVIDENCE_VLAN_MODE]==~0U);
+  sdk_oracle(&sample);
+ }
  setup(42);
  assert(rtl_fe_l2_evidence(NULL,output)>0 && strstr(output,"reason=no_fe") && !reads);
  fe.lock.deny=true;assert(rtl_fe_l2_evidence(&fe,output)==-EBUSY && !reads);
@@ -173,14 +201,59 @@ int main(void) {
   assert(strstr(output,"retirement_proven=0") && strstr(output,"hw_port=4"));
  }
  struct rtl_qm_rx qm={.ni=registers};
+ qm.refill.count[0]=3;qm.refill.count[1]=5;
+ qm.refill.eq_peak[0]=7;qm.refill.eq_peak[1]=11;
+ qm.refill.eq_retries[0]=13;qm.refill.eq_retries[1]=17;
+ qm.refill.eq_returned[0]=19;qm.refill.eq_returned[1]=23;
+ qm.refill.eq_full_stalls[0]=29;qm.refill.eq_full_stalls[1]=31;
+ qm.refill.eq_bad_credit[0]=0x100000025ULL;qm.refill.eq_bad_credit[1]=0x10000002bULL;
+ qm.refill.eq_bad_ready[0]=0x100000031ULL;qm.refill.eq_bad_ready[1]=0x100000035ULL;
+ for(unsigned q=0;q<8;q++)qm.voq_yields[q]=0x100000000ULL+q;
+ qm.next_voq=6;
+ qm.mcast_observe=(struct rtl_mcast_observe){
+  .hdr_bum=0x100000000ULL,.source27=0x100000001ULL,.source27_cpu=0x100000002ULL,
+  .source27_ptp=0x100000003ULL,.source27_pol_nonzero=0x100000004ULL,
+  .source27_mirror=0x100000005ULL,.last_source27_header=0x1234567890abcdefULL,
+ };
  for(unsigned i=0;i<32;i++) {
   setup(i);strict=false;registers[0x105c/4]=1U<<i;
   memcpy(before,registers,sizeof(before));
   assert(rtl_qm_rx_state(&qm,output)>0);
   assert(strstr(output,"monitor_selector=") && strstr(output,"monitor_atomic=0"));
+  assert(strstr(output,"refill_eq4_pending=3 refill_eq5_pending=5"));
+  assert(strstr(output,"refill_eq4_peak=7 refill_eq5_peak=11"));
+  assert(strstr(output,"refill_eq4_retries=13 refill_eq5_retries=17"));
+  assert(strstr(output,"refill_eq4_returned=19 refill_eq5_returned=23"));
+  assert(strstr(output,"refill_eq4_full_stalls=29 refill_eq5_full_stalls=31"));
+  assert(strstr(output,"refill_eq4_bad_credit=4294967333 refill_eq5_bad_credit=4294967339"));
+  assert(strstr(output,"refill_eq4_bad_ready=4294967345 refill_eq5_bad_ready=4294967349"));
   assert(!writes && !memcmp(before,registers,sizeof(before)));
+  unsigned int reads_before=reads;
+  assert(rtl_qm_rx_voq_state(&qm,output)>0);
+  assert(strstr(output,"refill_eq4_pending=3 refill_eq5_pending=5"));
+  assert(strstr(output,"refill_eq4_full_stalls=29 refill_eq5_full_stalls=31"));
+  assert(strstr(output,"refill_eq4_bad_credit=4294967333 refill_eq5_bad_credit=4294967339"));
+  assert(strstr(output,"refill_eq4_bad_ready=4294967345 refill_eq5_bad_ready=4294967349"));
+  assert(strstr(output,"voq7_yields=4294967303 voq6_yields=4294967302"));
+  assert(strstr(output,"voq1_yields=4294967297 voq0_yields=4294967296 next_voq=6"));
+  assert(strstr(output,"mc_rx_hdr_bum=4294967296 mc_rx_source27=4294967297"));
+  assert(strstr(output,"mc_rx_source27_cpu=4294967298 mc_rx_source27_ptp=4294967299"));
+  assert(strstr(output,"mc_rx_source27_pol=4294967300 mc_rx_source27_mirror=4294967301"));
+  assert(strstr(output,"mc_rx_last_header=1234567890abcdef mc_rx_forwarding_proven=0\n"));
+  assert(!writes && reads==reads_before && !memcmp(before,registers,sizeof(before)));
  }
- puts("PASS: passive L2: 32 field bits, 128 baseline combinations, 64 live snapshots, no-FE/down/shutdown/busy; QM 32 selectors unchanged");
+ /* Old cumulative keys also remain lossless above 32 bits. */
+ qm.refill.retries=qm.refill.returned=~0ULL;
+ qm.refill.eq_retries[0]=qm.refill.eq_retries[1]=~0ULL;
+ qm.refill.eq_returned[0]=qm.refill.eq_returned[1]=~0ULL;
+ qm.refill.eq_full_stalls[0]=qm.refill.eq_full_stalls[1]=~0ULL;
+ assert(rtl_qm_rx_state(&qm,output)>0);
+ assert(strstr(output,"refill_retries=18446744073709551615 refill_returned=18446744073709551615"));
+ unsigned reads_before=reads;assert(rtl_qm_rx_voq_state(&qm,output)>0 && reads==reads_before);
+ assert(strstr(output,"refill_eq4_retries=18446744073709551615 refill_eq5_retries=18446744073709551615"));
+ assert(strstr(output,"refill_eq4_returned=18446744073709551615 refill_eq5_returned=18446744073709551615"));
+ assert(strstr(output,"refill_eq4_full_stalls=18446744073709551615 refill_eq5_full_stalls=18446744073709551615"));
+ puts("PASS: passive L2: 32 field bits, 128 baseline combinations, 2 isolated baseline read faults, 64 live snapshots, no-FE/down/shutdown/busy; QM 32 selectors unchanged, 64-bit faults/fairness/metadata-only evidence");
 }
 '''
 
@@ -211,8 +284,8 @@ def sdk_oracle(path):
  L2FE_ARB_ARB_CTRL_EXT_t e={.wrd=s->words[RTL_L2_EVIDENCE_ARB_EXT]};
  L2FE_PLC_VLAN_MODE_CTRL_t v={.wrd=s->words[RTL_L2_EVIDENCE_VLAN_MODE]};
  L2FE_PLC_HASH_CTRL_t h={.wrd=s->words[RTL_L2_EVIDENCE_HASH_CONTROL]};
- assert(v.bf.l2e_glb_vlan_mode==s->native_l2_svl_compatible);
- assert((!h.bf.use_dot1p_l2e)==s->native_l2_priority_key_compatible);
+ assert((v.wrd!=~0U && v.bf.l2e_glb_vlan_mode)==s->native_l2_svl_compatible);
+ assert((h.wrd!=~0U && !h.bf.use_dot1p_l2e)==s->native_l2_priority_key_compatible);
  assert(m.bf.cp_lspid_to_pol_id_en==s->mce_copy_lspid_to_pol);
  assert(m.bf.buf_flush_en==s->mce_flush_requested);
  assert(a.bf.keep_o_lspid_en_for_mc==s->arb_keep_original_lspid);
@@ -233,7 +306,9 @@ def main():
     parser.add_argument("--registers", type=Path)
     args = parser.parse_args()
     fe = function((DRIVER / "rtl9617c-fe.c").read_text(), "rtl_fe_l2_evidence")
-    qm = function((DRIVER / "rtl9617c-qm.c").read_text(), "rtl_qm_rx_state")
+    qm_source = (DRIVER / "rtl9617c-qm.c").read_text()
+    qm = (function(qm_source, "rtl_qm_rx_state") +
+          function(qm_source, "rtl_qm_rx_voq_state"))
     header = (DRIVER / "rtl9617c-l2-evidence.h").read_text()
 
     def change_once(text, old, new):
@@ -246,6 +321,8 @@ def main():
          "u32 monitor_selector =", "writel(0x82, rx->ni + 0x105c);\n\tu32 monitor_selector ="), header),
         ("svl_compatibility_mutant", fe, qm, change_once(header,
          "& RTL_L2_VLAN_MODE_SVL", "& 2U")),
+        ("svl_failed_read_mutant", fe, qm, change_once(header,
+         "sample->words[RTL_L2_EVIDENCE_VLAN_MODE] != ~0U &&", "true &&")),
         ("priority_compatibility_mutant", fe, qm, change_once(header,
          "!(sample->words[RTL_L2_EVIDENCE_HASH_CONTROL]", "!!(sample->words[RTL_L2_EVIDENCE_HASH_CONTROL]")),
         ("mce_field_mutant", fe, qm, change_once(header, ">> 17", ">> 16")),

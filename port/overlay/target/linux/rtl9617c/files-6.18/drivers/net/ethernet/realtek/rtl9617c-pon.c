@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/rtl9617c-switch.h>
 #include <linux/rtnetlink.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-pon.h"
@@ -544,6 +545,7 @@ static ssize_t llid_table_store(struct device *dev, struct device_attribute *att
 			       const char *buf, size_t count)
 {
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
+	struct net *policy = NULL;
 	char operation[7];
 	unsigned int index, mac, llid, multicast;
 	bool add;
@@ -559,13 +561,22 @@ static ssize_t llid_table_store(struct device *dev, struct device_attribute *att
 		return -EINVAL;
 	mutex_lock(&pon->control_lock);
 	mutex_lock(&pon->lock);
-	ret = rtl_pon_mode_is_epon(pon->mode) ?
-		rtl_pon_llid_update(pon, add, index, mac, llid, multicast) : -EOPNOTSUPP;
+	ret = -EOPNOTSUPP;
+	if (rtl_pon_mode_is_epon(pon->mode)) {
+		/* A direct LLID edit changes the same FE source/destination
+		 * identity as MPCP. Keep admission closed through PDC remap,
+		 * including a failed/ambiguous command, before queuing rebuild. */
+		rtl_pon_policy_begin(pon, &policy);
+		ret = rtl_pon_llid_update(pon, add, index, mac, llid, multicast);
+	}
 	if (!ret)
 		ret = rtl_pon_pdc_refresh(pon);
+	rtl9617c_switch_policy_end(policy);
 	mutex_unlock(&pon->lock);
 	mutex_unlock(&pon->control_lock);
-	return ret ? ret : count;
+	if (ret)
+		return ret;
+	return count;
 }
 static DEVICE_ATTR_RW(llid_table);
 

@@ -44,6 +44,7 @@ struct rtl_l2_evidence {
 	unsigned int mce_copy_lspid_to_pol, mce_flush_requested;
 	unsigned int arb_keep_original_lspid, arb_mc_membership_check;
 	/* Necessary baseline checks only, independent of request/topology.
+	 * Unknown all-ones reads are not compatible; raw words remain visible.
 	 * Neither field proves the remaining hardware or policy prerequisites. */
 	unsigned int native_l2_svl_compatible, native_l2_priority_key_compatible;
 };
@@ -66,8 +67,10 @@ static inline int rtl_l2_evidence_read(const struct rtl_dq_io *io,
 		sample->lan_rx[i] = io->read(io->context,
 			RTL_L2_EVIDENCE_LAN_BASE + RTL_L2_EVIDENCE_LAN_STRIDE * i);
 	sample->native_l2_svl_compatible =
+		sample->words[RTL_L2_EVIDENCE_VLAN_MODE] != ~0U &&
 		!!(sample->words[RTL_L2_EVIDENCE_VLAN_MODE] & RTL_L2_VLAN_MODE_SVL);
 	sample->native_l2_priority_key_compatible =
+		sample->words[RTL_L2_EVIDENCE_HASH_CONTROL] != ~0U &&
 		!(sample->words[RTL_L2_EVIDENCE_HASH_CONTROL] & RTL_L2_FDB_HASH_USE_PRIORITY);
 	sample->mce_copy_lspid_to_pol =
 		(sample->words[RTL_L2_EVIDENCE_MCE_CONTROL] >> 17) & 1U;

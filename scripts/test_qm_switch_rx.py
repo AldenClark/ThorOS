@@ -53,7 +53,7 @@ static void dma_sync_single_for_cpu(void *dev,dma_addr_t addr,unsigned bytes,int
  (void)addr;assert(dev==active->device && (bytes==64 || bytes==2048) && dir==DMA_FROM_DEVICE);
 }
 static int rtl_qm_try_push(void *ctx,unsigned addr,unsigned eq) {
- assert(ctx==active && retired && addr==active->memory_dma+8192 && eq==4);pushed++;return 0;
+ assert(ctx==active && retired && addr==active->memory_dma+RTL_QM_PAYLOAD_OFFSET && eq==4);pushed++;return 0;
 }
 ''' + common[end:]
 common = common.replace(body(common, 'rtl_fe_switch_rx'), r'''
@@ -92,13 +92,13 @@ static void setup(struct rtl_qm_rx *rx,struct net_device *owner,struct net_devic
                   struct rtl_fe *fe,unsigned source,unsigned cpu,unsigned type,
                   unsigned packet_type,unsigned mirror) {
  *rx=(struct rtl_qm_rx){.memory_dma=0x4000000,.ring_dma=0x6000000,.device=owner,.fe=fe};
- rx->memory=calloc(1,RTL_QM_MEMORY_BYTES);rx->ring_memory=calloc(1,8192);rx->ni=calloc(1,65536);
+ rx->memory=calloc(1,RTL_QM_MEMORY_BYTES);rx->ring_memory=calloc(1,RTL_QM_RING_MEMORY_BYTES);rx->ni=calloc(1,65536);
  memset(owner,0,sizeof(*owner));memset(ports,0,5*sizeof(*ports));
  for(unsigned i=0;i<5;i++){ports[i].running=true;rx->lan[i]=&ports[i];}
  active=rx;wanted_source=source;wanted_input=source<5?&ports[source]:0;wanted_fe=fe;
  wanted_h0=(cpu<<31)|(5U<<18)|(mirror<<14)|(packet_type<<11);
  wanted_h1=(type<<30)|((64+cpu*8)<<15)|(source<<9)|(16<<3)|7;
- unsigned off=8192,header=8+cpu*8;
+ unsigned off=RTL_QM_PAYLOAD_OFFSET,header=8+cpu*8;
  put(__builtin_bswap32(wanted_h0),rx->memory+off+RTL_QM_HEADROOM);
  put(__builtin_bswap32(wanted_h1),rx->memory+off+RTL_QM_HEADROOM+4);
  packet_bytes(23,rx->memory+off+RTL_QM_HEADROOM+header);
@@ -126,15 +126,28 @@ int main(void) {
   assert(owner.stats.rx_dropped==1 && retired==1 && pushed==1);
   cleanup(&rx);cases++;
  }
- const unsigned other_sources[]={5,6,7,31,32,63};
+ const unsigned other_sources[]={5,6,7,27,31,32,63};
  struct rtl9617c_ni_endpoint endpoint={.receive=pon_receive};
  for(unsigned i=0;i<ARRAY_SIZE(other_sources);i++) {
   unsigned p=other_sources[i];setup(&rx,&owner,ports,&fe,p,1,2,3,1);rx.pon=&endpoint;
   assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && !hook_calls && !lan_calls);
   assert(pon_calls==(p==7 || p>=32));
   assert(owner.stats.rx_dropped==(p!=7 && p<32));
+  assert(rx.mcast_observe.source27==(p==27));
+  if(p==27) {
+   assert(rx.mcast_observe.source27_cpu==1 && !rx.mcast_observe.source27_ptp);
+   assert(rx.mcast_observe.source27_pol_nonzero==1 && rx.mcast_observe.source27_mirror==1);
+   assert(rx.mcast_observe.last_source27_header==((u64)wanted_h0<<32|wanted_h1));
+  }
   cleanup(&rx);cases++;
  }
+ /* A malformed source27 header is not evidence of a valid CPU copy. */
+ setup(&rx,&owner,ports,&fe,27,1,2,3,1);
+ put(__builtin_bswap32((wanted_h1 & ~(0x3fffU<<15)) | (7U<<15)),
+     rx.memory+RTL_QM_PAYLOAD_OFFSET+RTL_QM_HEADROOM+4);
+ assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && !hook_calls && !lan_calls && !pon_calls);
+ assert(owner.stats.rx_errors==1 && !rx.mcast_observe.source27 && !rx.mcast_observe.hdr_bum);
+ assert(retired==1 && pushed==1);cleanup(&rx);cases++;
  /* FE-less native mode still passes valid bytes/metadata to its no-op API. */
  setup(&rx,&owner,ports,0,4,0,0,0,0);
  assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && hook_calls==1 && lan_calls==1);

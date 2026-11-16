@@ -53,6 +53,8 @@
 
 #define RTL_PON_COLD_PDC_FIFO_STATUS 0x9010U
 #define RTL_PON_COLD_PDC_FIFO_DEPTH 31U
+#define RTL_PON_COLD_GATE_POLLS 1000U
+#define RTL_PON_COLD_GATE_STABLE 3U
 #define RTL_PON_COLD_FIFO_POLLS 1000U
 #define RTL_PON_COLD_FIFO_STABLE 3U
 
@@ -77,6 +79,11 @@ enum rtl_pon_cold_stage {
 struct rtl_pon_cold_state {
 	unsigned int control, epon_control, gpon_control;
 	unsigned int gated_mask, fifo_status, fifo_polls;
+	unsigned int gate_before[RTL_PON_COLD_GATE_COUNT];
+	unsigned int gate_requested[RTL_PON_COLD_GATE_COUNT];
+	unsigned int gate_readback[RTL_PON_COLD_GATE_COUNT];
+	unsigned int gate_written_mask, gate_sampled_mask;
+	unsigned int gate_polls, gate_stable;
 	unsigned int refused_register, refused_value;
 	int error;
 	unsigned char pdc_active, stage, ready;
@@ -118,6 +125,63 @@ static inline int rtl_pon_cold_globals_match(const struct rtl_dq_io *io,
 	return 0;
 }
 
+/* A completed MMIO transaction need not prove that a MAC has already
+ * acknowledged the new admission state. Write each gate only once, then
+ * observe a bounded number of stable, all-closed sweeps. The probe budget
+ * and 100--200 us requested waits are cold-start software limits, not an
+ * undocumented hardware timing guarantee. A permanently open gate still
+ * refuses takeover; the wait does not claim to fix every rejected write.
+ * Revalidate the original reset/mux snapshot before every subsequent MAC
+ * access: waiting must not authorize access to a newly held-reset block.
+ */
+static inline int rtl_pon_cold_wait_gates(const struct rtl_dq_io *io,
+					struct rtl_pon_cold_state *state)
+{
+	unsigned int poll, i, value, closed;
+	int ret;
+
+	if (!state->gated_mask)
+		return 0;
+	for (poll = 0; poll < RTL_PON_COLD_GATE_POLLS; poll++) {
+		closed = 1;
+		state->gate_polls++;
+		for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
+			if (!(state->gated_mask & (1U << i)))
+				continue;
+			ret = rtl_pon_cold_globals_match(io, state);
+			if (ret)
+				return ret;
+			value = io->read(io->context, rtl_pon_cold_gates[i].reg);
+			state->gate_readback[i] = value;
+			if (value == ~0U)
+				return rtl_pon_cold_error(state, -EIO,
+					rtl_pon_cold_gates[i].reg, value);
+			if (value & rtl_pon_cold_gates[i].mask)
+				closed = 0;
+		}
+		state->gate_stable = closed ? state->gate_stable + 1 : 0;
+		if (state->gate_stable == RTL_PON_COLD_GATE_STABLE)
+			return 0;
+		if (poll + 1 < RTL_PON_COLD_GATE_POLLS)
+			usleep_range(100, 200);
+	}
+	/* Report a still-open gate, or the last closed sample if the budget
+	 * ended before the stable window. Cached gate_stable disambiguates.
+	 */
+	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
+		if ((state->gated_mask & (1U << i)) &&
+		    (state->gate_readback[i] & rtl_pon_cold_gates[i].mask))
+			return rtl_pon_cold_error(state, -ETIMEDOUT,
+				rtl_pon_cold_gates[i].reg, state->gate_readback[i]);
+	}
+	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
+		if (state->gated_mask & (1U << i))
+			return rtl_pon_cold_error(state, -ETIMEDOUT,
+				rtl_pon_cold_gates[i].reg, state->gate_readback[i]);
+	}
+	return -ETIMEDOUT;
+}
+
 /* Recheck after the NI's own cold fabric transaction, before publication.
  * A changed mux/reset word is NOT permission to touch the newly selected
  * MAC. Reject first. The caller must quarantine any ambiguous shared write.
@@ -139,15 +203,25 @@ static inline int rtl_pon_cold_verify(const struct rtl_dq_io *io,
 	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
 		if (!(state->gated_mask & (1U << i)))
 			continue;
+		ret = rtl_pon_cold_globals_match(io, state);
+		if (ret)
+			return ret;
 		value = io->read(io->context, rtl_pon_cold_gates[i].reg);
+		state->gate_readback[i] = value;
 		if (value & rtl_pon_cold_gates[i].mask)
 			return rtl_pon_cold_error(state, -EIO,
 						  rtl_pon_cold_gates[i].reg, value);
 	}
 	if (state->pdc_active) {
+		ret = rtl_pon_cold_globals_match(io, state);
+		if (ret)
+			return ret;
 		value = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);
 		state->fifo_status = value;
 		state->fifo_polls++;
+		if (value == ~0U)
+			return rtl_pon_cold_error(state, -EIO,
+				RTL_PON_COLD_PDC_FIFO_STATUS, value);
 		if (value & RTL_PON_COLD_PDC_FIFO_DEPTH)
 			return rtl_pon_cold_error(state, -EBUSY,
 						  RTL_PON_COLD_PDC_FIFO_STATUS, value);
@@ -229,28 +303,41 @@ static inline int rtl_pon_cold_quiesce(const struct rtl_dq_io *io,
 	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
 		if (!(state->gated_mask & (1U << i)))
 			continue;
+		ret = rtl_pon_cold_globals_match(io, state);
+		if (ret)
+			return ret;
 		value = io->read(io->context, rtl_pon_cold_gates[i].reg);
+		state->gate_sampled_mask |= 1U << i;
+		state->gate_before[i] = value;
+		state->gate_readback[i] = value;
 		if (value == ~0U)
 			return rtl_pon_cold_error(state, -EIO,
 						  rtl_pon_cold_gates[i].reg, value);
-		if (value & rtl_pon_cold_gates[i].mask)
+		state->gate_requested[i] = value & ~rtl_pon_cold_gates[i].mask;
+		if (value & rtl_pon_cold_gates[i].mask) {
+			ret = rtl_pon_cold_globals_match(io, state);
+			if (ret)
+				return ret;
 			io->write(io->context, rtl_pon_cold_gates[i].reg,
-				  value & ~rtl_pon_cold_gates[i].mask);
+				  state->gate_requested[i]);
+			state->gate_written_mask |= 1U << i;
+		}
 	}
 	state->stage = RTL_PON_COLD_READBACK;
-	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
-		if (!(state->gated_mask & (1U << i)))
-			continue;
-		value = io->read(io->context, rtl_pon_cold_gates[i].reg);
-		if (value & rtl_pon_cold_gates[i].mask)
-			return rtl_pon_cold_error(state, -EIO,
-						  rtl_pon_cold_gates[i].reg, value);
-	}
+	ret = rtl_pon_cold_wait_gates(io, state);
+	if (ret)
+		return ret;
 	state->stage = RTL_PON_COLD_FIFO;
 	for (i = 0; i < RTL_PON_COLD_FIFO_POLLS; i++) {
+		ret = rtl_pon_cold_globals_match(io, state);
+		if (ret)
+			return ret;
 		value = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);
 		state->fifo_status = value;
 		state->fifo_polls++;
+		if (value == ~0U)
+			return rtl_pon_cold_error(state, -EIO,
+				RTL_PON_COLD_PDC_FIFO_STATUS, value);
 		if (value & RTL_PON_COLD_PDC_FIFO_DEPTH)
 			stable = 0;
 		else if (++stable == RTL_PON_COLD_FIFO_STABLE)

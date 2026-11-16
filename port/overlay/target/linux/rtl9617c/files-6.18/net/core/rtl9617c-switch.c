@@ -16,6 +16,7 @@
 #include <linux/export.h>
 #include <linux/if_arp.h>
 #include <linux/netdevice.h>
+#include <linux/rtl9617c-mcast.h>
 #include <linux/rtl9617c-switch.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -24,6 +25,13 @@
 
 static DEFINE_SPINLOCK(rtl9617c_switch_lock);
 static LIST_HEAD(rtl9617c_switch_guards);
+static u64 rtl9617c_switch_next_identity;
+
+static void rtl9617c_switch_close(struct rtl9617c_switch_guard *guard)
+{
+	guard->armed = false;
+	guard->ops->quiesce(guard->priv);
+}
 
 static bool rtl9617c_switch_net_blocked(const struct rtl9617c_switch_net *state)
 {
@@ -37,7 +45,7 @@ static void rtl9617c_switch_quiesce(struct net *net)
 
 	list_for_each_entry(guard, &rtl9617c_switch_guards, list)
 		if (guard->net == net)
-			guard->ops->quiesce(guard->priv);
+			rtl9617c_switch_close(guard);
 }
 
 static void rtl9617c_switch_rebuild(struct net *net)
@@ -70,12 +78,17 @@ int rtl9617c_switch_guard_register(struct rtl9617c_switch_guard *guard,
 		spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
 		return -EBUSY;
 	}
+	if (rtl9617c_switch_next_identity == U64_MAX) {
+		spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
+		return -EOVERFLOW;
+	}
 	guard->net = get_net(net);
 	guard->ops = ops;
 	guard->priv = priv;
+	guard->identity = ++rtl9617c_switch_next_identity;
 	guard->registered = true;
 	list_add_tail(&guard->list, &rtl9617c_switch_guards);
-	ops->quiesce(priv);
+	rtl9617c_switch_close(guard);
 	ops->rebuild(priv);
 	spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
 	return 0;
@@ -89,9 +102,10 @@ void rtl9617c_switch_guard_unregister(struct rtl9617c_switch_guard *guard)
 
 	spin_lock_irqsave(&rtl9617c_switch_lock, flags);
 	if (guard->registered) {
-		guard->ops->quiesce(guard->priv);
+		rtl9617c_switch_close(guard);
 		list_del_init(&guard->list);
 		guard->registered = false;
+		guard->identity = 0;
 		net = guard->net;
 		guard->net = NULL;
 	}
@@ -141,8 +155,10 @@ bool rtl9617c_switch_guard_try_arm(struct rtl9617c_switch_guard *guard,
 	if (rtl9617c_switch_net_blocked(state) || state->generation != generation)
 		goto out;
 	armed = guard->ops->arm(guard->priv);
-	if (!armed)
-		guard->ops->quiesce(guard->priv);
+	if (armed)
+		guard->armed = true;
+	else
+		rtl9617c_switch_close(guard);
 out:
 	spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
 	return armed;
@@ -169,7 +185,7 @@ void rtl9617c_switch_guard_quiesce(struct rtl9617c_switch_guard *guard)
 
 	spin_lock_irqsave(&rtl9617c_switch_lock, flags);
 	if (guard->registered)
-		guard->ops->quiesce(guard->priv);
+		rtl9617c_switch_close(guard);
 	spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
 }
 EXPORT_SYMBOL_GPL(rtl9617c_switch_guard_quiesce);
@@ -192,6 +208,45 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(rtl9617c_switch_guard_publish);
+
+/* Called under RCU by the bridge, without its multicast/hash lock held.
+ * Do not hold the gate across bridge processing: a bridge writer takes
+ * its own lock before this gate, and packet processing can update FDB/MDB.
+ * The second check at local delivery handles a queued/delayed hook.  Most
+ * importantly, an accepted copy is local-only regardless of a concurrent
+ * topology change; it can never be forwarded into a new hardware domain.
+ */
+bool rtl9617c_mcast_copy_valid(const struct sk_buff *skb,
+			     const struct net_device *ingress,
+			     const struct net_device *master)
+{
+	const struct rtl9617c_mcast_copy *copy;
+	struct rtl9617c_switch_guard *guard;
+	unsigned long flags;
+	bool valid = false;
+
+	copy = skb_ext_find(skb, SKB_EXT_RTL9617C_MCAST);
+	if (!copy || !ingress || !master || !copy->owner ||
+	    !copy->token || copy->token > 511 || copy->vid ||
+	    copy->ingress_ifindex != ingress->ifindex ||
+	    copy->master_ifindex != master->ifindex ||
+	    dev_net(ingress) != dev_net(master))
+		return false;
+
+	spin_lock_irqsave(&rtl9617c_switch_lock, flags);
+	list_for_each_entry(guard, &rtl9617c_switch_guards, list) {
+		if (guard->identity != copy->owner)
+			continue;
+		valid = guard->registered && guard->armed &&
+			guard->net == dev_net(ingress) &&
+			!rtl9617c_switch_net_blocked(&guard->net->rtl9617c_switch) &&
+			guard->net->rtl9617c_switch.generation == copy->generation;
+		break;
+	}
+	spin_unlock_irqrestore(&rtl9617c_switch_lock, flags);
+	return valid;
+}
+EXPORT_SYMBOL_GPL(rtl9617c_mcast_copy_valid);
 
 static int rtl9617c_switch_owned_lower(struct net_device *dev,
 				       struct netdev_nested_priv *priv)
@@ -419,13 +474,18 @@ static bool rtl9617c_switch_device_policy(const struct net_device *dev)
 static int rtl9617c_switch_upper_policy(struct net_device *dev,
 					struct netdev_nested_priv *priv)
 {
-	(void)priv;
-	return rtl9617c_switch_device_policy(dev);
+	/* Physical NI/PON endpoints cannot change namespace, but VLAN/macvlan
+	 * uppers can. A guard only owns one namespace's persistent NF/TCX/XDP
+	 * vetoes, so a cross-namespace upper must keep the whole fabric on CPU.
+	 * A successful move is fenced by switch_move_begin() in both namespaces;
+	 * this snapshot veto prevents the worker from reopening under old policy.
+	 */
+	return dev_net(dev) != priv->data || rtl9617c_switch_device_policy(dev);
 }
 
 bool rtl9617c_switch_device_has_policy(const struct net_device *dev)
 {
-	struct netdev_nested_priv priv = {};
+	struct netdev_nested_priv priv = { .data = dev_net(dev) };
 	bool policy;
 
 	ASSERT_RTNL();

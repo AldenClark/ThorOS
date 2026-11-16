@@ -28,6 +28,17 @@ HEADERS = {
 #include <stdint.h>
 #include <stddef.h>
 typedef uint64_t u64;
+typedef uint16_t u16;
+#define U64_MAX UINT64_MAX
+''',
+    "linux/skbuff.h": r'''
+#pragma once
+#include <linux/types.h>
+#define SKB_EXT_RTL9617C_MCAST 1
+struct sk_buff { void *mcast_copy; };
+static inline void *skb_ext_find(const struct sk_buff *skb, unsigned int id) { (void)id; return skb->mcast_copy; }
+static inline bool skb_ext_exist(const struct sk_buff *skb, unsigned int id) { return !!skb_ext_find(skb, id); }
+static inline void skb_ext_del(struct sk_buff *skb, unsigned int id) { (void)id; skb->mcast_copy = NULL; }
 ''',
     "linux/kconfig.h": "#pragma once\n#define CONFIG_RTL9617C_SWITCH_GUARD 1\n#define CONFIG_NET_XGRESS 1\n#define CONFIG_BRIDGE 1\n#define CONFIG_NET_SWITCHDEV 1\n#define IS_ENABLED(x) (x)\n#define IS_REACHABLE(x) (x)\n",
     "linux/cleanup.h": r'''
@@ -92,6 +103,7 @@ struct Qdisc;
 struct netdev_queue { struct Qdisc *qdisc_sleeping; };
 struct net_device {
  struct net *net;
+ int ifindex;
  struct Qdisc *qdisc;
  unsigned int num_tx_queues;
  unsigned int xdp_count;
@@ -558,9 +570,88 @@ static void namespace_move(void) {
  test_rtnl = false; cases++;
 }
 
+static void cross_namespace_upper(void) {
+ struct net fabric={0},other={0};
+ const struct Qdisc_ops noop={.id="noqueue"};struct Qdisc plain={.ops=&noop};
+ struct net_device lan={.net=&fabric,.qdisc=&plain};
+ struct net_device vlan={.net=&fabric,.qdisc=&plain},stacked={.net=&fabric,.qdisc=&plain};
+ struct switch_model model={.owned=&lan,.arm_succeeds=true};
+ struct rtl9617c_switch_guard guard={0};
+ lan.upper[0]=&vlan;lan.upper_count=1;vlan.lower[0]=&lan;vlan.lower_count=1;
+ vlan.upper[0]=&stacked;vlan.upper_count=1;stacked.lower[0]=&vlan;stacked.lower_count=1;
+ assert(!rtl9617c_switch_guard_register(&guard,&fabric,&scoped_operations,&model));
+ fresh_arm(&guard,&model);test_rtnl=true;
+ assert(!rtl9617c_switch_device_has_policy(&lan));
+ /* A movable VLAN upper retains an immutable physical lower. The core
+  * namespace move fence closes the old fabric BEFORE dev_net_set(). */
+ assert(rtl9617c_switch_move_begin(&vlan,&other)==&fabric);
+ assert(!model.open && fabric.rtl9617c_switch.active==1 && other.rtl9617c_switch.active==1);
+ vlan.net=&other;
+ rtl9617c_switch_policy_end(&other);rtl9617c_switch_policy_end(&fabric);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ model.arm_succeeds=!rtl9617c_switch_device_has_policy(&lan);
+ assert(!rtl9617c_switch_guard_try_arm(&guard,rtl9617c_switch_guard_generation(&guard)));
+ assert(!model.open);
+ /* A hook in the foreign namespace is not tracked by the fabric's guard;
+  * the structural veto must persist even when that namespace is idle. */
+ rtl9617c_switch_nf_block(&other);
+ assert(rtl9617c_switch_device_has_policy(&lan));rtl9617c_switch_nf_unblock(&other);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ assert(rtl9617c_switch_move_begin(&vlan,&fabric)==&other);vlan.net=&fabric;
+ rtl9617c_switch_policy_end(&fabric);rtl9617c_switch_policy_end(&other);
+ model.arm_succeeds=!rtl9617c_switch_device_has_policy(&lan);assert(model.arm_succeeds);
+ fresh_arm(&guard,&model);
+ /* Reject nested foreign uppers too, not only the immediate VLAN. After
+  * guarded unlink, an unrelated foreign device must not veto the fabric. */
+ assert(rtl9617c_switch_move_begin(&stacked,&other)==&fabric);stacked.net=&other;
+ rtl9617c_switch_policy_end(&other);rtl9617c_switch_policy_end(&fabric);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ struct net *scope=rtl9617c_switch_policy_begin(&vlan);assert(scope==&fabric);
+ vlan.upper_count=0;stacked.lower_count=0;rtl9617c_switch_policy_end(scope);
+ assert(!rtl9617c_switch_device_has_policy(&lan));model.arm_succeeds=true;
+ fresh_arm(&guard,&model);rtl9617c_switch_guard_unregister(&guard);
+ assert(!fabric.rtl9617c_switch.active && !other.rtl9617c_switch.active && !test_rcu_depth);
+ assert(!atomic_load(&fabric.references));test_rtnl=false;cases+=9;
+}
+
+static void mcast_copy_lifetime(void) {
+ struct net net={0},other={0};struct rtl9617c_switch_guard guard={0};
+ struct net_device lan={.net=&net,.ifindex=11},master={.net=&net,.ifindex=21};
+ struct switch_model model={0};attach(&guard,&net,&model);fresh_arm(&guard,&model);
+ struct rtl9617c_mcast_copy copy={.owner=guard.identity,.generation=net.rtl9617c_switch.generation,
+  .ingress_ifindex=11,.master_ifindex=21,.token=3};
+ struct sk_buff skb={.mcast_copy=&copy};
+ assert(rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ copy.owner++;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.owner--;
+ copy.generation++;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.generation--;
+ copy.ingress_ifindex++;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.ingress_ifindex--;
+ copy.master_ifindex++;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.master_ifindex--;
+ copy.vid=1;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.vid=0;
+ copy.token=512;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.token=0;
+ assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.token=3;
+ master.net=&other;assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));master.net=&net;
+ rtl9617c_switch_guard_quiesce(&guard);assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ fresh_arm(&guard,&model);assert(rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ rtl9617c_switch_guard_invalidate(&guard);fresh_arm(&guard,&model);
+ assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));copy.generation=net.rtl9617c_switch.generation;
+ assert(rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ u64 old=guard.identity;rtl9617c_switch_guard_unregister(&guard);
+ assert(!rtl9617c_mcast_copy_valid(&skb,&lan,&master));attach(&guard,&net,&model);fresh_arm(&guard,&model);
+ assert(guard.identity!=old&&!rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ copy.owner=guard.identity;assert(rtl9617c_mcast_copy_valid(&skb,&lan,&master));
+ rtl9617c_mcast_copy_clear(&skb);assert(!rtl9617c_mcast_copy_present(&skb));
+ rtl9617c_switch_guard_unregister(&guard);
+ u64 next=rtl9617c_switch_next_identity;rtl9617c_switch_next_identity=U64_MAX;
+ assert(rtl9617c_switch_guard_register(&guard,&net,&operations,&model)==-EOVERFLOW);
+ assert(!guard.registered&&!atomic_load(&net.references));rtl9617c_switch_next_identity=next;
+ cases+=18;
+}
+
 int main(void) {
  basic_and_nested(); persistent_vetoes(); feedback_publication(); namespaces_and_poison();
  threaded_interleavings(); qdisc_policy(); device_scope(); ppp_without_adjacency(); namespace_move();
+ cross_namespace_upper();
+ mcast_copy_lifetime();
  assert(list_empty(&rtl9617c_switch_guards));
  printf("L2 production gate: %u lifecycle/policy cases including 80 actual two-thread interleavings; stale epochs, nested scopes, late probe, persistent vetoes and namespace isolation PASS\n", cases);
  return 0;
@@ -574,10 +665,13 @@ def main():
     mutations = {
         "stale_epoch_arm": ("state->generation != generation", "((void)generation, false)"),
         "ignore_nested_policy": ("state->poisoned || state->active ||", "state->poisoned || false ||"),
-        "partial_arm_not_closed": ("if (!armed)\n\t\tguard->ops->quiesce", "if (false && !armed)\n\t\tguard->ops->quiesce"),
+        "partial_arm_not_closed": ("else\n\t\trtl9617c_switch_close(guard);", "else if (false)\n\t\trtl9617c_switch_close(guard);"),
+        "mcast_stale_epoch": ("guard->net->rtl9617c_switch.generation == copy->generation", "true"),
+        "mcast_ignores_closed_gate": ("guard->registered && guard->armed &&", "guard->registered && true &&"),
         "stale_fdb_publish": ("state->generation == generation", "((void)generation, true)"),
         "unrelated_device_closes_all": ("if (!rtl9617c_switch_related(net, dev))", "if (!rtl9617c_switch_related(net, dev) && false)"),
         "upper_device_policy_bypassed": ("policy = netdev_walk_all_upper_dev_rcu", "policy = false && netdev_walk_all_upper_dev_rcu"),
+        "cross_namespace_upper_bypassed": ("dev_net(dev) != priv->data ||", "((void)priv, false) ||"),
     }
     environment = dict(os.environ)
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")

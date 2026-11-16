@@ -266,6 +266,7 @@ targets=(
     net/bridge/br_nf_utils.o
     net/bridge/br_multicast.o
     net/bridge/br_mdb.o
+    net/bridge/br_rtl9617c_mdb.o
     net/bridge/br_multicast_eht.o
     net/bridge/br_vlan.o
     net/bridge/br_vlan_tunnel.o
@@ -302,7 +303,13 @@ patches = ('220-l2-switchdev-policy-gate.patch',
            '227-flowtable-direct-mtu-lifetime.patch',
            '228-flowtable-stats-timeout-wrap.patch',
            '229-flowtable-initial-publication.patch',
-           '230-flowtable-refresh-timeout-order.patch')
+           '230-flowtable-refresh-timeout-order.patch',
+           '233-flowtable-vlan-encapsulation.patch',
+           '234-native-bridge-effective-ageing.patch',
+           '235-ppp-flow-namespace-fence.patch',
+           '236-native-mdb-snapshot.patch',
+           '237-native-bum-copy-lifetime.patch',
+           '238-native-bridge-vlan-feedback.patch')
 callers = {
     line.removeprefix('+++ b/').removesuffix('.c') + '.o'
     for patch in patches

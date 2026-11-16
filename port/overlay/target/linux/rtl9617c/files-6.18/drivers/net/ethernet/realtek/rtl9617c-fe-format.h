@@ -340,6 +340,18 @@ struct rtl_fe_ipv4_key {
  unsigned char protocol, ingress, profile, mask;
 };
 
+/* This is the routed-unicast admission boundary, not a general address
+ * validator. Exact MDB uses a different classifier owner: multicast or
+ * reserved IPv4 endpoints and IPv6 multicast endpoints must never become
+ * ordinary route-hash keys, including through a NAT rewrite. Numeric IPv6
+ * inputs are the most significant word, as in rtl_fe_ipv6_key below. */
+static inline int rtl_fe_routed_unicast(unsigned int ipv6,
+ unsigned int source_msb,unsigned int destination_msb)
+{
+ if(ipv6)return (source_msb>>24)!=255 && (destination_msb>>24)!=255;
+ return (source_msb>>28)<14 && (destination_msb>>28)<14;
+}
+
 static inline void rtl_fe_ipv4_key(unsigned int words[RTL_FE_KEY_WORDS],
  const struct rtl_fe_ipv4_key *key)
 {

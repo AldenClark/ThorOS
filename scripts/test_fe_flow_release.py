@@ -15,6 +15,8 @@ parser.add_argument('--revision', help='Run the same teardown oracle against an 
 args = parser.parse_args()
 relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
 native = subprocess.check_output(['git', 'show', args.revision + ':' + relative], cwd=root, text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
+indexed = 'struct rtl_fe_destination {' in native
+hash_indexed = 'struct rtl_fe_flow **hash_owners;' in native
 def function(name):
     start = re.search(r'^.*\b' + name + r'\([^;]*?\)\s*\{',native,re.M).start()
     end = native.index('{',start)+1
@@ -34,6 +36,7 @@ common = r'''
 #include <stddef.h>
 #include <string.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c_destination_tree.h"
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;
 typedef uint32_t __le32;typedef uint64_t u64;
 #define ETH_ALEN 6
@@ -62,9 +65,6 @@ static void __clear_bit(unsigned int bit,unsigned long *words){words[bit/64]&=~(
 static void set_bit(unsigned int bit,unsigned long *words){words[bit/64]|=1UL<<(bit%64);}
 static bool test_bit(unsigned int bit,unsigned long *words){return (words[bit/64]>>(bit%64))&1;}
 static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
-struct rb_node {bool erased;};
-struct rb_root {unsigned int erases;};
-static void rb_erase(struct rb_node *n,struct rb_root *r){assert(!n->erased);n->erased=true;r->erases++;}
 static bool list_empty(struct list_head *h){return h->next==h;}
 struct rtl_fe;
 struct net_device {};
@@ -77,7 +77,9 @@ struct delayed_work {struct work_struct work;unsigned int queued,modified,delay;
 #define to_delayed_work(w) container_of(w,struct delayed_work,work)
 struct rtl_fe {
  struct list_head flows,ports,retries;
- struct rb_root cookies;
+ struct rb_root cookies,destinations;
+ unsigned int destination_count;
+ struct rtl_fe_flow **hash_owners;
  void *memory;
  struct rtl_fe_mac source_macs[15];
  struct rtl_fe_interface interfaces[32];
@@ -161,6 +163,18 @@ static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe,fe
 test = r'''
 static void initialize(struct rtl_fe *fe){
  memset(fe,0,sizeof(*fe));init_list(&fe->flows);init_list(&fe->ports);init_list(&fe->retries);
+ struct rtl_dq_io io=fe_io(fe);
+ /* This teardown fixture receives the established cold owner. The complete
+  * cold-prepare lifecycle has a separate oracle; here its real CMD handoff
+  * still runs with learning stopped, then ordinary traffic resumes. */
+ assert(rtl_l2_fdb_command_mode(&io)==-EBUSY);
+ assert(!fe_read(fe,RTL_L2_FDB_CONTROL));
+ fe_write(fe,RTL_L2_FDB_CONTROL,RTL_L2_FDB_LEARN_DISABLE);
+ assert(!rtl_l2_fdb_command_mode(&io));
+ assert(fe_read(fe,RTL_L2_FDB_CONTROL)==(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE));
+ fe_write(fe,RTL_L2_FDB_CONTROL,fe_read(fe,RTL_L2_FDB_CONTROL)&~RTL_L2_FDB_LEARN_DISABLE);
+ assert(!fe->deletes_FDB && !fe->restores_CAM && !fe->restores_IF && !fe->cache_invalidates);
+ fe->deletes_FDB=fe->restores_CAM=fe->restores_IF=fe->cache_invalidates=0;
  fe->memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(fe->memory);
  fe->enabled=fe->prepared=fe->engine_ready=fe->route_gate_ready=true;
  assert(fe_route_arm(fe) && fe->route_admitted && !fe->route_gate_verified);
@@ -168,6 +182,9 @@ static void initialize(struct rtl_fe *fe){
 static void check_gate(struct rtl_fe *fe){
  assert(!fe->route_admitted && fe->route_gate_verified);
  assert(((fe_read(fe,0x3418)>>10)&15)==1 && ((fe_read(fe,0x3424)>>10)&15)==1);
+}
+static void check_hash_owner(struct rtl_fe *fe,unsigned int index,struct rtl_fe_flow *owner){
+ if(fe->hash_owners)assert(fe->hash_owners[index]==owner);
 }
 static struct rtl_fe_flow *new_flow(struct rtl_fe *fe,unsigned int index,bool published){
  struct rtl_fe_flow *flow=calloc(1,sizeof(*flow));assert(flow);
@@ -307,15 +324,28 @@ int main(void){
  withdrawal_recovery_priority();
  withdrawal_to_resource_progress();
  struct rtl_fe fe;initialize(&fe);
+#ifdef INDEXED_HASH_OWNERS
+ fe.hash_owners=calloc(RTL_FE_HASH_ENTRIES,sizeof(*fe.hash_owners));assert(fe.hash_owners);
+#endif
  struct rtl_fe_port *port=calloc(1,sizeof(*port));assert(port);port->retired=true;list_add_tail(&port->list,&fe.ports);
  fe.source_macs[0].users=2;
  for(unsigned int i=0;i<5;i++)fe.source_macs[0].saved[i]=0x51000000+i;
  struct rtl_fe_flow *a=calloc(1,sizeof(*a)),*b=calloc(1,sizeof(*b));assert(a&&b);
  *a=(struct rtl_fe_flow){.hash_index=1280,.counter=31,.source_mac=0,.crc16=0x5141,
-  .destination_created=true,.published=true,.installed=true,.counted=true,.source_owned=true,.destination_owned=true,.interface_owned=true,
+#ifndef INDEXED_DESTINATIONS
+  .destination_created=true,
+#endif
+  .published=true,.installed=true,.counted=true,.source_owned=true,.destination_owned=true,.interface_owned=true,
   .destination={2,0x77,0x66,0x55,0x44,0x33}};
  a->input=port;
  *b=*a;init_list(&a->retry);init_list(&b->retry);b->hash_index=65344;b->counter=30;b->crc16=0xff4b;
+#ifdef INDEXED_DESTINATIONS
+ struct rtl_fe_destination *destination=calloc(1,sizeof(*destination));assert(destination);
+ destination->users=destination->live_users=2;destination->created=destination->ready=true;
+ memcpy(destination->address,a->destination,ETH_ALEN);fe_destination_index(&fe,destination);
+ a->destination_owner=b->destination_owner=destination;
+ a->destination_live=b->destination_live=true;
+#endif
  fe_write(&fe,0x3520,0x23451234);
  assert(!fe_mtu_get(&fe,a,1492) && !fe_mtu_get(&fe,b,1492));
  assert(a->mtu_index==b->mtu_index && fe.mtus[0].users==2);
@@ -324,11 +354,13 @@ int main(void){
  fe.interfaces[30]=(struct rtl_fe_interface){.users=1,.counted=true,.ready=true};
  list_add_tail(&a->list,&fe.flows);list_add_tail(&b->list,&fe.flows);
  set_bit(a->hash_index,fe.hashes);set_bit(b->hash_index,fe.hashes);
+ if(fe.hash_owners){fe.hash_owners[a->hash_index]=a;fe.hash_owners[b->hash_index]=b;}
  set_bit(a->counter,fe.counters);set_bit(b->counter,fe.counters);
  ((u32 *)fe.memory)[1280]=0x12345678;((u32 *)fe.memory)[65344]=0x87654321;
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  fe.oracle_hash_index=a->hash_index;
  assert(!fe_delete(&fe,a));
+ check_hash_owner(&fe,1280,NULL);check_hash_owner(&fe,65344,b);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  assert(fe.source_macs[0].users==1 && !fe.deletes_FDB && !fe.restores_CAM);
  assert(!test_bit(1280,fe.hashes) && test_bit(65344,fe.hashes));
@@ -336,16 +368,23 @@ int main(void){
   * live hardware owner until the existing cleanup can finish withdrawal. */
  fe.oracle_hash_index=b->hash_index;fe.fail_age=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->deleting);
+ check_hash_owner(&fe,65344,b);
  assert(b->withdrawal_pending && fe.pending_withdrawals==1);check_gate(&fe);
  assert(b->source_owned && b->destination_owned && b->interface_owned);
+#ifdef INDEXED_DESTINATIONS
+ assert(b->destination_owner->users==1 && !b->destination_owner->live_users);
+ assert(!b->destination_live); /* Retirement precedes even failed withdrawal. */
+#endif
  assert(test_bit(65344,fe.hashes) && test_bit(30,fe.counters));
  assert(((u32 *)fe.memory)[65344]==0x87654321); /* Failed withdrawal preserves the DDR key. */
  fe.fail_age_write=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
+ check_hash_owner(&fe,65344,b);
  assert(fe.pending_withdrawals==1 && !fe.reconciles);check_gate(&fe);
  assert(((u32 *)fe.memory)[65344]==0x87654321 && !fe.deletes_FDB);
  fe.fail_cache=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->published && b->destination_owned);
+ check_hash_owner(&fe,65344,b);
  assert(fe.pending_withdrawals==1 && !fe.reconciles);check_gate(&fe);
  assert(!fe.deletes_FDB && fe.source_macs[0].users==1);
  assert(!((u32 *)fe.memory)[65344] && b->interface_owned && b->mtu_owned);
@@ -354,6 +393,7 @@ int main(void){
   * and the physical row reservation until restoration can be retried. */
  fe.fail_IF=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT && b->source_owned && b->interface_owned);
+ check_hash_owner(&fe,65344,b);
  assert(!b->withdrawal_pending && !fe.pending_withdrawals && fe.reconciles==1);
  /* Cache withdrawal is complete even though EIF/CAM restoration is not.
   * A normal reconciliation can now recover unrelated routed flows. */
@@ -362,6 +402,7 @@ int main(void){
  assert(test_bit(30,fe.counters) && !fe.interfaces[30].ready);
  fe.fail_CAM=true;
  assert(fe_delete(&fe,b)==-ETIMEDOUT);
+ check_hash_owner(&fe,65344,b);
  assert(!fe.pending_withdrawals && fe.reconciles==1 && fe.route_admitted);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  assert(fe.deletes_FDB==1 && fe.source_macs[0].users==1);
@@ -372,10 +413,12 @@ int main(void){
  assert(b->deleting && fe.cleanup_work.queued==5);
  assert(fe.retries.next==&b->retry && b->retry.next==&fe.retries);
  fe_cleanup_work(&fe.cleanup_work.work);
+ check_hash_owner(&fe,65344,NULL);
  fe_collect_ports(&fe);assert(fe.ports.next==&port->list);
  port->bindings=0;
  fe_collect_ports(&fe);assert(fe.ports.next==&fe.ports);
  assert(fe.source_macs[0].users==0 && fe.deletes_FDB==1 && fe.restores_CAM==1);
+ assert(!fe.destination_count && RB_EMPTY_ROOT(&fe.destinations));
  assert(fe.cache_invalidates==2 && fe.restores_IF==2 && fe.deletes==2);
  for(unsigned int i=0;i<5;i++)assert(fe.cam[i]==0x51000000+i);
  assert(fe.flows.next==&fe.flows && !test_bit(65344,fe.hashes) && !test_bit(30,fe.counters));
@@ -384,9 +427,11 @@ int main(void){
   * issuing invalidation or counting an installation as a normal delete. */
  struct rtl_fe_flow *c=calloc(1,sizeof(*c));assert(c);
  c->hash_index=1413;init_list(&c->retry);list_add_tail(&c->list,&fe.flows);
+ if(fe.hash_owners)fe.hash_owners[c->hash_index]=c;
  set_bit(c->hash_index,fe.hashes);((u32 *)fe.memory)[c->hash_index]=0xaabbccdd;
  unsigned int before_invalidations=fe.cache_invalidates,before_barriers=dma_barriers;
  assert(!fe_delete(&fe,c));
+ check_hash_owner(&fe,1413,NULL);
  assert(!((u32 *)fe.memory)[1413] && !test_bit(1413,fe.hashes));
  assert(fe.cache_invalidates==before_invalidations && dma_barriers>before_barriers);
  assert(fe.deletes==2 && fe.cookies.erases==3 && list_empty(&fe.flows));
@@ -394,6 +439,7 @@ int main(void){
   * quarantined, no retry may re-arm work or perform MMIO after unmapping. */
  struct rtl_fe_flow *d=calloc(1,sizeof(*d));assert(d);
  d->hash_index=1536;d->crc16=1536;d->published=true;
+ if(fe.hash_owners)fe.hash_owners[d->hash_index]=d;
  init_list(&d->retry);list_add_tail(&d->list,&fe.flows);
  set_bit(d->hash_index,fe.hashes);((u32 *)fe.memory)[d->hash_index]=0xfeedbeef;
  fe.oracle_hash_index=d->hash_index;fe.shutting_down=true;fe.fail_age=true;
@@ -401,14 +447,19 @@ int main(void){
  fe.cleanup_delay=32*HZ;
  unsigned int reconciles=fe.reconciles;
  assert(fe_delete(&fe,d)==-ETIMEDOUT && d->published);
+ check_hash_owner(&fe,1536,d);
  assert(d->withdrawal_pending && fe.pending_withdrawals==1);check_gate(&fe);
  assert(fe.cleanup_work.queued==queued);
  assert(fe.cleanup_work.modified==modified); /* Shutdown must not expedite a timer. */
  fe.fail_age=true;fe_cleanup_work(&fe.cleanup_work.work);
  assert(fe.fail_age && d->published && fe.cleanup_work.queued==queued);
  fe.fail_age=false;assert(!fe_delete(&fe,d));
+ check_hash_owner(&fe,1536,NULL);
  assert(!fe.pending_withdrawals && fe.reconciles==reconciles && fe.cleanup_work.queued==queued);
  assert(list_empty(&fe.flows) && list_empty(&fe.retries));
+ if(fe.hash_owners)
+  for(unsigned int i=0;i<RTL_FE_HASH_ENTRIES;i++)assert(!fe.hash_owners[i]);
+ free(fe.hash_owners);
  free(fe.memory);
  assert(!fe.mtus[0].users && fe_read(&fe,0x3520)==0x23451234);
  puts("G3 removal order: DDR key zero and DMA barrier precede invalidation; age/cache failures retain ownership; unpublished rollback clears without invalidation");
@@ -421,7 +472,11 @@ if args.revision and 'withdrawal_pending' not in flow_struct:
     # Keep the old implementation executable under the same behavioral
     # oracle: an unused zero-initialized diagnostic field is not a fix.
     flow_struct = flow_struct.replace('\n};','\n bool withdrawal_pending;\n};')
-parts = [common,flow_struct]
+owner_struct = re.search(r'struct rtl_fe_destination \{.*?\n\};',native,re.S)[0] if indexed else ''
+parts = [('#define INDEXED_DESTINATIONS 1\n' if indexed else ''),
+    ('#define INDEXED_HASH_OWNERS 1\n' if hash_indexed else ''),common,owner_struct,flow_struct]
+if indexed:
+    parts += [function(n) for n in ('fe_destination_index','fe_destination_retire')]
 if 'static int fe_interface_transfer(' in native:
     parts += [function('fe_interface_transfer')]
 parts += [function(n) for n in ('fe_route_select_locked','fe_route_gate','fe_route_arm',
@@ -436,7 +491,7 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as w
     executable='\n'.join(parts)
     source.write_text(executable)
     subprocess.run(['cc','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
-        '-I'+str(drivers),str(source),'-o',str(binary)],check=True)
+        '-I'+str(drivers),'-I'+str(root/'scripts/fixtures'),str(source),'-o',str(binary)],check=True)
     subprocess.run([str(binary)],check=True)
     mutants = {
         'arm_ignores_pending_withdrawals': (
@@ -463,11 +518,22 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as w
             'if(was_pending && !flow->withdrawal_pending && fe->pending_withdrawals)',
             'if(false && was_pending && !flow->withdrawal_pending && fe->pending_withdrawals)'),
     }
+    if indexed:
+        mutants['failed_withdrawal_keeps_pin_shareable'] = (
+            'flow->deleting=true;\n fe_destination_retire(flow);',
+            'flow->deleting=true;')
+    if hash_indexed:
+        mutants['hash_index_released_before_withdrawal'] = (
+            'flow->deleting=true;\n',
+            'flow->deleting=true;\n if(fe->hash_owners)fe->hash_owners[flow->hash_index]=NULL;\n')
+        mutants['completed_release_retains_hash_index'] = (
+            'if(fe->hash_owners)fe->hash_owners[flow->hash_index]=NULL;',
+            '/* incorrect: released flow remains in the owner index */')
     for name,(before,after) in mutants.items():
         assert executable.count(before)==1, name
         mutant=Path(work)/(name+'.c');program=Path(work)/name
         mutant.write_text(executable.replace(before,after,1))
-        subprocess.run(['cc','-I'+str(drivers),str(mutant),'-o',str(program)],check=True)
+        subprocess.run(['cc','-I'+str(drivers),'-I'+str(root/'scripts/fixtures'),str(mutant),'-o',str(program)],check=True)
         rejected=subprocess.run([str(program)],capture_output=True,text=True)
         assert rejected.returncode and 'Assertion' in rejected.stderr, name
         print('Withdrawal mutation rejected:',name)
@@ -493,5 +559,6 @@ with tempfile.TemporaryDirectory(dir=root/'artifacts',prefix='fe-release-') as w
     'unpublished_rollback_clears_without_cache_command':True,
     'shared_MAC_last_owner_release':True,'retired_port_retained_until_failed_flow_cleanup_retries_finish':True,'CAM_restore_failure_retried_without_double_release':True,
     'hash_and_counter_slots_retained_until_release_completed':True,
+    'optional_hash_owner_index_retained_through_all_failure_stages_and_cleared_before_free':hash_indexed,
     'sanitizers':['ASan','UBSan'],'hardware_fault_injection':False,
 },indent=2)+'\n')

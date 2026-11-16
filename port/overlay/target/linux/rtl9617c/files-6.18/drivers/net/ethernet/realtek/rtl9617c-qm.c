@@ -4,7 +4,7 @@
  * Register sequences: Cortina-Access 2015 GPL-2.0+ aal_l3qm.c; ingress
  * classification: Realtek 2020 GPL-2.0+ aal_l2_classification.c, from
  * GPL-for-GP3000 5090fbcb6ba743dd7b1314811ef557bad0460147.
- * CPU rings: 1024 bytes per VOQ, 8-byte commands, as TYFZA1 ca-ne.ko.
+ * CPU rings: 2048 bytes per VOQ, retaining the SDK's 8-byte command format.
  */
 #include <linux/bitfield.h>
 #include <linux/etherdevice.h>
@@ -14,12 +14,18 @@
 #include <linux/ktime.h>
 #include <linux/prefetch.h>
 #include <linux/rcupdate.h>
+#include <linux/rtl9617c-mcast.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-qm.h"
 #include "rtl9617c-fe.h"
 #include "rtl9617c-rx-checksum.h"
+#include "rtl9617c-l2qm.h"
 
-#define EQ_ID 4
+#if NAPI_POLL_WEIGHT != RTL_QM_REFILL_RESERVE
+#error "QM refill reserve must track the native default NAPI weight"
+#endif
+
+#define EQ_ID RTL_QM_CPU_EQ_FIRST
 #define EQ_CFG (0x61e8 + EQ_ID * 20)
 #define EQ_PROFILE (0x6128 + EQ_ID * 4)
 #define RMU_CTRL 0x6104
@@ -30,6 +36,18 @@
 #define CPU_PUSH 0x636c
 #define CPU_READY 0x6368
 #define CB_CTRL 0x950c
+
+static int rtl_qm_rmw(void __iomem *reg, u32 clear, u32 set)
+{
+	u32 value = readl(reg);
+
+	/* Never reflect a failed bus read into unrelated shared control bits.
+	 * This is a command prerequisite, not a hardware completion/drain fence. */
+	if (value == ~0U)
+		return -EIO;
+	writel((value & ~clear) | set, reg);
+	return 0;
+}
 
 static int rtl_qm_window_idle(struct rtl_qm_rx *rx, unsigned int reg)
 {
@@ -86,15 +104,30 @@ static int rtl_qm_push(struct rtl_qm_rx *rx, u32 address, unsigned int eqid)
 {
 	u32 status;
 	int ret;
+	unsigned int eq;
+
+	if (eqid < EQ_ID || eqid >= EQ_ID + RTL_QM_CPU_EQ_COUNT)
+		return -EINVAL;
+	eq = eqid - EQ_ID;
 
 	/* EQM must have a released BID; PUSH FIFO readiness alone is insufficient. */
 	ret = readl_poll_timeout_atomic(rx->ni + 0x6328 + eqid * 4, status,
 				       status & GENMASK(13, 0), 1, 10000);
 	if (ret)
 		return ret;
+	/* A failed bus read must not manufacture thousands of released BIDs.
+	 * This EQ can never release more BIDs than its complete physical pool. */
+	if (status == ~0U || (status & GENMASK(13, 0)) > RTL_QM_BUFFERS_PER_EQ) {
+		rx->refill.eq_bad_credit[eq]++;
+		return -EIO;
+	}
 	ret = readl_poll_timeout_atomic(rx->ni + CPU_READY, status, status & BIT(31), 1, 10000);
 	if (ret)
 		return ret;
+	if (status == ~0U) {
+		rx->refill.eq_bad_ready[eq]++;
+		return -EIO;
+	}
 	writel(address | eqid, rx->ni + CPU_PUSH);
 	return 0;
 }
@@ -102,14 +135,33 @@ static int rtl_qm_push(struct rtl_qm_rx *rx, u32 address, unsigned int eqid)
 static int rtl_qm_try_push(void *context, unsigned int address, unsigned int eqid)
 {
 	struct rtl_qm_rx *rx = context;
-	unsigned int *credit = &rx->refill.credit[eqid - EQ_ID];
+	unsigned int *credit, eq;
+	u32 status;
+
+	if (eqid < EQ_ID || eqid >= EQ_ID + RTL_QM_CPU_EQ_COUNT)
+		return -EINVAL;
+	eq = eqid - EQ_ID;
+	credit = &rx->refill.credit[eq];
 
 	/* NAPI alone returns these EQs. Reuse a conservative credit snapshot
 	 * within this drain; every accepted PUSH consumes one released BID. */
-	if (!*credit)
-		*credit = readl(rx->ni + 0x6328 + eqid * 4) & GENMASK(13, 0);
+	if (!*credit) {
+		status = readl(rx->ni + 0x6328 + eqid * 4);
+		if (status == ~0U || (status & GENMASK(13, 0)) > RTL_QM_BUFFERS_PER_EQ) {
+			rx->refill.eq_bad_credit[eq]++;
+			return -EIO;
+		}
+		*credit = status & GENMASK(13, 0);
+	}
 	/* Keep the per-buffer FIFO check. Busy buffers wait for the next poll. */
-	if (!*credit || !(readl(rx->ni + CPU_READY) & BIT(31)))
+	if (!*credit)
+		return -EAGAIN;
+	status = readl(rx->ni + CPU_READY);
+	if (status == ~0U) {
+		rx->refill.eq_bad_ready[eq]++;
+		return -EIO;
+	}
+	if (!(status & BIT(31)))
 		return -EAGAIN;
 	writel(address | eqid, rx->ni + CPU_PUSH);
 	(*credit)--;
@@ -224,35 +276,54 @@ static int rtl_qm_ingress(struct rtl_qm_rx *rx, unsigned int port)
 	if (ret)
 		return ret;
 	/* NI downstream demultiplexer: logical CPU ports 16..23 enter L3QM. */
-	writel(readl(rx->ni + 0xa1dc) & ~0xffffU, rx->ni + 0xa1dc);
-	writel(readl(rx->ni + 0xa1ec) & ~0xffffU, rx->ni + 0xa1ec);
+	ret = rtl_qm_rmw(rx->ni + 0xa1dc, 0xffffU, 0);
+	if (ret)
+		return ret;
+	ret = rtl_qm_rmw(rx->ni + 0xa1ec, 0xffffU, 0);
+	if (ret)
+		return ret;
 	/* Preserve parser operation while admitting the native untagged LAN. */
-	writel(readl(rx->ni + 0x1404) | BIT(0) | BIT(1), rx->ni + 0x1404);
-	return 0;
+	return rtl_qm_rmw(rx->ni + 0x1404, 0, BIT(0) | BIT(1));
 }
 
 int rtl_qm_rx_alloc(struct device *dev, struct rtl_qm_rx *rx)
 {
+	int ret = -ENOMEM;
+
 	rx->device = dev;
 	rx->memory = dma_alloc_noncoherent(dev, RTL_QM_MEMORY_BYTES, &rx->memory_dma,
 		DMA_FROM_DEVICE, GFP_KERNEL);
 	if (!rx->memory)
 		return -ENOMEM;
-	rx->ring_memory = dma_alloc_noncoherent(dev, RTL_QM_RING_BYTES * RTL_QM_VOQS,
+	if (!rtl_qm_dma_range_valid(rx->memory_dma, RTL_QM_MEMORY_BYTES, RTL_QM_BUFFER_BYTES)) {
+		ret = -ERANGE;
+		goto free_payload;
+	}
+	rx->ring_memory = dma_alloc_noncoherent(dev, RTL_QM_RING_MEMORY_BYTES,
 		&rx->ring_dma, DMA_FROM_DEVICE, GFP_KERNEL);
 	if (!rx->ring_memory)
 		goto free_payload;
+	if (!rtl_qm_dma_range_valid(rx->ring_dma, RTL_QM_RING_MEMORY_BYTES, L1_CACHE_BYTES)) {
+		ret = -ERANGE;
+		goto free_ring;
+	}
 	rx->deepq_memory = dma_alloc_coherent(dev, RTL_DQ_MEMORY_BYTES, &rx->deepq_dma, GFP_KERNEL);
-	if (!rx->deepq_memory) {
-		dma_free_noncoherent(dev, RTL_QM_RING_BYTES * RTL_QM_VOQS, rx->ring_memory, rx->ring_dma, DMA_FROM_DEVICE);
-		rx->ring_memory = NULL;
-		goto free_payload;
+	if (!rx->deepq_memory)
+		goto free_ring;
+	if (!rtl_qm_dma_range_valid(rx->deepq_dma, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFER_BYTES)) {
+		ret = -ERANGE;
+		dma_free_coherent(dev, RTL_DQ_MEMORY_BYTES, rx->deepq_memory, rx->deepq_dma);
+		rx->deepq_memory = NULL;
+		goto free_ring;
 	}
 	return 0;
+free_ring:
+	dma_free_noncoherent(dev, RTL_QM_RING_MEMORY_BYTES, rx->ring_memory, rx->ring_dma, DMA_FROM_DEVICE);
+	rx->ring_memory = NULL;
 free_payload:
 	dma_free_noncoherent(dev, RTL_QM_MEMORY_BYTES, rx->memory, rx->memory_dma, DMA_FROM_DEVICE);
 	rx->memory = NULL;
-	return -ENOMEM;
+	return ret;
 }
 
 static unsigned int rtl_dq_read(void *context, unsigned int reg)
@@ -299,9 +370,12 @@ static void rtl_qm_axi_reorder(struct rtl_qm_rx *rx)
 static int rtl_qm_cpu_credits(struct rtl_qm_rx *rx)
 {
 	unsigned int voq;
-	u32 select = readl(rx->ni + 0x95a0) & ~3U;
+	u32 select = readl(rx->ni + 0x95a0);
 	int ret;
 
+	if (select == ~0U)
+		return -EIO;
+	select &= ~3U;
 	/* Configure only CPU0's two Ethernet EQs; CPU2/3 were radio PE owners. */
 	writel((RTL_QM_BUFFERS_PER_EQ / 8) << 16 |
 	       (RTL_QM_BUFFERS_PER_EQ / 64), rx->ni + 0x9580);
@@ -342,55 +416,86 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 {
 	void __iomem *ni = rx->ni;
 	unsigned int i;
-	u32 value;
+	u32 value, cb, rmu, es, reset;
 	int ret;
 	const struct rtl_dq_io dq = {rx, rtl_dq_read, rtl_dq_write, rtl_dq_indirect};
 
 	rx->deepq_configured = false;
-	writel(readl(ni + CB_CTRL) & ~BIT(31), ni + CB_CTRL);
-	writel(readl(ni + RMU_CTRL) & ~BIT(31), ni + RMU_CTRL);
-	writel(readl(ni + ES_CTRL) & ~BIT(31), ni + ES_CTRL);
+	/* Check every initial RMW source before the first write. GLOBAL reset
+	 * is shared with PON/L3: an all-ones read must never reset every block. */
+	cb = readl(ni + CB_CTRL);
+	rmu = readl(ni + RMU_CTRL);
+	es = readl(ni + ES_CTRL);
+	reset = readl(rx->block_reset);
+	if (cb == ~0U || rmu == ~0U || es == ~0U || reset == ~0U)
+		return -EIO;
+	writel(cb & ~BIT(31), ni + CB_CTRL);
+	writel(rmu & ~BIT(31), ni + RMU_CTRL);
+	writel(es & ~BIT(31), ni + ES_CTRL);
 	/* Native ownership starts with the same TQM reset as the stock Linux driver. */
-	writel(readl(rx->block_reset) | BIT(5), rx->block_reset);
+	writel(reset | BIT(5), rx->block_reset);
 	udelay(1000);
-	writel(readl(rx->block_reset) & ~BIT(5), rx->block_reset);
+	ret = rtl_qm_rmw(rx->block_reset, BIT(5), 0);
+	if (ret)
+		return ret;
 	ret = readl_poll_timeout(ni + 0x6850, value, value & BIT(30), 1, 100000);
+	if (value == ~0U)
+		return -EIO;
 	if (ret)
 		return ret;
 	/* ES_CTRL1's declared reset value enables every PUC port. Do not rely
 	 * on a pre-reset gate write surviving the reset's implementation. */
-	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
-	readl(ni + 0x610c);
+	ret = rtl_qm_rmw(ni + 0x610c, 0xffffU, 0);
+	if (ret)
+		return ret;
+	value = readl(ni + 0x610c);
+	if (value == ~0U || (value & 0xffffU))
+		return -EIO;
 	/* TQM reset invalidates old BIDs; all buffers are loaded anew below. */
 	memset(&rx->refill, 0, sizeof(rx->refill));
-	writel(readl(ni + RMU_CTRL) & ~BIT(31), ni + RMU_CTRL);
-	writel(readl(ni + ES_CTRL) & ~BIT(31), ni + ES_CTRL);
+	ret = rtl_qm_rmw(ni + RMU_CTRL, BIT(31), 0);
+	if (ret)
+		return ret;
+	ret = rtl_qm_rmw(ni + ES_CTRL, BIT(31), 0);
+	if (ret)
+		return ret;
 	writel(0, ni + 0x6110);
 	writel(0, ni + 0x6114);
 	/* Hardware write pointers survive ndo_stop/open; retire the old queue first. */
 	for (i = 0; i < RTL_QM_VOQS; i++) {
-		rx->read[i] = readl(ni + EPP_WRITE + i * 4) & (RTL_QM_RING_BYTES - 1);
+		value = readl(ni + EPP_WRITE + i * 4) & 0xffffffU;
+		if (value >= RTL_QM_RING_BYTES || (value & (RTL_QM_COMMAND_BYTES - 1)))
+			return -EIO;
+		rx->read[i] = value;
+	}
+	for (i = 0; i < RTL_QM_VOQS; i++) {
 		writel(rx->read[i], ni + EPP_READ + i * 4);
 	}
-	readl(ni + EPP_READ);
+	for (i = 0; i < RTL_QM_VOQS; i++) {
+		value = readl(ni + EPP_READ + i * 4) & 0xffffffU;
+		if (value != rx->read[i])
+			return -EIO;
+	}
 	rtl_qm_axi_reorder(rx);
 	memset(rx->ring_memory, 0, RTL_QM_RING_BYTES * RTL_QM_VOQS);
 	dma_sync_single_for_device(rx->device, rx->ring_dma,
 		RTL_QM_RING_BYTES * RTL_QM_VOQS, DMA_FROM_DEVICE);
 	dma_sync_single_for_device(rx->device, rx->memory_dma, RTL_QM_MEMORY_BYTES, DMA_FROM_DEVICE);
 	rx->trace_count = 0;
+	rx->next_voq = RTL_QM_VOQS - 1;
 	/* Unused bootloader EQs must not retain overlapping BID ownership. */
 	for (i = 0; i < 16; i++) {
 		writel(0, ni + 0x61e8 + i * 20);
 		writel(0, ni + 0x61ec + i * 20);
 	}
-	/* Distinct EQ4/EQ5: each has 256 buffers and its own BID range. */
-	for (i = 0; i < 2; i++) {
+	/* Distinct EQ4/EQ5: each has its own pool and disjoint BID range. */
+	for (i = 0; i < RTL_QM_CPU_EQ_COUNT; i++) {
 		unsigned int cfg = EQ_CFG + i * 20;
 
 		writel(1, ni + cfg);
-		writel((RTL_QM_BUFFERS_PER_EQ << 16) | (i * RTL_QM_BUFFERS_PER_EQ), ni + cfg + 4);
-		writel(5 | BIT(3) | (24 << 8), ni + cfg + 8);
+		writel((RTL_QM_BUFFERS_PER_EQ << 16) |
+		       (RTL_QM_CPU_BID_FIRST + i * RTL_QM_BUFFERS_PER_EQ), ni + cfg + 4);
+		writel(5 | BIT(3) | (RTL_QM_REFILL_THRESHOLD << 8), ni + cfg + 8);
 		writel(0x61008060, ni + cfg + 12);
 		writel(2, ni + cfg + 16);
 	}
@@ -414,11 +519,18 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	if (ret)
 		return ret;
 	value = readl(ni + 0x6000);
+	if (value == ~0U)
+		return -EIO;
 	writel((value & ~(BIT(11) | BIT(13))) | 0xff, ni + 0x6000);
-	writel(readl(ni + 0x68f4) | BIT(2), ni + 0x68f4);
+	ret = rtl_qm_rmw(ni + 0x68f4, 0, BIT(2));
+	if (ret)
+		return ret;
 	writel(0, ni + 0x6558);
 	/* Stock preserves max_buf_cnt_per_pkt while setting size/coalescing. */
-	writel((readl(ni + 0x657c + EQ_ID * 4) & GENMASK(31, 29)) |
+	value = readl(ni + 0x657c + EQ_ID * 4);
+	if (value == ~0U)
+		return -EIO;
+	writel((value & GENMASK(31, 29)) |
 	       ((RTL_QM_RING_BYTES / 16) << 8) | 0xf2,
 	       ni + 0x657c + EQ_ID * 4);
 	for (i = 0; i < RTL_QM_VOQS; i++) {
@@ -426,7 +538,7 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		writel(rx->ring_dma + i * RTL_QM_RING_BYTES, ni + EPP_BASE + i * 4);
 	}
 	for (i = 0; i < RTL_QM_BUFFERS; i++) {
-		ret = rtl_qm_push(rx, rx->memory_dma + RTL_QM_RING_BYTES * RTL_QM_VOQS +
+		ret = rtl_qm_push(rx, rx->memory_dma + RTL_QM_PAYLOAD_OFFSET +
 				  i * RTL_QM_BUFFER_BYTES, EQ_ID + i / RTL_QM_BUFFERS_PER_EQ);
 		if (ret)
 			return ret;
@@ -435,7 +547,9 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 	if (ret)
 		return ret;
 	writel(0xff, ni + 0x63c4);
-	writel(readl(ni + 0xa1bc) & ~0xffU, ni + 0xa1bc);
+	ret = rtl_qm_rmw(ni + 0xa1bc, 0xffU, 0);
+	if (ret)
+		return ret;
 	/* All registered LAN sources use the shared CPU0 receive pool. */
 	for (i = 0; i < ARRAY_SIZE(rx->lan); i++)
 		if (rcu_access_pointer(rx->lan[i])) {
@@ -451,30 +565,42 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 		ret = rtl_qm_window_idle(rx, 0x2db4);
 		if (ret)
 			return ret;
-		writel(0x8e308000, ni + 0x2db8);
+		writel(RTL_L2QM_PORT_FREE_CREDIT, ni + 0x2db8);
 		ret = rtl_qm_indirect(rx, 0x2db4, BIT(31) | BIT(30) | i);
 		if (ret)
 			return ret;
 	}
 	/* Enable both CPU forwarding and the queue-manager fabric connection. */
-	writel(readl(ni + 0x2300) | BIT(8) | BIT(9), ni + 0x2300);
+	ret = rtl_qm_rmw(ni + 0x2300, 0, BIT(8) | BIT(9));
+	if (ret)
+		return ret;
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 8);
 	writel(0xff | (6 << 16), ni + 0x2304 + 12 * 9);
 	/* Stock aal_l3_te_init starts CB scanning after credit initialization. */
 	/* Reassert the closed PON gate before either ES or RMU is enabled.
 	 * NI alone publishes the requested mask after full host activation. */
-	writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);
-	readl(ni + 0x610c);
-	writel(readl(ni + CB_CTRL) | BIT(31), ni + CB_CTRL);
+	ret = rtl_qm_rmw(ni + 0x610c, 0xffffU, 0);
+	if (ret)
+		return ret;
+	value = readl(ni + 0x610c);
+	if (value == ~0U || (value & 0xffffU))
+		return -EIO;
+	ret = rtl_qm_rmw(ni + CB_CTRL, 0, BIT(31));
+	if (ret)
+		return ret;
 	/* The CB conditions only govern admission when L3 tail-drop is enabled. */
-	writel(readl(ni + 0x9004) | BIT(2), ni + 0x9004);
+	ret = rtl_qm_rmw(ni + 0x9004, 0, BIT(2));
+	if (ret)
+		return ret;
 	/* CRC is stripped by QM; CPU0 dequeue and normal NI input are enabled. */
 	/* Keep the reset EPP wait setting, as the vendor RMW sequence does. */
 	writel(0x8462ff01, ni + ES_CTRL);
 	/* NI's lifetime owner enables the requested PON ports under tx_lock
 	 * only after FE validation and host publication. Do not race its saved
 	 * recovery mask or open PON egress during a failed cold initialization. */
-	writel(readl(ni + RMU_CTRL) | BIT(31), ni + RMU_CTRL);
+	ret = rtl_qm_rmw(ni + RMU_CTRL, 0, BIT(31));
+	if (ret)
+		return ret;
 	rx->deepq_configured = true;
 	return 0;
 }
@@ -482,10 +608,12 @@ int rtl_qm_rx_start(struct rtl_qm_rx *rx, unsigned int port)
 void rtl_qm_rx_stop(struct rtl_qm_rx *rx)
 {
 	rx->deepq_configured = false;
-	writel(readl(rx->ni + CB_CTRL) & ~BIT(31), rx->ni + CB_CTRL);
-	writel(readl(rx->ni + 0x610c) & ~0xffffU, rx->ni + 0x610c);
-	writel(readl(rx->ni + RMU_CTRL) & ~BIT(31), rx->ni + RMU_CTRL);
-	writel(readl(rx->ni + ES_CTRL) & ~BIT(31), rx->ni + ES_CTRL);
+	/* Best-effort gates only; neither success nor failure here proves drain
+	 * or licenses releasing an exposed DMA owner. Preserve unknown words. */
+	rtl_qm_rmw(rx->ni + CB_CTRL, BIT(31), 0);
+	rtl_qm_rmw(rx->ni + 0x610c, 0xffffU, 0);
+	rtl_qm_rmw(rx->ni + RMU_CTRL, BIT(31), 0);
+	rtl_qm_rmw(rx->ni + ES_CTRL, BIT(31), 0);
 }
 
 void rtl_qm_rx_free(struct device *dev, struct rtl_qm_rx *rx)
@@ -514,12 +642,16 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 	struct net_device *dev = napi->dev;
 	int cos;
 	int count = 0;
+	unsigned int published[RTL_QM_VOQS], available = 0;
 	u64 begin = READ_ONCE(rx->profile) ? ktime_get_ns() : 0;
-	bool checksum_enabled = readl(rx->ni + 0x3218) & BIT(16);
+	u32 checksum_control = readl(rx->ni + 0x3218);
+	bool checksum_enabled = checksum_control != ~0U && (checksum_control & BIT(16));
 
 	rtl_qm_refill_drain(&rx->refill, rx, rtl_qm_try_push, NAPI_POLL_WEIGHT);
-	/* Service PON control traffic before bulk data, matching the stock RX order. */
-	for (cos = RTL_QM_VOQS - 1; cos >= 0 && count < budget; cos--) {
+	/* Sample each VOQ once, highest priority first. An EPP published after
+	 * this snapshot belongs to the next NAPI poll, including extensions of
+	 * a shared cache line. No extra MMIO polling is needed per service burst. */
+	for (cos = RTL_QM_VOQS - 1; cos >= 0 && budget > 0; cos--) {
 		/* Stock ca_ni_rx_napi consumes only the published pointer interval.
 		 * Queue status can precede DDR publication and does not republish EPPs. */
 		unsigned int wr = readl(rx->ni + EPP_WRITE + cos * 4) & 0xffffff;
@@ -550,9 +682,28 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			if (end > rd)
 				dma_sync_single_for_cpu(rx->device, rx->ring_dma + base + rd,
 					end - rd, DMA_FROM_DEVICE);
+			published[cos] = wr;
+			available |= BIT(cos);
 		}
+	}
 
-		while (rx->read[cos] != wr && count < budget) {
+	/* A continuously busy high-priority VOQ previously consumed the entire
+	 * poll forever. Rotate bounded bursts so all eight queues get a visit
+	 * within one full default-budget poll. Keep the cursor across short
+	 * budgets too. Empty queues cost no budget, and a sole busy queue can
+	 * reuse the whole poll rather than being left until the 1ms timer. */
+	while (available && count < budget) {
+		unsigned int wr;
+		int limit = count + (budget - count > RTL_QM_RX_QUANTUM ?
+				    RTL_QM_RX_QUANTUM : budget - count);
+
+		cos = rx->next_voq < RTL_QM_VOQS ? rx->next_voq : RTL_QM_VOQS - 1;
+		while (!(available & BIT(cos)))
+			cos = cos ? cos - 1 : RTL_QM_VOQS - 1;
+		rx->next_voq = cos ? cos - 1 : RTL_QM_VOQS - 1;
+		wr = published[cos];
+
+		while (rx->read[cos] != wr && count < limit) {
 			unsigned int read = rx->read[cos];
 			void *entry = rx->ring_memory + cos * RTL_QM_RING_BYTES + read;
 			u32 command, length_word, address, offset, h0, h1;
@@ -560,6 +711,7 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			struct sk_buff *skb;
 			struct net_device *input;
 			unsigned int source;
+			int mcast_copy;
 			bool refill_buffer = false, valid_buffer;
 
 			dma_rmb();
@@ -567,18 +719,25 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			length_word = get_unaligned_le32(entry + 4);
 			address = command & 0xffffff80;
 			offset = address - lower_32_bits(rx->memory_dma);
-			/* Each CPU EQ owns a separate 256-buffer partition. Returning an
+			/* Each CPU EQ owns a separate buffer partition. Returning an
 			 * address from EQ4 as EQ5 (or vice versa) would create two owners
 			 * of that RAM, even though the address is in the overall pool. */
-			valid_buffer = offset >= RTL_QM_RING_BYTES * RTL_QM_VOQS &&
-				offset <= RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES &&
+			/* Unsigned subtraction also rejects addresses below the payload
+			 * base. Allocation validation already excluded 32-bit wrap. */
+			valid_buffer = offset <= RTL_QM_MEMORY_BYTES - RTL_QM_BUFFER_BYTES &&
 				!(offset & (RTL_QM_BUFFER_BYTES - 1)) &&
 				(command & 15) == EQ_ID +
-				(offset - RTL_QM_RING_BYTES * RTL_QM_VOQS) /
+				offset /
 				(RTL_QM_BUFFERS_PER_EQ * RTL_QM_BUFFER_BYTES);
 			if (valid_buffer &&
-			    rx->refill.count[(command & 15) - EQ_ID] == RTL_QM_REFILL_SIZE)
+			    rx->refill.count[(command & 15) - EQ_ID] >= RTL_QM_REFILL_SIZE) {
+				/* This EPP still owns its payload. Do not retire it or
+				 * overwrite a full deferred-return ring just to continue
+				 * polling. The existing 1ms pending-refill timer retries. */
+				rx->refill.eq_full_stalls[(command & 15) - EQ_ID]++;
+				available &= ~BIT(cos);
 				break;
+			}
 			rx->last_address = command;
 			rx->last_size = length_word;
 			count++;
@@ -606,6 +765,9 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 				dev->stats.rx_errors++;
 				goto consume;
 			}
+			/* Observe source27 candidates before demux drops them. This is
+			 * evidence only: no inferred ingress, domain or forwarded mark. */
+			rtl_mcast_observe_rx(&rx->mcast_observe, h0, h1, length);
 			rx->cpu_packets++;
 			rx->cpu_bytes += length;
 			/* Warm only validated, CPU-owned bytes while allocating the skb. */
@@ -628,6 +790,12 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			/* Packet bytes and metadata are private now. Return the EPP
 			 * credit before GRO or endpoint callbacks can hold up the poll. */
 			rtl_qm_rx_retire(rx, cos, command, refill_buffer);
+			mcast_copy = rtl_fe_mcast_rx(rx->fe, skb, h0, h1, &source);
+			if (mcast_copy < 0) {
+				dev->stats.rx_dropped++;
+				dev_kfree_skb_any(skb);
+				continue;
+			}
 			if (source >= ARRAY_SIZE(rx->lan)) {
 				struct rtl9617c_ni_endpoint *endpoint;
 
@@ -645,7 +813,10 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			}
 			rcu_read_lock();
 			input = rcu_dereference(rx->lan[source]);
-			if (!input || !netif_running(input)) {
+			if (!input || !netif_running(input) ||
+			    (mcast_copy &&
+			     !rtl9617c_mcast_copy_valid(skb, input,
+					netdev_master_upper_dev_get_rcu(input)))) {
 				dev->stats.rx_dropped++;
 				dev_kfree_skb_any(skb);
 				rcu_read_unlock();
@@ -669,12 +840,21 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			skb->protocol = eth_type_trans(skb, input);
 			input->stats.rx_packets++;
 			input->stats.rx_bytes += length;
-			napi_gro_receive(napi, skb);
+			/* Immutable epoch metadata must survive unchanged to bridge
+			 * validation. GRO may merge different hardware generations. */
+			if (mcast_copy)
+				netif_receive_skb(skb);
+			else
+				napi_gro_receive(napi, skb);
 			rcu_read_unlock();
 			continue;
 consume:
 			rtl_qm_rx_retire(rx, cos, command, refill_buffer);
 		}
+		if (rx->read[cos] == wr)
+			available &= ~BIT(cos);
+		else if (available & BIT(cos))
+			rx->voq_yields[cos]++;
 	}
 	/* Every EPP is retired before its BID can return to hardware. */
 	rtl_qm_refill_drain(&rx->refill, rx, rtl_qm_try_push, NAPI_POLL_WEIGHT);
@@ -689,7 +869,17 @@ consume:
 
 ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 {
-	return sysfs_emit(buf, "voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u cpu_packets=%llu cpu_bytes=%llu ring_errors=%llu buffer_errors=%llu\n",
+	return sysfs_emit(buf,
+		"voq7=%llu voq6=%llu voq5=%llu voq4=%llu voq3=%llu voq2=%llu voq1=%llu voq0=%llu "
+		"budget_hits=%llu rx_prefetch=%u pppoe_checksum=%u cpu_packets=%llu cpu_bytes=%llu "
+		"ring_errors=%llu buffer_errors=%llu refill_eq4_pending=%u refill_eq5_pending=%u "
+		"refill_eq4_peak=%u refill_eq5_peak=%u refill_eq4_retries=%llu refill_eq5_retries=%llu "
+		"refill_eq4_returned=%llu refill_eq5_returned=%llu refill_eq4_full_stalls=%llu refill_eq5_full_stalls=%llu "
+		"refill_eq4_bad_credit=%llu refill_eq5_bad_credit=%llu refill_eq4_bad_ready=%llu refill_eq5_bad_ready=%llu "
+		"voq7_yields=%llu voq6_yields=%llu voq5_yields=%llu voq4_yields=%llu "
+		"voq3_yields=%llu voq2_yields=%llu voq1_yields=%llu voq0_yields=%llu next_voq=%u "
+		"mc_rx_hdr_bum=%llu mc_rx_source27=%llu mc_rx_source27_cpu=%llu mc_rx_source27_ptp=%llu "
+		"mc_rx_source27_pol=%llu mc_rx_source27_mirror=%llu mc_rx_last_header=%016llx mc_rx_forwarding_proven=0\n",
 		READ_ONCE(rx->voq_packets[7]), READ_ONCE(rx->voq_packets[6]),
 		READ_ONCE(rx->voq_packets[5]), READ_ONCE(rx->voq_packets[4]),
 		READ_ONCE(rx->voq_packets[3]), READ_ONCE(rx->voq_packets[2]),
@@ -697,7 +887,24 @@ ssize_t rtl_qm_rx_voq_state(struct rtl_qm_rx *rx, char *buf)
 		READ_ONCE(rx->poll_budget_hits), READ_ONCE(rx->rx_prefetch),
 		READ_ONCE(rx->pppoe_rx_checksum), READ_ONCE(rx->cpu_packets),
 		READ_ONCE(rx->cpu_bytes), READ_ONCE(rx->ring_errors),
-		READ_ONCE(rx->buffer_errors));
+		READ_ONCE(rx->buffer_errors),
+		READ_ONCE(rx->refill.count[0]), READ_ONCE(rx->refill.count[1]),
+		READ_ONCE(rx->refill.eq_peak[0]), READ_ONCE(rx->refill.eq_peak[1]),
+		READ_ONCE(rx->refill.eq_retries[0]), READ_ONCE(rx->refill.eq_retries[1]),
+		READ_ONCE(rx->refill.eq_returned[0]), READ_ONCE(rx->refill.eq_returned[1]),
+		READ_ONCE(rx->refill.eq_full_stalls[0]),
+		READ_ONCE(rx->refill.eq_full_stalls[1]),
+		READ_ONCE(rx->refill.eq_bad_credit[0]), READ_ONCE(rx->refill.eq_bad_credit[1]),
+		READ_ONCE(rx->refill.eq_bad_ready[0]), READ_ONCE(rx->refill.eq_bad_ready[1]),
+		READ_ONCE(rx->voq_yields[7]), READ_ONCE(rx->voq_yields[6]),
+		READ_ONCE(rx->voq_yields[5]), READ_ONCE(rx->voq_yields[4]),
+		READ_ONCE(rx->voq_yields[3]), READ_ONCE(rx->voq_yields[2]),
+		READ_ONCE(rx->voq_yields[1]), READ_ONCE(rx->voq_yields[0]),
+		READ_ONCE(rx->next_voq),
+		READ_ONCE(rx->mcast_observe.hdr_bum), READ_ONCE(rx->mcast_observe.source27),
+		READ_ONCE(rx->mcast_observe.source27_cpu), READ_ONCE(rx->mcast_observe.source27_ptp),
+		READ_ONCE(rx->mcast_observe.source27_pol_nonzero), READ_ONCE(rx->mcast_observe.source27_mirror),
+		READ_ONCE(rx->mcast_observe.last_source27_header));
 }
 
 ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
@@ -707,7 +914,7 @@ ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 	 * selector. The returned bus sample is labeled with the observed selector,
 	 * not silently interpreted as the formerly forced bus 0x82. */
 	u32 monitor_selector = readl(rx->ni + 0x105c);
-	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%u refill_returned=%u refill_peak=%u\n",
+	return sysfs_emit(buf, "memory=%pad rmu=%08x es=%08x status=%08x eqreq=%08x pushrdy=%08x epp=%08x wr0=%u rd0=%u last=%08x/%08x hdra=%08x/%08x monitor=%08x monitor_selector=%08x monitor_atomic=0 ni_demux=%08x rxcount=%u txcount=%u no_buffer=%u last_no_buffer_EQ=%u VOQ=%u fe_drop=%u lenerr=%u td_global=%08x td_port=%08x td_priority=%08x l3te_control=%08x l3te_packets=%u l3te_tail_drop=%u refill_pending=%u refill_retries=%llu refill_returned=%llu refill_peak=%u refill_eq4_pending=%u refill_eq5_pending=%u refill_eq4_peak=%u refill_eq5_peak=%u refill_eq4_retries=%llu refill_eq5_retries=%llu refill_eq4_returned=%llu refill_eq5_returned=%llu refill_eq4_full_stalls=%llu refill_eq5_full_stalls=%llu refill_eq4_bad_credit=%llu refill_eq5_bad_credit=%llu refill_eq4_bad_ready=%llu refill_eq5_bad_ready=%llu\n",
 		&rx->memory_dma, readl(rx->ni + RMU_CTRL), readl(rx->ni + ES_CTRL),
 		readl(rx->ni + 0x6850), readl(rx->ni + 0x6328 + EQ_ID * 4),
 		readl(rx->ni + CPU_READY), readl(rx->ni + 0x659c),
@@ -719,7 +926,14 @@ ssize_t rtl_qm_rx_state(struct rtl_qm_rx *rx, char *buf)
 		readl(rx->ni + 0x6824), readl(rx->ni + 0x2d60), readl(rx->ni + 0x2d64),
 		readl(rx->ni + 0x2d78), readl(rx->ni + 0x9004),
 		readl(rx->ni + 0x9710), readl(rx->ni + 0x971c), READ_ONCE(rx->refill.pending),
-		rx->refill.retries, rx->refill.returned, rx->refill.peak);
+		READ_ONCE(rx->refill.retries), READ_ONCE(rx->refill.returned), READ_ONCE(rx->refill.peak),
+		READ_ONCE(rx->refill.count[0]), READ_ONCE(rx->refill.count[1]),
+		READ_ONCE(rx->refill.eq_peak[0]), READ_ONCE(rx->refill.eq_peak[1]),
+		READ_ONCE(rx->refill.eq_retries[0]), READ_ONCE(rx->refill.eq_retries[1]),
+		READ_ONCE(rx->refill.eq_returned[0]), READ_ONCE(rx->refill.eq_returned[1]),
+		READ_ONCE(rx->refill.eq_full_stalls[0]), READ_ONCE(rx->refill.eq_full_stalls[1]),
+		READ_ONCE(rx->refill.eq_bad_credit[0]), READ_ONCE(rx->refill.eq_bad_credit[1]),
+		READ_ONCE(rx->refill.eq_bad_ready[0]), READ_ONCE(rx->refill.eq_bad_ready[1]));
 }
 
 ssize_t rtl_qm_deepq_state(struct rtl_qm_rx *rx, char *buf)
@@ -727,8 +941,9 @@ ssize_t rtl_qm_deepq_state(struct rtl_qm_rx *rx, char *buf)
 	ssize_t length;
 	unsigned int eq, cfg;
 
-	length = sysfs_emit(buf, "configured=%u memory=%pad bytes=%u buffers_per_pool=%u map=%08x puc_enable=%08x profile=%08x port16=%08x port31=%08x\n",
+	length = sysfs_emit(buf, "configured=%u memory=%pad bytes=%u buffers_per_pool=%u bid_first=%u bid_end_exclusive=%u lan_deepq_supported=0 map=%08x puc_enable=%08x profile=%08x port16=%08x port31=%08x\n",
 		rx->deepq_configured, &rx->deepq_dma, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFERS,
+		RTL_DQ_BID_FIRST, RTL_DQ_BID_END,
 		readl(rx->ni + 0x68f8), readl(rx->ni + 0x610c), readl(rx->ni + 0x612c),
 		readl(rx->ni + 0x6148 + 16 * 4), readl(rx->ni + 0x6148 + 31 * 4));
 	for (eq = RTL_DQ_EQ_PRIVATE; eq <= RTL_DQ_EQ_SHARED; eq++) {
@@ -757,10 +972,14 @@ ssize_t rtl_qm_rx_trace(struct rtl_qm_rx *rx, char *buf)
 
 ssize_t rtl_qm_rx_pool(struct rtl_qm_rx *rx, char *buf)
 {
-	ssize_t length = 0;
+	ssize_t length;
 	unsigned int i;
 
-	for (i = 0; i < 2; i++) {
+	length = sysfs_emit(buf, "cpu_buffers=%u buffers_per_eq=%u payload_bytes=%u ring_bytes_per_voq=%u ring_commands_per_voq=%u refill_slots_per_eq=%u bid_first=%u bid_end_exclusive=%u\n",
+		RTL_QM_BUFFERS, RTL_QM_BUFFERS_PER_EQ, RTL_QM_PAYLOAD_BYTES,
+		RTL_QM_RING_BYTES, RTL_QM_RING_COMMANDS, RTL_QM_REFILL_SIZE,
+		RTL_QM_CPU_BID_FIRST, RTL_QM_CPU_BID_END);
+	for (i = 0; i < RTL_QM_CPU_EQ_COUNT; i++) {
 		unsigned int cfg = EQ_CFG + i * 20;
 		unsigned int monitor = 0x66d8 + (EQ_ID + i) * 16;
 		length += scnprintf(buf + length, PAGE_SIZE - length,

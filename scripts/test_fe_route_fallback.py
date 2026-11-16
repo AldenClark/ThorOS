@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run production FE fallback admission for legal bridge-unreachable builds.
+"""Run production shared-L3 selector safety and bridge-unreachable fallback.
 
 The shipped TYFZA1 configuration has built-in bridge/switchdev/guard and does
-not use this branch. This checks a supported BRIDGE=n/m configuration variant,
-not a claimed explanation or benchmark for production board throughput.
+not use the fallback branch. The shared LPB selector/gate/arm functions are
+also used by the native owner. Neither host fixture is an ASIC benchmark.
 """
 import hashlib
 import json
@@ -51,15 +51,28 @@ struct rtl_fe {
  unsigned int pending_withdrawals;
  uint32_t reg[0x10000/4],initial_lan[FE_LAN_PORTS];
  unsigned int writes,lan25_writes,lan16_writes,fail_cpu_mask,fail_route_mask;
+ unsigned int all_ones_mask,all_ones_at[2],selector_reads[2],selector_writes[2];
+ uint32_t initial_lpb[2];
 };
 static unsigned int fe_read(void *context,unsigned int reg){
- struct rtl_fe *fe=context;assert(reg<0x10000);return fe->reg[reg/4];
+ struct rtl_fe *fe=context;assert(reg<0x10000);
+ if(reg==0x3418 || reg==0x3424){
+  unsigned int side=reg==0x3424;
+  fe->selector_reads[side]++;
+  if((fe->all_ones_mask&BIT(side)) ||
+     fe->selector_reads[side]==fe->all_ones_at[side])return ~0U;
+ }
+ return fe->reg[reg/4];
 }
 static void fe_write(void *context,unsigned int reg,unsigned int value){
  struct rtl_fe *fe=context;assert(reg<0x10000);fe->writes++;
  if(reg==0x3418 || reg==0x3424){
   assert(fe->route_lock.held);
   unsigned int side=reg==0x3424,profile=(value>>10)&15;
+  /* The actual RMW must never copy a failed all-ones read into any
+   * unrelated LPB bit, even if its profile readback later fails. */
+  assert((value&~(15U<<10))==(fe->initial_lpb[side]&~(15U<<10)));
+  fe->selector_writes[side]++;
   if(profile==0)
    for(unsigned int port=0;port<FE_LAN_PORTS;port++)
     assert(((fe_read(fe,FE_LAN_RX_CTRL(port))>>16)&63)==16);
@@ -91,7 +104,9 @@ tests = r'''
 static void initialize(struct rtl_fe *fe){
  memset(fe,0,sizeof(*fe));
  fe->enabled=fe->prepared=fe->engine_ready=fe->route_gate_ready=true;
- fe->reg[0x3418/4]=fe->reg[0x3424/4]=1U<<10;
+ for(unsigned int side=0;side<2;side++)
+  fe->reg[(0x3418+side*12)/4]=fe->initial_lpb[side]=
+   ((0xa5a0035aU^(side<<28))&~(15U<<10))|(1U<<10);
  for(unsigned int port=0;port<FE_LAN_PORTS;port++)
   fe->reg[FE_LAN_RX_CTRL(port)/4]=fe->initial_lan[port]=
    0x18100400U|(port<<24)|port;
@@ -102,8 +117,63 @@ static void expect_lan(struct rtl_fe *fe,unsigned int target){
   assert((rx&BIT(28)) && ((rx>>16)&63)==target);
  }
 }
+static void selector_read_faults(void){
+ struct rtl_fe fe;
+ unsigned long flags;
+ /* Each connector can fail before RMW or at readback. Both selectors
+  * must still be observed; failure never turns into successful admission
+  * merely because the other connector accepted its write. */
+ for(unsigned int side=0;side<2;side++)
+  for(unsigned int profile=0;profile<2;profile++)
+   for(unsigned int read=1;read<=2;read++){
+    initialize(&fe);
+    for(unsigned int other=0;other<2;other++)
+     fe.reg[(0x3418+other*12)/4]=
+      (fe.initial_lpb[other]&~(15U<<10))|((profile^1U)<<10);
+    fe.all_ones_at[side]=read;
+    spin_lock_irqsave(&fe.route_lock,flags);
+    assert(!fe_route_select_locked(&fe,profile));
+    spin_unlock_irqrestore(&fe.route_lock,flags);
+    assert(fe.selector_reads[0]==2 && fe.selector_reads[1]==2);
+    assert(fe.selector_writes[side]==(read==2));
+    assert(fe.selector_writes[side^1U]==1);
+    assert(((fe.reg[(0x3418+(side^1U)*12)/4]>>10)&15)==profile);
+    assert(((fe.reg[(0x3418+side*12)/4]>>10)&15)==
+           (read==1?(profile^1U):profile));
+   }
+ for(unsigned int side=0;side<2;side++){
+  /* Administrative disable is not the same as never owning L3. Its
+   * retained LPBs must still be closed, even with no withdrawal latch. */
+  initialize(&fe);fe.enabled=false;
+  for(unsigned int other=0;other<2;other++)
+   fe.reg[(0x3418+other*12)/4]=fe.initial_lpb[other]&~(15U<<10);
+  fe.all_ones_mask=BIT(side);fe_route_gate(&fe);
+  assert(!fe.route_gate_verified && !fe.route_admitted);
+  assert(!fe.selector_writes[side] && fe.selector_writes[side^1U]==1);
+  assert(!fe_route_arm(&fe) && !fe.route_gate_verified && !fe.route_admitted);
+  fe.all_ones_mask=0;fe_route_gate(&fe);
+  assert(fe.route_gate_verified && !fe.route_admitted);
+  for(unsigned int other=0;other<2;other++)
+   assert(((fe.reg[(0x3418+other*12)/4]>>10)&15)==1);
+  /* Normal arm must likewise refuse a persistently inaccessible LPB;
+   * its best-effort CPU recovery may not claim both sides were gated. */
+  initialize(&fe);fe.all_ones_mask=BIT(side);
+  assert(!fe_route_arm(&fe) && !fe.route_gate_verified && !fe.route_admitted);
+  assert(!fe.selector_writes[side]);
+ }
+ /* A genuinely cold native-only owner has no configured L3 gate. Do not
+  * read or write a foreign LPB just to manufacture a verified boolean. */
+ initialize(&fe);fe.enabled=fe.prepared=fe.route_gate_ready=false;
+ fe_route_gate(&fe);
+ assert(!fe.writes && !fe.selector_reads[0] && !fe.selector_reads[1]);
+ assert(!fe.route_gate_verified && !fe.route_admitted && fe_route_arm(&fe));
+ assert(!fe.writes && !fe.selector_reads[0] && !fe.selector_reads[1]);
+ fe.pending_withdrawals=1;
+ assert(!fe_route_arm(&fe) && !fe.route_gate_verified && !fe.writes);
+}
 int main(void){
  struct rtl_fe fe;
+ selector_read_faults();
  /* Valid baseline routing is still available without a reachable bridge. */
  initialize(&fe);fe_switch_reconcile_locked(&fe);
  assert(fe.route_admitted && fe_switch_flow_allowed(&fe));expect_lan(&fe,25);
@@ -156,7 +226,7 @@ int main(void){
   fe_switch_reconcile_locked(&fe);expect_lan(&fe,16);assert(!fe.writes);
   assert(!fe_switch_flow_allowed(&fe));
  }
- puts("Legal bridge-unreachable FE fallback: route/CPU selector readback precedes every RX25 opening; failure keeps CPU16; native production path unchanged");
+ puts("Production shared-L3 selector: all-ones RMW rejected on both LPBs, readback/ignored writes and retained/cold ownership checked; bridge-unreachable fallback never opens RX25 before verified route/CPU selection");
 }
 '''
 
@@ -175,6 +245,11 @@ old_order = reconcile.replace(check, '').replace(
     '\tfe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));',
     '\tfe_read(fe, FE_LAN_RX_CTRL(FE_LAN_PORTS - 1));\n\tfe_route_arm(fe);')
 mutants = {
+    'all_ones_used_as_RMW_base': production.replace(
+        '  if(value==~0U) {selected=false;continue;}\n', ''),
+    'only_first_LPB_readback_checked': production.replace(
+        ' for(i=0;i<2;i++)\n  if(((fe_read(fe,0x3418+i*12)>>10)&15)!=profile)selected=false;',
+        ' for(i=0;i<1;i++)\n  if(((fe_read(fe,0x3418+i*12)>>10)&15)!=profile)selected=false;'),
     'open_RX25_before_unchecked_arm': production.replace(reconcile, old_order),
     'ignore_failed_route_arm': production.replace(
         check, '\tfe_switch_quiesce_locked(fe);\n\tfe_route_arm(fe);\n'),
@@ -201,7 +276,10 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-route-fallba
 (root / 'logs/fe-route-fallback.json').write_text(json.dumps({
     'FE_source_sha256': hashlib.sha256(native.encode()).hexdigest(),
     'switch_source_sha256': hashlib.sha256(switch.encode()).hexdigest(),
-    'configuration': 'legal bridge-unreachable variant; not shipped TYFZA1 native-L2 path',
+    'configuration': 'shared production L3 selectors and legal bridge-unreachable fallback variant',
+    'all_ones_LPB_RMW_refused': True,
+    'both_LPB_readbacks_required': True,
+    'cold_unowned_L3_has_no_MMIO': True,
     'pending_CPU_gate_readback_precedes_RX25': True,
     'normal_route_arm_readback_precedes_RX25': True,
     'existing_RX25_quiesced_before_route_readmission': True,

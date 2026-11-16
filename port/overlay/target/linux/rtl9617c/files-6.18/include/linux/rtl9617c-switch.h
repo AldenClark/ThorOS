@@ -11,7 +11,8 @@
 struct net;
 struct net_device;
 
-/* Control-plane state only; never consulted on the packet fast path. */
+/* Policy epoch.  The exceptional MCE CPU-copy path also validates this
+ * epoch before handing an already replicated frame to a bridge. */
 struct rtl9617c_switch_net {
 	u64 generation;
 	unsigned int active;
@@ -41,6 +42,9 @@ struct rtl9617c_switch_guard {
 	struct net *net;
 	const struct rtl9617c_switch_guard_ops *ops;
 	void *priv;
+	/* Allocated once per registration, never reused during this boot. */
+	u64 identity;
+	bool armed;
 	bool registered;
 };
 
@@ -50,6 +54,8 @@ struct rtl9617c_switch_guard {
  */
 bool br_rtl9617c_l2_eligible(const struct net_device *master);
 bool br_rtl9617c_l2_port_eligible(const struct net_device *port);
+/* Additional admission for the native 802.1Q tagged-only IVL backend. */
+bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port);
 #else
 static inline bool br_rtl9617c_l2_eligible(const struct net_device *master)
 {
@@ -59,9 +65,20 @@ static inline bool br_rtl9617c_l2_port_eligible(const struct net_device *port)
 {
 	return false;
 }
+static inline bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port)
+{
+	return false;
+}
 #endif
 
 #if IS_REACHABLE(CONFIG_BRIDGE)
+/* RTNL held; raw jiffies, matching bridge FDB hold_time(), including
+ * topology-change forward_delay. The caller's generation gate provides
+ * consistency with concurrent STP timer/BPDU writers. Zero disables dynamic
+ * learning, not permanent ownership of previously learned entries. Do not
+ * round a positive sub-second interval to the special zero policy. */
+int br_rtl9617c_fdb_hold_time(const struct net_device *master,
+				unsigned long *ticks);
 /* Delete only a still-owned dynamic HW-learned VID-0 entry.  Unlike a broad
  * DEL_TO_BRIDGE event this must never remove a newer user/static/local row.
  */
@@ -70,7 +87,17 @@ bool br_rtl9617c_fdb_forget(const struct net_device *port,
 int br_rtl9617c_fdb_learn(const struct net_device *port,
 			 const unsigned char *addr,
 			 struct rtl9617c_switch_guard *guard, u64 generation);
+int br_rtl9617c_fdb_learn_vid(const struct net_device *port,
+			     const unsigned char *addr, u16 vid,
+			     struct rtl9617c_switch_guard *guard, u64 generation);
+bool br_rtl9617c_fdb_forget_vid(const struct net_device *port,
+			       const unsigned char *addr, u16 vid);
 #else
+static inline int br_rtl9617c_fdb_hold_time(const struct net_device *master,
+					 unsigned long *ticks)
+{
+	return -EOPNOTSUPP;
+}
 static inline bool br_rtl9617c_fdb_forget(const struct net_device *port,
 				       const unsigned char *addr)
 {
@@ -82,6 +109,56 @@ static inline int br_rtl9617c_fdb_learn(const struct net_device *port,
 				      u64 generation)
 {
 	return -EOPNOTSUPP;
+}
+static inline int br_rtl9617c_fdb_learn_vid(const struct net_device *port,
+					  const unsigned char *addr, u16 vid,
+					  struct rtl9617c_switch_guard *guard,
+					  u64 generation)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool br_rtl9617c_fdb_forget_vid(const struct net_device *port,
+					    const unsigned char *addr, u16 vid)
+{
+	return false;
+}
+#endif
+
+#if IS_REACHABLE(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
+/* RTNL held, with no driver's FE mutex held across notifications.  Publish
+ * only an already programmed static-sticky or LOCAL FDB row.  local requires
+ * port==NULL and means CPU delivery, including a port-owned LOCAL address;
+ * otherwise port must still be a member of master and match the FDB dst.
+ *
+ * cookie is returned only on success.  It identifies this exact publication,
+ * independently of the policy generation, entry address or a recycled guard
+ * pointer.  Keep the bridge device alive until cleanup; cleanup removes only
+ * this owner's mark and never deletes or reassigns an FDB entry. */
+int br_rtl9617c_fdb_offload(const struct net_device *master,
+			   const struct net_device *port,
+			   const unsigned char *addr, unsigned short vid, bool local,
+			   struct rtl9617c_switch_guard *guard, u64 generation,
+			   u64 *cookie);
+bool br_rtl9617c_fdb_unoffload(const struct net_device *master,
+			      const unsigned char *addr, unsigned short vid,
+			      struct rtl9617c_switch_guard *guard, u64 cookie);
+#else
+static inline int br_rtl9617c_fdb_offload(const struct net_device *master,
+				       const struct net_device *port,
+				       const unsigned char *addr,
+				       unsigned short vid, bool local,
+				       struct rtl9617c_switch_guard *guard,
+				       u64 generation, u64 *cookie)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool br_rtl9617c_fdb_unoffload(const struct net_device *master,
+					  const unsigned char *addr,
+					  unsigned short vid,
+					  struct rtl9617c_switch_guard *guard,
+					  u64 cookie)
+{
+	return false;
 }
 #endif
 

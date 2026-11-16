@@ -1,0 +1,153 @@
+From: ThorOS maintainers
+Subject: [PATCH] bridge: validate immutable RTL9617C multicast copy epochs
+
+An MCE CPU copy has already been replicated to an exact native LAN set.
+It must not borrow the receiving port's current switchdev hardware domain,
+nor be reflooded when a queued copy meets a newer bridge configuration.
+Keep an independent scalar skb extension through queues and clones, validate
+the never-reused guard identity and policy epoch, retain normal ingress and
+local/VLAN-self policy, and consume the extension before upper-layer receive.
+The native guard replaces the unused legacy learning-extension slot rather
+than exhausting the kernel's seven-extension limit in maximal configs.
+
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4921,7 +4921,9 @@ enum skb_ext_id {
+ enum skb_ext_id {
+-#ifdef CONFIG_ARCH_RTL9617C
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	SKB_EXT_RTL9617C_MCAST,
++#elif defined(CONFIG_ARCH_RTL9617C)
+ 	SKB_EXT_RTL9617C_BRIDGE,
+ #endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	SKB_EXT_BRIDGE_NF,
+ #endif
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -37,6 +37,7 @@
+ #ifdef CONFIG_ARCH_RTL9617C
+ #include <linux/rtl9617c-bridge.h>
+ #endif
++#include <linux/rtl9617c-mcast.h>
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+@@ -5111,7 +5112,9 @@ static const u8 skb_ext_type_len[] = {
+ static const u8 skb_ext_type_len[] = {
+-#ifdef CONFIG_ARCH_RTL9617C
++#if IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
++	[SKB_EXT_RTL9617C_MCAST] = SKB_EXT_CHUNKSIZEOF(struct rtl9617c_mcast_copy),
++#elif defined(CONFIG_ARCH_RTL9617C)
+ 	[SKB_EXT_RTL9617C_BRIDGE] = SKB_EXT_CHUNKSIZEOF(struct rtl9617c_bridge_frame),
+ #endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+ #endif
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -92,6 +92,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/rtl9617c-switch.h>
++#include <linux/rtl9617c-mcast.h>
+ #include <linux/etherdevice.h>
+ #include <linux/ethtool.h>
+ #include <linux/ethtool_netlink.h>
+ #include <linux/skbuff.h>
+@@ -5975,6 +5976,25 @@ static int __netif_receive_skb_core(struct sk_buff **pskb, bool pfmemalloc,
+ 
+ another_round:
+ 	skb->skb_iif = skb->dev->ifindex;
++	/* An immutable MCE copy may be queued across bridge detach or netns
++	 * changes. Capture the RCU handler before validating its old epoch,
++	 * and never let a missing/replaced bridge handler fall through to
++	 * the standalone interface's packet taps, redirect hooks or stack.
++	 * Native eligibility proved this exact port had only the bridge
++	 * handler. A concurrent publication closes its guard before changing
++	 * that relationship; bridge ingress validates the epoch again.
++	 */
++	if (rtl9617c_mcast_copy_present(skb)) {
++		__this_cpu_inc(softnet_data.processed);
++		rx_handler = rcu_dereference(skb->dev->rx_handler);
++		if (!rx_handler || !rtl9617c_mcast_copy_valid(skb, skb->dev,
++					netdev_master_upper_dev_get_rcu(skb->dev)))
++			goto drop;
++		if (rx_handler(&skb) != RX_HANDLER_CONSUMED)
++			goto drop;
++		ret = NET_RX_SUCCESS;
++		goto out;
++	}
+ 
+ 	__this_cpu_inc(softnet_data.processed);
+ 
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -20,6 +20,7 @@
+ #include <net/dsa.h>
+ #include <linux/export.h>
+ #include <linux/rculist.h>
++#include <linux/rtl9617c-mcast.h>
+ #include "br_private.h"
+ #include "br_private_tunnel.h"
+ 
+@@ -36,6 +37,18 @@ static int br_pass_frame_up(struct sk_buff *skb, bool promisc)
+ 	struct net_bridge *br = netdev_priv(brdev);
+ 	struct net_bridge_vlan_group *vg;
+ 
++	if (rtl9617c_mcast_copy_present(skb)) {
++		if (!rtl9617c_mcast_copy_valid(skb, skb->dev, brdev)) {
++			kfree_skb(skb);
++			return NET_RX_DROP;
++		}
++		/* A stacked bridge must not inherit this lower bridge's
++		 * no-reflood contract.  Normal self-VLAN admission below still
++		 * applies; this is not a bypass to the host network stack.
++		 */
++		rtl9617c_mcast_copy_clear(skb);
++	}
++
+ 	dev_sw_netstats_rx_add(brdev, skb->len);
+ 
+ 	vg = br_vlan_group_rcu(br);
+@@ -95,6 +108,10 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		goto drop;
+ 
+ 	br = p->br;
++	if (rtl9617c_mcast_copy_present(skb) &&
++	    !rtl9617c_mcast_copy_valid(skb, p->dev, br->dev))
++		goto drop;
++
+ 
+ 	if (br_mst_is_enabled(p)) {
+ 		state = BR_STATE_FORWARDING;
+@@ -213,6 +230,19 @@ int br_handle_frame_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 		break;
+ 	}
+ 
++	/* Hardware emitted the complete native egress set using the epoch
++	 * carried by this copy.  Never forward it with today's FDB/MDB or
++	 * hardware-domain assignment, even if that set is now different.
++	 * Local delivery still follows the normal bridge decisions above.
++	 */
++	if (rtl9617c_mcast_copy_present(skb)) {
++		if (dst && test_bit(BR_FDB_LOCAL, &dst->flags))
++			return br_pass_frame_up(skb, false);
++		if (local_rcv)
++			return br_pass_frame_up(skb, promisc);
++		goto drop;
++	}
++
+ 	if (dst) {
+ 		unsigned long now = jiffies;
+ 
+@@ -372,6 +402,10 @@ static rx_handler_result_t br_handle_frame(struct sk_buff **pskb)
+ 	br_tc_skb_miss_set(skb, false);
+ 
+ 	p = br_port_get_rcu(skb->dev);
++	if (rtl9617c_mcast_copy_present(skb) &&
++	    (!p || !rtl9617c_mcast_copy_valid(skb, p->dev, p->br->dev)))
++		goto drop;
++
+ 	if (p->flags & BR_VLAN_TUNNEL)
+ 		br_handle_ingress_vlan_tunnel(skb, p, nbp_vlan_group_rcu(p));
+ 
