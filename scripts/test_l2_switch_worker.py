@@ -20,19 +20,21 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DRIVERS = ROOT / "port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek"
 source = (DRIVERS / "rtl9617c-fe-switch.h").read_text()
+source += "\n" + (DRIVERS / "rtl9617c-fe-switch-vlan.h").read_text()
 
 
 def function(name):
-    start = source.index(name + "(")
-    start = source.rfind("\n", 0, start) + 1
-    if not source[start:].startswith("static "):
-        start = source.rfind("\n", 0, start - 1) + 1
-    end = source.index("{", start) + 1
+    body = (DRIVERS / "rtl9617c-fe-switch-vlan.h").read_text() if name == "fe_switch_age_ticks" else source
+    start = body.index(name + "(")
+    start = body.rfind("\n", 0, start) + 1
+    if not body[start:].startswith("static "):
+        start = body.rfind("\n", 0, start - 1) + 1
+    end = body.index("{", start) + 1
     depth = 1
     while depth:
-        depth += (source[end] == "{") - (source[end] == "}")
+        depth += (body[end] == "{") - (body[end] == "}")
         end += 1
-    return source[start:end] + "\n"
+    return body[start:end] + "\n"
 
 
 COMMON = r'''
@@ -45,7 +47,8 @@ COMMON = r'''
 #include <string.h>
 #include <time.h>
 #include "rtl9617c-l2-format.h"
-typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
+#include "rtl9617c-l2-domain.h"
+typedef uint32_t u32;typedef uint64_t u64;typedef uint16_t u16;typedef unsigned char u8;
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
 #define HZ 250
@@ -87,7 +90,8 @@ struct work_struct {unsigned int unused;};
 struct delayed_work {struct work_struct work;};
 struct rtl_fe_bridge;
 struct rtl9617c_switch_guard {struct rtl_fe_bridge *owner;u64 generation;bool blocked;};
-struct rtl_fe_switch_hw {bool owned,open,port_policy_ready;u32 ports,learning_mask,isolated_mask;};
+struct rtl_fe_switch_hw {bool owned,open,port_policy_ready;u32 ports,learning_mask,isolated_mask;const struct rtl_l2_vlan_plan *vlan_plan;};
+struct rtl_mcast_groups {unsigned short group[5][4];unsigned char enabled[5];};
 struct rtl_fe {bool lock,enabled,prepared,engine_ready,shutting_down,route_admitted;struct rtl_fe_bridge *bridge;};
 '''
 
@@ -109,6 +113,11 @@ static unsigned int restore_fail_at,offload_fail_at,append_fail_at,replay_error_
 static unsigned int online_ports,static_port,offline_port,invalidates,extra_replay_rows,port_policies;
 static struct rtl_l2_fdb_entry installed[RTL_L2_FDB_ENTRIES*4];
 static int hw_error,domain_error,flush_error,port_policy_error;
+static int mcast_error,mcast_hw_error;
+static unsigned int mcast_prepares,mcast_applies,mcast_arms,mcast_revokes;
+static bool mcast_ready,mcast_live;
+static int mdb_error,mdb_hw_error;
+static unsigned int mdb_prepares,mdb_steers;
 static bool rtnl_held,arm_failure,epoch_during_append,additional_policy;
 static enum fe_switch_reason policy_reason;
 static clock_t ageing;
@@ -117,7 +126,7 @@ static void mutex_unlock(bool *lock){assert(*lock);*lock=false;}
 static void rtnl_lock(void){assert(!rtnl_held);rtnl_held=true;}
 static void rtnl_unlock(void){assert(rtnl_held);rtnl_held=false;}
 static void fe_switch_hw_gate(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw){
- assert(owner==&fe && hw==&sw.hw);hw->open=false;owner->route_admitted=false;closures++;
+ assert(owner==&fe && hw==&sw.hw && !mcast_live);hw->open=false;owner->route_admitted=false;closures++;
 }
 static bool fe_switch_hw_arm(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,u32 route,bool route_allowed){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open);
@@ -125,6 +134,7 @@ static bool fe_switch_hw_arm(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u3
  assert(!native || (hw->owned && hw->port_policy_ready && sw.domain_owned && sw.offloaded==native));
  assert(route_allowed==sw.route_policy_allowed && (route_allowed || !route));
  assert(!native || sw.local_target==(route_allowed && owner->enabled && owner->prepared?25U:16U));
+ assert(!native || !mcast_ready || mcast_live);
  hw->open=!arm_failure;owner->route_admitted=!arm_failure && owner->enabled && route_allowed;return !arm_failure;
 }
 static void fe_switch_gate(void *private);
@@ -134,6 +144,43 @@ static bool switchdev_fdb_is_dynamically_learned(const struct switchdev_notifier
 static bool is_valid_ether_addr(const u8 *mac){unsigned int any=0;for(unsigned int i=0;i<6;i++)any|=mac[i];return any && !(mac[0]&1);}
 static void ether_addr_copy(u8 *dst,const u8 *src){memcpy(dst,src,6);}
 static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
+static bool fe_switch_vlan_replay_member(struct rtl_fe_bridge *owner,
+ const struct switchdev_notifier_fdb_info *info,int port){
+ (void)info;(void)port;assert(!owner->vlan_domain);return false;
+}
+static void fe_mcast_revoke(struct rtl_fe *owner){assert(owner==&fe);mcast_revokes++;mcast_live=false;}
+static void fe_mcast_arm(struct rtl_fe *owner,u64 generation){
+ assert(owner==&fe && generation==sw.guard.generation && !sw.active && !sw.hw.open);
+ if(mcast_ready){mcast_arms++;mcast_live=true;}
+}
+static int fe_mcast_prepare_bum(struct rtl_fe *owner,struct rtl9617c_switch_guard *guard,
+ u64 generation,struct net_device *bridge,struct net_device **devs,
+ const unsigned long *flags,unsigned int native,struct rtl_mcast_groups *groups){
+ assert(owner==&fe && guard==&sw.guard && generation==guard->generation && bridge==&master);
+ assert(devs==sw.ports && flags && native && groups && fe.lock && rtnl_held);
+ assert(sw.domain_owned && !sw.hw.open && !sw.active);mcast_prepares++;
+ memset(groups,0,sizeof(*groups));
+ if(mcast_error)return mcast_error;
+ groups->enabled[0]=groups->enabled[1]=3;mcast_ready=true;return 0;
+}
+static int fe_switch_hw_mcast_groups(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,
+ const struct rtl_mcast_groups *groups){
+ assert(owner==&fe && hw==&sw.hw && groups->enabled[0]==3);
+ assert(mcast_ready && fe.lock && !hw->open && sw.domain_owned);mcast_applies++;
+ return mcast_hw_error;
+}
+static int fe_mdb_prepare(struct rtl_fe *owner,struct rtl9617c_switch_guard *guard,
+ u64 generation,struct net_device *bridge,struct net_device **devs,const unsigned long *flags,
+ unsigned int forwarding,unsigned int *steer){
+ assert(owner==&fe && guard==&sw.guard && generation==guard->generation && bridge==&master);
+ assert(devs==sw.ports && flags && forwarding && steer && fe.lock && rtnl_held);
+ assert(sw.domain_owned && !sw.hw.open && !sw.active && sw.route_policy_allowed && fe.enabled && fe.prepared);
+ mdb_prepares++;*steer=mdb_error?0:forwarding;return mdb_error;
+}
+static int fe_switch_hw_mdb_steer(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,unsigned int ports){
+ assert(owner==&fe && hw==&sw.hw && !sw.replay_ports && ports==hw->ports);
+ assert(sw.route_policy_allowed && fe.enabled && fe.prepared && !hw->open);mdb_steers++;return mdb_hw_error;
+}
 static void rtl9617c_switch_guard_invalidate(struct rtl9617c_switch_guard *guard){
  assert(guard==&sw.guard);invalidates++;guard->generation++;fe_switch_gate(&sw);
 }
@@ -190,6 +237,10 @@ static enum fe_switch_reason fe_switch_snapshot(struct rtl_fe_bridge *owner,stru
  if(policy_reason==FE_SWITCH_PORT_POLICY)plan->flags[0]|=BIT(31);
  if(policy_reason==FE_SWITCH_NO_BRIDGE)plan->ports=0;
  return fe_switch_plan_validate(plan);
+}
+static enum fe_switch_reason fe_switch_vlan_snapshot(struct rtl_fe_bridge *owner,
+ struct fe_switch_plan *plan,enum fe_switch_reason reason){
+ assert(owner==&sw && plan);sw.vlan_domain=false;return reason;
 }
 static void change_state(unsigned int kind){
  if(kind==1)sw.guard.generation++;
@@ -320,6 +371,9 @@ static void setup(void){
  closures=restores=unoffloads=snapshots=syncs=route_flushes=offloads=prepares=claims=appends=arms=scheduled=last_delay=0;
  restore_fail_at=offload_fail_at=append_fail_at=replay_error_at=change_in_sync=change_in_replay=0;
  hw_error=domain_error=flush_error=port_policy_error=0;rtnl_held=arm_failure=epoch_during_append=additional_policy=false;
+ mcast_error=-EOPNOTSUPP;mcast_hw_error=0;mcast_prepares=mcast_applies=mcast_arms=mcast_revokes=0;
+ mcast_ready=mcast_live=false;
+ mdb_error=-EOPNOTSUPP;mdb_hw_error=0;mdb_prepares=mdb_steers=0;
 }
 static void run(void){
  fe_switch_work(&sw.work);assert(!fe.lock && !rtnl_held && !sw.replaying && !sw.replay_ports);
@@ -620,7 +674,50 @@ static void stable_owner_identity(void){
  fe_switch_track_port_locked(&fe,&ports[0],64,true);assert(invalidates==before);
  fe.bridge=NULL;fe_switch_track_port_locked(&fe,&ports[0],0,true);assert(invalidates==before);cases++;
 }
+static void multicast_publication_boundaries(void){
+ setup();mcast_error=0;run();
+ assert(sw.active && mcast_live && mcast_prepares==1 && mcast_applies==1 && mcast_arms==1);
+ assert(mcast_revokes && appends==3 && publish_successes==2);
+ sw.requested=false;run();assert(!sw.active && !mcast_live && mcast_arms==1);
+ const int unavailable[]={-EOPNOTSUPP,-ENOSPC};
+ for(unsigned int i=0;i<ARRAY_SIZE(unavailable);i++){
+  setup();mcast_error=unavailable[i];run();
+  assert(sw.active && !mcast_live && mcast_prepares==1 && !mcast_applies && !mcast_arms);
+  assert(appends==3 && !sw.error);
+ }
+ const int failures[]={-EAGAIN,-EIO,-EBUSY,-ETIMEDOUT};
+ for(unsigned int i=0;i<ARRAY_SIZE(failures);i++)for(unsigned int stage=0;stage<2;stage++){
+  setup();mcast_error=stage?0:failures[i];mcast_hw_error=stage?failures[i]:0;run();
+  assert(!sw.active && !sw.hw.open && !mcast_live && !mcast_arms && !appends && !publish_calls);
+  assert(sw.error==failures[i] && mcast_prepares==1 && mcast_applies==stage);
+ }
+ setup();mcast_error=0;epoch_during_append=true;run();
+ assert(mcast_applies==1 && !mcast_live && !mcast_arms && !sw.active);
+ setup();mcast_error=0;fail_publish_at=2;run();
+ assert(mcast_arms==1 && !mcast_live && !sw.active && unpublish_calls==1);
+ setup();mcast_error=0;arm_failure=true;run();
+ assert(mcast_arms==1 && !mcast_live && !sw.active && !sw.hw.open);
+ setup();mdb_error=0;run();assert(sw.active && mdb_prepares==1 && mdb_steers==1);
+ const int mdb_fallback[]={-EOPNOTSUPP,-ENOSPC};
+ for(unsigned int i=0;i<ARRAY_SIZE(mdb_fallback);i++){
+  setup();mdb_error=mdb_fallback[i];run();assert(sw.active && !sw.error && mdb_prepares==1 && !mdb_steers);
+ }
+ for(unsigned int i=0;i<ARRAY_SIZE(failures);i++)for(unsigned int stage=0;stage<2;stage++){
+  setup();mdb_error=stage?0:failures[i];mdb_hw_error=stage?failures[i]:0;run();
+  assert(!sw.active && !sw.hw.open && !mcast_live && !appends && !publish_calls);
+  assert(sw.error==failures[i] && mdb_prepares==1 && mdb_steers==stage);
+ }
+ for(unsigned int policy=0;policy<4;policy++){
+  setup();mdb_error=0;
+  if(policy==0)configured_flags[0]&=~BR_LEARNING;
+  if(policy==1)configured_flags[0]|=BR_ISOLATED;
+  if(policy==2)fe.enabled=false;
+  if(policy==3)fe.prepared=false;
+  run();assert(sw.active && !mdb_prepares && !mdb_steers);
+ }
+}
 int main(void){success_and_policy();replay_to_publication();released_lock_changes();transaction_failures();independent_port_policies();static_feedback_ownership();static_capacity_boundaries();retry_classification();stable_owner_identity();
+ multicast_publication_boundaries();
  printf("Native switch production worker: %u policy/RCU/FDB-replay/rollback cases; forwarding-only native subsets, learning/isolation route gates, independent static-cookie journal and 4096/4128-row success/failure boundaries PASS\n",cases);return 0;}
 '''
 
@@ -630,7 +727,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
     r"struct rtl_fe_bridge \{.*?\n\};",
 ])
 functions = "\n".join(function(name) for name in [
-    "fe_switch_scan_reset", "fe_switch_route_plan_validate", "fe_switch_plan_validate", "fe_switch_forwarding_ports", "fe_switch_flag_ports", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb", "fe_switch_static_stage", "fe_switch_static_publish", "fe_switch_unoffload", "fe_switch_atomic_event",
+    "fe_switch_scan_reset", "fe_switch_route_plan_validate", "fe_switch_plan_validate", "fe_switch_forwarding_ports", "fe_switch_flag_ports", "fe_switch_needs_recovery", "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_vlan_find", "fe_switch_bridge_for_vid", "fe_switch_is_master", "fe_switch_age_ticks", "fe_switch_replay_fdb", "fe_switch_static_stage", "fe_switch_static_publish", "fe_switch_unoffload", "fe_switch_atomic_event",
     "fe_switch_gate", "fe_switch_arm", "fe_switch_work",
 ])
 def replace_once(candidate, before, after):
@@ -649,6 +746,12 @@ early_native = replace_once(
 # rebuild. Removing only the worker's redundant reset is not a regression.
 assert functions.count("\tfe_switch_scan_reset(sw);") == 2
 mutants = {
+    "native_producer_opens_before_rx_provenance": replace_once(
+        functions, "\tif (sw->native_mask)\n\t\tfe_mcast_arm(sw->fe, sw->route_generation);",
+        "\tif (false && sw->native_mask)\n\t\tfe_mcast_arm(sw->fe, sw->route_generation);"),
+    "gate_leaves_old_cpu_copy_epoch_active": functions.replace(
+        function("fe_switch_gate"), replace_once(function("fe_switch_gate"),
+        "\tfe_mcast_revoke(sw->fe);", "\tif (false) fe_mcast_revoke(sw->fe);")),
     "rebuild_retains_same_generation_scan": functions.replace(
         "\tfe_switch_scan_reset(sw);", "\tif (0) fe_switch_scan_reset(sw);"),
     "native_aging_disables_independent_routing": functions.replace(
@@ -693,15 +796,17 @@ mutants = {
     "trap_only_static_falsely_published": replace_once(
         functions, "\t\tif (sw->replay_traps[i / 32] & BIT(i % 32))",
         "\t\tif (false && (sw->replay_traps[i / 32] & BIT(i % 32)))"),
-    "static_publication_decodes_reused_rules": replace_once(
-        functions, "\t\tstruct fe_switch_published *row = &sw->published[i];",
+    "static_publication_decodes_reused_rules": functions.replace(
+        function("fe_switch_static_publish"), replace_once(function("fe_switch_static_publish"),
+        "\t\tstruct fe_switch_published *row = &sw->published[i];",
         "\t\tstruct fe_switch_published *row = &sw->published[i];\n"
         "\t\tstruct rtl_l2_fdb_entry reused;\n"
         "\t\trtl_l2_fdb_decode(sw->rules[i], &reused);\n"
-        "\t\tether_addr_copy(row->address, reused.mac);"),
-    "static_withdrawal_uses_flushed_rule_count": replace_once(
-        functions, "\tfor (i = 0; i < sw->published_count; i++)\n\t\tif (sw->master",
-        "\tfor (i = 0; i < sw->rule_count; i++)\n\t\tif (sw->master"),
+        "\t\tether_addr_copy(row->address, reused.mac);")),
+    "static_withdrawal_uses_flushed_rule_count": functions.replace(
+        function("fe_switch_unoffload"), replace_once(function("fe_switch_unoffload"),
+        "\tfor (i = 0; i < sw->published_count; i++) {",
+        "\tfor (i = 0; i < sw->rule_count; i++) {")),
     "static_publication_failure_ignored": replace_once(
         functions, "\t\tret = fe_switch_static_publish(sw, generation);",
         "\t\tret = fe_switch_static_publish(sw, generation);\n\t\tret = 0;"),

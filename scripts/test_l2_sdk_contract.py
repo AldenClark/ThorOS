@@ -111,6 +111,8 @@ TABLES = {
     "MEMBERSHIP_ID": ("L2FE_PLE_MMSHP_CHK_ID_MAP", 1),
     "PORT_MEMBERSHIP": ("L2FE_PLE_PORT_MMSHP_CHK", 2),
     "VLAN_LAN_INDEX": ("L2FE_VE_LAN_VL_IDX", 1),
+    "VLAN_WAN_S_INDEX": ("L2FE_VE_WAN_SVL_IDX", 1),
+    "VLAN_WAN_C_INDEX": ("L2FE_VE_WAN_CVL_IDX", 1),
     "VLAN_FIB": ("L2FE_VE_VL_FIB", 2),
     "MC_FIB": ("L2FE_ARB_MC_FIB_TBL", 3),
     "MC_VECTOR": ("NI_HV_MCE_INDX_LKUP", 2),
@@ -442,6 +444,22 @@ static void check_classifier_gate(void)
  ref.t2_ctrl=T2_CTRL_BYPASS;
  assert(sizeof(ref)<=sizeof(reference));memcpy(reference,&ref,sizeof(ref));
  rtl_fe_classify_cpu_original(native);assert(!memcmp(native,reference,sizeof(native)));
+ /* Exact multicast belongs to result group0 (forwarding). Neutral mode0
+  * ancillary defaults carry NO valid override, not a competing CPU/hash
+  * destination. This uses the genuine packed RTL77C action definition. */
+ for(unsigned int exact=0;exact<2;exact++)
+  for(unsigned int profile=0;profile<2;profile++)
+   for(unsigned int result=0;result<4;result++) {
+    cls_fib_mod_0_t action={0};unsigned int encoded[7]={0};
+    if(profile)action=ref;
+    else if(!exact || !result) {
+     action.dpid_vld=1;action.dpid_pri=1;action.permit=1;action.mcgid=16;
+     action.t2_ctrl_vld=1;action.t2_ctrl=0;action.stage2_ctrl_vld=1;
+    }
+    memcpy(encoded,&action,sizeof(action));
+    rtl_fe_classifier_default(native,profile,result,exact);
+    assert(!memcmp(native,encoded,sizeof(native)));
+   }
  /* No source rewrite, editing, policer, multicast, or vendor deep-Q bit. */
  assert(!ref.lspid_vld && !ref.deepq && !ref.mc && !ref.stage2_ctrl_vld);
  assert(L3_CLS_PROFILE_MAX==2 && L3_CLS_KEY_TBL_ENTRY_MAX==256);

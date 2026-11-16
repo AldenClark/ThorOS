@@ -90,6 +90,23 @@ int main(void){
  f.shutting_down=false;p.retired=true;
  assert(fe_install(&p,a,1)==-ENODEV);p.retired=false;
  a.bridge=true;assert(fe_install(&p,a,1)==-EOPNOTSUPP);a.bridge=false;
+ /* Even a caller bypassing fe_parse cannot publish multicast IP keys or
+  * multicast NAT actions into the ordinary unicast hash namespace. */
+ const unsigned int multicast4[]={0xe0000001U,0xef000001U,0xf0000001U,0xffffffffU};
+ for(unsigned int side=0;side<2;side++)for(unsigned int ip=0;ip<4;ip++) {
+  struct rtl_fe_rule bad=a;
+  if(side)bad.key.destination=multicast4[ip];else bad.key.source=multicast4[ip];
+  assert(fe_install(&p,bad,1)==-EOPNOTSUPP);
+  bad=a;bad.action.address=multicast4[ip];bad.action.translate_destination=side;
+  assert(fe_install(&p,bad,1)==-EOPNOTSUPP);
+ }
+ for(unsigned int side=0;side<2;side++)for(unsigned int scope=0;scope<16;scope++) {
+  struct rtl_fe_rule bad=a;bad.ipv6=true;bad.action.translate=false;
+  bad.key6.source[0]=bad.key6.destination[0]=0x20010db8U;
+  if(side)bad.key6.destination[0]=0xff000000U|(scope<<16);
+  else bad.key6.source[0]=0xff000000U|(scope<<16);
+  assert(fe_install(&p,bad,1)==-EOPNOTSUPP);
+ }
  assert(!allocations && !mmio && !f.installs && f.flows.next==&f.flows);
  for(unsigned int i=0;i<sizeof(f.hashes)/sizeof(f.hashes[0]);i++)assert(!f.hashes[i]);
  for(unsigned int i=0;i<RTL_FE_MEMORY_BYTES/sizeof(unsigned int);i++)assert(!((unsigned int *)f.memory)[i]);
@@ -122,4 +139,4 @@ with tempfile.TemporaryDirectory(dir=here,prefix='main-publish-') as d:
  subprocess.run(['cc','-std=c11','-Wno-unused-function','-fsanitize=address,undefined','-I'+str(drivers),str(p/'repro.c'),'-o',str(p/'repro')],check=True)
  r=subprocess.run([str(p/'repro')],capture_output=True,text=True)
  assert r.returncode==0, r.stdout+r.stderr
- print('PASS: offline/policy-gated/shutdown admission has zero allocation/MMIO/DDR writes; same-bucket CRC32 collision and pending cache invalidation block publication')
+ print('PASS: multicast/reserved route/NAT endpoints and offline/policy-gated/shutdown admission have zero allocation/MMIO/DDR writes; same-bucket CRC32 collision and pending cache invalidation block publication')

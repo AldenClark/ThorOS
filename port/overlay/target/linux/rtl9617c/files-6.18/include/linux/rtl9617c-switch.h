@@ -11,7 +11,8 @@
 struct net;
 struct net_device;
 
-/* Control-plane state only; never consulted on the packet fast path. */
+/* Policy epoch.  The exceptional MCE CPU-copy path also validates this
+ * epoch before handing an already replicated frame to a bridge. */
 struct rtl9617c_switch_net {
 	u64 generation;
 	unsigned int active;
@@ -41,6 +42,9 @@ struct rtl9617c_switch_guard {
 	struct net *net;
 	const struct rtl9617c_switch_guard_ops *ops;
 	void *priv;
+	/* Allocated once per registration, never reused during this boot. */
+	u64 identity;
+	bool armed;
 	bool registered;
 };
 
@@ -50,12 +54,18 @@ struct rtl9617c_switch_guard {
  */
 bool br_rtl9617c_l2_eligible(const struct net_device *master);
 bool br_rtl9617c_l2_port_eligible(const struct net_device *port);
+/* Additional admission for the native 802.1Q tagged-only IVL backend. */
+bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port);
 #else
 static inline bool br_rtl9617c_l2_eligible(const struct net_device *master)
 {
 	return false;
 }
 static inline bool br_rtl9617c_l2_port_eligible(const struct net_device *port)
+{
+	return false;
+}
+static inline bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port)
 {
 	return false;
 }
@@ -77,6 +87,11 @@ bool br_rtl9617c_fdb_forget(const struct net_device *port,
 int br_rtl9617c_fdb_learn(const struct net_device *port,
 			 const unsigned char *addr,
 			 struct rtl9617c_switch_guard *guard, u64 generation);
+int br_rtl9617c_fdb_learn_vid(const struct net_device *port,
+			     const unsigned char *addr, u16 vid,
+			     struct rtl9617c_switch_guard *guard, u64 generation);
+bool br_rtl9617c_fdb_forget_vid(const struct net_device *port,
+			       const unsigned char *addr, u16 vid);
 #else
 static inline int br_rtl9617c_fdb_hold_time(const struct net_device *master,
 					 unsigned long *ticks)
@@ -94,6 +109,18 @@ static inline int br_rtl9617c_fdb_learn(const struct net_device *port,
 				      u64 generation)
 {
 	return -EOPNOTSUPP;
+}
+static inline int br_rtl9617c_fdb_learn_vid(const struct net_device *port,
+					  const unsigned char *addr, u16 vid,
+					  struct rtl9617c_switch_guard *guard,
+					  u64 generation)
+{
+	return -EOPNOTSUPP;
+}
+static inline bool br_rtl9617c_fdb_forget_vid(const struct net_device *port,
+					    const unsigned char *addr, u16 vid)
+{
+	return false;
 }
 #endif
 

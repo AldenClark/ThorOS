@@ -376,6 +376,19 @@ def source_for(args):
     return source, True
 
 
+def mutate_hw_function(source, name, before, after):
+    """Change the intended production function, never another caller's guard."""
+    start = source.index(name + "(")
+    opening = source.index("{", start)
+    end, depth = opening + 1, 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    body = source[start:end]
+    assert body.count(before) == 1, (name, before)
+    return source[:start] + body.replace(before, after, 1) + source[end:]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sdk", type=Path)
@@ -392,7 +405,8 @@ def main():
         "cpu_fallback_removed": (hw, policy.replace("destinations | (1U << RTL_L2_POLICY_CPU) |", "destinations |", 1)),
         "all_ones_checker_accepted": (hw, policy.replace("arb_ext != ~0U &&", "1 &&", 1)),
         "partial_policy_still_ready": (hw.replace("WRITE_ONCE(hw->port_policy_ready, false);", "/* omitted */", 1), policy),
-        "arm_accepts_partial_policy": (hw.replace("!READ_ONCE(hw->port_policy_ready) ||", "/* omitted */", 1), policy),
+        "arm_accepts_partial_policy": (mutate_hw_function(hw, "fe_switch_hw_arm",
+            "!READ_ONCE(hw->port_policy_ready) ||", "/* omitted */"), policy),
         "ignored_redirects": (hw.replace("if (words[0] & RTL_L2_POLICY_REDIRECT_ENABLE)", "if (false)"), policy),
         "membership_not_verified": (recipe.without_table_verification(hw, "RTL_L2_TBL_PORT_MEMBERSHIP"), policy),
         "stp_not_verified": (recipe.without_table_verification(hw, "RTL_L2_TBL_ILPB"), policy),

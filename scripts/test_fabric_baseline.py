@@ -629,7 +629,7 @@ def main():
             "fabric->inherited_fdb_words[i] = row.words[i];\n\t\t\tret = 0;", 1),
         "old_narrow_scan_filter": production.replace("rtl_l2_fdb_scan_filter(filter);", "/* deliberately omitted */"),
         "missing_mode_readback": production.replace(
-            "ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,\n\t\t\tfabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);",
+            "ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,\n\t\t\t(fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode);",
             "ret = 0;"),
         "old_1522_frame_budget": production.replace(
             "#define RTL_FABRIC_NATIVE_MAX_FRAME RTL_NI_FRAME_WIRE_BYTES", "#define RTL_FABRIC_NATIVE_MAX_FRAME 1522U", 1),
@@ -644,7 +644,7 @@ def main():
         "false_native_mtu_compatibility": production.replace(
             "maximum == RTL_FABRIC_NATIVE_MAX_FRAME", "maximum <= RTL_FABRIC_NATIVE_MAX_FRAME", 1),
         "warm_rewrites_baseline": production.replace(
-            "return rtl_fabric_check(io, fabric);", "{ fabric->ready = 0; return rtl_fabric_cold_prepare(io, fabric); }", 1),
+            "return rtl_fabric_check(io, fabric);", "{ fabric->ready = 0; return rtl_fabric_cold_prepare_mode(io, fabric, mode); }", 1),
         "cold_replays_saved_scan_edge": production.replace(
             "control = (live & ~owned) | (control & owned);", "/* stale saved control */", 1),
         "acquire_replays_pre_gate_edge": production.replace(

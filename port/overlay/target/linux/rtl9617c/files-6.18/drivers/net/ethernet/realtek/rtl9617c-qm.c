@@ -14,6 +14,7 @@
 #include <linux/ktime.h>
 #include <linux/prefetch.h>
 #include <linux/rcupdate.h>
+#include <linux/rtl9617c-mcast.h>
 #include <linux/unaligned.h>
 #include "rtl9617c-qm.h"
 #include "rtl9617c-fe.h"
@@ -710,6 +711,7 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			struct sk_buff *skb;
 			struct net_device *input;
 			unsigned int source;
+			int mcast_copy;
 			bool refill_buffer = false, valid_buffer;
 
 			dma_rmb();
@@ -788,6 +790,12 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			/* Packet bytes and metadata are private now. Return the EPP
 			 * credit before GRO or endpoint callbacks can hold up the poll. */
 			rtl_qm_rx_retire(rx, cos, command, refill_buffer);
+			mcast_copy = rtl_fe_mcast_rx(rx->fe, skb, h0, h1, &source);
+			if (mcast_copy < 0) {
+				dev->stats.rx_dropped++;
+				dev_kfree_skb_any(skb);
+				continue;
+			}
 			if (source >= ARRAY_SIZE(rx->lan)) {
 				struct rtl9617c_ni_endpoint *endpoint;
 
@@ -805,7 +813,10 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			}
 			rcu_read_lock();
 			input = rcu_dereference(rx->lan[source]);
-			if (!input || !netif_running(input)) {
+			if (!input || !netif_running(input) ||
+			    (mcast_copy &&
+			     !rtl9617c_mcast_copy_valid(skb, input,
+					netdev_master_upper_dev_get_rcu(input)))) {
 				dev->stats.rx_dropped++;
 				dev_kfree_skb_any(skb);
 				rcu_read_unlock();
@@ -829,7 +840,12 @@ int rtl_qm_rx_poll(struct rtl_qm_rx *rx, struct napi_struct *napi, int budget)
 			skb->protocol = eth_type_trans(skb, input);
 			input->stats.rx_packets++;
 			input->stats.rx_bytes += length;
-			napi_gro_receive(napi, skb);
+			/* Immutable epoch metadata must survive unchanged to bridge
+			 * validation. GRO may merge different hardware generations. */
+			if (mcast_copy)
+				netif_receive_skb(skb);
+			else
+				napi_gro_receive(napi, skb);
 			rcu_read_unlock();
 			continue;
 consume:

@@ -24,3 +24,7 @@ python3 scripts/test_fe_destination_index.py --kernel "$kernel" --mutants
 python3 scripts/test_flowtable_encap_skb.py --kernel "$kernel" --mutants
 python3 scripts/test_flowtable_encap_actions.py --kernel "$kernel" --mutants
 python3 scripts/test_ppp_namespace_fence.py --kernel "$kernel" --mutants
+python3 scripts/test_l2_vlan_feedback.py --kernel "$kernel" --mutants
+python3 scripts/test_native_mdb_snapshot.py --kernel "$kernel" --mutants \
+    --output artifacts/native-mdb-snapshot.json
+python3 scripts/test_mcast_dispatch.py --kernel "$kernel"

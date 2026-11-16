@@ -35,6 +35,13 @@ struct rtl_fabric {
 	unsigned char ready, poisoned, changed, refusal, inherited_fdb_present;
 };
 
+/* Selected once during the provider's cold, externally fenced handoff.
+ * Values deliberately match the SVL bit, not an arbitrary runtime knob. */
+enum rtl_fabric_vlan_mode {
+	RTL_FABRIC_VLAN_IVL = 0,
+	RTL_FABRIC_VLAN_SVL = RTL_L2_VLAN_MODE_SVL,
+};
+
 static inline int rtl_fabric_match(const struct rtl_dq_io *io,
 		struct rtl_fabric *fabric, unsigned int reg, unsigned int mask,
 		unsigned int expected)
@@ -178,22 +185,29 @@ static inline int rtl_fabric_restore_command(const struct rtl_dq_io *io,
 	return 0;
 }
 
-static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
-					 struct rtl_fabric *fabric)
+static inline int rtl_fabric_cold_prepare_mode(const struct rtl_dq_io *io,
+					      struct rtl_fabric *fabric,
+					      enum rtl_fabric_vlan_mode mode)
 {
-	struct rtl_l2_fdb_result row;
+	struct rtl_l2_fdb_result row = { 0 };
 	unsigned int filter[RTL_L2_FDB_FILTER_WORDS], control, live, i, minimum, maximum;
 	unsigned int vlan_written = 0, frame_written = 0, oversize_written = 0;
 	unsigned int selector_changed = 0;
 	unsigned int lease = 0;
 	int ret, cleanup;
 
-	if (!rtl_l2_io_valid(io) || !fabric)
+	if (!rtl_l2_io_valid(io) || !fabric ||
+	    (mode != RTL_FABRIC_VLAN_IVL && mode != RTL_FABRIC_VLAN_SVL))
 		return -EINVAL;
 	if (fabric->poisoned)
 		return -EIO;
-	if (fabric->ready)
+	if (fabric->ready) {
+		/* A warm caller cannot reinterpret live native rows or L3 DMAC
+		 * pins. Even a failed request must not alter the owned baseline. */
+		if ((fabric->vlan_mode & RTL_L2_VLAN_MODE_SVL) != (unsigned int)mode)
+			return -EBUSY;
 		return rtl_fabric_check(io, fabric);
+	}
 	fabric->refusal = 0;
 	fabric->changed = 0;
 	fabric->cold_rx_gated = 0;
@@ -308,7 +322,7 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 	ret = rtl_fabric_drain(io);
 	if (ret)
 		goto restore;
-	if (!(fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL)) {
+	if ((fabric->original_vlan_mode & RTL_L2_VLAN_MODE_SVL) != (unsigned int)mode) {
 		ret = rtl_l2_fdb_command_mode(io);
 		if (ret)
 			goto restore;
@@ -323,8 +337,9 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 			if (ret)
 				goto restore;
 		}
-		/* Every inherited valid row vetoes reinterpretation, including a
-		 * static or multicast IVL key. A complete all-valid MISS proves empty. */
+		/* Either direction of mode change reinterprets inherited keys.
+		 * Every valid row vetoes it, including static/multicast entries.
+		 * Only a complete all-valid MISS proves this FDB namespace empty. */
 		ret = rtl_l2_fdb_scan(io, 0, &row);
 		if (ret > 0) {
 			fabric->inherited_fdb_present = 1;
@@ -344,9 +359,9 @@ static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
 		}
 		vlan_written = 1;
 		io->write(io->context, RTL_L2_VLAN_MODE_CONTROL,
-			fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);
+			(fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode);
 		ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, ~0U,
-			fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL);
+			(fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode);
 		if (ret)
 			goto restore;
 	}
@@ -442,7 +457,7 @@ restore:
 	}
 	if (ret)
 		goto refuse;
-	fabric->vlan_mode = fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL;
+	fabric->vlan_mode = (fabric->original_vlan_mode & ~RTL_L2_VLAN_MODE_SVL) | mode;
 	fabric->ready = 1;
 	fabric->changed = !!(vlan_written || frame_written || oversize_written ||
 		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE) ||
@@ -455,6 +470,14 @@ refuse:
 	fabric->refusal = !fabric->poisoned;
 	fabric->error = ret;
 	return ret;
+}
+
+/* Existing default remains SVL. Opt-in IVL is only available to the same
+ * cold owner through the explicit mode entry point above. */
+static inline int rtl_fabric_cold_prepare(const struct rtl_dq_io *io,
+					 struct rtl_fabric *fabric)
+{
+	return rtl_fabric_cold_prepare_mode(io, fabric, RTL_FABRIC_VLAN_SVL);
 }
 
 #endif

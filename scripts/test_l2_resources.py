@@ -176,7 +176,8 @@ static void geometry_and_capacity(void)
   [RTL_L2_TBL_MC_VECTOR]=256, [RTL_L2_TBL_REDIR_LDPID]=64,
   [RTL_L2_TBL_REDIR_DROP]=32, [RTL_L2_TBL_CF_KEY]=1024,
   [RTL_L2_TBL_CF_FIB]=512, [RTL_L2_TBL_IPPB]=64,
-  [RTL_L2_TBL_SPECIAL_PRIORITY]=31
+  [RTL_L2_TBL_SPECIAL_PRIORITY]=31,
+  [RTL_L2_TBL_VLAN_WAN_S_INDEX]=4096, [RTL_L2_TBL_VLAN_WAN_C_INDEX]=4096
  };
  unsigned int total = 0, table, index;
  for (table = 0; table < RTL_L2_TBL_COUNT; table++) { assert(expected[table]); total += expected[table]; }

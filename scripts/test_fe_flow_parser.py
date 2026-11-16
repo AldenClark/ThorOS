@@ -475,6 +475,47 @@ int main(void)
   .ipv4={htonl(0x0a000002),htonl(0xc6336401)},.ipv4_mask={~0U,~0U},
   .ports={htons(53000),htons(443)},.ports_mask={65535,65535}};
  struct nf_flow_rule nf={.rule=&base};ethernet_actions(&nf,source,destination,&pon);
+ /* The ordinary hash domain is unicast-only. A multicast IP MDB miss
+  * must never find an installed ordinary route with the same IP tuple;
+  * NAT cannot introduce a multicast/reserved endpoint either. Exercise
+  * actual fe_parse and the same action list used by Linux above. */
+ unsigned int multicast_cases=0;
+ const unsigned int multicast4[]={0xe0000001U,0xef010203U,0xf0000001U,0xffffffffU};
+ for(unsigned int protocol=6;protocol<=17;protocol+=11)
+  for(unsigned int side=0;side<2;side++)for(unsigned int ip=0;ip<4;ip++) {
+   struct flow_rule rule=base;
+   rule.basic.ip_proto=protocol;
+   if(side)rule.ipv4.dst=htonl(multicast4[ip]);else rule.ipv4.src=htonl(multicast4[ip]);
+   struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
+   assert(fe_parse(&lp,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_PROTOCOL);
+   multicast_cases++;
+   rule=base;rule.basic.ip_proto=protocol;
+   unsigned int n=rule.action.num_entries++;
+   rule.action.entries[n]=rule.action.entries[n-1];
+   rule.action.entries[n-1]=(struct flow_action_entry){.id=FLOW_ACTION_MANGLE,
+    .mangle={.htype=FLOW_ACT_MANGLE_HDR_TYPE_IP4,
+     .offset=side?offsetof(struct iphdr,daddr):offsetof(struct iphdr,saddr),
+     .val=htonl(multicast4[ip]),.mask=0}};
+   memset(&parsed,0,sizeof(parsed));
+   assert(fe_parse(&lp,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_NAT);
+   multicast_cases++;
+  }
+ for(unsigned int protocol=6;protocol<=17;protocol+=11)
+  for(unsigned int side=0;side<2;side++)for(unsigned int scope=0;scope<16;scope++) {
+   struct flow_rule rule=base;
+   rule.used&=~BIT(FLOW_DISSECTOR_KEY_IPV4_ADDRS);rule.used|=BIT(FLOW_DISSECTOR_KEY_IPV6_ADDRS);
+   rule.basic.n_proto=htons(ETH_P_IPV6);rule.basic.ip_proto=protocol;
+   for(unsigned int i=0;i<4;i++) {
+    rule.ipv6.src.s6_addr32[i]=htonl(i?i:0x20010db8U);
+    rule.ipv6.dst.s6_addr32[i]=htonl(i?i+1:0x20010db8U);
+    rule.ipv6_mask.src.s6_addr32[i]=rule.ipv6_mask.dst.s6_addr32[i]=~0U;
+   }
+   if(side)rule.ipv6.dst.s6_addr32[0]=htonl(0xff000000U|(scope<<16));
+   else rule.ipv6.src.s6_addr32[0]=htonl(0xff000000U|(scope<<16));
+   struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
+   assert(fe_parse(&lp,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_PROTOCOL);
+   multicast_cases++;
+  }
  for(unsigned int mutation=0;mutation<20;mutation++) {
   struct flow_rule rule=base;
   struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
@@ -534,7 +575,7 @@ int main(void)
   if(!limits[i] || limits[i]>0x3fff)assert(ret==-EOPNOTSUPP);
   else assert(!ret && parsed.mtu==limits[i]);
  }
- printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, %u bidirectional PPPoE/QinQ and %u authorized bridge vectors; 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,pppoe_cases,bridge_cases);
+ printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, %u bidirectional PPPoE/QinQ and %u authorized bridge vectors; %u multicast/NAT endpoint rejections, 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,pppoe_cases,bridge_cases,multicast_cases);
 }
 '''
 
@@ -568,6 +609,7 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts',prefix='fe-parser-') as 
     'Linux_NAT_builder_sha256':hashlib.sha256(upstream.encode()).hexdigest(),
     'Linux_version':json.loads((root / 'port/sources.lock.json').read_text())['openwrt']['kernel'],
     'TCP_UDP_both_directions':True,
+    'multicast_route_and_NAT_endpoints_fall_back':True,
     'vectors':1028,'IPv6_128bit_route_vectors':4,'Linux_VLAN_QinQ_vectors':288,'PPPoE_IPv4_IPv6_both_directions':128,'sanitizers':['ASan','UBSan'],
     'hardware_flowtable_acceptance':False,
 },indent=2)+'\n')

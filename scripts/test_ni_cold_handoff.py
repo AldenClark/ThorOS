@@ -90,6 +90,7 @@ common = r'''
 #include "rtl9617c-pon-cold.h"
 #include "rtl9617c-l2qm.h"
 #include "rtl9617c-l2-es.h"
+#include "rtl9617c-mcast-cold.h"
 typedef uint32_t u32;
 typedef uint64_t resource_size_t;
 #define __iomem
@@ -118,6 +119,7 @@ typedef uint64_t resource_size_t;
 #define RTL_XRAM_TX_END 1024
 #define RTL_XRAM_TX_START 512
 #define HRTIMER_MODE_REL 0
+#define GFP_KERNEL 0
 struct mutex {pthread_mutex_t native;};
 struct device {void *data;int kobj;};
 struct device_attribute {int unused;};
@@ -128,6 +130,7 @@ struct rtl_lan {struct rtl_xram *shared;unsigned int port;};
 struct net_device {void *priv;unsigned char dev_addr[6];void *phydev;};
 struct rtl_fe {
  struct mutex lock;struct rtl_fabric fabric;
+ struct rtl_l2_owner *l2_owner;struct rtl_fe_mcast *mcast;int error;
  bool engine_ready,prepared,dma_exposed,shutting_down;
 };
 struct rtl_ni_owner {bool exposed;};
@@ -162,6 +165,7 @@ static bool stuck_pon_gate,stuck_fifo,post_fabric_drift;
 static unsigned int map_calls,unmap_calls,pon_reads,pon_writes;
 static unsigned int ni_reads,ni_writes,ni_init_writes;
 static unsigned int ni_ignored_register,ni_allones_register,registered_port_mask;
+static unsigned int mce_diagnostic_fault_register;
 static unsigned int ni_fault_reads,ni_allones_read;
 static int expected_open_result;
 static unsigned int registrations,sysfs_calls,mib_calls,exposes,opens,dma_starts,qm_starts;
@@ -170,6 +174,15 @@ static pthread_cond_t changed=PTHREAD_COND_INITIALIZER;
 static _Thread_local unsigned int held,role;
 static bool block_baseline,baseline_entered,allow_baseline,second_attempted;
 static bool rtnl;
+static bool native_l2_ivl;
+static void *kvzalloc(size_t size,unsigned int flags){assert(!flags);return calloc(1,size);}
+static void *kvcalloc(size_t count,size_t size,unsigned int flags){assert(!flags);return calloc(count,size);}
+static void kvfree(void *memory){free(memory);}
+#define lockdep_assert_held(lock) do{(void)(lock);assert(held);}while(0)
+static unsigned int fe_read(void *context,unsigned int reg){
+ if(mce_diagnostic_fault_register==reg){mce_diagnostic_fault_register=0;return ~0U;}
+ return read_reg(context,reg);
+}
 static void mutex_lock(struct mutex *lock){
  assert(!pthread_mutex_lock(&gate));
  if(role==2)second_attempted=true;
@@ -357,7 +370,13 @@ static void schedule_delayed_work(int *work,int delay){
 common = common.replace('/* NI_REGISTRATION_TAIL */', registration_tail)
 
 map_struct = re.search(r'struct rtl_ni_cold_maps \{.*?\n\};', source, re.S).group()
-functions = '\n'.join(function(fe_source, name) for name in (
+multicast_source = (DRIVERS / 'rtl9617c-fe-mcast.h').read_text()
+functions = re.search(r'struct rtl_fe_mcast \{.*?\n\};', multicast_source, re.S).group() + '\n'
+functions += function(fe_source, 'fe_mcast_inherited_l3_check') + '\n'
+functions += '\n'.join(function(multicast_source, name) for name in (
+    'fe_mcast_cold_prepare', 'fe_mcast_free')) + '\n'
+functions += '\n'.join(function(fe_source, name) for name in (
+    'fe_l2_owner_allocate', 'fe_l2_owner_free',
     'rtl_fe_fabric_cold_prepare', 'rtl_fe_fabric_cold_abort'))
 functions += '\n' + map_struct + '\n' + '\n'.join(function(source, name) for name in (
     'rtl_mib_read', 'rtl_mib_write',
@@ -394,11 +413,15 @@ static void init(struct rtl_xram *priv,bool required){
  map_calls=unmap_calls=pon_reads=pon_writes=registrations=sysfs_calls=mib_calls=exposes=opens=dma_starts=qm_starts=0;
  ni_reads=ni_writes=ni_init_writes=0;
  ni_ignored_register=ni_allones_register=0;registered_port_mask=1;expected_open_result=0;
+ mce_diagnostic_fault_register=0;
  ni_fault_reads=0;ni_allones_read=1;
  block_baseline=baseline_entered=allow_baseline=second_attempted=false;rtnl=false;
 }
 static void done(struct rtl_xram *priv){
  assert(leases_empty() && !held);
+ /* Test teardown only: each independent fixture ends all modeled hardware
+  * activity. Production retained-owner release has its separate oracle. */
+ fe_mcast_free(&fe);fe_l2_owner_free(&fe);
  assert(!pthread_mutex_destroy(&priv->fabric_lock.native));assert(!pthread_mutex_destroy(&fe.lock.native));
 }
 static void cached_snapshot(struct rtl_xram *priv){
@@ -486,6 +509,8 @@ int main(void){
   if(flavor==2)pon_global[0]=0; /* PDC reset: no speculative MAC/FIFO access. */
   assert(!probe_publication_tail(&platform));normal_lan(&priv);
   assert(priv.fabric_managed && fe.fabric.ready && !fe.fabric.poisoned);
+  assert(fe.l2_owner && fe.l2_owner->sealed && fe.mcast);
+  assert(fe.l2_owner->mc_error==-EOPNOTSUPP && !fe.mcast->state.contract_ready);
   assert(rtl_fabric_native_mtu_compatible(&fe.fabric));
   assert(m.vlan_writes==1 && m.frame_writes==1 && m.scans==1);
   assert(priv.native_groups_created==(sysfs_result==0));
@@ -498,6 +523,25 @@ int main(void){
   assert(ni_init_writes==old_init); /* No repeated L2QM/ES setup on warm opens. */
   assert(dma_starts==1 && qm_starts==1 && priv.fabric_managed);
   done(&priv);cases++;
+ }
+ /* Optional MCE diagnostic reads have not acquired any shared hardware
+  * lease. An all-ones result in each real FE preflight read must preserve
+  * NI publication, first LAN open and the existing DMA/QM baseline. */
+ {
+  const unsigned registers[]={0xaa28,0x3834,0x38a0};
+  for(unsigned reg=0;reg<ARRAY_SIZE(registers);reg++){
+   init(&priv,true);mce_diagnostic_fault_register=registers[reg];
+   assert(!probe_publication_tail(&platform));normal_lan(&priv);
+   assert(priv.fabric_managed && !priv.fabric_error && !priv.engine_poisoned);
+   assert(fe.fabric.ready && !fe.fabric.poisoned && !fe.fabric.error);
+   assert(fe.l2_owner && fe.l2_owner->sealed && !rtl_l2_owner_retained(fe.l2_owner));
+   assert(!fe.l2_owner->error && !fe.l2_owner->failures && !mce_diagnostic_fault_register);
+   assert(fe.l2_owner->mc_error==-EIO && fe.mcast->state.error==-EIO);
+   assert(fe.mcast->state.cold_register==registers[reg] && fe.mcast->state.cold_reads==reg+1);
+   assert(!fe.mcast->state.contract_ready && !fe.mcast->state.fdb_filter_owned);
+   assert(!fe.mcast->state.mce_control_owned && dma_starts==1 && qm_starts==1);
+   done(&priv);cases++;
+  }
  }
  /* Legacy/unflagged bring-up still boots; this is not the shipping default. */
  init(&priv,false);assert(!probe_publication_tail(&platform));normal_lan(&priv);

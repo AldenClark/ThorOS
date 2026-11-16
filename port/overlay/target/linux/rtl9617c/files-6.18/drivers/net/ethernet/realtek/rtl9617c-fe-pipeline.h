@@ -98,6 +98,26 @@ static inline void rtl_fe_classify_cpu_original(unsigned int words[7])
  rtl_fe_bits_set(words,204,4,15); /* T2_CTRL_BYPASS */
 }
 
+/* Type0 is forwarding, type1 QoS, type2/3 other application results in
+ * the pinned RTL77C cls_rule contract. An exact type0 multicast result must
+ * not compete with three default forwarding/T2 overrides. For an owner
+ * admitted to the exact-MDB profile, make those defaults genuinely neutral:
+ * every mode0 valid selector is zero. A type0 miss still supplies the usual
+ * route-hash/CPU destination. Profile1 keeps the full original-packet gate.
+ * The caller separately owns and zeros the adjacent format row.
+ */
+static inline void rtl_fe_classifier_default(unsigned int words[7],
+ unsigned int profile,unsigned int result,unsigned int exact_mcast)
+{
+ unsigned int i;
+
+ if(profile)rtl_fe_classify_cpu_original(words);
+ else if(!exact_mcast || !result) {
+  rtl_fe_classify_hash(words,0,0);
+  rtl_fe_bits_set(words,208,1,0); /* preserve actual source */
+ } else for(i=0;i<7;i++)words[i]=0;
+}
+
 /* Each of the two CLS profiles owns 128 key rows, all in this one window.
  * No mutation: a foreign full/short/flow key makes default-only ownership
  * unsafe. Check all four valid flags, including the second half of long keys.

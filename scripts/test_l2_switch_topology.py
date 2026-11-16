@@ -38,6 +38,7 @@ COMMON = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-l2-format.h"
+#include "rtl9617c-l2-domain.h"
 typedef uint32_t u32;typedef uint8_t u8;
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
@@ -89,6 +90,7 @@ struct rtl_fe_port {
 struct rtl_fe {struct list_head ports;bool enabled;};
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask,replay_ports;
+ bool vlan_domain;
  unsigned int local_target,rule_count,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
  unsigned int replay_traps[(RTL_L2_FDB_ENTRIES+31)/32];
 };
@@ -97,6 +99,12 @@ struct switchdev_notifier_fdb_info {
  struct switchdev_notifier_info info;unsigned int vid;bool locked,is_local,added_by_user;
  const u8 *addr;
 };
+/* The VID-aware replay/member contract has its own production helper test.
+ * This fixture intentionally keeps the existing SVL topology unchanged. */
+static bool fe_switch_vlan_replay_member(struct rtl_fe_bridge *sw,
+ const struct switchdev_notifier_fdb_info *info,int port){
+ (void)info;(void)port;assert(!sw->vlan_domain);return false;
+}
 static bool netif_running(const struct net_device *dev){return dev->running;}
 static bool netif_carrier_ok(const struct net_device *dev){return dev->carrier;}
 static struct net_device *netdev_master_upper_dev_get(struct net_device *dev){return dev->master;}

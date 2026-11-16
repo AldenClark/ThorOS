@@ -5,6 +5,7 @@ common=r'''
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <errno.h>
 typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned long long u64;typedef uintptr_t dma_addr_t;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U<<(l))&(~0U>>(31-(h))))
@@ -36,9 +37,14 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned lo
 #define EPP_READ 0x7100
 #include "rtl9617c-qm-refill.h"
 #include "rtl9617c-mcast-observe.h"
-struct net_device {bool running;struct {u64 rx_errors,rx_dropped,rx_packets,rx_bytes;} stats;};
+struct net_device {bool running;int ifindex;struct {u64 rx_errors,rx_dropped,rx_packets,rx_bytes;} stats;};
 struct napi_struct {struct net_device *dev;};
 struct sk_buff {u8 storage[128],*data;unsigned len,priority,protocol,ip_summed;struct net_device *dev;};
+struct rtl9617c_mcast_copy {int ingress_ifindex;};
+#define SKB_EXT_RTL9617C_MCAST 1
+static void *skb_ext_find(struct sk_buff *s,unsigned id){(void)s;(void)id;abort();return NULL;}
+static struct net_device *netdev_master_upper_dev_get_rcu(struct net_device *d){(void)d;return NULL;}
+static bool rtl9617c_mcast_copy_valid(const struct sk_buff *s,const struct net_device *d,const struct net_device *m){(void)s;(void)d;(void)m;return false;}
 struct rtl9617c_ni_endpoint {void (*receive)(struct rtl9617c_ni_endpoint *,struct napi_struct *,struct sk_buff *,unsigned);};
 struct rtl_fe {unsigned int unused;};
 struct rtl_qm_rx {
@@ -83,6 +89,9 @@ static void rtl_fe_switch_rx(struct rtl_fe *fe,struct sk_buff *s,unsigned source
  (void)h0;assert(fe==active->fe && source<5 && source==((h1>>9)&63));
  assert(s->data==s->storage && s->len==64 && !s->protocol);
 }
+static int rtl_fe_mcast_rx(struct rtl_fe *fe,struct sk_buff *s,u32 h0,u32 h1,unsigned *source) {
+ (void)fe;(void)s;(void)h0;(void)source;return ((h1>>9)&63)==27?-EACCES:0;
+}
 static unsigned eth_type_trans(struct sk_buff *s,struct net_device *d){(void)d;s->data+=14;s->len-=14;return ETH_P_IP;}
 static void packet_bytes(unsigned id,u8 *b){memset(b,0xa5,64);b[0]=2;b[12]=8;b[13]=0;b[14]=0x45;b[23]=17;b[36]=18081>>8;b[37]=18081&255;put(__builtin_bswap32(id),b+42);}
 static void enqueue(unsigned id){
@@ -98,5 +107,6 @@ static void received(struct sk_buff *s){unsigned skip=kind==0?14:0;u8 expected[6
  if(!injected++){for(unsigned i=64;i<129;i++)enqueue(i);}free(s);
 }
 static void napi_gro_receive(struct napi_struct *n,struct sk_buff *s){(void)n;assert(kind==0);received(s);}
+static void netif_receive_skb(struct sk_buff *s){(void)s;abort();}
 static void pon_receive(struct rtl9617c_ni_endpoint *e,struct napi_struct *n,struct sk_buff *s,unsigned metadata){(void)e;(void)n;assert(kind==2&&metadata==(7|5<<8));received(s);}
 '''

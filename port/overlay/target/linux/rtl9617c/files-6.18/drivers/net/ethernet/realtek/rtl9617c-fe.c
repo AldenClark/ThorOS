@@ -34,11 +34,30 @@
 #include "rtl9617c-fe-cache-snapshot.h"
 #include "rtl9617c-fe-observe.h"
 #include "rtl9617c-l2-evidence.h"
+#include "rtl9617c-l2-owner.h"
 #include "rtl9617c-fabric.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
 
 struct rtl_fe_bridge;
+struct rtl_fe_mcast;
+struct rtl_fe_mdb;
+struct rtl9617c_switch_guard;
+static int fe_mcast_cold_prepare(struct rtl_fe *fe);
+static void fe_mcast_free(struct rtl_fe *fe);
+static bool fe_mcast_retained(struct rtl_fe *fe);
+static bool fe_mcast_available(struct rtl_fe *fe);
+static ssize_t fe_mcast_stats(struct rtl_fe *fe, char *buffer, size_t bytes);
+static int fe_mdb_profile_prepare(struct rtl_fe *fe);
+static int fe_mdb_profile_check(struct rtl_fe *fe);
+static int fe_mdb_prepare(struct rtl_fe *fe, struct rtl9617c_switch_guard *guard,
+ u64 generation, const struct net_device *master,
+ struct net_device *const ports[5], const unsigned long flags[5],
+ unsigned int forwarding, unsigned int *steer_ports);
+static int fe_mdb_withdraw(struct rtl_fe *fe);
+static bool fe_mdb_retained(struct rtl_fe *fe);
+static void fe_mdb_free(struct rtl_fe *fe);
+static ssize_t fe_mdb_stats(struct rtl_fe *fe, char *buffer, size_t bytes);
 static struct rtl_fe_bridge *fe_bridge_start(struct rtl_fe *fe);
 static int fe_bridge_stop(struct rtl_fe_bridge *bridge);
 static ssize_t fe_bridge_stats(struct rtl_fe_bridge *bridge, char *buffer, size_t bytes);
@@ -57,6 +76,12 @@ static void fe_switch_track_port_locked(struct rtl_fe *fe, struct net_device *de
 #define FE_DESTINATIONS (4096 + 32)
 #define FE_LAN_PORTS 5
 #define FE_LAN_RX_CTRL(port) (0xa5f8+0x90*(port))
+
+/* Boot-only namespace selection; warm policy changes never reinterpret the
+ * shared FDB while native rows or L3 DA-rewrite pins may still be live. */
+static bool native_l2_ivl;
+module_param(native_l2_ivl, bool, 0400);
+MODULE_PARM_DESC(native_l2_ivl, "Select IVL at the fenced cold handoff (default SVL; reboot required)");
 
 enum rtl_fe_mode {
  RTL_FE_MODE_OFF,
@@ -194,6 +219,10 @@ struct rtl_fe {
  struct rtl_itu_paths *itu_paths;
  struct net_device *itu_netdev;
  struct rtl_fe_bridge *bridge;
+ struct rtl_l2_owner *l2_owner;
+ struct rtl_fe_mcast *mcast;
+ struct rtl_fe_mdb *mdb;
+ bool native_mdb_profile;
  struct rtl_fabric fabric;
  DECLARE_BITMAP(hashes,RTL_FE_HASH_ENTRIES);
  DECLARE_BITMAP(counters,FE_INTERFACES);
@@ -226,6 +255,47 @@ static struct rtl_dq_io fe_io(struct rtl_fe *fe)
  return (struct rtl_dq_io){fe,fe_read,fe_write,fe_access};
 }
 
+static bool __maybe_unused fe_native_l2_ivl(const struct rtl_fe *fe)
+{
+ return native_l2_ivl && fe->fabric.ready && !fe->fabric.poisoned &&
+        !(fe->fabric.vlan_mode&RTL_L2_VLAN_MODE_SVL);
+}
+
+static void fe_l2_owner_free(struct rtl_fe *fe)
+{
+ if(!fe->l2_owner)return;
+ kvfree(fe->l2_owner->journal.row_index);
+ kvfree(fe->l2_owner->rows);
+ kvfree(fe->l2_owner);
+ fe->l2_owner=NULL;
+}
+
+/* Allocate before the first cold shared write. No devm lifetime: an unknown
+ * indirect completion or published immutable MCE object retains this owner
+ * even when platform removal has to quarantine the rest of the FE. */
+static int fe_l2_owner_allocate(struct rtl_fe *fe)
+{
+ struct rtl_l2_owner *owner;
+ struct rtl_l2_snapshot *rows;
+ unsigned short *index;
+ unsigned int entries=rtl_l2_journal_index_count();
+ int ret;
+
+ if(fe->l2_owner)return 0;
+ owner=kvzalloc(sizeof(*owner),GFP_KERNEL);
+ if(!owner)return -ENOMEM;
+ rows=kvcalloc(RTL_L2_OWNER_ROWS,sizeof(*rows),GFP_KERNEL);
+ index=kvcalloc(entries,sizeof(*index),GFP_KERNEL);
+ if(!rows || !index) {ret=-ENOMEM;goto free;}
+ ret=rtl_l2_owner_init(owner,rows,index,entries,1);
+ if(ret)goto free;
+ fe->l2_owner=owner;
+ return 0;
+free:
+ kvfree(index);kvfree(rows);kvfree(owner);
+ return ret;
+}
+
 int rtl_fe_fabric_cold_prepare(struct rtl_fe *fe)
 {
  struct rtl_dq_io io;
@@ -238,11 +308,34 @@ int rtl_fe_fabric_cold_prepare(struct rtl_fe *fe)
   ret=-EBUSY;
   goto out;
  }
- ret=rtl_fabric_cold_prepare(&io,&fe->fabric);
+ ret=fe_l2_owner_allocate(fe);
+ if(ret) {
+  /* No fabric write has happened. Keep optional native admission off. */
+  fe->error=ret;
+  ret=1;
+  goto out;
+ }
+ ret=rtl_fabric_cold_prepare_mode(&io,&fe->fabric,
+  native_l2_ivl?RTL_FABRIC_VLAN_IVL:RTL_FABRIC_VLAN_SVL);
  /* A verified preflight refusal preserves the old software/routing
   * baseline. Ambiguous writes and failed cleanup never publish NI users.
   */
  if(ret && fe->fabric.refusal && !fe->fabric.poisoned)ret=1;
+ if(!ret && !fe->l2_owner->sealed) {
+  if(native_l2_ivl)ret=rtl_l2_owner_vlan_cold_scan(fe->l2_owner,&io);
+  if(!ret) {
+   /* This audits all independent multicast roots, not just VLAN free
+    * space. A clean incompatible inherited policy leaves MCE on CPU. */
+   fe->l2_owner->mc_error=fe_mcast_cold_prepare(fe);
+   if(fe->l2_owner->ledger.quarantined)ret=fe->l2_owner->error;
+  }
+  rtl_l2_owner_seal(fe->l2_owner);
+  if(ret) {
+   fe->fabric.ready=0;
+   fe->fabric.poisoned=1;
+   fe->fabric.error=ret;
+  }
+ }
 out:
  mutex_unlock(&fe->lock);
  return ret;
@@ -471,7 +564,7 @@ static int fe_prepare(struct rtl_fe *fe)
   /* These are control words, not arbitrary mask/hash payloads. Refuse
    * an inaccessible control bank before claiming a writable snapshot. */
   if((fe_registers[i]==0x30a4 || fe_registers[i]==0x2300 ||
-      fe_registers[i]==0xa1e0) && fe->saved[i]==~0U) {
+      fe_registers[i]==0xa1e0 || fe_registers[i]==0x3400) && fe->saved[i]==~0U) {
    fe->base_rejected_register=fe_registers[i];
    fe->base_rejected_value=fe->saved[i];
    return -EIO;
@@ -495,6 +588,10 @@ static int fe_prepare(struct rtl_fe *fe)
    fe->map_saved[i][side]=fe_read(fe,0x1658);
   }
  }
+ /* This is a device-lifetime profile selection, derived from the actual
+  * cold multicast owner, not a module knob or a runtime policy promise.
+  * Failed/unsupported MCE handoff keeps the established route recipe. */
+ fe->native_mdb_profile=fe_mcast_available(fe);
  fe->prepared=true;
  /* Original aal_l3fe_l4_chksum: EPP checksum status requires this engine. */
  /* SDK L3FE checksum engines: explicitly enable IPv4 and L4 checking.
@@ -534,13 +631,13 @@ static int fe_prepare(struct rtl_fe *fe)
  /* Linux must generate TTL/Hop-Limit errors from the original ingress
   * packet; override an accelerated WAN action's deep-Q flag as well. */
  fe_write(fe,0x30cc,(fe_read(fe,0x30cc)&~0xfffU)|0xf21);
- /* Use the SAME action in all result groups; they are not assumed to be
-  * mutually exclusive packet classes. Normal profile0 keeps actual LSPID
-  * (LAN0..4 / PON7); profile1 skips T2 and sends the original frame to CPU. */
+ /* The optional exact-MDB owner uses forwarding group0 only and neutral
+  * ancillary defaults, so a TCAM hit cannot compete with a default Hash
+  * action. Without that cold owner preserve the original all-group route
+  * recipe. Profile1 remains the original-packet CPU gate in both modes. */
  for(i=0;i<2;i++) {
-  if(i)rtl_fe_classify_cpu_original(cls);
-  else {rtl_fe_classify_hash(cls,0,0);rtl_fe_bits_set(cls,208,1,0);}
   for(type=0;type<4;type++) {
+   rtl_fe_classifier_default(cls,i,type,fe->native_mdb_profile);
    ret=rtl_fe_classifier_write(&io,fe_classifier_default_index(i,type,1),zero);
    if(!ret)ret=rtl_fe_classifier_write(&io,fe_classifier_default_index(i,type,0),cls);
    if(ret)return ret;
@@ -567,7 +664,21 @@ static int fe_prepare(struct rtl_fe *fe)
  fe->route_admitted=false;
  spin_unlock_irqrestore(&fe->route_lock,flags);
  if(ret)return ret;
- fe_write(fe,0x3400,(fe_read(fe,0x3400)&~(BIT(0)|BIT(10)))|BIT(3)|BIT(2)|BIT(19));
+ /* Removing my-MAC bypass also exposes ordinary route-only/PON traffic
+  * to profile0. Install persistent, disjoint MC/non-MC-IP and broadcast
+  * CPU guards BEFORE that change, not only for the current MDB ingress.
+  * They use no MCE token and survive every warm policy withdrawal. */
+ if(fe->native_mdb_profile) {
+  ret=fe_mdb_profile_prepare(fe);
+  if(ret)return ret;
+ }
+ value=fe_read(fe,0x3400);
+ if(value==~0U) {fe->base_rejected_register=0x3400;fe->base_rejected_value=value;return -EIO;}
+ /* A multicast DA is not the router's own unicast MAC. Once the exact
+  * profile is owned it must reach CLS; retaining my-MAC-fail bypass would
+  * silently skip the installed MDB rules. Preserve it in legacy mode. */
+ fe_write(fe,0x3400,(value&~(BIT(0)|BIT(10)|
+  (fe->native_mdb_profile?BIT(20):0)))|BIT(3)|BIT(2)|BIT(19));
  fe_write(fe,0x3404,7|(25<<8)|(1<<14)|(24<<16)|(2<<22)|(3<<24));
  value=fe_read(fe,0x2300);
  if(value==~0U) {fe->base_rejected_register=0x2300;fe->base_rejected_value=value;return -EIO;}
@@ -1216,6 +1327,10 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
   data->key.source=ntohl(addresses.key->src);data->key.destination=ntohl(addresses.key->dst);
   new_source=addresses.key->src;new_destination=addresses.key->dst;
  }
+ data->reject_reason=FE_REJECT_PROTOCOL;
+ if(!rtl_fe_routed_unicast(data->ipv6,
+    data->ipv6?data->key6.source[0]:data->key.source,
+    data->ipv6?data->key6.destination[0]:data->key.destination))return -EOPNOTSUPP;
  new_sport=ports.key->src;new_dport=ports.key->dst;
  data->reject_reason=FE_REJECT_ACTION;
  flow_action_for_each(i,act,&rule->action) {
@@ -1291,6 +1406,8 @@ static int fe_parse(struct rtl_fe_port *port,struct flow_cls_offload *cls,struct
  source_changed=!data->ipv6 && (new_source!=addresses.key->src || new_sport!=ports.key->src);
  destination_changed=!data->ipv6 && (new_destination!=addresses.key->dst || new_dport!=ports.key->dst);
  data->reject_reason=FE_REJECT_NAT;
+ if(!data->ipv6 && !rtl_fe_routed_unicast(0,ntohl(new_source),
+    ntohl(new_destination)))return -EOPNOTSUPP;
  if(source_changed && destination_changed)return -EOPNOTSUPP;
  /* A remaining input tag has unknown PCP/DEI. Leave it untouched, or let
   * Linux perform a partial-stack edit; a new tag is fully specified. */
@@ -1497,6 +1614,14 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
  if(port->retired || fe->shutting_down)return -ENODEV;
  /* No producer owns the old bridge hash templates. Native L2 uses FDB. */
  if(data.bridge)return -EOPNOTSUPP;
+ /* Keep the publisher independently bounded even if a future caller
+  * constructs a rule without the current nft parser. An exact-MDB miss
+  * must not find a multicast IP route in the ordinary unicast hash. */
+ if(!rtl_fe_routed_unicast(data.ipv6,
+    data.ipv6?data.key6.source[0]:data.key.source,
+    data.ipv6?data.key6.destination[0]:data.key.destination) ||
+    (!data.ipv6 && data.action.translate &&
+     !rtl_fe_routed_unicast(0,data.action.address,data.action.address)))return -EOPNOTSUPP;
  if(!fe->engine_ready || !fe->enabled || !fe_switch_flow_allowed(fe) ||
     !netif_running(data.input->netdev) || !netif_running(data.output->netdev) ||
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
@@ -2240,7 +2365,11 @@ static int fe_base_check_locked(struct rtl_fe *fe)
     !fe_base_match(fe,0x351c,BIT(31)|BIT(12)|BIT(10)|(63U<<4)|
                    (63U<<16)|(7U<<24),BIT(31)|BIT(12)|BIT(10)|(32U<<4)|(16U<<16)))
   return -EIO;
- ret=rtl_fe_classifier_keys_empty(&io);
+ if(fe->native_mdb_profile && !fe_base_match(fe,0x3400,BIT(20),0))return -EIO;
+ /* Quiesce has withdrawn exact MDB keys. The two immutable CPU guards
+  * remain owned; verify their complete KEY/FIB and reject every other
+  * valid classifier row instead of treating those guards as foreign. */
+ ret=fe->native_mdb_profile?fe_mdb_profile_check(fe):rtl_fe_classifier_keys_empty(&io);
  if(ret)return ret;
  for(i=0;i<2;i++) {
   for(side=0;side<4;side++) {
@@ -2251,8 +2380,7 @@ static int fe_base_check_locked(struct rtl_fe *fe)
   for(type=0;type<4;type++)for(row=0;row<2;row++) {
    memset(expected,0,sizeof(expected));
    if(!row) {
-    if(i)rtl_fe_classify_cpu_original(expected);
-    else {rtl_fe_classify_hash(expected,0,0);rtl_fe_bits_set(expected,208,1,0);}
+    rtl_fe_classifier_default(expected,i,type,fe->native_mdb_profile);
    }
    ret=rtl_fe_classifier_read(&io,fe_classifier_default_index(i,type,row),actual);
    if(ret)return ret;
@@ -2533,7 +2661,9 @@ bool rtl_fe_free(struct rtl_fe *fe)
  /* This check precedes ALL ownership handoff, including the shared FDB
   * command-mode lease. An exposed/partial base may still be referenced by
   * a PON packet; do not restore a boot owner just because software is idle. */
- if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed || fe->fabric.poisoned))ret=-EBUSY;
+ if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed || fe->fabric.poisoned ||
+             rtl_l2_owner_retained(fe->l2_owner) || fe_mcast_retained(fe) ||
+             fe_mdb_retained(fe)))ret=-EBUSY;
  if(!ret && !bound && list_empty(&fe->blocks) && list_empty(&fe->flows)) {
   struct rtl_dq_io io=fe_io(fe);
   ret=rtl_fe_fdb_restore_mode(&io,fe->fdb_cmd_mode_saved);
@@ -2555,6 +2685,9 @@ bool rtl_fe_free(struct rtl_fe *fe)
  dma_free_coherent(fe->device,RTL_FE_MEMORY_BYTES,fe->memory,fe->dma);
  kvfree(fe->hash_owners);
  kvfree(fe->itu_paths);
+ fe_mcast_free(fe);
+ fe_mdb_free(fe);
+ fe_l2_owner_free(fe);
  kfree(fe);
  return true;
 }
@@ -2678,6 +2811,24 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fabric_cold_rx_gated=0x%x fabric_inherited_fdb_present=%u fabric_inherited_fdb_index=%u\n",
   fe->fabric.cold_rx_gated,fe->fabric.inherited_fdb_present,fe->fabric.inherited_fdb_index);
+ if(fe->l2_owner) {
+  struct rtl_l2_owner *owner=fe->l2_owner;
+
+  length+=scnprintf(buffer+length,PAGE_SIZE-length,
+   "l2_owner_sealed=%u l2_owner_ready=0x%x l2_owner_quarantined=%u l2_owner_error=%d "
+   "l2_owner_journal=%u/%u l2_owner_reads=%u l2_owner_publications=%u "
+   "l2_owner_withdrawals=%u l2_owner_aborts=%u l2_owner_failures=%u\n",
+   owner->sealed,owner->ready_mask,owner->ledger.quarantined || owner->journal.quarantined,
+   owner->error,owner->count,owner->journal.capacity,owner->scan_reads,
+   owner->publications,owner->withdrawals,owner->aborts,owner->failures);
+  for(i=0;i<RTL_L2_SHARED_COUNT;i++)
+   length+=scnprintf(buffer+length,PAGE_SIZE-length,
+    "l2_bank_%u_capacity=%u l2_bank_%u_leased=%u l2_bank_%u_verified_available=%u\n",
+    i,rtl_l2_shared_capacity(i),i,rtl_l2_shared_leased(&owner->ledger,i),
+    i,rtl_l2_shared_available(&owner->ledger,i));
+ }
+ length+=fe_mcast_stats(fe,buffer+length,PAGE_SIZE-length);
+ length+=fe_mdb_stats(fe,buffer+length,PAGE_SIZE-length);
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_pin_vid=%u fdb_pin_sc=%u fdb_pin_port=%u\n",
   RTL_FE_FDB_PIN_VID,RTL_FE_FDB_PIN_SCIND,RTL_FE_FDB_PIN_PORT);
@@ -2702,4 +2853,62 @@ ssize_t rtl_fe_state(struct rtl_fe *fe,char *buffer)
  return length;
 }
 
+#include "rtl9617c-fe-mcast.h"
+
+static bool fe_mcast_available(struct rtl_fe *fe)
+{
+ return IS_REACHABLE(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_NET_SWITCHDEV) &&
+  IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD) &&
+  fe->mcast && fe->mcast->state.contract_ready &&
+  rtl_l2_owner_ready(fe->l2_owner,RTL_L2_SHARED_MC_FIB) &&
+  rtl_l2_owner_ready(fe->l2_owner,RTL_L2_SHARED_MC_VECTOR);
+}
+
+static int fe_mcast_inherited_l3_check(struct rtl_fe *fe)
+{
+ struct rtl_mcast_state *state=&fe->mcast->state;
+ static const unsigned int registers[]={0xaa28,0x3834,0x38a0};
+ unsigned int i,value;
+
+ lockdep_assert_held(&fe->lock);
+ /* Capture actual inherited XRAM/hash/cache configuration without taking
+  * over any foreign command window or dereferencing foreign DDR memory.
+  * These values are evidence, NOT an empty-table or complete-drain proof:
+  * HASH_INI.ht_size=0 is a 512-entry table; CACHE_INI.ct_size=0 disables
+  * only the cache. Zero DMA addresses cannot prove disabled consumers.
+  */
+ for(i=0;i<ARRAY_SIZE(registers);i++) {
+  value=fe_read(fe,registers[i]);
+  state->cold_reads++;
+  state->cold_register=registers[i];
+  state->cold_value=value;
+  if(value==~0U)return -EIO;
+ }
+ /* The existing NI handoff proves LAN/PON ingress exclusion and the L2
+  * stage drain. It does NOT hand over CPU XRAM/DMALSO injection, inherited
+  * ICLS/L3 classifier/DDR roots, or an MCE packet-retirement completion.
+  * Keep this admission explicitly closed until that real owner contract
+  * exists. Neither an idle command window, elapsed delay, equal counters,
+  * nor the MCE flush request may manufacture a success branch here.
+  */
+ return -EOPNOTSUPP;
+}
+
+static ssize_t fe_mcast_stats(struct rtl_fe *fe, char *buffer, size_t bytes)
+{
+ const struct rtl_mcast_state *state;
+
+ if(!fe->mcast)return scnprintf(buffer,bytes,"mce_owner=0 mce_cold_handoff_verified=0\n");
+ state=&fe->mcast->state;
+ return scnprintf(buffer,bytes,
+  "mce_owner=1 mce_contract_ready=%u mce_cold_handoff_verified=0 mce_error=%d "
+  "mce_cold_reads=%u mce_cold_register=0x%x mce_cold_value=0x%x "
+  "mce_groups=%u mce_tokens=%u mce_publications=%u mce_fallbacks=%u "
+  "mce_rx_copies=%llu mce_rx_rejected=%llu mce_rx_no_memory=%llu\n",
+  state->contract_ready,state->error,state->cold_reads,state->cold_register,state->cold_value,
+  state->groups,state->tokens,state->publications,state->fallbacks,
+  READ_ONCE(state->rx_copies),READ_ONCE(state->rx_rejected),READ_ONCE(state->rx_no_memory));
+}
+
 #include "rtl9617c-fe-switch.h"
+#include "rtl9617c-fe-mdb.h"

@@ -51,7 +51,7 @@ L2_HW_REASONS = ('ok', 'requires-existing-svl', 'priority-fdb-key', 'tpid-profil
                  'mac-limit-io', 'table-io', 'shared-command-busy', 'pipeline-drain-timeout',
                  'native-mtu-baseline', 'control-packet-classification',
                  'port-policy-transaction', 'isolation-baseline', 'redirect-baseline',
-                 'admission-readback')
+                 'admission-readback', 'ivl-parser-consumer-unverified')
 COLD_STAGES = ('none', 'global_snapshot', 'select_family', 'write_receive_gates',
                'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready')
 COLD_GATES = ((0x088c, 1, 'EPON_1G'), (0x10b4, 1 << 7, 'EPON_10G'),

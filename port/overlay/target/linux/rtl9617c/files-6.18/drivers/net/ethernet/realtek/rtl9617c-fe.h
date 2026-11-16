@@ -34,6 +34,9 @@ int rtl_fe_switch_set(struct rtl_fe *fe, bool requested);
 bool rtl_fe_switch_get(struct rtl_fe *fe);
 void rtl_fe_switch_rx(struct rtl_fe *fe, struct sk_buff *skb,
                      unsigned int source, u32 header0, u32 header1);
+/* 1 verified local-only MCE copy; 0 ordinary frame; negative means drop. */
+int rtl_fe_mcast_rx(struct rtl_fe *fe, struct sk_buff *skb,
+                   u32 header0, u32 header1, unsigned int *source);
 ssize_t rtl_fe_state(struct rtl_fe *fe, char *buffer);
 ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer);
 #endif

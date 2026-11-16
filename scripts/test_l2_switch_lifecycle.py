@@ -67,19 +67,25 @@ static bool is_valid_ether_addr(const unsigned char *mac) {
  unsigned int any = 0; for (unsigned int i = 0; i < 6; i++) any |= mac[i];
  return any && !(mac[0] & 1);
 }
-struct rtl_fe { bool shutting_down, engine_ready, enabled, route_admitted; };
+struct rtl_fe { bool shutting_down, engine_ready, enabled, route_admitted, mcast_active; uint64_t mcast_generation; };
 struct rtl_fe_switch_hw { bool open, allow_arm; unsigned int closes, arms; u32 native, route; };
 struct rtl_fe_bridge {
  struct rtl_fe *fe; struct rtl_fe_switch_hw hw;
  bool stopping, active, flow_allowed, route_policy_allowed; u32 native_mask, route_mask, armed_route_mask;
+ uint64_t route_generation;
  unsigned int work;
 };
+static void fe_mcast_revoke(struct rtl_fe *fe) { fe->mcast_active=false; }
+static void fe_mcast_arm(struct rtl_fe *fe, uint64_t generation) {
+ assert(!fe->mcast_active); fe->mcast_generation=generation; fe->mcast_active=true;
+}
 static void fe_switch_hw_gate(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw) {
- assert(fe); hw->open = false; hw->closes++; fe->route_admitted=false;
+ assert(fe && !fe->mcast_active); hw->open = false; hw->closes++; fe->route_admitted=false;
 }
 static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw, u32 native, u32 route, bool route_allowed) {
  assert(fe && fe->engine_ready && !fe->shutting_down);
  assert(!(native & route) && !((native | route) & ~31U));
+ assert(!!native==fe->mcast_active); /* RX provenance precedes opening a native producer. */
  hw->arms++; hw->native = native; hw->route = route; hw->open = hw->allow_arm;
  fe->route_admitted = hw->allow_arm && fe->enabled && route_allowed;
  return hw->allow_arm;
@@ -185,10 +191,12 @@ static void policy_and_domains(void) {
 
 static void admission_callbacks(void) {
  struct rtl_fe fe = {.engine_ready=true,.enabled=true};
- struct rtl_fe_bridge sw = {.fe=&fe,.hw={.allow_arm=true},.native_mask=3,.route_mask=28,.route_policy_allowed=true};
+ struct rtl_fe_bridge sw = {.fe=&fe,.hw={.allow_arm=true},.native_mask=3,.route_mask=28,.route_policy_allowed=true,.route_generation=42};
  assert(fe_switch_arm(&sw) && sw.active && sw.hw.open && sw.flow_allowed);
+ assert(fe.mcast_active && fe.mcast_generation==42);
  assert(sw.hw.arms==1 && sw.hw.native==3 && sw.hw.route==28 && sw.armed_route_mask==28);
  fe_switch_gate(&sw);assert(!sw.active && !sw.hw.open && sw.hw.closes==1 && !sw.armed_route_mask && !sw.flow_allowed);
+ assert(!fe.mcast_active);
  fe.enabled=false;sw.route_mask=0;
  assert(fe_switch_arm(&sw) && sw.active && !sw.flow_allowed && !sw.armed_route_mask);
  fe_switch_gate(&sw);fe.enabled=true;
@@ -197,6 +205,7 @@ static void admission_callbacks(void) {
  fe_switch_gate(&sw);sw.route_policy_allowed=true;
  sw.native_mask=0;sw.route_mask=31;
  assert(fe_switch_arm(&sw) && !sw.active && sw.hw.open && sw.flow_allowed); /* Route-only is not native L2. */
+ assert(!fe.mcast_active);
  fe_switch_gate(&sw);
  for(unsigned int condition=0;condition<3;condition++) {
   unsigned int arms=sw.hw.arms;
@@ -208,6 +217,7 @@ static void admission_callbacks(void) {
  }
  sw.native_mask=3;sw.route_mask=28;sw.hw.allow_arm=false;
  assert(!fe_switch_arm(&sw) && !sw.active && !sw.flow_allowed);
+ assert(!fe.mcast_active); /* Partial admission cannot authorize queued CPU copies. */
  fe_switch_queue(&sw);assert(queue_calls==1 && sw.work);
  sw.stopping=true;fe_switch_queue(&sw);assert(queue_calls==1);
  sw.stopping=false;sw.work=0;fe_switch_rebuild(&sw);assert(queue_calls==2 && sw.work);

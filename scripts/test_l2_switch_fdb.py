@@ -42,6 +42,7 @@ COMMON = r'''
 #include <stdlib.h>
 #include <string.h>
 #include "rtl9617c-l2-format.h"
+#include "rtl9617c-l2-domain.h"
 typedef uint32_t u32; typedef uint64_t u64; typedef unsigned char u8;
 /* Match Linux's task accessor macro: a local variable named current must
  * fail this host build just as it does in the real ARM64 kernel. */
@@ -68,14 +69,15 @@ struct rtl_dq_io {struct rtl_fe *context;};
 struct rtl_l2_fdb_result {unsigned int raw,status,index,words[4];};
 struct rtl_fe_switch_hw {bool owned,drained; int drain_error,restore_error; unsigned int drains,restores;u32 learning_mask;};
 struct rtl9617c_switch_guard {struct rtl_fe_bridge *owner;u64 generation;unsigned int invalidations;};
-struct fe_switch_learned {u8 address[6];u8 port;};
-struct fe_switch_published {u8 address[6];u8 destination;u64 cookie;};
+struct fe_switch_learned {u8 address[6];u8 port;unsigned short vid;};
+struct fe_switch_published {u8 address[6];u8 destination;unsigned short vid;u64 cookie;};
 '''
 
 BACKEND = r'''
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct rtl9617c_switch_guard guard;struct rtl_fe_switch_hw hw;
  struct net_device *ports[5],*master;struct delayed_work scan_work;struct work_struct work;
+ struct net_device *masters[5];unsigned int master_count;bool vlan_domain;struct rtl_l2_vlan_plan vlans;
  struct fe_switch_published *published;unsigned int published_count;
  struct fe_switch_learned *learned,*next;unsigned int learned_count,pending_count;
  unsigned int scan_start,scan_count,scan_old,scan_cursor;u64 scan_generation;
@@ -100,7 +102,7 @@ static u64 nanoseconds,operation_ns;
 static unsigned long last_delay;
 static unsigned int max_slice_operations;
 static unsigned int change_during_sort;
-struct feedback {bool add;unsigned int port;u8 mac[6];};
+struct feedback {bool add;unsigned int port;unsigned short vid;u8 mac[6];};
 static struct feedback events[RTL_L2_FDB_ENTRIES*4];static unsigned int event_count,cases;
 static bool is_valid_ether_addr(const u8 *mac) {
  unsigned int any=0;for(unsigned int i=0;i<6;i++)any|=mac[i];return any && !(mac[0]&1);
@@ -128,6 +130,12 @@ static int fe_switch_hw_restore(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw
  assert(owner->lock && hw->drained && !pending && !sw.domain_owned);hw->restores++;
  if(hw->restore_error)return hw->restore_error;
  hw->owned=false;return 0;
+}
+static int fe_mdb_withdraw(struct rtl_fe *owner){
+ assert(owner==&fe && fe.lock && sw.hw.drained && !sw.domain_owned);return 0;
+}
+static int fe_mcast_retire_all(struct rtl_fe *owner){
+ assert(owner==&fe && fe.lock && !sw.hw.owned && !sw.domain_owned);return 0;
 }
 static int rtl_l2_fdb_scan(const struct rtl_dq_io *io,unsigned int start,struct rtl_l2_fdb_result *out){
  assert(io->context->lock && start<RTL_L2_FDB_ENTRIES);scans++;nanoseconds+=operation_ns;
@@ -178,22 +186,24 @@ static int rtl_l2_fdb_command(const struct rtl_dq_io *io,enum rtl_l2_fdb_command
  return 0;
 }
 static bool netif_is_bridge_port(struct net_device *dev){return dev->bridge;}
-static int br_rtl9617c_fdb_learn(struct net_device *dev,const u8 *address,
+static int br_rtl9617c_fdb_learn_vid(struct net_device *dev,const u8 *address,unsigned short vid,
  struct rtl9617c_switch_guard *guard,u64 generation){
+ assert(sw.vlan_domain ? vid==10 || vid==20 : !vid);
  assert(rtnl_held && event_count<RTL_L2_FDB_ENTRIES*4);learn_calls++;nanoseconds+=operation_ns;
  if(epoch_on_learn && learn_calls==epoch_on_learn)rtl9617c_switch_guard_invalidate(guard);
  if(generation!=guard->generation || !guard->owner->active)return -EAGAIN;
  if(fail_learn_at && learn_calls==fail_learn_at)return -ENOMEM;
- events[event_count]=(struct feedback){.add=true,.port=dev->port};
+ events[event_count]=(struct feedback){.add=true,.port=dev->port,.vid=vid};
  memcpy(events[event_count++].mac,address,6);
  if(epoch_after_learn && learn_calls==epoch_after_learn)rtl9617c_switch_guard_invalidate(guard);
  return 0;
 }
-static bool br_rtl9617c_fdb_forget(struct net_device *dev,const u8 *address){
+static bool br_rtl9617c_fdb_forget_vid(struct net_device *dev,const u8 *address,unsigned short vid){
+ assert(sw.vlan_domain ? vid==10 || vid==20 : !vid);
  assert(rtnl_held && event_count<RTL_L2_FDB_ENTRIES*4);nanoseconds+=operation_ns;
  if(protected_mac && address[5]==protected_mac)return false;
  if(epoch_on_forget){epoch_on_forget=0;rtl9617c_switch_guard_invalidate(&sw.guard);}
- events[event_count]=(struct feedback){.add=false,.port=dev->port};
+ events[event_count]=(struct feedback){.add=false,.port=dev->port,.vid=vid};
  memcpy(events[event_count++].mac,address,6);return true;
 }
 static bool br_rtl9617c_fdb_unoffload(const struct net_device *master,const u8 *address,
@@ -552,7 +562,27 @@ static void batch_fault_matrix(void){
   cases++;
  }
 }
-int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();learning_mask_policy();batch_fault_matrix();
+static void vlan_key_reconciliation(void){
+ setup();sw.vlan_domain=true;sw.master_count=1;sw.masters[0]=&ports[4];
+ struct rtl_l2_vlan_spec spec={.vid=10,.bridge=1,.members=3,.forwarding=3,.learning=3};
+ assert(!rtl_l2_vlan_plan_add(&sw.vlans,&spec));spec.vid=20;
+ assert(!rtl_l2_vlan_plan_add(&sw.vlans,&spec));
+ /* One MAC on different VLANs is two keys, never a duplicate/move. */
+ put_row(5,7,1,20,false);put_row(30,7,0,10,false);put_row(50,7,0,30,false);
+ fe_switch_scan(&sw.scan_work.work);
+ assert(sw.polls==1 && sw.learned_count==2 && event_count==2);
+ assert(sw.learned[0].vid==10 && sw.learned[0].port==0);
+ assert(sw.learned[1].vid==20 && sw.learned[1].port==1);
+ assert(events[0].add && events[0].vid==10 && events[1].add && events[1].vid==20);
+ used[30]=false;event_count=0;fe_switch_scan(&sw.scan_work.work);
+ assert(sw.learned_count==1 && event_count==2 && !events[0].add && events[0].vid==10);
+ assert(events[1].add && events[1].vid==20);
+ /* Flush owns only the planned exact VID namespace, not a foreign VID,
+  * even when that row has the same MAC and destination as an owned row. */
+ sw.domain_owned=true;mutex_lock(&fe.lock);assert(!fe_switch_restore_locked(&sw));mutex_unlock(&fe.lock);
+ assert(!used[5] && used[50] && deletes==1);cases++;
+}
+int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();learning_mask_policy();batch_fault_matrix();vlan_key_reconciliation();
  printf("Native switch production FDB: %u rollback/status/batched-scan scenarios; full 4128-row capacity, timed slices, generation/rebuild restart, partial feedback ownership and MAC moves passed (max %u boundary operations/slice)\n",cases,max_slice_operations);
  return 0;}
 '''
@@ -560,11 +590,13 @@ int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_mov
 enum = re.search(r"enum fe_switch_reason \{.*?\n\};", source, re.S)[0]
 constants = "\n" + "\n".join(re.findall(r"^#define FE_SWITCH_SCAN_\w+ .+$", source, re.M)) + "\n"
 functions = "\n".join(function(name) for name in [
-    "fe_switch_scan_reset", "fe_switch_scan_slice_done", "fe_switch_native_key", "fe_switch_learned_owned", "fe_switch_fdb_write",
+    "fe_switch_scan_reset", "fe_switch_scan_slice_done", "fe_switch_native_key", "fe_switch_vlan_find", "fe_switch_bridge_for_vid", "fe_switch_domain_key", "fe_switch_learned_owned", "fe_switch_domain_learned", "fe_switch_fdb_write",
     "fe_switch_domain_claim", "fe_switch_domain_flush", "fe_switch_restore_locked",
     "fe_switch_feedback", "fe_switch_unoffload", "fe_switch_learned_compare", "fe_switch_scan",
 ])
 mutants = {
+    "vlan_identity_removed_from_scan_sort": functions.replace(
+        "\tif (left->vid != right->vid)\n\t\treturn left->vid < right->vid ? -1 : 1;\n", "", 1),
     "scan_ignores_learning_mask": functions.replace(
         "sw->native_mask & sw->hw.learning_mask", "sw->native_mask", 1),
     "scan_ignores_native_subset": functions.replace(

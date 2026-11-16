@@ -1,0 +1,428 @@
+From: ThorOS maintainers <noreply@thoros.local>
+Subject: [PATCH] bridge: expose exact bounded MDB snapshots and fence writers
+
+The switchdev MDB object contains only a multicast MAC and VID. It cannot
+authorize native IPv4/IPv6 replication, especially source filtering and
+colliding IP groups. Link the exact typed snapshot implementation and
+fence actual multicast policy producers, not deferred lossy notifications.
+
+Scope complete reports and timer/configuration mutations, including error
+rollback and source/router/querier changes that emit no MDB notification.
+Hardware offload feedback and read-only requests remain outside this gate.
+Unknown control types and normal multicast data do not invalidate policy.
+Periodic query TX only invalidates on real querier/address changes, rather
+than exhausting immutable replication resources on unchanged timer polls.
+
+Timer dequeue is earlier than callback execution. The snapshot API exposes
+those time dependencies explicitly; its epoch does not promise hardware
+expiry. The native consumer must trap unsupported timed policy to CPU.
+
+--- a/net/bridge/Makefile
++++ b/net/bridge/Makefile
+@@ -20,7 +20,8 @@
+ br_netfilter-$(subst m,y,$(CONFIG_IPV6)) += br_netfilter_ipv6.o
+ obj-$(CONFIG_BRIDGE_NETFILTER) += br_netfilter.o
+ 
+-bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o br_multicast_eht.o
++bridge-$(CONFIG_BRIDGE_IGMP_SNOOPING) += br_multicast.o br_mdb.o br_multicast_eht.o \
++					br_rtl9617c_mdb.o
+ 
+ bridge-$(CONFIG_BRIDGE_VLAN_FILTERING) += br_vlan.o br_vlan_tunnel.o br_vlan_options.o br_mst.o
+ 
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -651,6 +651,7 @@
+ {
+ 	struct net_bridge_mdb_entry *mp = timer_container_of(mp, t, timer);
+ 	struct net_bridge *br = mp->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (hlist_unhashed(&mp->mdb_node) || !netif_running(br->dev) ||
+@@ -883,6 +884,7 @@
+ 	struct net_bridge *br = pg->key.port->br;
+ 	struct hlist_node *tmp;
+ 	bool changed;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (!netif_running(br->dev) || timer_pending(&pg->timer) ||
+@@ -1092,6 +1094,16 @@
+ }
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
++static void br_multicast_set_has_ipv6_addr(struct net_bridge *br, bool has_addr)
++{
++	if (br_opt_get(br, BROPT_HAS_IPV6_ADDR) == has_addr)
++		return;
++
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
++	br_opt_toggle(br, BROPT_HAS_IPV6_ADDR, has_addr);
++}
++
+ static struct sk_buff *br_ip6_multicast_alloc_query(struct net_bridge_mcast *brmctx,
+ 						    struct net_bridge_mcast_port *pmctx,
+ 						    struct net_bridge_port_group *pg,
+@@ -1168,11 +1180,11 @@
+ 	if (ipv6_dev_get_saddr(dev_net(brmctx->br->dev), brmctx->br->dev,
+ 			       &ip6h->daddr, 0, &ip6h->saddr)) {
+ 		kfree_skb(skb);
+-		br_opt_toggle(brmctx->br, BROPT_HAS_IPV6_ADDR, false);
++		br_multicast_set_has_ipv6_addr(brmctx->br, false);
+ 		return NULL;
+ 	}
+ 
+-	br_opt_toggle(brmctx->br, BROPT_HAS_IPV6_ADDR, true);
++	br_multicast_set_has_ipv6_addr(brmctx->br, true);
+ 	ipv6_eth_mc_map(&ip6h->daddr, eth->h_dest);
+ 
+ 	hopopt = (u8 *)(ip6h + 1);
+@@ -1339,6 +1351,7 @@
+ 	struct net_bridge_group_src *src = timer_container_of(src, t, timer);
+ 	struct net_bridge_port_group *pg;
+ 	struct net_bridge *br = src->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (hlist_unhashed(&src->node) || !netif_running(br->dev) ||
+@@ -1675,6 +1688,7 @@
+ {
+ 	struct net_bridge *br = pmctx->port->br;
+ 	bool del;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (pmctx->multicast_router == MDB_RTR_TYPE_DISABLED ||
+@@ -1722,6 +1736,8 @@
+ static void br_multicast_local_router_expired(struct net_bridge_mcast *brmctx,
+ 					      struct timer_list *timer)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	spin_lock(&brmctx->br->multicast_lock);
+ 	if (brmctx->multicast_router == MDB_RTR_TYPE_DISABLED ||
+ 	    brmctx->multicast_router == MDB_RTR_TYPE_PERM ||
+@@ -1755,6 +1771,8 @@
+ static void br_multicast_querier_expired(struct net_bridge_mcast *brmctx,
+ 					 struct bridge_mcast_own_query *query)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	spin_lock(&brmctx->br->multicast_lock);
+ 	if (!netif_running(brmctx->br->dev) ||
+ 	    br_multicast_ctx_vlan_global_disabled(brmctx) ||
+@@ -1785,14 +1803,40 @@
+ }
+ #endif
+ 
+-static void br_multicast_query_delay_expired(struct timer_list *t)
++static void br_ip4_multicast_query_delay_expired(struct timer_list *t)
++{
++	struct net_bridge_mcast *brmctx = timer_container_of(brmctx, t,
++						     ip4_other_query.delay_timer);
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++}
++
++#if IS_ENABLED(CONFIG_IPV6)
++static void br_ip6_multicast_query_delay_expired(struct timer_list *t)
+ {
++	struct net_bridge_mcast *brmctx = timer_container_of(brmctx, t,
++						     ip6_other_query.delay_timer);
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
+ }
++#endif
+ 
+ static void br_multicast_select_own_querier(struct net_bridge_mcast *brmctx,
+ 					    struct br_ip *ip,
+ 					    struct sk_buff *skb)
+ {
++	bool changed = false;
++
++	if (ip->proto == htons(ETH_P_IP))
++		changed = brmctx->ip4_querier.addr.src.ip4 != ip_hdr(skb)->saddr;
++#if IS_ENABLED(CONFIG_IPV6)
++	else
++		changed = !ipv6_addr_equal(&brmctx->ip6_querier.addr.src.ip6,
++					  &ipv6_hdr(skb)->saddr);
++#endif
++	if (!changed)
++		return;
++
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	if (ip->proto == htons(ETH_P_IP))
+ 		brmctx->ip4_querier.addr.src.ip4 = ip_hdr(skb)->saddr;
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -1863,6 +1907,12 @@
+ 					int ifindex,
+ 					struct br_ip *saddr)
+ {
++	if (querier->port_ifidx == ifindex &&
++	    !memcmp(&querier->addr, saddr, sizeof(*saddr)))
++		return;
++
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	write_seqcount_begin(&querier->seq);
+ 	querier->port_ifidx = ifindex;
+ 	memcpy(&querier->addr, saddr, sizeof(*saddr));
+@@ -2052,6 +2102,7 @@
+ {
+ 	struct net_bridge *br = pmctx->port->br;
+ 	bool del = false;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	timer_delete_sync(&pmctx->ip6_mc_router_timer);
+@@ -2091,6 +2142,7 @@
+ 	struct net_bridge *br = port->br;
+ 	struct net_bridge_port_group *pg;
+ 	struct hlist_node *n;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	/* Take care of the remaining groups, only perm ones should be left */
+ 	spin_lock_bh(&br->multicast_lock);
+@@ -2134,6 +2186,7 @@
+ static void br_multicast_enable_port_ctx(struct net_bridge_mcast_port *pmctx)
+ {
+ 	struct net_bridge *br = pmctx->port->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 	if (br_multicast_port_ctx_is_vlan(pmctx) &&
+@@ -2171,6 +2224,7 @@
+ static void br_multicast_disable_port_ctx(struct net_bridge_mcast_port *pmctx)
+ {
+ 	struct net_bridge *br = pmctx->port->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 	if (br_multicast_port_ctx_is_vlan(pmctx) &&
+@@ -3874,6 +3928,8 @@
+ 	    pim_hdr_type(pimhdr) != PIM_TYPE_HELLO)
+ 		return;
+ 
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	spin_lock(&brmctx->br->multicast_lock);
+ 	br_ip4_multicast_mark_router(brmctx, pmctx);
+ 	spin_unlock(&brmctx->br->multicast_lock);
+@@ -3887,6 +3943,8 @@
+ 	    igmp_hdr(skb)->type != IGMP_MRDISC_ADV)
+ 		return -ENOMSG;
+ 
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	spin_lock(&brmctx->br->multicast_lock);
+ 	br_ip4_multicast_mark_router(brmctx, pmctx);
+ 	spin_unlock(&brmctx->br->multicast_lock);
+@@ -3925,6 +3983,13 @@
+ 	ih = igmp_hdr(skb);
+ 	src = eth_hdr(skb)->h_source;
+ 	BR_INPUT_SKB_CB(skb)->igmp = ih->type;
++	/* Ordinary data and unknown control types are not policy writers. */
++	CLASS(rtl9617c_switch_policy, policy)(
++		ih->type == IGMP_HOST_MEMBERSHIP_REPORT ||
++		ih->type == IGMPV2_HOST_MEMBERSHIP_REPORT ||
++		ih->type == IGMPV3_HOST_MEMBERSHIP_REPORT ||
++		ih->type == IGMP_HOST_MEMBERSHIP_QUERY ||
++		ih->type == IGMP_HOST_LEAVE_MESSAGE ? brmctx->br->dev : NULL);
+ 
+ 	switch (ih->type) {
+ 	case IGMP_HOST_MEMBERSHIP_REPORT:
+@@ -3958,6 +4023,8 @@
+ 	if (icmp6_hdr(skb)->icmp6_type != ICMPV6_MRDISC_ADV)
+ 		return;
+ 
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	spin_lock(&brmctx->br->multicast_lock);
+ 	br_ip6_multicast_mark_router(brmctx, pmctx);
+ 	spin_unlock(&brmctx->br->multicast_lock);
+@@ -3990,6 +4057,11 @@
+ 
+ 	mld = (struct mld_msg *)skb_transport_header(skb);
+ 	BR_INPUT_SKB_CB(skb)->igmp = mld->mld_type;
++	CLASS(rtl9617c_switch_policy, policy)(
++		mld->mld_type == ICMPV6_MGM_REPORT ||
++		mld->mld_type == ICMPV6_MLD2_REPORT ||
++		mld->mld_type == ICMPV6_MGM_QUERY ||
++		mld->mld_type == ICMPV6_MGM_REDUCTION ? brmctx->br->dev : NULL);
+ 
+ 	switch (mld->mld_type) {
+ 	case ICMPV6_MGM_REPORT:
+@@ -4142,7 +4214,7 @@
+ 	timer_setup(&brmctx->ip4_other_query.timer,
+ 		    br_ip4_multicast_querier_expired, 0);
+ 	timer_setup(&brmctx->ip4_other_query.delay_timer,
+-		    br_multicast_query_delay_expired, 0);
++		    br_ip4_multicast_query_delay_expired, 0);
+ 	timer_setup(&brmctx->ip4_own_query.timer,
+ 		    br_ip4_multicast_query_expired, 0);
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -4151,7 +4223,7 @@
+ 	timer_setup(&brmctx->ip6_other_query.timer,
+ 		    br_ip6_multicast_querier_expired, 0);
+ 	timer_setup(&brmctx->ip6_other_query.delay_timer,
+-		    br_multicast_query_delay_expired, 0);
++		    br_ip6_multicast_query_delay_expired, 0);
+ 	timer_setup(&brmctx->ip6_own_query.timer,
+ 		    br_ip6_multicast_query_expired, 0);
+ #endif
+@@ -4159,6 +4231,8 @@
+ 
+ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	__br_multicast_stop(brmctx);
+ }
+ 
+@@ -4260,6 +4334,8 @@
+ 
+ void br_multicast_open(struct net_bridge *br)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	ASSERT_RTNL();
+ 
+ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
+@@ -4325,6 +4401,8 @@
+ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on)
+ {
+ 	struct net_bridge *br;
++	CLASS(rtl9617c_switch_policy, policy)(br_vlan_is_master(vlan) ?
++		vlan->br->dev : vlan->port->br->dev);
+ 
+ 	/* it's okay to check for the flag without the multicast lock because it
+ 	 * can only change under RTNL -> multicast_lock, we need the latter to
+@@ -4393,6 +4471,7 @@
+ 	struct net_bridge_vlan_group *vg;
+ 	struct net_bridge_vlan *vlan;
+ 	struct net_bridge_port *p;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED) == on)
+ 		return 0;
+@@ -4428,6 +4507,8 @@
+ 
+ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(vlan->br->dev);
++
+ 	ASSERT_RTNL();
+ 
+ 	/* BR_VLFLAG_GLOBAL_MCAST_ENABLED relies on eventual consistency and
+@@ -4444,6 +4525,8 @@
+ 
+ void br_multicast_stop(struct net_bridge *br)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
++
+ 	ASSERT_RTNL();
+ 
+ 	if (br_opt_get(br, BROPT_MCAST_VLAN_SNOOPING_ENABLED)) {
+@@ -4471,6 +4554,7 @@
+ 	struct net_bridge_mdb_entry *mp;
+ 	HLIST_HEAD(deleted_head);
+ 	struct hlist_node *tmp;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 	hlist_for_each_entry_safe(mp, tmp, &br->mdb_list, mdb_node)
+@@ -4486,6 +4570,7 @@
+ int br_multicast_set_router(struct net_bridge_mcast *brmctx, unsigned long val)
+ {
+ 	int err = -EINVAL;
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
+ 
+ 	spin_lock_bh(&brmctx->br->multicast_lock);
+ 
+@@ -4544,6 +4629,7 @@
+ 	unsigned long now = jiffies;
+ 	int err = -EINVAL;
+ 	bool del = false;
++	CLASS(rtl9617c_switch_policy, policy)(pmctx->port->br->dev);
+ 
+ 	brmctx = br_multicast_port_ctx_get_global(pmctx);
+ 	spin_lock_bh(&brmctx->br->multicast_lock);
+@@ -4691,6 +4777,7 @@
+ {
+ 	bool change_snoopers = false;
+ 	int err = 0;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 	if (!!br_opt_get(br, BROPT_MULTICAST_ENABLED) == !!val)
+@@ -4765,6 +4852,7 @@
+ int br_multicast_set_querier(struct net_bridge_mcast *brmctx, unsigned long val)
+ {
+ 	unsigned long max_delay;
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
+ 
+ 	val = !!val;
+ 
+@@ -4801,6 +4889,8 @@
+ int br_multicast_set_igmp_version(struct net_bridge_mcast *brmctx,
+ 				  unsigned long val)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	/* Currently we support only version 2 and 3 */
+ 	switch (val) {
+ 	case 2:
+@@ -4821,6 +4911,8 @@
+ int br_multicast_set_mld_version(struct net_bridge_mcast *brmctx,
+ 				 unsigned long val)
+ {
++	CLASS(rtl9617c_switch_policy, policy)(brmctx->br->dev);
++
+ 	/* Currently we support version 1 and 2 */
+ 	switch (val) {
+ 	case 1:
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@ -1082,6 +1082,7 @@
+ 			struct netlink_ext_ack *extack)
+ {
+ 	int ret;
++	CLASS(rtl9617c_switch_policy, policy)(cfg->br->dev);
+ 
+ 	spin_lock_bh(&cfg->br->multicast_lock);
+ 	ret = br_mdb_add_group(cfg, extack);
+@@ -1364,6 +1365,7 @@
+ 	struct net_bridge_port_group __rcu **pp;
+ 	struct br_ip ip = cfg->group;
+ 	int err = -EINVAL;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 	mp = br_mdb_ip_get(br, &ip);
+@@ -1532,6 +1534,7 @@
+ 			 const struct br_mdb_flush_desc *desc)
+ {
+ 	struct net_bridge_mdb_entry *mp;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock_bh(&br->multicast_lock);
+ 
+--- a/net/bridge/br_multicast_eht.c
++++ b/net/bridge/br_multicast_eht.c
+@@ -211,6 +211,7 @@
+ 									  t,
+ 									  timer);
+ 	struct net_bridge *br = set_h->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (RB_EMPTY_NODE(&set_h->rb_node) || timer_pending(&set_h->timer))
+@@ -229,6 +230,7 @@
+ 								      t,
+ 								      timer);
+ 	struct net_bridge *br = eht_set->br;
++	CLASS(rtl9617c_switch_policy, policy)(br->dev);
+ 
+ 	spin_lock(&br->multicast_lock);
+ 	if (RB_EMPTY_NODE(&eht_set->rb_node) || timer_pending(&eht_set->timer))
+

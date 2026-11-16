@@ -3,8 +3,10 @@
 import hashlib
 import json
 import argparse
+import os
 from pathlib import Path
 import re
+import resource
 import subprocess
 import tempfile
 
@@ -12,18 +14,21 @@ root = Path(__file__).resolve().parents[1]
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--revision', help='Run the same hardware contract against an older commit')
+parser.add_argument('--mutants', action='store_true', help='Run semantic exact-MDB profile regressions')
 args = parser.parse_args()
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 relative = str((drivers / 'rtl9617c-fe.c').relative_to(root))
 source = subprocess.check_output(['git', 'show', args.revision + ':' + relative], text=True) if args.revision else (drivers / 'rtl9617c-fe.c').read_text()
 
-def function(name):
-    start = re.search(r'^(?:static )?(?:int|void|bool|unsigned int) ' + name + r'\(', source, re.M).start()
-    end = source.index('{', start) + 1
+def function(name, text=source):
+    start = re.search(r'^(?:static )?(?:int|void|bool|unsigned int) ' + name +
+                      r'\([^;{}]*\)\s*\{', text, re.M).start()
+    end = text.index('{', start) + 1
     depth = 1
     while depth:
-        depth += (source[end] == '{') - (source[end] == '}')
+        depth += (text[end] == '{') - (text[end] == '}')
         end += 1
-    return source[start:end]
+    return text[start:end]
 
 registers = re.search(r'static const unsigned int fe_registers\[\] = \{.*?\};', source, re.S).group()
 registers += '\n' + re.search(r'static const unsigned int fe_cls_mode0_mask\[2\]\[7\] = \{.*?\};', source, re.S).group()
@@ -34,10 +39,14 @@ common = r'''
 #include <stddef.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <linux/ppp_defs.h>
 #include <linux/if_ether.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-l2-owner.h"
+#include "rtl9617c-mdb-offload.h"
+typedef uint64_t u64;
 #define BIT(n) (1U<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define FE_LAN_PORTS 5
@@ -45,6 +54,18 @@ common = r'''
 #define lower_32_bits(v) ((unsigned int)(v))
 #define upper_32_bits(v) ((unsigned int)((uint64_t)(v)>>32))
 #define WRITE_ONCE(dst,value) ((dst)=(value))
+#define READ_ONCE(value) (value)
+#define smp_load_acquire(value) (*(value))
+#define GFP_KERNEL 0
+#define CONFIG_BRIDGE 1
+#define CONFIG_NET_SWITCHDEV 1
+#define CONFIG_RTL9617C_SWITCH_GUARD 1
+#define IS_REACHABLE(option) (option)
+#define IS_ENABLED(option) (option)
+#define lockdep_assert_held(lock) assert((lock)->held)
+/* ACTUAL_MDB_OWNER_TYPES */
+/* ACTUAL_RX_GATE_DEFINES */
+struct rtl_fe_mcast {struct {bool contract_ready;unsigned int rx_active;} state;};
 struct spinlock {bool held;};
 #define spin_lock_irqsave(lock,flags) do{(flags)=0;assert(!(lock)->held);(lock)->held=true;}while(0)
 #define spin_unlock_irqrestore(lock,flags) do{(void)(flags);assert((lock)->held);(lock)->held=false;}while(0)
@@ -64,10 +85,12 @@ struct rtl_fe {
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
  struct spinlock route_lock;bool route_gate_ready,route_admitted,route_gate_verified,dma_exposed;
  unsigned int pending_withdrawals;
- bool base_ready,base_failed;
+ bool base_ready,base_failed,native_mdb_profile;
+ struct rtl_l2_owner *l2_owner;struct rtl_fe_mcast *mcast;struct rtl_fe_mdb *mdb;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][4][2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
  unsigned int reg[0x10000/4],mask[8],cls[1056][7],map[256],cls_keys[256];
+ unsigned int cls_key_other[256][10],guard_first_command;
  struct rtl_fe_cam_protocol protocol_cam[3];unsigned char ppp_protocol_ids[2];
  unsigned int cam[9][64][5];
  unsigned int admission_writes,cache_ready,fail_mask,fail_mask_writes,deletes,fail_delete;
@@ -81,6 +104,7 @@ struct rtl_fe {
  int switch_error;bool switch_recovery,switch_returns_cmd;
  unsigned int expected_lan[5];
 };
+static void *kvzalloc(size_t bytes,unsigned int flags){assert(!flags);return calloc(1,bytes);}
 static unsigned int fe_read(void *ctx,unsigned int reg){
  struct rtl_fe *f=ctx;assert(reg<0x10000);
  if(reg==f->bus_fault_register && ++f->bus_fault_reads==f->bus_fault_nth) {
@@ -95,6 +119,11 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
   f->bus_fault_writes++;
  }
  f->register_writes++;
+ if(reg==0x3400 && f->native_mdb_profile && !(value&BIT(20))) {
+  /* A guard failure must not authorize MC fallback into the route hash. */
+  assert(f->mdb && f->mdb->tcam.guards_ready && f->mdb->tcam.guard_exposed);
+  assert(f->route_gate_ready && f->route_gate_verified && !f->route_admitted);
+ }
  if(reg!=0x3418 && reg!=0x3424 &&
     !(reg>=0xa5f8 && reg<=0xa838 && !((reg-0xa5f8)%0x90)))f->base_writes++;
  if(reg==0x383c)assert(f->dma_exposed);
@@ -119,6 +148,8 @@ static void fe_write(void *ctx,unsigned int reg,unsigned int value){
 static int fe_access(void *ctx,unsigned int reg,unsigned int value){
  struct rtl_fe *f=ctx;unsigned int index=value&255,i;
  f->commands++;
+ if(f->native_mdb_profile && f->mdb && !f->guard_first_command)
+  f->guard_first_command=f->commands;
  if(f->fail_command==f->commands)return -ETIMEDOUT;
  if(reg==0x3200){
   unsigned int bank=(value>>16)&15;index=value&63;assert(bank==2||bank==8);
@@ -134,9 +165,16 @@ static int fe_access(void *ctx,unsigned int reg,unsigned int value){
   for(i=0;i<4;i++)if(value&BIT(30))selected[bank*4+i]=f->reg[(0x3920-i*4)/4];
   else f->reg[(0x3920-i*4)/4]=selected[bank*4+i];
  } else if(reg==0x3380){
-  assert(!(value&BIT(30)) && (value&~(BIT(31)|255U))==0);f->key_reads++;
-  if(f->fail_key_read==index+1)return -ETIMEDOUT;
-  f->reg[0x3384/4]=f->cls_keys[index];
+  assert((value&~(BIT(31)|BIT(30)|255U))==0);
+  if(value&BIT(30)) {
+   for(i=0;i<10;i++)f->cls_key_other[index][i]=f->reg[(0x33ac-i*4)/4];
+   f->cls_keys[index]=f->reg[0x3384/4];
+  } else {
+   f->key_reads++;
+   if(f->fail_key_read==index+1)return -ETIMEDOUT;
+   for(i=0;i<10;i++)f->reg[(0x33ac-i*4)/4]=f->cls_key_other[index][i];
+   f->reg[0x3384/4]=f->cls_keys[index];
+  }
  } else if(reg==0x33b0){
   unsigned int side=value&0x3fff;assert(side<1056);
   if(value&BIT(30))assert(!(f->reg[0x351c/4]&BIT(10)));
@@ -176,7 +214,34 @@ static int fe_delete(struct rtl_fe *f,struct rtl_fe_flow *p){
 lan_defines = re.search(r'^#define FE_LAN_PORTS[^\n]*\n#define FE_LAN_RX_CTRL[^\n]*', source, re.M)
 if lan_defines:
     common = common.replace('#define FE_LAN_PORTS 5\n#define FE_LAN_RX_CTRL(p) (0xa5f8+0x90*(p))', lan_defines.group())
+mdb_source = (drivers / 'rtl9617c-fe-mdb.h').read_text()
+hw_source = (drivers / 'rtl9617c-fe-switch-hw.h').read_text()
+mdb_types = '\n'.join(re.search(pattern, mdb_source, re.M | re.S).group() for pattern in (
+    r'^enum fe_mdb_reason \{.*?^\};', r'^struct rtl_fe_mdb \{.*?^\};'))
+common = common.replace('/* ACTUAL_MDB_OWNER_TYPES */', mdb_types)
+common = common.replace('/* ACTUAL_RX_GATE_DEFINES */', '\n'.join(
+    re.search(r'^#define ' + name + r'[^\n]*', hw_source, re.M).group()
+    for name in ('FE_SW_RX_BYPASS', 'FE_SW_RX_DEST_MASK', 'FE_SW_RX_CPU')))
+profile_helpers = '\n'.join(function(name, text) for text, name in (
+    (source, 'fe_mcast_available'),
+    (hw_source, 'fe_switch_hw_rx_check'), (hw_source, 'fe_switch_hw_route_closed'),
+    (mdb_source, 'fe_mdb_fail'), (mdb_source, 'fe_mdb_windows'),
+    (mdb_source, 'fe_mdb_profile_prepare'), (mdb_source, 'fe_mdb_profile_check')))
 test = r'''
+static void fixture_mcast_owner(struct rtl_fe *f)
+{
+ static struct rtl_l2_owner owner;
+ static struct rtl_l2_snapshot rows[RTL_L2_OWNER_ROWS];
+ static unsigned short indices[15231];
+ static struct rtl_fe_mcast multicast={.state={.contract_ready=true}};
+ /* The independent cold-admission oracle proves that real hardware is
+  * currently refused. Supply that external readiness boundary here so
+  * the ACTUAL FE->MDB guard allocator/writer/base-check path can execute. */
+ if(!owner.ledger.generation)
+  assert(!rtl_l2_owner_init(&owner,rows,indices,ARRAY_SIZE(indices),1));
+ owner.ready_mask=RTL_L2_OWNER_MC_READY;
+ f->l2_owner=&owner;f->mcast=&multicast;
+}
 static void initialize(struct rtl_fe *f) {
  memset(f,0,sizeof(*f));f->dma=0x03800000;f->engine_ready=true;
  for(unsigned int i=0;i<0x10000/4;i++)f->reg[i]=0x80000000U+i;
@@ -289,9 +354,57 @@ int main(void) {
   assert(((f.cls[r][5]>>22)&3)==(p?3:0));
   for(unsigned int word=0;word<7;word++)assert(!f.cls[r+1][word]);
  }
+ /* An actually admitted cold MCE owner selects its immutable MDB-friendly
+  * profile at FIRST prepare, not by rewriting a warm route owner. The
+  * forwarding miss is unchanged; ancillary default actions are neutral. */
+ struct rtl_fe exact=cold;fixture_mcast_owner(&exact);exact.reg[0x3400/4]|=BIT(20);
+ assert(!rtl_fe_enable(&exact) && exact.native_mdb_profile);
+ assert(exact.mdb && exact.mdb->tcam.guards_ready && exact.mdb->tcam.guard_exposed);
+ assert(exact.mdb->tcam.used==0 && exact.mdb->tcam.active==0 && !exact.mdb->tcam.exposed);
+ assert(!(exact.reg[0x3400/4]&BIT(20)));check_cpu_gate(&exact);
+ for(unsigned int p=0;p<2;p++)for(unsigned int type=0;type<4;type++)
+  for(unsigned int word=0;word<7;word++) {
+   unsigned int r=rows[p][type];
+   assert(exact.cls[r][word]==(!p&&type?0:base.cls[r][word]));
+   assert(!exact.cls[r+1][word]);
+  }
+ assert(fe_route_arm(&exact));
+ assert(!rtl_fe_engine_suspend(&exact));exact.mcast=NULL;
+ unsigned int exact_writes=exact.base_writes;
+ assert(!rtl_fe_engine_resume(&exact) && exact.native_mdb_profile);
+ assert(exact.base_writes==exact_writes);check_cpu_gate(&exact);
+ struct rtl_fe exact_base=exact;
+ struct rtl_fe_mdb exact_owner=*exact.mdb;
+ exact.reg[0x3400/4]|=BIT(20);
+ assert(rtl_fe_engine_resume(&exact)==-EIO && exact.base_rejected_register==0x3400);
+ drifts++;
+ for(unsigned int type=1;type<4;type++) {
+  exact=exact_base;*exact.mdb=exact_owner;exact.cls[rows[0][type]][6]|=BIT(11);
+  assert(rtl_fe_engine_resume(&exact)==-EIO && exact.base_failed);
+  drifts++;
+ }
+ for(unsigned int guard=0;guard<2;guard++)for(unsigned int side=0;side<2;side++) {
+  exact=exact_base;*exact.mdb=exact_owner;
+  exact.cls_key_other[(RTL_MDB_TCAM_SLOTS+guard)*2+side][0]^=1U;
+  assert(rtl_fe_engine_resume(&exact)==-EIO && exact.base_failed);
+  drifts++;
+  exact=exact_base;*exact.mdb=exact_owner;
+  exact.cls[rtl_mdb_fib_index(RTL_MDB_TCAM_SLOTS+guard)+side][0]^=1U;
+  assert(rtl_fe_engine_resume(&exact)==-EIO && exact.base_failed);
+  drifts++;
+ }
+ for(unsigned int failure=0;failure<3;failure++) {
+  struct rtl_fe failed=cold;fixture_mcast_owner(&failed);failed.reg[0x3400/4]|=BIT(20);
+  failed.fail_command=exact_base.guard_first_command+failure*256;
+  assert(rtl_fe_enable(&failed)<0 && failed.base_failed && failed.shutting_down);
+  assert(failed.mdb && failed.prepared && (failed.reg[0x3400/4]&BIT(20)));
+  failures++;
+  free(failed.mdb); /* Terminal fixture cleanup, not production owner release. */
+ }
+ free(exact_base.mdb);
  /* Reject failed control snapshots without acquiring ownership; later
   * RMW/readback faults retain and quarantine the already-exposed base. */
- const unsigned int cold_bus_fault[]={0x2300,0xa1e0,0x30a4};
+ const unsigned int cold_bus_fault[]={0x2300,0xa1e0,0x30a4,0x3400};
  for(unsigned int n=0;n<ARRAY_SIZE(cold_bus_fault);n++)for(unsigned int nth=1;nth<=3;nth++) {
   f=cold;f.bus_fault_register=cold_bus_fault[n];f.bus_fault_nth=nth;
   assert(rtl_fe_enable(&f)==-EIO && f.bus_fault_seen);
@@ -573,13 +686,53 @@ for helper in ('fe_enable_locked', 'fe_cpu_path_locked'):
     if re.search(r'^static int ' + helper + r'\(', source, re.M):
         functions.insert(functions.index('rtl_fe_enable'), helper)
 functions += ['rtl_fe_engine_suspend', 'rtl_fe_engine_resume']
+body = common + profile_helpers + registers + '\n' + '\n'.join(function(n) for n in functions) + test
+pipeline = (drivers / 'rtl9617c-fe-pipeline.h').read_text()
+variants = [('production', body, pipeline)]
+def replace_one(text, old, new):
+    assert text.count(old) == 1, old
+    return text.replace(old, new, 1)
+if args.mutants:
+    variants += [
+        ('ancillary-default-competes', body, replace_one(pipeline,
+         'else if(!exact_mcast || !result)', 'else if((void)exact_mcast,(void)result,1)')),
+        ('my-mac-bypass-not-cleared', replace_one(body,
+         '(fe->native_mdb_profile?BIT(20):0)', '0'), pipeline),
+        ('my-mac-bypass-not-verified', replace_one(body,
+         'if(fe->native_mdb_profile && !fe_base_match(fe,0x3400,BIT(20),0))return -EIO;',
+         '/* missing owned multicast classifier admission check */'), pipeline),
+        ('warm-profile-selection', replace_one(body,
+         'if(fe->base_failed)return -EIO;\n if(fe->fabric.poisoned)',
+         'fe->native_mdb_profile=fe_mcast_available(fe);if(fe->base_failed)return -EIO;\n if(fe->fabric.poisoned)'), pipeline),
+        ('ignore-cold-owner', replace_one(body,
+         'fe->native_mdb_profile=fe_mcast_available(fe);',
+         '(void)fe_mcast_available(fe);fe->native_mdb_profile=true;'), pipeline),
+        ('skip-persistent-cpu-guards', replace_one(body,
+         'ret=fe_mdb_profile_prepare(fe);', '(void)fe_mdb_profile_prepare;ret=0;'), pipeline),
+        ('skip-warm-cpu-guard-check', replace_one(body,
+         'ret=fe->native_mdb_profile?fe_mdb_profile_check(fe):rtl_fe_classifier_keys_empty(&io);',
+         '(void)fe_mdb_profile_check;ret=fe->native_mdb_profile?0:rtl_fe_classifier_keys_empty(&io);'), pipeline),
+    ]
+environment = dict(os.environ)
+environment.setdefault('ASAN_OPTIONS', 'detect_leaks=0')
+rejected = []
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycle-') as work:
     path = Path(work) / 'test.c'
     binary = Path(work) / 'test'
-    path.write_text(common + registers + '\n' + '\n'.join(function(n) for n in functions) + test)
-    subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-g', '-fsanitize=address,undefined',
-        '-I', str(drivers), str(path), '-o', str(binary)], check=True)
-    subprocess.run([str(binary)], check=True)
+    for name, program, helper in variants:
+        path.write_text(program)
+        (Path(work) / 'rtl9617c-fe-pipeline.h').write_text(helper)
+        subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-g', '-fsanitize=address,undefined',
+            '-I', str(drivers), str(path), '-o', str(binary)], check=True)
+        result = subprocess.run([str(binary)], env=environment, text=True, capture_output=True)
+        if name == 'production':
+            if result.returncode:
+                raise AssertionError(result.stdout + result.stderr)
+            print(result.stdout, end='')
+        else:
+            assert result.returncode and 'Assertion' in result.stderr, name + result.stderr
+            rejected.append(name)
+            print('PASS semantic mutation rejected: ' + name)
 (root / 'logs/fe-five-lan-lifecycle.json').write_text(json.dumps({
     'production_source_sha256': hashlib.sha256(source.encode()).hexdigest(),
     'LAN_ports': [0, 1, 2, 3, 4], 'exact_enable_disable_cycles': 10,
@@ -597,6 +750,12 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-lan-lifecycl
     'GEM_gate_opens_after_CLS_defaults_LPB_cache': True,
     'PON_stream_identity_and_CPU_profile_retained_while_OFF': True,
     'two_profiles_four_result_groups_two_rows_retained_not_boot_restored': True,
+    'exact_mdb_profile_selected_only_at_first_cold_owned_prepare': True,
+    'exact_mdb_ancillary_defaults_neutral_and_mymac_bypass_clear_readback': True,
+    'real_FE_to_MDB_persistent_CPU_guards_before_global_mymac_change': True,
+    'warm_base_verifies_complete_CPU_guard_keys_and_results': True,
+    'mdb_profile_owner_source_sha256': hashlib.sha256(mdb_source.encode()).hexdigest(),
+    'mutants_rejected': rejected,
     'all_foreign_TCAM_valid_flags_rejected_without_data_writes': True,
     'both_CPU_profile_readbacks_required_before_enable': True,
     'CPU_original_profile_stops_both_LAN_and_PON_hash_admission': True,

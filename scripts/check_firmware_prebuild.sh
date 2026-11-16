@@ -15,7 +15,7 @@ python3 scripts/test_qspi_poll.py
 python3 scripts/test_lan_pm_mapping.py
 python3 scripts/test_ni_mib_evidence.py
 python3 scripts/test_lan_link_mode.py
-python3 scripts/test_fe_lan_lifecycle.py
+python3 scripts/test_fe_lan_lifecycle.py --mutants
 python3 scripts/test_fe_route_fallback.py
 python3 scripts/test_fe_cache_slot_zero.py
 python3 scripts/test_fe_hash_collision.py
@@ -29,12 +29,14 @@ python3 scripts/test_fe_window_idle.py
 python3 scripts/test_ni_oam_owner.py
 python3 scripts/test_l2_table_transactions.py
 python3 scripts/test_l2_resources.py --mutants --sanitize
+python3 scripts/test_l2_owner.py --mutants --sanitize
 python3 scripts/test_l2_domain.py --mutants --sanitize
 python3 scripts/test_l2_hardware_recipe.py
 python3 scripts/test_l2_port_policy.py
 python3 scripts/test_l2qm_baseline.py
 python3 scripts/test_l2_es_cold.py
 python3 scripts/test_fabric_baseline.py
+python3 scripts/test_fabric_modes.py --mutants
 python3 scripts/test_pon_cold_handoff.py
 python3 scripts/test_pon_probe_unwind.py --mutants
 python3 scripts/test_pon_transactions.py --case address --case epon-policy --mutants
@@ -47,9 +49,11 @@ python3 scripts/test_l2_switch_control.py
 python3 scripts/test_l2_switch_worker.py
 python3 scripts/test_l2_switch_fdb.py
 python3 scripts/test_l2_switch_topology.py
+python3 scripts/test_l2_vlan_control.py
 python3 scripts/test_l2_effective_ageing.py
 python3 scripts/test_l2_evidence.py
 python3 scripts/test_l2_bridge_eligibility.py
+python3 scripts/test_l2_vlan_feedback.py --mutants
 python3 scripts/test_l2_static_fdb.py --sanitize --mutants
 python3 scripts/test_fe_observe.py
 python3 scripts/test_fe_callback_lifecycle.py
@@ -74,6 +78,11 @@ python3 scripts/test_qm_rx_bounds.py
 python3 scripts/test_qm_switch_rx.py
 python3 scripts/test_qm_rx_fairness.py --mutants
 python3 scripts/test_mcast_observe.py --mutants
+python3 scripts/test_mcast_runtime.py --mutants
+python3 scripts/test_mcast_dispatch.py
+python3 scripts/test_qm_mcast_copy.py --mutants
+python3 scripts/test_mdb_offload.py --mutants
+python3 scripts/test_fe_mdb.py --mutants
 python3 scripts/test_qm_table_staging.py
 python3 scripts/test_qm_refill_credit.py --mutants
 python3 scripts/test_qm_startup_faults.py --mutants

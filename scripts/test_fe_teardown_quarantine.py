@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run production FE teardown: failed hardware withdrawal must retain DMA owners."""
 from pathlib import Path
+import os
 import re
 import resource
 import subprocess
@@ -10,13 +11,17 @@ root = Path(__file__).resolve().parents[1]
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 source = (drivers / 'rtl9617c-fe.c').read_text()
-start = re.search(r'^bool rtl_fe_free\(', source, re.M).start()
-end = source.index('{', start) + 1
-depth = 1
-while depth:
-    depth += (source[end] == '{') - (source[end] == '}')
-    end += 1
-production = source[start:end]
+def function(text, declaration):
+    start = re.search(declaration, text, re.M).start()
+    end = text.index('{', start) + 1
+    depth = 1
+    while depth:
+        depth += (text[end] == '{') - (text[end] == '}')
+        end += 1
+    return text[start:end]
+production = function(source, r'^bool rtl_fe_free\(')
+retained = function((drivers / 'rtl9617c-fe-mcast.h').read_text(),
+                    r'^static bool fe_mcast_retained\(')
 
 fixture = r'''
 #include <assert.h>
@@ -27,6 +32,7 @@ fixture = r'''
 #include <stdio.h>
 #include <errno.h>
 #include "rtl9617c-fe-pipeline.h"
+#include "rtl9617c-l2-owner.h"
 #define BIT(n) (1U << (n))
 enum rtl_fe_mode {RTL_FE_MODE_OFF,RTL_FE_MODE_CPU,RTL_FE_MODE_HARDWARE};
 struct list_head {struct list_head *next,*prev;};
@@ -39,8 +45,12 @@ static void list_add_tail(struct list_head *n,struct list_head *h){n->next=h;n->
 static void list_del(struct list_head *n){n->next->prev=n->prev;n->prev->next=n->next;}
 struct rtl_fe_port {struct list_head list;unsigned int bindings;};
 struct rtl_fe_flow {struct list_head list;};
+struct rtl_fe_mcast {struct {bool fdb_filter_owned,mce_control_owned;} state;};
 struct rtl_fe {
  struct {bool poisoned;} fabric;
+ struct rtl_l2_owner *l2_owner;
+ struct rtl_fe_mcast *mcast;
+ bool mdb_retained_model;
  struct list_head ports,blocks,flows;
  bool shutting_down,engine_ready,dma_exposed,prepared,base_failed;
  enum rtl_fe_mode desired_mode;
@@ -89,6 +99,13 @@ static void kvfree(void *pointer){
  if(pointer==current->hash_owners)index_frees++;else path_frees++;
  free(pointer);
 }
+static void fe_mcast_free(struct rtl_fe *fe){assert(fe==current);}
+static bool fe_mdb_retained(struct rtl_fe *fe){return fe->mdb_retained_model;}
+static void fe_mdb_free(struct rtl_fe *fe){assert(fe==current && !fe_mdb_retained(fe));}
+static void fe_l2_owner_free(struct rtl_fe *fe){
+ assert(fe==current);assert(!rtl_l2_owner_retained(fe->l2_owner));
+ free(fe->l2_owner);fe->l2_owner=NULL;
+}
 static void dma_free_coherent(void *device,unsigned int bytes,void *pointer,uintptr_t dma){
  (void)device;(void)dma;assert(bytes==RTL_FE_MEMORY_BYTES);assert(cancelled);dma_frees++;free(pointer);
 }
@@ -118,7 +135,7 @@ int main(void){
  fe=make_owner();free(fe->hash_owners);fe->hash_owners=NULL;
  assert(rtl_fe_free(fe));assert(dma_frees==1 && path_frees==1 && !index_frees);
  /* No unsafe cleanup succeeds merely because software ownership looks idle. */
- for(unsigned int fault=0;fault<18;fault++){
+ for(unsigned int fault=0;fault<26;fault++){
   fe=make_owner();port=calloc(1,sizeof(*port));assert(port);list_add_tail(&port->list,&fe->ports);
   struct rtl_fe_flow flow={};struct list_head block;
   if(fault==0)fe->fail_disable=-ETIMEDOUT;
@@ -135,12 +152,27 @@ int main(void){
   if(fault==11)fe->fdb_control=~0U;
   if(fault==12)fe->fdb_control|=RTL_L2_FDB_INFO_INIT;
   if(fault==13)fe->fdb_control&=~RTL_L2_FDB_LEARN_DISABLE;
-  if(fault>=14)fe->mode_fault=fault-13;
+  if(fault>=14 && fault<18)fe->mode_fault=fault-13;
+  if(fault>=18 && fault<23) {
+   fe->l2_owner=calloc(1,sizeof(*fe->l2_owner));assert(fe->l2_owner);
+   assert(!rtl_l2_shared_init(&fe->l2_owner->ledger,1));
+   if(fault==18)fe->l2_owner->ledger.quarantined=1;
+   if(fault==19)fe->l2_owner->journal.quarantined=1;
+   /* A retired publication or unpublished dependency is not proof that
+    * the hardware/CPU owner can be destroyed. All three banks retain. */
+   if(fault>=20)fe->l2_owner->ledger.bank[fault-20].leased[0]=1;
+  }
+  if(fault>=23 && fault<25) {
+   fe->mcast=calloc(1,sizeof(*fe->mcast));assert(fe->mcast);
+   if(fault==23)fe->mcast->state.mce_control_owned=true;
+   if(fault==24)fe->mcast->state.fdb_filter_owned=true;
+  }
+  if(fault==25)fe->mdb_retained_model=true;
   unsigned int initial_control=fe->fdb_control;
   assert(!rtl_fe_free(fe));
   assert(fe->shutting_down && !fe->engine_ready && fe->desired_mode==RTL_FE_MODE_OFF);
   assert(!dma_frees && !path_frees && !index_frees && !frees && warnings==1 && cancelled==1 && debug_removed==1);
-  if(fault<14)assert(!mode_writes && fe->fdb_control==initial_control);
+  if(fault<14 || fault>=18)assert(!mode_writes && fe->fdb_control==initial_control);
   else assert(mode_writes==1);
   int expected=fault>=5?-EBUSY:fault==4?-ETIMEDOUT:fe->fail_disable;
   if(fault==11 || fault==14 || fault==15)expected=-EIO;
@@ -148,22 +180,24 @@ int main(void){
   assert(fe->error==expected);
   /* Test-only deallocation of deliberately quarantined model objects. Real
    * hardware owners stay allocated until a reboot/drain can be proved. */
-  free(port);free(fe->memory);free(fe->itu_paths);free(fe->hash_owners);free(fe);
+  free(port);free(fe->memory);free(fe->itu_paths);free(fe->hash_owners);free(fe->l2_owner);free(fe->mcast);free(fe);
  }
- puts("FE teardown: exposure/callback guards, validated CMD handback, no-op/scan edges and 18 retained-owner faults PASS");
+ puts("FE teardown: exposure/callback guards, validated CMD handback, no-op/scan edges and 26 retained-owner faults PASS");
 }
 '''
 with tempfile.TemporaryDirectory(dir=root / 'artifacts', prefix='fe-quarantine-') as directory:
     path = Path(directory)
-    (path / 'test.c').write_text(fixture + production + tests)
+    (path / 'test.c').write_text(fixture + retained + production + tests)
     subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
                     '-I', str(drivers),
                     str(path / 'test.c'), '-o', str(path / 'test')], check=True)
-    subprocess.run([str(path / 'test')], check=True)
+    environment = dict(os.environ)
+    environment.setdefault('ASAN_OPTIONS', 'detect_leaks=0')
+    subprocess.run([str(path / 'test')], check=True, env=environment)
     # Removing the cold-owner guard must fail at the poisoned retention case.
     broken = production.replace(' || fe->fabric.poisoned', '')
     assert broken != production
-    (path / 'mutant.c').write_text(fixture + broken + tests)
+    (path / 'mutant.c').write_text(fixture + retained + broken + tests)
     subprocess.run(['cc', '-Wall', '-Wextra', '-Werror',
                     '-I', str(drivers),
                     str(path / 'mutant.c'), '-o', str(path / 'mutant')], check=True)

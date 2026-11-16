@@ -5,12 +5,15 @@
  * guard closes admission BEFORE policy publication.  Only an unchanged,
  * fully programmed snapshot may reopen the hardware path.
  *
- * This first hardware contract is deliberately explicit: a single, native
- * untagged LAN bridge, per-port learning/isolation, hardware unicast and
- * CPU-only BUM/control packets. Non-forwarding STP ports remain on CPU;
+ * The admitted hardware contract is a single native untagged LAN bridge,
+ * per-port learning/isolation and hardware unicast. An independently owned
+ * MCE recipe may add eligible BUM replication; control packets stay on CPU.
+ * Non-forwarding STP ports remain on CPU;
  * their control frames and software bridge state machine remain intact.
- * VLAN filtering and complex bridge policy use the software path.
- * No skb is treated as an authorization and no CPU trap is marked forwarded.
+ * VID-aware control-plane support does not bypass the unverified IVL
+ * parser/consumer contract: VLAN filtering still uses the software path.
+ * No skb is treated as an authorization and ordinary traps are not marked
+ * forwarded. MCE CPU copies have a separate immutable provenance extension.
  */
 #include <linux/if_bridge.h>
 #include <linux/jiffies.h>
@@ -23,6 +26,7 @@
 #include <net/switchdev.h>
 
 #include "rtl9617c-l2-table.h"
+#include "rtl9617c-l2-domain.h"
 
 #if IS_REACHABLE(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_NET_SWITCHDEV) && \
     IS_ENABLED(CONFIG_RTL9617C_SWITCH_GUARD)
@@ -57,8 +61,9 @@ struct fe_switch_plan {
 };
 
 /* A pure capability check, shared by the real worker and host regressions.
- * Multicast snooping is intentionally NOT a veto: every multicast frame is
- * trapped, so Linux retains its MDB, router-port and per-packet decisions.
+ * Multicast snooping is intentionally NOT a veto: unsupported multicast is
+ * trapped. The separate bounded MDB/MCE snapshot governs any replication,
+ * so this generic port check never guesses snooping/router-port policy.
  */
 static enum fe_switch_reason
 fe_switch_route_plan_validate(const struct fe_switch_plan *plan)
@@ -156,11 +161,13 @@ static u32 fe_switch_flag_ports(const struct fe_switch_plan *plan, u32 ports,
 struct fe_switch_learned {
 	u8 address[ETH_ALEN];
 	u8 port;
+	u16 vid;
 };
 
 struct fe_switch_published {
 	u8 address[ETH_ALEN];
 	u8 destination;
+	u16 vid;
 	u64 cookie;
 };
 
@@ -183,6 +190,14 @@ struct rtl_fe_bridge {
 	 * Atomic callbacks only compare them, never dereference a cached device.
 	 */
 	struct net_device *ports[FE_LAN_PORTS], *master;
+	/* The IVL backend borrows the complete bridge topology under RTNL.
+	 * VLAN IDs are globally unique across these masters: this silicon's
+	 * FDB key has no independent bridge FID. Never retain device references
+	 * past unoffload/unregister or use these pointers from packet context. */
+	struct net_device *masters[FE_LAN_PORTS];
+	struct rtl_l2_vlan_plan vlans;
+	unsigned int master_count;
+	bool vlan_domain;
 	/* Stable physical owner identities, including PON/EPON outputs 32..63.
 	 * Updated at add/remove under FE mutex, never cleared by a snapshot. */
 	struct net_device *owned_devices[64];
@@ -273,6 +288,9 @@ static void fe_switch_gate(void *private)
 {
 	struct rtl_fe_bridge *sw = private;
 
+	/* Revoke CPU-copy provenance before any old packet can enter Linux
+	 * under a replacement bridge generation. No FE/guard lock is taken. */
+	fe_mcast_revoke(sw->fe);
 	WRITE_ONCE(sw->active, false);
 	WRITE_ONCE(sw->armed_route_mask, 0);
 	WRITE_ONCE(sw->flow_allowed, false);
@@ -308,6 +326,12 @@ static bool fe_switch_arm(void *private)
 	if (READ_ONCE(sw->stopping) || READ_ONCE(sw->fe->shutting_down) ||
 	    !READ_ONCE(sw->fe->engine_ready))
 		return false;
+	/* try_arm holds the guard lock after validating the worker epoch. Make
+	 * receive provenance ready before the first native selector opens, or
+	 * a newly replicated CPU copy could be dropped in the partial-open
+	 * window. Bridge delivery waits for this same guard to publish armed. */
+	if (sw->native_mask)
+		fe_mcast_arm(sw->fe, sw->route_generation);
 	armed = fe_switch_hw_arm(sw->fe, &sw->hw,
 				sw->native_mask, sw->route_mask,
 				sw->route_policy_allowed);
@@ -316,6 +340,11 @@ static bool fe_switch_arm(void *private)
 	WRITE_ONCE(sw->flow_allowed, armed && sw->route_policy_allowed &&
 		   sw->fe->enabled &&
 		   READ_ONCE(sw->fe->route_admitted));
+	/* The guard calls us with its lock held; never call the generation
+	 * getter here. This is the exact worker generation already checked by
+	 * try_arm(), not a fresh or guessed token for queued MCE copies. */
+	if (!armed || !sw->native_mask)
+		fe_mcast_revoke(sw->fe);
 	return armed;
 }
 
@@ -343,6 +372,56 @@ static bool fe_switch_native_key(const struct rtl_l2_fdb_entry *entry)
 	       !entry->key_dot1p;
 }
 
+static const struct rtl_l2_vlan_spec *
+fe_switch_vlan_find(const struct rtl_fe_bridge *sw, unsigned int vid)
+{
+	unsigned int i;
+
+	if (!sw->vlan_domain || !vid || vid >= RTL_L2_VLAN_IDS - 1)
+		return NULL;
+	for (i = 0; i < sw->vlans.count; i++)
+		if (sw->vlans.vlans[i].vid == vid)
+			return &sw->vlans.vlans[i];
+	return NULL;
+}
+
+static struct net_device *
+fe_switch_bridge_for_vid(const struct rtl_fe_bridge *sw, unsigned int vid)
+{
+	const struct rtl_l2_vlan_spec *vlan;
+
+	if (!sw->vlan_domain)
+		return vid ? NULL : sw->master;
+	vlan = fe_switch_vlan_find(sw, vid);
+	if (!vlan || !vlan->bridge || vlan->bridge > sw->master_count)
+		return NULL;
+	return sw->masters[vlan->bridge - 1];
+}
+
+/* Atomic notifiers may compare identities, but never dereference these
+ * borrowed RTNL-owned bridge pointers. Unregister clears them after cleanup. */
+static bool fe_switch_is_master(const struct rtl_fe_bridge *sw,
+				const struct net_device *dev)
+{
+	unsigned int i;
+
+	if (dev == READ_ONCE(sw->master))
+		return true;
+	for (i = 0; i < FE_LAN_PORTS; i++)
+		if (dev == READ_ONCE(sw->masters[i]))
+			return true;
+	return false;
+}
+
+static bool fe_switch_domain_key(const struct rtl_fe_bridge *sw,
+				 const struct rtl_l2_fdb_entry *entry)
+{
+	if (!sw->vlan_domain)
+		return fe_switch_native_key(entry);
+	return entry->valid && !entry->key_sc && !entry->key_dot1p &&
+	       fe_switch_vlan_find(sw, entry->key_vid);
+}
+
 static bool fe_switch_learned_owned(const struct rtl_l2_fdb_entry *entry,
 				   u32 ports)
 {
@@ -350,6 +429,25 @@ static bool fe_switch_learned_owned(const struct rtl_l2_fdb_entry *entry,
 	       !entry->multicast && !entry->temporary &&
 	       !entry->in_station_move && entry->destination < FE_LAN_PORTS &&
 	       (ports & BIT(entry->destination)) && is_valid_ether_addr(entry->mac);
+}
+
+static bool fe_switch_domain_learned(const struct rtl_fe_bridge *sw,
+				     const struct rtl_l2_fdb_entry *entry,
+				     unsigned int ports)
+{
+	const struct rtl_l2_vlan_spec *vlan;
+
+	if (!sw->vlan_domain)
+		return fe_switch_learned_owned(entry, ports);
+	if (!fe_switch_domain_key(sw, entry) || entry->is_static ||
+	    entry->multicast || entry->temporary || entry->in_station_move ||
+	    entry->destination >= FE_LAN_PORTS ||
+	    !(ports & BIT(entry->destination)) ||
+	    !is_valid_ether_addr(entry->mac))
+		return false;
+	vlan = fe_switch_vlan_find(sw, entry->key_vid);
+	return vlan && (vlan->learning & vlan->forwarding &
+			BIT(entry->destination));
 }
 
 static int fe_switch_fdb_write(struct rtl_fe_bridge *sw,
@@ -397,7 +495,7 @@ static int fe_switch_domain_claim(struct rtl_fe_bridge *sw)
 		 * be affected, even if its key cannot collide with native VID0.
 		 * Static L3 pins in VID4095/SC1 remain untouched and eligible.
 		 */
-		if (fe_switch_native_key(&entry) ||
+		if (fe_switch_domain_key(sw, &entry) ||
 		    (entry.valid && !entry.is_static))
 			return -EEXIST;
 		start = row.index + 1;
@@ -424,7 +522,7 @@ static int fe_switch_domain_flush(struct rtl_fe_bridge *sw)
 		if (!ret)
 			break;
 		rtl_l2_fdb_decode(row.words, &entry);
-		if (fe_switch_native_key(&entry))
+		if (fe_switch_domain_key(sw, &entry))
 			memcpy(sw->rules[count++], row.words, sizeof(row.words));
 		start = row.index + 1;
 	}
@@ -447,7 +545,7 @@ static int fe_switch_domain_flush(struct rtl_fe_bridge *sw)
 		if (!ret)
 			break;
 		rtl_l2_fdb_decode(row.words, &entry);
-		if (fe_switch_native_key(&entry))
+		if (fe_switch_domain_key(sw, &entry))
 			return -EIO;
 		start = row.index + 1;
 	}
@@ -468,7 +566,14 @@ static int fe_switch_restore_locked(struct rtl_fe_bridge *sw)
 	if (!ret)
 		ret = fe_switch_domain_flush(sw);
 	if (!ret)
+		ret = fe_mdb_withdraw(sw->fe);
+	if (!ret)
 		ret = fe_switch_hw_restore(sw->fe, &sw->hw);
+	/* Both direct DFT and precise classifier consumers have disappeared.
+	 * Retiring their aggregate active refs does not recycle published MCE
+	 * rows/tokens or assert that old hardware/stack packets have drained. */
+	if (!ret)
+		ret = fe_mcast_retire_all(sw->fe);
 	if (ret) {
 		sw->error = ret;
 		sw->reason = FE_SWITCH_IO_ERROR;
@@ -626,6 +731,8 @@ fe_switch_snapshot(struct rtl_fe_bridge *sw, struct fe_switch_plan *plan)
 	return fe_switch_plan_validate(plan);
 }
 
+#include "rtl9617c-fe-switch-vlan.h"
+
 /* Replay is synchronous and supplies our non-NULL ctx. Ordinary FDB events
  * never program a table in atomic context; they invalidate the snapshot.
  */
@@ -637,7 +744,10 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	int port = fe_switch_port_index(sw, info->info.dev);
 	bool trap;
 
-	if (info->vid || switchdev_fdb_is_dynamically_learned(info))
+	if ((!sw->vlan_domain && info->vid) ||
+	    switchdev_fdb_is_dynamically_learned(info))
+		return 0;
+	if (sw->vlan_domain && !fe_switch_vlan_replay_member(sw, info, port))
 		return 0;
 	if (info->locked || (!info->is_local && port < 0) ||
 	    !is_valid_ether_addr(info->addr))
@@ -651,6 +761,7 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	 */
 	trap = !info->is_local && !(sw->replay_ports & BIT(port));
 	ether_addr_copy(entry.mac, info->addr);
+	entry.key_vid = info->vid;
 	entry.is_static = 1;
 	entry.valid = 1;
 	entry.sa_permit = entry.da_permit = 1;
@@ -663,7 +774,8 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	 */
 	for (i = 0; i < sw->rule_count; i++) {
 		rtl_l2_fdb_decode(sw->rules[i], &previous);
-		if (ether_addr_equal(previous.mac, entry.mac))
+		if (previous.key_vid == entry.key_vid &&
+		    ether_addr_equal(previous.mac, entry.mac))
 			break;
 	}
 	if (i == RTL_L2_FDB_ENTRIES)
@@ -694,6 +806,7 @@ static void fe_switch_static_stage(struct rtl_fe_bridge *sw)
 		rtl_l2_fdb_decode(sw->rules[i], &entry);
 		ether_addr_copy(sw->published[count].address, entry.mac);
 		sw->published[count].destination = entry.destination;
+		sw->published[count].vid = entry.key_vid;
 		sw->published[count].cookie = 0;
 		count++;
 	}
@@ -710,12 +823,13 @@ static int fe_switch_static_publish(struct rtl_fe_bridge *sw, u64 generation)
 
 	for (i = 0; i < sw->published_count; i++) {
 		struct fe_switch_published *row = &sw->published[i];
+		struct net_device *master = fe_switch_bridge_for_vid(sw, row->vid);
 		bool local = row->destination >= FE_LAN_PORTS;
 		struct net_device *dev = local ? NULL : sw->ports[row->destination];
 
-		if (!sw->master || (!local && !dev))
+		if (!master || (!local && !dev))
 			return -ENODEV;
-		ret = br_rtl9617c_fdb_offload(sw->master, dev, row->address, 0,
+		ret = br_rtl9617c_fdb_offload(master, dev, row->address, row->vid,
 					   local, &sw->guard, generation, &row->cookie);
 		if (ret)
 			return ret;
@@ -744,7 +858,7 @@ static int fe_switch_atomic_event(struct notifier_block *nb,
 		return notifier_from_errno(ret);
 	}
 	if (fe_switch_port_index(sw, info->dev) < 0 &&
-	    info->dev != READ_ONCE(sw->master))
+	    !fe_switch_is_master(sw, info->dev))
 		return NOTIFY_DONE;
 	/* New ordinary CPU-learned sources are not a configuration change.
 	 * Rebuilding for each such source would flush the hardware learning we
@@ -773,10 +887,11 @@ static int fe_switch_blocking_event(struct notifier_block *nb,
 			return NOTIFY_DONE;
 	}
 	if (fe_switch_port_index(sw, info->dev) >= 0 ||
-	    info->dev == READ_ONCE(sw->master))
+	    fe_switch_is_master(sw, info->dev))
 		fe_switch_queue(sw);
-	/* Do not claim MDB/VLAN objects were hardware-offloaded. Their packets
-	 * stay on the CPU path, including default multicast snooping.
+	/* Notification receipt is not an offload acknowledgment. VID/MDB
+	 * snapshots, retained hardware ownership and epoch publication are
+	 * validated by the worker; unsupported objects keep the CPU path.
 	 */
 	return NOTIFY_DONE;
 }
@@ -798,12 +913,12 @@ static int fe_switch_feedback(struct rtl_fe_bridge *sw,
 		 * helper validates the epoch and publishes under hash->gate locks,
 		 * atomically with the move's pre-publication policy BEGIN.
 		 */
-		ret = br_rtl9617c_fdb_learn(dev, entry->address,
-					  &sw->guard, generation);
+		ret = br_rtl9617c_fdb_learn_vid(dev, entry->address, entry->vid,
+					      &sw->guard, generation);
 		if (ret)
 			return ret;
 		WRITE_ONCE(sw->learned_adds, sw->learned_adds + 1);
-	} else if (br_rtl9617c_fdb_forget(dev, entry->address)) {
+	} else if (br_rtl9617c_fdb_forget_vid(dev, entry->address, entry->vid)) {
 		/* A user may have replaced a formerly learned key with a static
 		 * or local entry. The helper validates current ownership and the
 		 * old destination under the bridge hash lock before deleting it.
@@ -818,11 +933,14 @@ static void fe_switch_unoffload(struct rtl_fe_bridge *sw)
 {
 	unsigned int i;
 
-	for (i = 0; i < sw->published_count; i++)
-		if (sw->master && sw->published[i].cookie)
-			br_rtl9617c_fdb_unoffload(sw->master,
-				sw->published[i].address, 0, &sw->guard,
-				sw->published[i].cookie);
+	for (i = 0; i < sw->published_count; i++) {
+		struct fe_switch_published *row = &sw->published[i];
+		struct net_device *master = fe_switch_bridge_for_vid(sw, row->vid);
+
+		if (master && row->cookie)
+			br_rtl9617c_fdb_unoffload(master, row->address, row->vid,
+						 &sw->guard, row->cookie);
+	}
 	WRITE_ONCE(sw->published_count, 0);
 	for (i = 0; i < sw->learned_count; i++)
 		fe_switch_feedback(sw, &sw->learned[i], false, 0);
@@ -856,7 +974,7 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 	if (READ_ONCE(sw->stopping))
 		return NOTIFY_DONE;
 	port = fe_switch_port_index(sw, dev);
-	native = port >= 0 || dev == READ_ONCE(sw->master);
+	native = port >= 0 || fe_switch_is_master(sw, dev);
 	/* Routing also owns PON logical netdevices, which are deliberately not
 	 * native LAN bridge ports. Their carrier/address/MTU/upper changes must
 	 * invalidate the route generation too, including linkwatch events that
@@ -877,10 +995,15 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 		mutex_unlock(&sw->fe->lock);
 		fe_switch_unoffload(sw);
 		if (event == NETDEV_UNREGISTER) {
+			unsigned int i;
+
 			if (port >= 0)
 				WRITE_ONCE(sw->ports[port], NULL);
 			if (dev == sw->master)
 				WRITE_ONCE(sw->master, NULL);
+			for (i = 0; i < FE_LAN_PORTS; i++)
+				if (dev == sw->masters[i])
+					WRITE_ONCE(sw->masters[i], NULL);
 		}
 	}
 	switch (event) {
@@ -913,8 +1036,9 @@ static void fe_switch_work(struct work_struct *work)
 	struct rtl_fe_bridge *sw = container_of(work, struct rtl_fe_bridge, work);
 	struct rtl_fe *fe = sw->fe;
 	struct fe_switch_plan plan;
+	struct rtl_mcast_groups groups;
 	unsigned long age_ticks, seconds;
-	unsigned int i;
+	unsigned int i, mdb_ports;
 	u32 native_ports;
 	u64 generation;
 	int ret = 0;
@@ -946,6 +1070,7 @@ static void fe_switch_work(struct work_struct *work)
 	}
 	generation = rtl9617c_switch_guard_generation(&sw->guard);
 	sw->reason = fe_switch_snapshot(sw, &plan);
+	sw->reason = fe_switch_vlan_snapshot(sw, &plan, sw->reason);
 	sw->route_policy_allowed =
 		fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK;
 	sw->local_target = sw->route_policy_allowed &&
@@ -999,7 +1124,7 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	if (sw->reason != FE_SWITCH_OK)
 		goto arm;
-	ret = br_rtl9617c_fdb_hold_time(sw->master, &age_ticks);
+	ret = fe_switch_age_ticks(sw, &age_ticks);
 	/* Read the actual FDB hold_time in jiffies, including topology-change
 	 * forward_delay. Hardware exposes whole 19-bit seconds. In particular,
 	 * never round a positive sub-second policy into no-learning zero.
@@ -1050,6 +1175,7 @@ static void fe_switch_work(struct work_struct *work)
 		ret = -EAGAIN;
 		goto failure;
 	}
+	sw->hw.vlan_plan = sw->vlan_domain ? &sw->vlans : NULL;
 	ret = fe_switch_hw_prepare(fe, &sw->hw, native_ports, seconds,
 				   br_multicast_enabled(sw->master),
 				   sw->route_policy_allowed);
@@ -1073,6 +1199,33 @@ static void fe_switch_work(struct work_struct *work)
 	if (ret) {
 		sw->reason = ret == -EEXIST ? FE_SWITCH_FOREIGN_FDB : FE_SWITCH_IO_ERROR;
 		goto failure;
+	}
+	/* The first MCE contract is the unchanged SVL/VID0 domain. Tagged
+	 * VLANs still need a separate proof of late MCE VE/ELPB consumption;
+	 * a local parser drain is not permission to repurpose those rows. */
+	if (!sw->vlan_domain) {
+		ret = fe_mcast_prepare_bum(fe, &sw->guard, generation, sw->master,
+					   sw->ports, plan.flags, native_ports, &groups);
+		if (!ret)
+			ret = fe_switch_hw_mcast_groups(fe, &sw->hw, &groups);
+		else if (ret == -EOPNOTSUPP || ret == -ENOSPC)
+			ret = 0; /* Keep exact unicast and the existing CPU BUM path. */
+		if (ret)
+			goto failure;
+		/* Until an independently gated classifier-only profile exists,
+		 * exact MDB uses the already-authorized routed engine. Native L2
+		 * isolation/learning-off may not reopen that engine by implication. */
+		if (sw->route_policy_allowed && fe->enabled && fe->prepared) {
+			mdb_ports = 0;
+			ret = fe_mdb_prepare(fe, &sw->guard, generation, sw->master,
+					     sw->ports, plan.flags, native_ports, &mdb_ports);
+			if (!ret)
+				ret = fe_switch_hw_mdb_steer(fe, &sw->hw, mdb_ports);
+			else if (ret == -EOPNOTSUPP || ret == -ENOSPC)
+				ret = 0; /* Helper returns clean fallback, never a live prefix. */
+			if (ret)
+				goto failure;
+		}
 	}
 	for (i = 0; i < sw->rule_count; i++) {
 		ret = fe_switch_fdb_write(sw, RTL_L2_FDB_APPEND, sw->rules[i]);
@@ -1146,6 +1299,8 @@ static int fe_switch_learned_compare(const void *a, const void *b)
 {
 	const struct fe_switch_learned *left = a, *right = b;
 
+	if (left->vid != right->vid)
+		return left->vid < right->vid ? -1 : 1;
 	return memcmp(left->address, right->address, ETH_ALEN);
 }
 
@@ -1207,9 +1362,10 @@ static void fe_switch_scan(struct work_struct *work)
 			if (!ret)
 				break;
 			rtl_l2_fdb_decode(row.words, &entry);
-			if (fe_switch_learned_owned(&entry,
+			if (fe_switch_domain_learned(sw, &entry,
 					sw->native_mask & sw->hw.learning_mask)) {
 				ether_addr_copy(sw->next[sw->scan_count].address, entry.mac);
+				sw->next[sw->scan_count].vid = entry.key_vid;
 				sw->next[sw->scan_count++].port = entry.destination;
 			}
 			sw->scan_start = row.index + 1;
@@ -1415,8 +1571,10 @@ static int fe_bridge_stop(struct rtl_fe_bridge *sw)
 	ret = fe_switch_restore_locked(sw);
 	mutex_unlock(&sw->fe->lock);
 	fe_switch_unoffload(sw);
-	for (port = 0; port < FE_LAN_PORTS; port++)
+	for (port = 0; port < FE_LAN_PORTS; port++) {
 		WRITE_ONCE(sw->ports[port], NULL);
+		WRITE_ONCE(sw->masters[port], NULL);
+	}
 	WRITE_ONCE(sw->master, NULL);
 	rtnl_unlock();
 	/* Drain callbacks/work only outside RTNL and the FE mutex. Even an
@@ -1455,10 +1613,14 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 			       char *buffer, size_t bytes)
 {
 	const struct fe_switch_hw_observed *observed;
+	unsigned int port, bum = 0;
 	ssize_t length;
 
 	if (!sw)
 		return scnprintf(buffer, bytes, "l2_supported=0 l2_requested=0 l2_active=0\n");
+	if (READ_ONCE(sw->active))
+		for (port = 0; port < FE_LAN_PORTS; port++)
+			bum |= sw->hw.bum_enabled[port];
 	length = scnprintf(buffer, bytes,
 		"l2_supported=1 l2_requested=%u l2_active=%u l2_reason=%u "
 		"l2_hw_reason=%u l2_hw_reason_name=%s "
@@ -1466,7 +1628,7 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 		"l2_flow_allowed=%u l2_route_policy_allowed=%u "
 		"l2_static=%u l2_static_published=%u l2_learned=%u l2_rebuilds=%llu l2_polls=%llu "
 		"l2_learn_adds=%llu l2_learn_deletes=%llu l2_scan_errors=%llu "
-		"l2_bum_hardware=0 l2_vlan_hardware=0 l2_mdb_hardware=0 "
+		"l2_bum_hardware=%u l2_bum_classes=%#x l2_vlan_hardware=0 l2_mdb_hardware=%u "
 		"l2_multibridge_hardware=0 l2_local_target=%u l2_rx_gate_verified=%u "
 		"l2_learning_ports=%#x l2_isolated_ports=%#x "
 		"l2_journal_used=%u l2_journal_capacity=%u "
@@ -1479,7 +1641,8 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw,
 		READ_ONCE(sw->published_count),
 		READ_ONCE(sw->learned_count), sw->rebuilds, sw->polls,
 		READ_ONCE(sw->learned_adds), READ_ONCE(sw->learned_deletes),
-		sw->scan_errors, sw->local_target, READ_ONCE(sw->hw.rx_gate_verified),
+		sw->scan_errors, !!bum, bum, !!(READ_ONCE(sw->active) && sw->hw.mdb_ports),
+		sw->local_target, READ_ONCE(sw->hw.rx_gate_verified),
 		sw->hw.learning_mask,
 		sw->hw.isolated_mask, sw->hw.count, sw->hw.journal.capacity,
 		sw->hw.journal.quarantined, sw->retry_count);
@@ -1568,9 +1731,11 @@ static ssize_t fe_bridge_stats(struct rtl_fe_bridge *sw, char *buffer, size_t by
 void rtl_fe_switch_rx(struct rtl_fe *fe, struct sk_buff *skb,
 		     unsigned int source, u32 header0, u32 header1)
 {
-	/* Every CPU-delivered native-L2 frame was TRAPPED, never also flooded
-	 * by the ASIC. In particular Header-A BC/MC bits do not prove forwarding.
-	 * Leave offload_fwd_mark clear so Linux forwards exactly one CPU copy.
+	/* Ordinary CPU traps are not proof of autonomous forwarding: Header-A
+	 * BC/MC bits alone must never set offload_fwd_mark. MCE copies are handled
+	 * before demux by rtl_fe_mcast_rx(), using an immutable token plus an skb
+	 * extension whose epoch is revalidated by the bridge before delivery.
+	 * Leave both kinds' metadata intact here; never manufacture provenance.
 	 */
 	(void)fe;
 	(void)skb;

@@ -44,7 +44,8 @@ COMMON = r'''
 #include <string.h>
 #include "rtl9617c-l2-format.h"
 #include "rtl9617c-l2-resources.h"
-typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
+#include "rtl9617c-l2-domain.h"
+typedef uint32_t u32;typedef uint64_t u64;typedef uint16_t u16;typedef unsigned char u8;
 #define FE_LAN_PORTS 5
 #define FE_SW_SNAPSHOTS 256
 #define BIT(n) (1U << (n))
@@ -105,6 +106,10 @@ static unsigned int init_net;
 '''
 
 BACKEND = r'''
+static bool fe_switch_vlan_replay_member(struct rtl_fe_bridge *sw,
+ const struct switchdev_notifier_fdb_info *info,int port){
+ (void)info;(void)port;assert(!sw->vlan_domain);return false;
+}
 static struct rtl_fe fe;
 static struct rtl_fe_bridge *live;
 static struct net_device ports[5],master,foreign,pon[3];
@@ -462,7 +467,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
 ])
 functions = "\n".join(function(name) for name in [
     "fe_switch_queue", "fe_switch_reconcile_locked", "fe_switch_request_current", "fe_switch_request_locked",
-    "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb",
+    "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_is_master", "fe_switch_replay_fdb",
     "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_switch_netdev_event", "fe_bridge_start", "fe_bridge_stop",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:

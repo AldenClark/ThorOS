@@ -9,6 +9,7 @@
 #include "rtl9617c-l2-table.h"
 #include "rtl9617c-l2-resources.h"
 #include "rtl9617c-l2-port-policy.h"
+#include "rtl9617c-mcast-state.h"
 
 /* Native LAN admission and its reversible L2 resources have one owner.
  * The policy compiler holds fe->lock for prepare/drain/restore. The core
@@ -69,6 +70,7 @@ enum fe_switch_hw_reason {
 	FE_SW_HW_ISOLATION,
 	FE_SW_HW_REDIRECT,
 	FE_SW_HW_ADMISSION,
+	FE_SW_HW_IVL_CONTRACT,
 };
 
 struct fe_switch_hw_observed {
@@ -89,6 +91,11 @@ struct rtl_fe_switch_hw {
 	unsigned int filter[RTL_L2_FDB_FILTER_WORDS];
 	unsigned int run_control;
 	unsigned int learning_mask, isolated_mask, local_target;
+	/* Non-NULL only for an explicitly requested IVL control-plane snapshot.
+	 * It is not evidence that the hardware VLAN/parser contract is supported. */
+	const struct rtl_l2_vlan_plan *vlan_plan;
+	unsigned char bum_enabled[FE_LAN_PORTS];
+	unsigned int mdb_ports;
 	enum fe_switch_hw_reason reason;
 	struct fe_switch_hw_observed observed;
 	bool globals_owned, prepared, drained, port_policy_ready;
@@ -107,6 +114,7 @@ static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
 		"native-mtu-baseline", "control-packet-classification",
 		"port-policy-transaction", "isolation-baseline", "redirect-baseline",
 		"admission-readback",
+		"ivl-parser-consumer-unverified",
 	};
 
 	return (unsigned int)hw->reason < ARRAY_SIZE(names) ? names[hw->reason] : "unknown";
@@ -702,6 +710,139 @@ static int fe_switch_hw_port_policy(struct rtl_fe *fe,
 	return 0;
 }
 
+/* Replace only the native owner's existing CPU DFT producers. MCE rows
+ * have an independent FE-lifetime owner because a local L2 drain does not
+ * prove that copies already queued in MCE/NI have disappeared. Mark each
+ * immutable group published BEFORE exposing its number in a producer; a
+ * command timeout can never turn that number into a reusable allocation.
+ */
+static int fe_switch_hw_mcast_groups(struct rtl_fe *fe,
+		struct rtl_fe_switch_hw *hw, const struct rtl_mcast_groups *groups)
+{
+	struct rtl_l2_snapshot *snapshot;
+	unsigned int words[RTL_L2_TABLE_MAX_WORDS], x[3], y[3];
+	unsigned int port, kind, slot = 0, id, enabled;
+	int ret;
+
+	if (!groups || hw->vlan_plan || !hw->globals_owned ||
+	    !READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
+	    !READ_ONCE(hw->port_policy_ready) || hw->journal.quarantined ||
+	    hw->journal.restoring)
+		return -EBUSY;
+	/* Validate the complete producer set before the first publication. */
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		enabled = groups->enabled[port];
+		if ((enabled & ~15U) || (enabled && !(hw->ports & BIT(port))))
+			return -EINVAL;
+		/* CF distinguishes known/unknown multicast, not L2/L3 DFT class.
+		 * Both classes must have a safe vector before either trap is removed. */
+		if ((enabled & 12U) && (enabled & 12U) != 12U)
+			return -EINVAL;
+		for (kind = 0; kind < 4; kind++) {
+			if (!(enabled & BIT(kind)))
+				continue;
+			if (groups->group[port][kind] >= RTL_L2_MC_VECTOR_ENTRIES)
+				return -EINVAL;
+			snapshot = fe_switch_hw_snapshot_find(hw, RTL_L2_TBL_DFT_FWD,
+							port * 4 + kind);
+			if (!snapshot || !snapshot->valid)
+				return -EIO;
+		}
+	}
+	WRITE_ONCE(hw->port_policy_ready, false);
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(hw->ports & BIT(port)))
+			continue;
+		enabled = groups->enabled[port];
+		for (kind = 0; kind < 4; kind++) {
+			if (!(enabled & BIT(kind)))
+				continue;
+			snapshot = fe_switch_hw_snapshot_find(hw, RTL_L2_TBL_DFT_FWD,
+							port * 4 + kind);
+			memcpy(words, snapshot->words, sizeof(words));
+			ret = rtl_l2_dft_flood_build(groups->group[port][kind],
+						    words[0], words);
+			if (ret)
+				return ret;
+			ret = fe_mcast_publish(fe, groups->group[port][kind]);
+			if (!ret)
+				ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_DFT_FWD,
+							   port * 4 + kind, words);
+			if (ret)
+				return ret;
+		}
+		/* Keep tagged frames and special/control packets on CPU. Those
+		 * traps are independent of ordinary broadcast/multicast flooding. */
+		for (kind = 2; kind < FE_SW_CF_PER_PORT; kind++) {
+			if (!(kind == 2 ? enabled & BIT(0) : (enabled & 12U) == 12U))
+				continue;
+			id = hw->cf[slot + kind];
+			ret = rtl_l2_cf_pkt_type_key(x, y, port,
+				kind == 2 ? RTL_L2_CF_BROADCAST :
+				kind == 3 ? RTL_L2_CF_MULTICAST :
+				RTL_L2_CF_UNKNOWN_MULTICAST);
+			if (ret)
+				return ret;
+			x[2] &= ~BIT(16);
+			y[2] &= ~BIT(16);
+			ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_KEY, id, x);
+			if (!ret)
+				ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_KEY,
+							   id + RTL_L2_CF_ENTRIES, y);
+			if (ret)
+				return ret;
+		}
+		hw->bum_enabled[port] = enabled;
+		slot += FE_SW_CF_PER_PORT;
+	}
+	WRITE_ONCE(hw->port_policy_ready, true);
+	return 0;
+}
+
+/* Exact MDB keys/actions are already installed and verified by the FE
+ * classifier owner. Only then may MC packets from those ingress ports be
+ * directed to the normal LAN L3 connector. Its misses must retain the
+ * original CPU packet; this helper never opens that engine on its own.
+ */
+static int fe_switch_hw_mdb_steer(struct rtl_fe *fe,
+				struct rtl_fe_switch_hw *hw, unsigned int ports)
+{
+	unsigned int port, kind, slot = 0, fib[3];
+	int ret;
+
+	if (!ports)
+		return 0;
+	if ((ports & ~hw->ports) || hw->vlan_plan || !hw->globals_owned ||
+	    !READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
+	    !READ_ONCE(hw->port_policy_ready) || hw->journal.quarantined ||
+	    hw->journal.restoring)
+		return -EBUSY;
+	if (!hw->route_policy_allowed || !fe->enabled || !fe->prepared ||
+	    hw->local_target != 25)
+		return -EOPNOTSUPP;
+	/* Snooping-off generic MC and exact MDB are mutually exclusive. */
+	for (port = 0; port < FE_LAN_PORTS; port++)
+		if ((ports & BIT(port)) && (hw->bum_enabled[port] & 12U))
+			return -EINVAL;
+	WRITE_ONCE(hw->port_policy_ready, false);
+	rtl_l2_cf_destination(fib, 25);
+	for (port = 0; port < FE_LAN_PORTS; port++) {
+		if (!(hw->ports & BIT(port)))
+			continue;
+		if (ports & BIT(port))
+			for (kind = 3; kind < FE_SW_CF_PER_PORT; kind++) {
+				ret = fe_switch_hw_replace(fe, hw, RTL_L2_TBL_CF_FIB,
+							   hw->cf[slot + kind], fib);
+				if (ret)
+					return ret;
+			}
+		slot += FE_SW_CF_PER_PORT;
+	}
+	hw->mdb_ports = ports;
+	WRITE_ONCE(hw->port_policy_ready, true);
+	return 0;
+}
+
 static int fe_switch_hw_limit_write(struct rtl_fe *fe, unsigned int port,
 				    unsigned int expected)
 {
@@ -778,7 +919,7 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	unsigned int i, field;
 	int ret;
 
-	(void)snooping; /* All multicast is trapped; Linux owns MDB/snooping. */
+	(void)snooping; /* Initial recipe traps MC; a separate snapshot may add MCE. */
 	hw->reason = FE_SW_HW_OK;
 	if (!ports || (ports & ~FE_SW_LAN_MASK) || ageing > 0x7ffffUL)
 		return -EINVAL;
@@ -811,9 +952,14 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	 * this from ILPB PVID fields or from a late classifier tag redirect.
 	 * Preserve PON's global mode: an existing IVL engine is unsupported,
 	 * never silently converted and never globally flushed. */
-	if (hw->observed.vlan_mode == ~0U ||
+	/* The VID-aware Linux control plane and the cold table owner are not
+	 * a packet-parser contract. The pinned Taurus target does not compile
+	 * generic vlan.c; its apparent IVL recipe cannot prove HASH_CTRL bits
+	 * 0..2 or foreign LAN-index consumers. Keep this explicit even if a
+	 * stale/corrupted mode read happens to show SVL for an IVL snapshot. */
+	if (hw->vlan_plan || hw->observed.vlan_mode == ~0U ||
 	    !(hw->observed.vlan_mode & RTL_L2_VLAN_MODE_SVL)) {
-		hw->reason = FE_SW_HW_VLAN_MODE;
+		hw->reason = hw->vlan_plan ? FE_SW_HW_IVL_CONTRACT : FE_SW_HW_VLAN_MODE;
 		/* All-ones is not proof of SVL merely because that bit is set.
 		 * Unknown shared lookup state is a retryable read failure, never
 		 * permission to own the VID0 namespace or rewrite global mode. */

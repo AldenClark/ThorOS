@@ -46,6 +46,8 @@ struct model {
  unsigned int delays, settles, clear_after, pending_reads, native_writes, tx_writes;
  unsigned int route_gates, route_arms, rx_writes;
  unsigned int lpb_reads;
+ unsigned int mc_publications,mc_fail_at;
+ bool mc_published[RTL_L2_MC_VECTOR_ENTRIES],mc_strict;
  unsigned int corrupt_read_address, corrupt_read_value, corrupt_after_command;
  unsigned int corrupt_after_writes, ignore_write_table, ignore_write_address;
  unsigned int ignore_write_value, corrupt_trigger_value;
@@ -100,6 +102,13 @@ static void complete(struct model *m)
  for (unsigned int w = 0; w < l.words; w++) {
   if (m->pending_request & BIT(30)) {
    assert(m->reg[(l.data0 - 4*w)/4] == m->pending_words[w]);
+   if(m->mc_strict && t==RTL_L2_TBL_DFT_FWD && !w){
+    unsigned int group=0,redirect=0,valid=0;
+    rtl_l2_field_get(m->pending_words,RTL_L2_DFT_GROUP,&group);
+    rtl_l2_field_get(m->pending_words,RTL_L2_DFT_REDIRECT,&redirect);
+    rtl_l2_field_get(m->pending_words,RTL_L2_DFT_GROUP_VALID,&valid);
+    assert(valid && !redirect && group<RTL_L2_MC_VECTOR_ENTRIES && m->mc_published[group]);
+   }
    if(!m->ignore_write || (unsigned int)t!=m->ignore_write_table)
     m->rows[t][index][w] = m->pending_words[w];
   } else {
@@ -207,13 +216,19 @@ static bool fe_route_arm(struct rtl_fe *fe) {
  for(unsigned int i=0;i<2;i++)fe->model->reg[(0x3418+i*12)/4]&=~(15U<<10);
  return true;
 }
+static int fe_mcast_publish(struct rtl_fe *fe,unsigned short group)
+ {
+  assert(fe && group<RTL_L2_MC_VECTOR_ENTRIES);model.mc_publications++;
+  if(model.mc_fail_at==model.mc_publications)return -EIO;
+  model.mc_published[group]=true;return 0;
+ }
 #include "rtl9617c-fe-switch-hw.h"
 #include "rtl9617c-fabric.h"
 
 static struct rtl_fe fe = { .model = &model };
 static struct rtl_fe_switch_hw hw;
 static struct rtl_l2_snapshot hw_rows[FE_SW_SNAPSHOTS];
-static unsigned short hw_index[7039];
+static unsigned short hw_index[15231];
 
 static void reset(void)
 {
@@ -791,12 +806,131 @@ static void admission_faults(void)
  assert(!model.lpb_reads);cases++;
 }
 
+static void multicast_producers(void)
+{
+ struct rtl_mcast_groups groups;
+ struct rtl_l2_vlan_plan vlan_plan={0};
+ reset();hw.vlan_plan=&vlan_plan;
+ assert(fe_switch_hw_prepare(&fe,&hw,3,300,true,true)==-EOPNOTSUPP);
+ assert(hw.reason==FE_SW_HW_IVL_CONTRACT && !hw.globals_owned && !hw.count);
+ /* A supplied VID snapshot may never fall into the old SVL recipe even
+  * if the live mode differs from the cold owner's recorded IVL choice. */
+ assert(!strcmp(fe_switch_hw_reason_name(&hw),"ivl-parser-consumer-unverified"));fault_cases++;
+ for(unsigned int enabled=0;enabled<16;enabled++){
+  if((enabled&12) && (enabled&12)!=12)continue;
+  reset();assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
+  memset(&groups,0,sizeof(groups));unsigned int snapshots=hw.count;
+  for(unsigned int p=0;p<5;p++){
+   groups.enabled[p]=enabled;
+   for(unsigned int k=0;k<4;k++)groups.group[p][k]=100+p*4+k;
+  }
+  model.mc_strict=true;assert(!fe_switch_hw_mcast_groups(&fe,&hw,&groups));model.mc_strict=false;
+  assert(hw.count==snapshots && hw.port_policy_ready);
+  assert(model.mc_publications==5*(unsigned int)__builtin_popcount(enabled));
+  for(unsigned int p=0;p<5;p++){
+   assert(hw.bum_enabled[p]==enabled);
+   for(unsigned int k=0;k<4;k++){
+    unsigned int id=0,redirect=0,valid=0;
+    const unsigned int *row=model.rows[RTL_L2_TBL_DFT_FWD][p*4+k];
+    rtl_l2_field_get(row,RTL_L2_DFT_GROUP,&id);
+    rtl_l2_field_get(row,RTL_L2_DFT_REDIRECT,&redirect);
+    rtl_l2_field_get(row,RTL_L2_DFT_GROUP_VALID,&valid);
+    assert(valid && id==((enabled&BIT(k))?groups.group[p][k]:16U));
+    assert(redirect==!(enabled&BIT(k)));
+   }
+   for(unsigned int k=0;k<5;k++){
+    unsigned int id=hw.cf[p*5+k];
+    bool removed=k==2?(enabled&1):k>=3?((enabled&12)==12):false;
+    assert(!!(model.rows[RTL_L2_TBL_CF_KEY][id][2]&BIT(16))==!removed);
+    assert(!!(model.rows[RTL_L2_TBL_CF_KEY][id+512][2]&BIT(16))==!removed);
+   }
+  }
+  assert(fe_switch_hw_arm(&fe,&hw,31,0,true));
+  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
+ }
+ /* Mixed L2/L3 multicast class removal would admit an unprogrammed DFT;
+  * malformed/non-owned producers are rejected before publishing anything. */
+ for(unsigned int invalid=0;invalid<4;invalid++){
+  reset();assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));
+  memset(&groups,0,sizeof(groups));groups.enabled[0]=3;
+  if(invalid==0)groups.enabled[0]=4;
+  if(invalid==1)groups.enabled[0]=8;
+  if(invalid==2)groups.enabled[4]=3;
+  if(invalid==3)groups.group[0][0]=256;
+  unsigned int writes=model.writes;
+  assert(fe_switch_hw_mcast_groups(&fe,&hw,&groups)==-EINVAL);
+  assert(!model.mc_publications && model.writes==writes);
+  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ }
+ for(unsigned int failure=1;failure<=20;failure++){
+  reset();assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
+  memset(&groups,0,sizeof(groups));
+  for(unsigned int p=0;p<5;p++){
+   groups.enabled[p]=15;for(unsigned int k=0;k<4;k++)groups.group[p][k]=100+p*4+k;
+  }
+  model.mc_fail_at=failure;model.mc_strict=true;
+  assert(fe_switch_hw_mcast_groups(&fe,&hw,&groups)==-EIO);model.mc_strict=false;
+  assert(!hw.port_policy_ready && !fe_switch_hw_arm(&fe,&hw,31,0,true));cpu_only();
+  assert(model.mc_publications==failure);
+  assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+ }
+ reset();assert(!fe_switch_hw_prepare(&fe,&hw,31,300,true,true));
+ memset(&groups,0,sizeof(groups));groups.enabled[0]=3;groups.group[0][0]=100;groups.group[0][1]=101;
+ model.ignore_write=true;model.ignore_write_table=RTL_L2_TBL_DFT_FWD;model.mc_strict=true;
+ assert(fe_switch_hw_mcast_groups(&fe,&hw,&groups)==-EIO);model.mc_strict=false;
+ assert(!hw.port_policy_ready && hw.journal.quarantined && model.mc_published[100]);
+ model.ignore_write=false;
+ assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+}
+
+static void exact_mdb_steering(void)
+{
+ reset();fe.enabled=fe.prepared=true;
+ assert(!fe_switch_hw_prepare(&fe,&hw,21,300,true,true));
+ unsigned int count=hw.count;
+ assert(!fe_switch_hw_mdb_steer(&fe,&hw,17));
+ assert(hw.mdb_ports==17 && hw.port_policy_ready && hw.count==count);
+ unsigned int slot=0;
+ for(unsigned int p=0;p<5;p++){
+  if(!(21&BIT(p)))continue;
+  for(unsigned int k=0;k<5;k++){
+   unsigned int id=hw.cf[slot+k];
+   const unsigned int *f=model.rows[RTL_L2_TBL_CF_FIB][id];
+   assert(((f[1]>>8)&63U)==((k>=3 && (17&BIT(p)))?25U:16U));
+   assert((model.rows[RTL_L2_TBL_CF_KEY][id][2]&BIT(16)) &&
+          (model.rows[RTL_L2_TBL_CF_KEY][id+512][2]&BIT(16)));
+  }
+  slot+=5;
+ }
+ assert(fe_switch_hw_arm(&fe,&hw,21,10,true));
+ assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
+ for(unsigned int failure=0;failure<5;failure++){
+  reset();fe.enabled=fe.prepared=true;
+  assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,failure!=0));
+  if(failure==1)fe.enabled=false;
+  if(failure==2)fe.prepared=false;
+  if(failure==3)hw.local_target=16;
+  if(failure==4)hw.bum_enabled[0]=12;
+  unsigned int writes=model.writes;
+  assert(fe_switch_hw_mdb_steer(&fe,&hw,1)==(failure==4?-EINVAL:-EOPNOTSUPP));
+  assert(model.writes==writes && !hw.mdb_ports);fault_cases++;
+ }
+ reset();fe.enabled=fe.prepared=true;
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,300,true,true));
+ model.ignore_write=true;model.ignore_write_table=RTL_L2_TBL_CF_FIB;
+ assert(fe_switch_hw_mdb_steer(&fe,&hw,3)==-EIO);
+ assert(!hw.port_policy_ready && !hw.mdb_ports && hw.journal.quarantined);
+ assert(!fe_switch_hw_arm(&fe,&hw,3,28,true));cpu_only();
+ model.ignore_write=false;
+ assert(!fe_switch_hw_drain(&fe,&hw));assert(!fe_switch_hw_restore(&fe,&hw));restored();fault_cases++;
+}
+
 /*SDK_ORACLE*/
 int main(void)
 {
  for(unsigned int ports=1;ports<32;ports++) { recipe(ports,false); recipe(ports,true); }
  for(unsigned int ports=1;ports<32;ports++) { cold_to_native(ports,false); cold_to_native(ports,true); }
- guards(); faults();readback_faults();admission_faults();
+ guards(); faults();readback_faults();admission_faults();multicast_producers();exact_mdb_steering();
  /*SDK_RUN*/
  printf("{\"recipe_cases\":%u,\"fault_cases\":%u,\"cold_to_native_cases\":%u,\"hardware_verified\":false}\n",cases,fault_cases,cold_cases);
  return 0;
@@ -964,6 +1098,15 @@ def main():
                 "", 1),
             "stale_l3_gate_latch": production.replace(
                 "if (value == ~0U || ((value >> 10) & 15U) != 1U)", "if (value & 0U)", 1),
+            "mcast_producer_before_owner_publication": production.replace(
+                "ret = fe_mcast_publish(fe, groups->group[port][kind]);", "ret = 0;", 1),
+            "mcast_cpu_trap_removed_without_safe_classes": production.replace(
+                "kind == 2 ? enabled & BIT(0) : (enabled & 12U) == 12U",
+                "kind == 2 ? enabled & BIT(0) : true", 1),
+            "mcast_dft_write_not_verified": without_table_verification(production, "RTL_L2_TBL_DFT_FWD"),
+            "mdb_cf_action_write_not_verified": without_table_verification(production, "RTL_L2_TBL_CF_FIB"),
+            "mdb_ignores_existing_generic_flood": production.replace(
+                "(hw->bum_enabled[port] & 12U)", "false", 1),
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
