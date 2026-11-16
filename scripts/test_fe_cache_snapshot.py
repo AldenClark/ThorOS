@@ -15,7 +15,7 @@ fixture = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-fe-cache-snapshot.h"
-static unsigned int keys[3][7],fibs[2][7],data[7],config;
+static unsigned int keys[3][7],fibs[2][14],data[7],config;
 static unsigned int requests,key_reads,fib_reads,match_way,fail_at,mode,base;
 static unsigned int rd(void *p,unsigned int reg){
  (void)p;if(reg==0x38a0)return config;
@@ -23,11 +23,17 @@ static unsigned int rd(void *p,unsigned int reg){
 }
 static int req(void *p,unsigned int reg,unsigned int value){
  (void)p;assert(reg==0x38e4);assert((value&~0xfffU)==0x80000000U);
- unsigned int idx=value&2047U;assert(idx>=base && idx<base+32);
+ unsigned int half=!!(config&(1U<<17)),upper=half&&!!(value&(1U<<10));
+ unsigned int idx=value&(half?1023U:2047U);
+ if(half)assert((value&(1U<<11)) || !(value&(1U<<10)));
+ else assert(idx>=base && idx<base+32);
  requests++;if(requests==fail_at)return -ETIMEDOUT;
  memset(data,0,sizeof(data));
  if(idx!=base+match_way)return 0;
- if(value&(1U<<11)){assert(mode!=1);memcpy(data,fibs[fib_reads?1:0],sizeof(data));fib_reads++;}
+ if(value&(1U<<11)){
+  assert(mode!=1);unsigned int sample=fib_reads/(half?2U:1U);
+  memcpy(data,fibs[sample?1:0]+(upper?7:0),sizeof(data));fib_reads++;
+ }
  else {memcpy(data,keys[key_reads<3?key_reads:2],sizeof(data));key_reads++;}
  return 0;
 }
@@ -41,7 +47,8 @@ static void reset(void){
   memset(keys[i],0,sizeof(keys[i]));keys[i][0]=expected.crc32;
   keys[i][1]=0x13e1U|(7U<<13)|(i<<19); /* age0 remains a valid match. */
  }
- memcpy(fibs[0],expected.action,sizeof(fibs[0]));memcpy(fibs[1],fibs[0],sizeof(fibs[1]));
+ memset(fibs,0,sizeof(fibs));
+ memcpy(fibs[0],expected.action,sizeof(expected.action));memcpy(fibs[1],fibs[0],sizeof(fibs[1]));
 }
 static void snapshot_cases(void){
  struct rtl_fe_cache_snapshot s;
@@ -77,6 +84,57 @@ static void snapshot_cases(void){
   assert(!s.complete && s.error==-ETIMEDOUT && requests==failure && !s.word_mask);
  }
 }
+static void wide_reset(unsigned int row){
+ reset();config=rtl_fe_cache_config(1);base=0;match_way=row;
+}
+static void wide_snapshot_cases(void){
+ struct rtl_fe_cache_snapshot s;
+ expected.action[7]=0x3579bdf1U;expected.action[8]=0x2468ace0U;
+ expected.action[9]=0x89abcdefU;expected.action[10]=1;
+ for(unsigned int row=0;row<1024;row++) {
+  wide_reset(row);rtl_fe_cache_snapshot(&io,&expected,&s);
+  assert(!s.complete && s.action_bits==321 && s.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS);
+  assert(s.cache_index==row && s.scanned==row+1 && requests==row+7);
+  assert(fib_reads==4 && !s.word_mask);
+ }
+ wide_reset(1023);fibs[0][10]^=1;fibs[1][10]^=1;
+ rtl_fe_cache_snapshot(&io,&expected,&s);
+ assert(!s.complete && s.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS &&
+        s.word_mask==(1U<<10) && s.diff[10]==1);
+ /* Another owner with the same CRC32/slot/low13 and different CRC16 high
+  * bits is indistinguishable when scanning the whole half cache. A unique,
+  * stable candidate must not be promoted to a target hit or mismatch. */
+ for(unsigned int high=0;high<8;high++) {
+  unsigned short saved=expected.crc16;
+  expected.crc16=(saved&8191U)|(high<<13);
+  wide_reset(37);rtl_fe_cache_snapshot(&io,&expected,&s);
+  assert(!s.complete && s.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS);
+  assert(s.cache_index==37 && !s.word_mask);
+  expected.crc16=saved;
+ }
+ wide_reset(3);mode=1;keys[0][1]|=1U<<18;
+ rtl_fe_cache_snapshot(&io,&expected,&s);
+ assert(!s.complete && s.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS &&
+        s.check_actions==1 && !fib_reads && requests==1024);
+ for(unsigned int word=7;word<=10;word++) {
+  wide_reset(2);fibs[1][word]^=1;rtl_fe_cache_snapshot(&io,&expected,&s);
+  assert(!s.complete && s.observation==RTL_FE_CACHE_FIB_CHANGED);
+ }
+ for(unsigned int read=1;read<3;read++) {
+  wide_reset(5);keys[read][1]^=1U<<13;rtl_fe_cache_snapshot(&io,&expected,&s);
+  assert(!s.complete && s.observation==RTL_FE_CACHE_KEY_CHANGED);
+ }
+ wide_reset(4);fibs[1][10]^=~1U;fibs[1][11]=~0U;fibs[1][13]=~0U;
+ rtl_fe_cache_snapshot(&io,&expected,&s);
+ assert(!s.complete && s.observation==RTL_FE_CACHE_IDENTITY_AMBIGUOUS && !s.word_mask); /* Undefined padding isn't a field. */
+ wide_reset(1024);rtl_fe_cache_snapshot(&io,&expected,&s);
+ assert(s.complete && s.observation==RTL_FE_CACHE_SET_MISS && s.scanned==1024 && requests==1024);
+ for(unsigned int failure=1;failure<=10;failure++) {
+  wide_reset(3);fail_at=failure;rtl_fe_cache_snapshot(&io,&expected,&s);
+  assert(!s.complete && s.error==-ETIMEDOUT && requests==failure);
+ }
+ for(unsigned int i=7;i<RTL_FE_NAPTV6_ACTION_WORDS;i++)expected.action[i]=0;
+}
 /* Execute the actual production read-op helper with fake MMIO/time at its
  * boundary. The poll records each requested timeout, and can fail pre/post. */
 typedef uint64_t u64;typedef uint32_t u32;
@@ -109,7 +167,7 @@ static void access_cases(void){
  for(unsigned int i=0;i<4;i++){access_reset();assert(fe_cache_read_access(&ctx,0x38e4,invalid[i])==-EINVAL);assert(!writes && !polls);}
  access_reset();assert(fe_cache_read_access(&ctx,0x38b0,0x80000000)==-EINVAL);assert(!writes && !polls);
 }
-int main(void){snapshot_cases();access_cases();puts("FE cache snapshot production helper oracles PASS");return 0;}
+int main(void){snapshot_cases();wide_snapshot_cases();access_cases();puts("FE cache snapshot: full/paired SRAM, all 1024 wide rows, 321-bit candidate/identity-alias and deadline contracts PASS");return 0;}
 '''
 with tempfile.TemporaryDirectory(prefix='fe-cache-snapshot-') as temp:
     path = Path(temp)

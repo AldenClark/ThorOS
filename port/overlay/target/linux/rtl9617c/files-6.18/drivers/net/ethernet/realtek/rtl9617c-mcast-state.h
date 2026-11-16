@@ -3,6 +3,7 @@
 #define RTL9617C_MCAST_STATE_H
 
 #include "rtl9617c-l2-owner.h"
+#include "rtl9617c-mcast-handoff.h"
 
 #define RTL_MCAST_LAN_PORTS 5U
 #define RTL_MCAST_LAN_MASK 31U
@@ -34,6 +35,7 @@ struct rtl_mcast_groups {
 };
 
 struct rtl_mcast_state {
+	struct rtl_mcast_handoff handoff;
 	struct rtl_mcast_token token[RTL_MCAST_TOKEN_COUNT];
 	struct rtl_mcast_vector vector[RTL_L2_MC_VECTOR_ENTRIES];
 	unsigned int forbidden_token[RTL_MCAST_TOKEN_COUNT / 32U];
@@ -42,6 +44,7 @@ struct rtl_mcast_state {
 	unsigned long long active_owner, active_generation;
 	unsigned long long rx_copies, rx_rejected, rx_no_memory;
 	unsigned int groups, tokens, preparations, fallbacks, publications;
+	unsigned int capacity_fallbacks, unpublished_aborts;
 	unsigned int cold_reads, cold_register, cold_value;
 	unsigned int saved_fdb_filter[RTL_L2_FDB_FILTER_WORDS];
 	unsigned int saved_mce_control;
@@ -95,6 +98,8 @@ abort:
 	/* No external consumer was published.  Restore only these exact
 	 * reservations; an ambiguous journal prevents any further allocation.
 	 */
+	if (owner->ledger.quarantined || owner->journal.quarantined)
+		return ret == -EOPNOTSUPP || ret == -ENOSPC ? -EIO : ret;
 	for (undo = 0; undo < RTL_MCAST_LAN_PORTS; undo++) {
 		abort_ret = rtl_l2_owner_abort(owner, io, RTL_L2_SHARED_MC_FIB,
 					     ids[undo]);
@@ -111,12 +116,14 @@ static inline int rtl_mcast_group_prepare(struct rtl_mcast_state *state,
 		unsigned short vid, unsigned int egress, unsigned short *group)
 {
 	struct rtl_mcast_token *copy = 0;
-	unsigned int token, index, port, words[3];
+	unsigned int token, index, port, words[3], needed;
 	unsigned long long actions;
 	unsigned short action_id, vector_id;
+	unsigned char new_token;
 	int ret;
 
-	if (!state || !owner || !group || !identity ||
+	if (!state || !owner || !group || !identity || !generation ||
+	    !rtl_l2_io_valid(io) ||
 	    ingress >= RTL_MCAST_LAN_PORTS || ingress_ifindex <= 0 ||
 	    master_ifindex <= 0 || ingress_ifindex == master_ifindex ||
 	    (egress & ~RTL_MCAST_LAN_MASK) || (egress & (1U << ingress)))
@@ -125,11 +132,9 @@ static inline int rtl_mcast_group_prepare(struct rtl_mcast_state *state,
 	 * need their own immutable edit and downstream-consumer contract.
 	 */
 	if (vid || !egress || !state->contract_ready ||
+	    !rtl_l2_owner_ready(owner, RTL_L2_SHARED_MC_FIB) ||
 	    !rtl_l2_owner_ready(owner, RTL_L2_SHARED_MC_VECTOR))
 		return -EOPNOTSUPP;
-	ret = rtl_mcast_lan_prepare(state, owner, io);
-	if (ret)
-		return ret;
 	for (token = 1; token < RTL_MCAST_TOKEN_COUNT; token++) {
 		copy = &state->token[token];
 		if (copy->allocated && copy->owner == identity &&
@@ -138,13 +143,37 @@ static inline int rtl_mcast_group_prepare(struct rtl_mcast_state *state,
 		    copy->master_ifindex == master_ifindex && copy->vid == vid)
 			break;
 	}
-	if (token == RTL_MCAST_TOKEN_COUNT) {
+	new_token = token == RTL_MCAST_TOKEN_COUNT;
+	if (!new_token) {
+		for (index = 1; index < RTL_L2_MC_VECTOR_ENTRIES; index++)
+			if (state->vector[index].allocated &&
+			    state->vector[index].token == token &&
+			    state->vector[index].egress == egress) {
+				*group = index;
+				return 0;
+			}
+	} else {
 		for (token = 1; token < RTL_MCAST_TOKEN_COUNT; token++)
 			if (!state->token[token].allocated &&
 			    !rtl_l2_owner_has(state->forbidden_token, token))
 				break;
 		if (token == RTL_MCAST_TOKEN_COUNT)
-			return -ENOSPC;
+			goto capacity;
+	}
+	/* Check the COMPLETE new dependency graph before the first reservation
+	 * or command. Ordinary vector/POL exhaustion must not strand new LAN
+	 * actions or a CPU token. The FE mutex serializes this check with all
+	 * reservations, so a successful preflight cannot race another user.
+	 * An already installed immutable group above needs no new capacity.
+	 */
+	needed = (state->lan_ready ? 0 : RTL_MCAST_LAN_PORTS) + new_token;
+	if (rtl_l2_shared_available(&owner->ledger, RTL_L2_SHARED_MC_FIB) < needed ||
+	    !rtl_l2_shared_available(&owner->ledger, RTL_L2_SHARED_MC_VECTOR))
+		goto capacity;
+	ret = rtl_mcast_lan_prepare(state, owner, io);
+	if (ret)
+		return ret;
+	if (new_token) {
 		ret = rtl_l2_owner_reserve(owner, RTL_L2_SHARED_MC_FIB, 1, &action_id);
 		if (ret)
 			return ret;
@@ -165,13 +194,6 @@ static inline int rtl_mcast_group_prepare(struct rtl_mcast_state *state,
 		};
 		state->tokens++;
 	}
-	for (index = 1; index < RTL_L2_MC_VECTOR_ENTRIES; index++)
-		if (state->vector[index].allocated &&
-		    state->vector[index].token == token &&
-		    state->vector[index].egress == egress) {
-			*group = index;
-			return 0;
-		}
 	ret = rtl_l2_owner_reserve(owner, RTL_L2_SHARED_MC_VECTOR, 1, &vector_id);
 	if (ret)
 		return ret;
@@ -191,6 +213,9 @@ static inline int rtl_mcast_group_prepare(struct rtl_mcast_state *state,
 	state->groups++;
 	*group = vector_id;
 	return 0;
+capacity:
+	state->capacity_fallbacks++;
+	return -ENOSPC;
 }
 
 /* Call BEFORE the first externally reachable producer write, including a
@@ -208,6 +233,7 @@ static inline int rtl_mcast_group_publish(struct rtl_mcast_state *state,
 		return -EINVAL;
 	vector = &state->vector[group];
 	if (!vector->allocated || !vector->token ||
+	    vector->token >= RTL_MCAST_TOKEN_COUNT ||
 	    !state->token[vector->token].allocated)
 		return -EPERM;
 	if (vector->active)
@@ -249,8 +275,15 @@ static inline int rtl_mcast_abort_unpublished(struct rtl_mcast_state *state,
 	unsigned int index, port;
 	int ret;
 
-	if (!state || !owner)
+	if (!state || !owner || !rtl_l2_io_valid(io))
 		return -EINVAL;
+	/* A retained transaction is a hardware failure, never optional
+	 * EOPNOTSUPP/ENOSPC capacity fallback. In particular, do not let the
+	 * first lease check replace an original timeout with EOPNOTSUPP and
+	 * allow the caller to re-arm forwarding after an uncertain write. */
+	if (owner->ledger.quarantined || owner->journal.quarantined)
+		return owner->error && owner->error != -EOPNOTSUPP &&
+			owner->error != -ENOSPC ? owner->error : -EIO;
 	for (index = 1; index < RTL_L2_MC_VECTOR_ENTRIES; index++) {
 		if (!state->vector[index].allocated || state->vector[index].published)
 			continue;
@@ -259,6 +292,7 @@ static inline int rtl_mcast_abort_unpublished(struct rtl_mcast_state *state,
 			return ret;
 		state->vector[index] = (struct rtl_mcast_vector) { 0 };
 		state->groups--;
+		state->unpublished_aborts++;
 	}
 	for (index = 1; index < RTL_MCAST_TOKEN_COUNT; index++) {
 		if (!state->token[index].allocated || state->token[index].published)

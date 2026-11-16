@@ -22,7 +22,7 @@ for name in removed:
 packages = {line.split()[0] for line in args.manifest.read_text().splitlines() if line.strip()}
 retained = ('tyfza1-pon-control', 'luci-app-tyfza1-pon',
             'kmod-tun', 'kmod-wireguard', 'kmod-nft-socket', 'kmod-nft-tproxy',
-            'ppp', 'ppp-mod-pppoe', 'firewall4', 'dnsmasq')
+            'ppp', 'ppp-mod-pppoe', 'firewall4', 'dnsmasq', 'ip-full', 'ip-bridge')
 missing = set(retained) - packages
 if missing:
     parser.error(f'missing essential router/ONU packages: {sorted(missing)}')

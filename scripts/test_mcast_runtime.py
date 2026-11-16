@@ -29,7 +29,7 @@ def transport():
 
 
 def function(source, name):
-    found = re.search(r"^(?:static\s+)?(?:int|void)\s+(?:__maybe_unused\s+)?" + name + r"\(", source, re.M)
+    found = re.search(r"^(?:static\s+)?(?:int|void|ssize_t)\s+(?:__maybe_unused\s+)?" + name + r"\(", source, re.M)
     if not found:
         raise AssertionError(name)
     start = source.index("{", found.start())
@@ -86,6 +86,43 @@ static void ready(void) {
 }
 static int group(unsigned long long epoch,unsigned port,unsigned egress,unsigned short *id) {
  return rtl_mcast_group_prepare(&state,&owner,&io,5,epoch,port,port+10,31,0,egress,id);
+}
+static void handoff_contract(void) {
+ const unsigned registers[]={0xaa28,0x3400,0x3834,0x38a0,0xaa60};
+ /* These literal addresses are independent of the production probe's
+  * array and name the pinned CPUXRAM_CFG/STG0_CTRL/HASH_INI/CACHE_INI/
+  * MCE_CTL_REG configuration words, never their adjacent counters. */
+ fresh();struct rtl_mcast_handoff observed;
+ for(unsigned i=0;i<5;i++)m.regs[registers[i]/4]=0x12345600U+i;
+ unsigned commands=m.command,writes=direct_writes;
+ assert(rtl_mcast_handoff_probe(&observed,&cold_io)==-EOPNOTSUPP);
+ assert(observed.valid_mask==31&&observed.missing==31&&observed.reads==5);
+ for(unsigned i=0;i<5;i++)assert(observed.value[i]==0x12345600U+i);
+ assert(!observed.bad_register&&!observed.bad_value);
+ assert(m.command==commands&&direct_writes==writes);
+ /* A failed sample is not a valid zero, and must not suppress other
+  * independent samples or clear any unproven retirement contract. */
+ for(unsigned failed=0;failed<5;failed++) {
+  m.regs[registers[failed]/4]=~0U;
+  assert(rtl_mcast_handoff_probe(&observed,&cold_io)==-EIO);
+  assert(observed.valid_mask==(31U^(1U<<failed))&&observed.missing==31);
+  assert(observed.bad_register==registers[failed]&&observed.bad_value==~0U);
+  assert(observed.reads==5&&m.command==commands&&direct_writes==writes);
+  m.regs[registers[failed]/4]=0x12345600U+failed;
+ }
+ /* Zero hash/cache values, XRAM TX disabled, a flush request and equal
+  * MCE counters do not manufacture a producer or packet-retirement ACK. */
+ for(unsigned flush=0;flush<2;flush++)for(unsigned xram=0;xram<2;xram++) {
+  for(unsigned i=0;i<5;i++)m.regs[registers[i]/4]=0;
+  m.regs[0xaa28/4]=xram<<9;m.regs[0xaa60/4]=flush<<18;
+  m.regs[0xaa74/4]=m.regs[0xaa78/4]=1234;
+  assert(rtl_mcast_handoff_probe(&observed,&cold_io)==-EOPNOTSUPP);
+  assert(observed.valid_mask==31&&observed.missing==31&&!observed.bad_register);
+  assert(m.command==commands&&direct_writes==writes);
+ }
+ assert(rtl_mcast_handoff_probe(NULL,&cold_io)==-EINVAL);
+ assert(rtl_mcast_handoff_probe(&observed,NULL)==-EINVAL);
+ test_cases+=12;
 }
 static void matrix(void) {
  ready();unsigned short ids[5][32]={{0}};
@@ -160,16 +197,50 @@ static void unpublished_abort(void) {
  assert(state.vector[first].published&&state.token[token].published);
  assert(rtl_l2_owner_has(owner.published[1],state.token[token].action));test_cases+=3;
 }
+static void capacity_preflight(void) {
+ unsigned short claimed[255],out=1234;
+ /* A full vector bank must not first install LAN recipes or a CPU token. */
+ ready();assert(!rtl_l2_owner_reserve(&owner,2,255,claimed));
+ unsigned commands=m.command;
+ for(unsigned i=0;i<3;i++)assert(group(1,0,2,&out)==-ENOSPC&&out==1234);
+ assert(m.command==commands&&!state.lan_ready&&!state.tokens&&!state.groups);
+ assert(!rtl_l2_shared_leased(&owner.ledger,1)&&state.capacity_fallbacks==3);
+ /* Five free actions can fit LAN-only, but not a complete new group. */
+ ready();assert(!rtl_l2_owner_reserve(&owner,1,59,claimed));commands=m.command;
+ assert(group(1,0,2,&out)==-ENOSPC&&m.command==commands);
+ assert(!state.lan_ready&&!state.tokens&&!state.groups);
+ assert(rtl_l2_shared_leased(&owner.ledger,1)==59);
+ /* Exhausted provenance space must also be rejected before any write. */
+ ready();memset(state.forbidden_token,0xff,sizeof(state.forbidden_token));commands=m.command;
+ assert(group(1,0,2,&out)==-ENOSPC&&m.command==commands);
+ assert(!state.lan_ready&&!rtl_l2_shared_leased(&owner.ledger,1));
+ /* Reusing the SAME immutable recipe needs no free slot, but a new
+  * generation must not consume a token when no vector can follow it. */
+ ready();unsigned short existing;assert(!group(1,0,2,&existing));
+ assert(!rtl_mcast_group_publish(&state,&owner,existing));
+ assert(!rtl_l2_owner_reserve(&owner,2,254,claimed));commands=m.command;
+ assert(!group(1,0,2,&out)&&out==existing&&m.command==commands);
+ assert(group(2,0,2,&out)==-ENOSPC&&m.command==commands);
+ assert(state.tokens==1&&state.groups==1&&rtl_l2_shared_leased(&owner.ledger,1)==6);
+ assert(group(0,0,2,&out)==-EINVAL&&m.command==commands);
+ unsigned token=state.vector[existing].token;state.vector[existing].token=512;
+ assert(rtl_mcast_group_publish(&state,&owner,existing)==-EPERM);
+ state.vector[existing].token=token;
+ test_cases+=8;
+}
 static void transaction_faults(void) {
  ready();unsigned before=m.command;unsigned short g;
  assert(!group(1,0,2,&g));unsigned operations=m.command-before;
  for(unsigned fault=1;fault<=operations;fault++) {
   ready();m.error=-ETIMEDOUT;m.fault_at=m.command+fault;
-  int ret=group(1,0,2,&g);assert(ret<0 && m.pending && owner.ledger.quarantined);
+  int ret=group(1,0,2,&g);assert(ret==-ETIMEDOUT && m.pending && owner.ledger.quarantined);
   for(unsigned i=1;i<256;i++)assert(!state.vector[i].published);
   for(unsigned i=1;i<512;i++)assert(!state.token[i].published);
+  unsigned stalled=m.command;
+  assert(rtl_mcast_abort_unpublished(&state,&owner,&io)==-ETIMEDOUT&&m.command==stalled);
   complete(true);unsigned commands=m.command;
   assert(group(2,0,2,&g)==-EOPNOTSUPP&&m.command==commands);
+  assert(rtl_mcast_abort_unpublished(&state,&owner,&io)==-ETIMEDOUT&&m.command==commands);
   test_faults++;
  }
 }
@@ -226,6 +297,8 @@ static void cold_roots(void) {
 '''
 
 RX_SHIM = r'''
+#include <stdarg.h>
+#include <sys/types.h>
 typedef uint32_t u32;typedef uint16_t u16;typedef uint64_t u64;
 #define BIT(n) (1U<<(n))
 #define READ_ONCE(x) (x)
@@ -239,6 +312,10 @@ struct rtl9617c_mcast_copy {u64 owner,generation;int ingress_ifindex,master_ifin
 struct sk_buff {unsigned char data[64];struct rtl9617c_mcast_copy copy;bool has_copy;};
 struct rtl_fe_mcast {struct rtl_mcast_state state;};
 struct rtl_fe {struct rtl_fe_mcast *mcast;};
+static int scnprintf(char *buffer,size_t bytes,const char *format,...) {
+ va_list args;va_start(args,format);int length=vsnprintf(buffer,bytes,format,args);va_end(args);
+ return !bytes?0:(size_t)length<bytes?length:(int)bytes-1;
+}
 static bool allocation_fail;
 static void *skb_ext_add(struct sk_buff *skb,unsigned id) {
  assert(id==SKB_EXT_RTL9617C_MCAST);if(allocation_fail)return NULL;skb->has_copy=true;return &skb->copy;
@@ -249,6 +326,23 @@ static bool is_link_local_ether_addr(const unsigned char *a) {
 '''
 
 RX_TEST = r'''
+static void cached_evidence(void) {
+ struct rtl_fe fe={0};char buffer[1024];unsigned commands=m.command,writes=direct_writes;
+ assert(fe_mcast_evidence(&fe,buffer,sizeof(buffer))>0);
+ assert(strstr(buffer,"not-attempted")&&strstr(buffer,"mce_sample_valid=0x0"));
+ struct rtl_fe_mcast mc={0};fe.mcast=&mc;
+ mc.state.handoff.missing=31;mc.state.handoff.valid_mask=23;
+ mc.state.handoff.value[RTL_MCAST_HANDOFF_CACHE]=~0U;
+ mc.state.capacity_fallbacks=3;mc.state.unpublished_aborts=2;
+ assert(fe_mcast_evidence(&fe,buffer,sizeof(buffer))>0);
+ assert(strstr(buffer,"mce_missing_contracts=0x1f")&&strstr(buffer,"mce_sample_valid=0x17"));
+ assert(strstr(buffer,"mce_cache_ini=0xffffffff")&&strstr(buffer,"mce_capacity_fallbacks=3"));
+ assert(strstr(buffer,"mce_unpublished_aborts=2")&&strstr(buffer,"mce_cold_handoff_verified=0"));
+ char small[33];memset(small,0x5a,sizeof(small));
+ assert(fe_mcast_evidence(&fe,small,32)==31&&small[31]==0&&small[32]==0x5a);
+ assert(!fe_mcast_evidence(&fe,small,0));
+ assert(m.command==commands&&direct_writes==writes);test_cases+=3;
+}
 static void rx_contract(void) {
  ready();unsigned short group_id;assert(!group(53,2,3,&group_id));
  assert(!rtl_mcast_group_publish(&state,&owner,group_id));
@@ -284,7 +378,7 @@ static void rx_contract(void) {
  assert(rtl_fe_mcast_rx(&fe,&skb,h0,h1,&source)<0);test_cases+=2;
 }
 int main(void) {
- matrix();bounds_and_exhaustion();unpublished_abort();transaction_faults();cold_roots();rx_contract();
+ handoff_contract();matrix();bounds_and_exhaustion();unpublished_abort();capacity_preflight();transaction_faults();cold_roots();cached_evidence();rx_contract();
  printf("{\"cases\":%u,\"fault_points\":%u,\"state_bytes\":%zu,\"hardware_verified\":false}\n",
         test_cases,test_faults,sizeof(state));
 }
@@ -305,7 +399,7 @@ def run(headers, sanitize):
             (work / name).write_text(text)
         source = (DRIVER / "rtl9617c-fe-mcast.h").read_text()
         actual = "\n".join(function(source, name) for name in
-                            ("fe_mcast_revoke", "fe_mcast_arm", "rtl_fe_mcast_rx"))
+                            ("fe_mcast_revoke", "fe_mcast_arm", "fe_mcast_evidence", "rtl_fe_mcast_rx"))
         (work / "test.c").write_text(transport() + SETUP + RX_SHIM + actual + RX_TEST)
         cmd = [os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-Wall", "-Wextra", "-Werror",
                "-Wno-unused-function", "-Wno-unused-variable", "-I", str(work), "-I", str(DRIVER),
@@ -324,7 +418,7 @@ def main():
     parser.add_argument("--no-sanitize", action="store_true")
     parser.add_argument("--mutants", action="store_true")
     args = parser.parse_args()
-    names = ["rtl9617c-mcast-state.h", "rtl9617c-mcast-cold.h"]
+    names = ["rtl9617c-mcast-state.h", "rtl9617c-mcast-cold.h", "rtl9617c-mcast-handoff.h"]
     headers = {name: (DRIVER / name).read_text() for name in names}
     result = run(headers, not args.no_sanitize)
     if result.returncode:
@@ -336,9 +430,18 @@ def main():
             "ingress_reflection": (names[0], "(egress & (1U << ingress))", "0"),
             "epoch_aba": (names[0], "copy->generation == generation", "1"),
             "all_lan_bits": (names[0], "if (egress & (1U << port))", "if (1)"),
+            "partial_action_capacity": (names[0], ") + new_token;", ");"),
+            "skip_vector_preflight": (names[0], "!rtl_l2_shared_available(&owner->ledger, RTL_L2_SHARED_MC_VECTOR)", "0"),
+            "zero_epoch_token": (names[0], "|| !generation ||", "||"),
+            "timeout_downgraded_to_fallback": (names[0], "return ret == -EOPNOTSUPP || ret == -ENOSPC ? -EIO : ret;", "return -EOPNOTSUPP;"),
+            "quarantine_downgraded_to_fallback": (names[0], "return owner->error && owner->error != -EOPNOTSUPP &&\n\t\t\towner->error != -ENOSPC ? owner->error : -EIO;", "return -EOPNOTSUPP;"),
             "group_high_alias": (names[1], "if (group >= RTL_L2_MC_VECTOR_ENTRIES)", "if (0 && group >= RTL_L2_MC_VECTOR_ENTRIES)"),
             "one_sided_valid": (names[1], "if ((x[2] ^ y[2]) & (1U << 16))", "if (0 && ((x[2] ^ y[2]) & (1U << 16)))"),
             "old_cp_token_alias": (names[1], "value | source", "value"),
+            "skip_mce_retirement_contract": (names[2], "RTL_MCAST_NEEDS_DDR_RETIRE | RTL_MCAST_NEEDS_MCE_RETIRE)", "RTL_MCAST_NEEDS_DDR_RETIRE)"),
+            "invalid_sample_marked_valid": (names[2], "if (value == ~0U)", "if (0)"),
+            "xram_disabled_implies_handoff": (names[2], "return ret;", "return (state->value[0] & (1U << 9)) ? 0 : ret;"),
+            "read_counter_instead_of_config": (names[2], "0x38a0, 0xaa60,", "0x38a0, 0xaa74,"),
         }
         for label, (name, old, new) in mutations.items():
             if old not in headers[name]:

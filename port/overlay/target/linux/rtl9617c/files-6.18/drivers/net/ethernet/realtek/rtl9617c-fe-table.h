@@ -85,12 +85,21 @@ static inline int rtl_fe_crc_hardware(const struct rtl_dq_io *io,
 
 #define RTL_FE_HASH_ENTRIES 65536
 #define RTL_FE_CACHE_ENTRIES 2048
+#define RTL_FE_NAPTV6_CACHE_ENTRIES (RTL_FE_CACHE_ENTRIES / 2)
 #define RTL_FE_ACTION_BYTES 48
 #define RTL_FE_HASH_BYTES (RTL_FE_HASH_ENTRIES * 4)
 #define RTL_FE_ACTION_OFFSET RTL_FE_HASH_BYTES
 #define RTL_FE_OVERFLOW_OFFSET (RTL_FE_ACTION_OFFSET + RTL_FE_HASH_ENTRIES * RTL_FE_ACTION_BYTES)
 #define RTL_FE_DEFAULT_OFFSET (RTL_FE_OVERFLOW_OFFSET + 64 * RTL_FE_ACTION_BYTES)
 #define RTL_FE_MEMORY_BYTES ((RTL_FE_DEFAULT_OFFSET + 32 * 16 + 4095) & ~4095U)
+
+static inline unsigned int rtl_fe_cache_config(unsigned int naptv6)
+{
+ /* aal_hash_cache_init/table_size_set: full 224-bit SRAM or paired
+  * 448-bit SRAM. ct_size remains 2K; cache_half halves usable entries. */
+ return (1U << 18) | (1U << 16) | 4U |
+  (naptv6 ? (1U << 17) | (4U << 8) : (3U << 8));
+}
 
 /* Original board defaults:64K main entries,32-entry buckets,384-bit slots.
  * The224-bit normal action fits its48-byte slot;defaults use128-bit slots.
@@ -112,7 +121,14 @@ static inline void rtl_fe_dma_tables(const struct rtl_dq_io *io,
   (io->read(io->context, 0x3834) & ~0x300ffU) | 3 | (7 << 2) | (4 << 5));
  io->write(io->context, 0x3848, 4);
  io->write(io->context, 0x3854, 1);
- io->write(io->context, 0x38a0, (1 << 18) | (1 << 16) | (3 << 8) | 4);
+ io->write(io->context, 0x38a0, rtl_fe_cache_config(0));
+}
+
+static inline void rtl_fe_dma_tables_mode(const struct rtl_dq_io *io,
+ unsigned int address, unsigned int address_high, unsigned int naptv6)
+{
+ rtl_fe_dma_tables(io,address,address_high);
+ if(naptv6)io->write(io->context,0x38a0,rtl_fe_cache_config(1));
 }
 /* Stock Hash AXI errata and cache initialization precede LAN admission.
  * aal_hash_hw_patch_set enables the stage1 request and ID1 limit controls

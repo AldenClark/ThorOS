@@ -91,7 +91,7 @@ struct rtl_fe {struct list_head ports;bool enabled;};
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask,replay_ports;
  bool vlan_domain;
- unsigned int local_target,rule_count,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
+ unsigned int local_target,rule_count,reason,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
  unsigned int replay_traps[(RTL_L2_FDB_ENTRIES+31)/32];
 };
 struct switchdev_notifier_info {struct net_device *dev;};
@@ -123,6 +123,14 @@ static bool switchdev_fdb_is_dynamically_learned(const struct switchdev_notifier
 static bool is_valid_ether_addr(const u8 *mac){unsigned int any=0;for(unsigned int i=0;i<6;i++)any|=mac[i];return any && !(mac[0]&1);}
 static void ether_addr_copy(u8 *dst,const u8 *src){memcpy(dst,src,6);}
 static bool ether_addr_equal(const u8 *a,const u8 *b){return !memcmp(a,b,6);}
+static void rcu_read_lock(void){}
+static void rcu_read_unlock(void){}
+static struct net_device *br_switchdev_fdb_find_port(struct net_device *br,const u8 *address,unsigned short vid){
+ (void)br;(void)address;(void)vid;return NULL;
+}
+static struct net_device *fe_switch_bridge_for_vid(struct rtl_fe_bridge *sw,unsigned short vid){
+ assert(!sw->vlan_domain);return vid?NULL:sw->master;
+}
 '''
 
 TEST = r'''

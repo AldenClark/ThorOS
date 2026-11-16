@@ -13,6 +13,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--kernel', type=Path,
                     help='Prepared kernel tree (default: OpenWrt build directory)')
 parser.add_argument('--revision', help='Historical native parser for a negative control')
+parser.add_argument('--mutants', action='store_true', help='Reject scoped same-port admission semantic mutations')
 args = parser.parse_args()
 drivers = root / 'port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek'
 native = (drivers / 'rtl9617c-fe.c').read_text()
@@ -47,6 +48,7 @@ common = r'''
 #include <stddef.h>
 #include <arpa/inet.h>
 #include <linux/ip.h>
+#include <linux/ipv6.h>
 #include <linux/ppp_defs.h>
 #include "rtl9617c-fe-format.h"
 #include "rtl9617c-fe-observe.h"
@@ -64,6 +66,7 @@ typedef uint8_t u8;typedef uint16_t u16,__be16;typedef uint32_t u32;
 #define ETH_P_PPP_SES 0x8864
 #define VLAN_VID_MASK 4095
 #define VLAN_HLEN 4
+#define FE_LAN_PORTS 5
 #define BIT(n) (1U<<(n))
 #define BIT_ULL(n) (1ULL<<(n))
 #define NF_FLOW_RULE_ACTION_MAX 24
@@ -76,7 +79,7 @@ enum {FLOW_ACTION_REDIRECT,FLOW_ACTION_CSUM,FLOW_ACTION_MANGLE,FLOW_ACTION_VLAN_
 enum {TCA_CSUM_UPDATE_FLAG_IPV4HDR=1,TCA_CSUM_UPDATE_FLAG_ICMP=2,
  TCA_CSUM_UPDATE_FLAG_TCP=8,TCA_CSUM_UPDATE_FLAG_UDP=16,TCA_CSUM_UPDATE_FLAG_SCTP=64};
 enum flow_action_mangle_base {FLOW_ACT_MANGLE_HDR_TYPE_ETH,FLOW_ACT_MANGLE_HDR_TYPE_IP4,
- FLOW_ACT_MANGLE_HDR_TYPE_TCP,FLOW_ACT_MANGLE_HDR_TYPE_UDP};
+ FLOW_ACT_MANGLE_HDR_TYPE_TCP,FLOW_ACT_MANGLE_HDR_TYPE_UDP,FLOW_ACT_MANGLE_HDR_TYPE_IP6};
 struct net_device {int ifindex;};
 struct flow_dissector_key_meta {int ingress_ifindex;u16 ingress_iftype;u8 l2_miss;};
 struct flow_dissector_key_basic {__be16 n_proto;u8 ip_proto;};
@@ -139,7 +142,7 @@ static u32 get_unaligned(const u32 *p){u32 v;memcpy(&v,p,4);return v;}
 static void put_unaligned(u32 v,u32 *p){memcpy(p,&v,4);}
 struct rtl_fe;
 struct rtl_fe_port {struct rtl_fe *fe;struct net_device *netdev;unsigned int source,destination,llid;};
-struct rtl_fe {struct rtl_fe_port *ports[2];struct net_device *itu_netdev;struct rtl_itu_paths *itu_paths;};
+struct rtl_fe {struct rtl_fe_port *ports[2];struct net_device *itu_netdev;struct rtl_itu_paths *itu_paths;bool naptv6;};
 static struct rtl_fe_port *fe_port(struct rtl_fe *fe,struct net_device *dev){for(unsigned int i=0;i<2;i++)if(fe->ports[i]->netdev==dev)return fe->ports[i];return NULL;}
 struct net {};
 enum flow_offload_tuple_dir {FLOW_OFFLOAD_DIR_ORIGINAL,FLOW_OFFLOAD_DIR_REPLY};
@@ -190,6 +193,286 @@ static void ethernet_actions(struct nf_flow_rule *nf,const u8 *source,const u8 *
  entry=flow_action_entry_next(nf);memcpy(&short_value,destination+4,2);value=short_value;mask=0xffff0000;
  flow_offload_mangle(entry,FLOW_ACT_MANGLE_HDR_TYPE_ETH,4,&value,&mask);
  entry=flow_action_entry_next(nf);entry->id=FLOW_ACTION_REDIRECT;entry->dev=output;
+}
+/* Both routed directions resolve to the SAME physical UNI. Compile the
+ * actual kernel match and VLAN/PPPoE action builders, then the production
+ * parser/action encoder; a hand-written tag stack would miss wire order. */
+static unsigned int same_uni_routes(struct rtl_fe_port *port,const u8 *source,const u8 *destination)
+{
+ unsigned int cases=0;
+ for(unsigned int physical=0;physical<5;physical++)
+  for(unsigned int ipv6=0;ipv6<2;ipv6++)
+   for(unsigned int protocol=6;protocol<=17;protocol+=11)
+    for(unsigned int in_tags=0;in_tags<3;in_tags++)
+     for(unsigned int out_tags=0;out_tags<3;out_tags++)
+      for(unsigned int vector=0;vector<4;vector++)
+       for(unsigned int nat=0;nat<(ipv6?1U:2U);nat++)
+        for(unsigned int direction=0;direction<2;direction++) {
+  struct flow_offload flow={};
+  port->source=port->destination=physical;
+  for(unsigned int dir=0;dir<2;dir++) {
+   struct flow_offload_tuple *t=&flow.tuplehash[dir].tuple;
+   t->iifidx=port->netdev->ifindex;t->l3proto=ipv6?AF_INET6:AF_INET;
+   t->l4proto=protocol;t->mtu=1400;
+   t->src_v4.s_addr=htonl(dir?0xc6336402:0x0a000001);
+   t->dst_v4.s_addr=htonl(dir?(nat?0xcb007103:0x0a000001):0xc6336402);
+   t->src_port=htons(dir?443:53000);t->dst_port=htons(dir?(nat?54000:53000):443);
+   for(unsigned int word=0;word<4;word++) {
+    t->src_v6.s6_addr32[word]=htonl(word?word+dir*7:0x20010db8);
+    t->dst_v6.s6_addr32[word]=htonl(word?word+!dir*7:0x20010db8);
+   }
+   t->encap_num=dir?out_tags:in_tags;
+   for(unsigned int tag=0;tag<t->encap_num;tag++) {
+    t->encap[tag].proto=htons((vector^dir)&BIT(tag)?ETH_P_8021AD:ETH_P_8021Q);
+    /* Include VID0 priority tags and fully distinct logical VLANs. */
+    t->encap[tag].id=vector?(100+100*dir+tag):tag;
+   }
+  }
+  struct nf_flow_match match={};
+  assert(!nf_flow_rule_match(&match,&flow.tuplehash[direction].tuple,NULL));
+  struct flow_rule rule={.used=match.dissector.used_keys,
+   .meta=match.key.meta,.meta_mask=match.mask.meta,
+   .control=match.key.control,.control_mask=match.mask.control,
+   .tcp=match.key.tcp,.tcp_mask=match.mask.tcp,
+   .basic=match.key.basic,.basic_mask=match.mask.basic,
+   .ipv4=match.key.ipv4,.ipv4_mask=match.mask.ipv4,
+   .ipv6=match.key.ipv6,.ipv6_mask=match.mask.ipv6,
+   .ports=match.key.tp,.ports_mask=match.mask.tp,
+   .vlan=match.key.vlan,.vlan_mask=match.mask.vlan,
+   .cvlan=match.key.cvlan,.cvlan_mask=match.mask.cvlan};
+  struct nf_flow_rule nf={.rule=&rule};
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};
+  struct rtl_fe_rule parsed={};
+  if(nat) {
+   assert(!flow_offload_ipv4_snat(NULL,&flow,direction,&nf));
+   assert(!flow_offload_port_snat(NULL,&flow,direction,&nf));
+  }
+  assert(!linux_vlan_actions(&flow,direction,&nf));
+  ethernet_actions(&nf,source,destination,port->netdev);
+  assert(!fe_parse(port,&cls,&parsed));
+  assert(parsed.input==port && parsed.output==port && !parsed.bridge);
+  assert(parsed.key.ingress==physical && parsed.action.destination==physical);
+  assert(parsed.ipv6==ipv6 && parsed.action.translate==nat && !parsed.action.deep_queue);
+  if(nat) {
+   assert(parsed.action.translate_destination==direction);
+   assert(parsed.action.address==(direction?0x0a000001:0xcb007103));
+   assert(parsed.action.port==(direction?53000:54000));
+  }
+  unsigned int input=flow.tuplehash[direction].tuple.encap_num;
+  unsigned int output=flow.tuplehash[!direction].tuple.encap_num;
+  assert(parsed.mtu==1400 && parsed.vlan_count==input && parsed.action.vlan_count==output);
+  assert(parsed.action.vlan_set==(input||output));
+  assert(parsed.ethernet_bytes==14+4*output);
+  assert(!memcmp(parsed.source,source,6) && !memcmp(parsed.destination,destination,6));
+  for(unsigned int tag=0;tag<input;tag++) {
+   const typeof(flow.tuplehash[direction].tuple.encap[0]) *e=&flow.tuplehash[direction].tuple.encap[tag];
+   assert(parsed.vlan[tag].vid==e->id && parsed.vlan[tag].tpid==(e->proto==htons(ETH_P_8021AD)?2:1));
+  }
+  for(unsigned int tag=0;tag<output;tag++) {
+   const typeof(flow.tuplehash[!direction].tuple.encap[0]) *e=&flow.tuplehash[!direction].tuple.encap[tag];
+   assert(parsed.action.vlan[tag].vid==e->id && parsed.action.vlan[tag].tpid==(e->proto==htons(ETH_P_8021AD)?2:1));
+  }
+  unsigned int words[8];rtl_fe_ipv4_action(words,&parsed.action);
+  assert(((words[0]>>8)&1023)==physical); /* Exact selected egress; no L2 lookup. */
+  assert((words[0]&(1U<<28)) && !(words[0]&(1U<<29))); /* L3 rewrite, not MAC keep. */
+  assert((words[1]&(1U<<11)) && (words[1]&(1U<<12))); /* TTL/Hop-Limit. */
+  assert(words[2]&(1U<<16)); /* Indexed next-hop destination rewrite. */
+  cases++;
+ }
+ port->source=port->destination=0;
+ return cases;
+}
+static unsigned int packed_bits(const unsigned int *words,unsigned int offset,unsigned int width)
+{
+ unsigned int result=0;
+ for(unsigned int bit=0;bit<width;bit++)
+  result|=((words[(offset+bit)/32]>>((offset+bit)%32))&1U)<<bit;
+ return result;
+}
+/* Exact Linux IPv6 SNAT/DNAT and port constructors. A port-only request
+ * must carry the original entire address; zero high96 is never harmless. */
+static unsigned int naptv6_routes(struct rtl_fe_port *lan,struct rtl_fe_port *pon,
+ const u8 *source,const u8 *destination)
+{
+ unsigned int cases=0;
+ const unsigned short ports[]={0,1,1024,53000,65535,53,443,32768};
+ for(unsigned int protocol=6;protocol<=17;protocol+=11)
+  for(unsigned int dnat=0;dnat<2;dnat++)
+   for(unsigned int direction=0;direction<2;direction++)
+    for(unsigned int kind=0;kind<3;kind++) /* port, address, or both */
+     for(unsigned int encap=0;encap<5;encap++)
+      for(unsigned int vector=0;vector<8;vector++) {
+  struct flow_offload flow={};
+  for(unsigned int dir=0;dir<2;dir++) {
+   struct flow_offload_tuple *t=&flow.tuplehash[dir].tuple;
+   t->iifidx=dir?pon->netdev->ifindex:lan->netdev->ifindex;
+   t->l3proto=AF_INET6;t->l4proto=protocol;t->mtu=1400;
+   t->src_port=htons(dir?443:ports[vector]);
+   t->dst_port=htons(dir?ports[vector]:443);
+   for(unsigned int word=0;word<4;word++) {
+    t->src_v6.s6_addr32[word]=htonl(word?0x12345678U+vector*7919+word*901+dir*733:0x20010db8U+dir);
+    t->dst_v6.s6_addr32[word]=htonl(word?0x12345678U+vector*7919+word*901+!dir*733:0x20010db8U+!dir);
+   }
+  }
+  struct flow_offload_tuple *reply=&flow.tuplehash[1].tuple;
+  struct in6_addr *translated=dnat?&reply->src_v6:&reply->dst_v6;
+  if(kind)for(unsigned int word=0;word<4;word++)
+   translated->s6_addr32[word]=htonl(word?0xa1223344U+word*103+vector*317:0x20020db8U+vector);
+  if(kind!=1) {
+   if(dnat)reply->src_port=htons(443^0x1234);
+   else reply->dst_port=htons(ports[vector]^0x1234);
+  }
+  unsigned int tags=encap==1?1:(encap==2||encap==4?2:0);
+  bool ppp=encap>=3;
+  for(unsigned int tag=0;tag<tags;tag++) {
+   reply->encap[tag].proto=htons(tag?ETH_P_8021Q:ETH_P_8021AD);
+   reply->encap[tag].id=100+vector*3+tag;
+  }
+  reply->encap_num=tags+ppp;
+  if(ppp) {
+   reply->encap[tags].proto=htons(ETH_P_PPP_SES);
+   reply->encap[tags].id=0x1234+vector;
+  }
+  struct nf_flow_match match={};
+  assert(!nf_flow_rule_match(&match,&flow.tuplehash[direction].tuple,NULL));
+  struct flow_rule rule={.used=match.dissector.used_keys,
+   .meta=match.key.meta,.meta_mask=match.mask.meta,
+   .control=match.key.control,.control_mask=match.mask.control,
+   .tcp=match.key.tcp,.tcp_mask=match.mask.tcp,
+   .basic=match.key.basic,.basic_mask=match.mask.basic,
+   .ipv4=match.key.ipv4,.ipv4_mask=match.mask.ipv4,
+   .ipv6=match.key.ipv6,.ipv6_mask=match.mask.ipv6,
+   .ports=match.key.tp,.ports_mask=match.mask.tp,
+   .vlan=match.key.vlan,.vlan_mask=match.mask.vlan,
+   .cvlan=match.key.cvlan,.cvlan_mask=match.mask.cvlan,
+   .pppoe=match.key.pppoe,.pppoe_mask=match.mask.pppoe};
+  struct nf_flow_rule nf={.rule=&rule};
+  if(dnat) {
+   assert(!flow_offload_ipv6_dnat(NULL,&flow,direction,&nf));
+   assert(!flow_offload_port_dnat(NULL,&flow,direction,&nf));
+  } else {
+   assert(!flow_offload_ipv6_snat(NULL,&flow,direction,&nf));
+   assert(!flow_offload_port_snat(NULL,&flow,direction,&nf));
+  }
+  assert(!linux_vlan_actions(&flow,direction,&nf));
+  ethernet_actions(&nf,source,destination,direction?lan->netdev:pon->netdev);
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};
+  struct rtl_fe_rule parsed={};struct rtl_fe_port *input=direction?pon:lan;
+  lan->fe->naptv6=false;
+  assert(fe_parse(input,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_NAT);
+  lan->fe->naptv6=true;memset(&parsed,0,sizeof(parsed));
+  assert(!fe_parse(input,&cls,&parsed));
+  const struct flow_offload_tuple *other=&flow.tuplehash[!direction].tuple;
+  bool destination_changed=dnat^direction;
+  const struct in6_addr *address=destination_changed?&other->src_v6:&other->dst_v6;
+  __be16 translated_port=destination_changed?other->src_port:other->dst_port;
+  assert(parsed.ipv6 && parsed.action.translate && parsed.action.translate_ipv6);
+  assert(parsed.action.translate_destination==destination_changed);
+  for(unsigned int word=0;word<3;word++)
+   assert(parsed.action.address6_high[word]==ntohl(address->s6_addr32[word]));
+  assert(parsed.action.address==ntohl(address->s6_addr32[3]));
+  assert(parsed.action.port==ntohs(translated_port));
+  assert(parsed.action.destination==(direction?lan->destination:pon->destination));
+  assert(parsed.action.vlan_count==(direction?0:tags));
+  assert(parsed.pppoe_input==(ppp&&direction));
+  assert(parsed.egress_pppoe==((ppp&&!direction)?3U|((0x1234+vector)<<2):0));
+  assert(parsed.action.pppoe_pop==(ppp&&direction));
+  unsigned int packed[RTL_FE_NAPTV6_ACTION_WORDS];
+  memset(packed,255,sizeof(packed));rtl_fe_naptv6_action(packed,&parsed.action);
+  assert(packed_bits(packed,45,1)==1 && packed_bits(packed,46,1)==destination_changed);
+  assert(packed_bits(packed,47,32)==ntohl(address->s6_addr32[3]));
+  assert(packed_bits(packed,79,1)==1 && packed_bits(packed,224,1)==1);
+  for(unsigned int word=0;word<3;word++)
+   assert(packed_bits(packed,225+32*word,32)==ntohl(address->s6_addr32[2-word]));
+  assert(packed_bits(packed,191,16)==ntohs(translated_port));
+  assert(!(packed[10]&~1U) && !packed[11]);
+  /* A supported L4 checksum does not imply an IPv4 header checksum. */
+  unsigned int n=rule.action.num_entries++;
+  rule.action.entries[n]=rule.action.entries[n-1];
+  rule.action.entries[n-1]=(struct flow_action_entry){.id=FLOW_ACTION_CSUM,
+   .csum_flags=protocol==IPPROTO_TCP?TCA_CSUM_UPDATE_FLAG_TCP:TCA_CSUM_UPDATE_FLAG_UDP};
+  memset(&parsed,0,sizeof(parsed));assert(!fe_parse(input,&cls,&parsed));
+  rule.action.entries[n-1].csum_flags|=TCA_CSUM_UPDATE_FLAG_IPV4HDR;
+  memset(&parsed,0,sizeof(parsed));assert(fe_parse(input,&cls,&parsed)==-EOPNOTSUPP);
+  cases++;
+ }
+ lan->fe->naptv6=false;
+ return cases;
+}
+static unsigned int naptv6_boundaries(struct rtl_fe_port *lan,struct rtl_fe_port *pon,
+ const u8 *source,const u8 *destination)
+{
+ unsigned int cases=0;
+ struct flow_rule base={.used=BIT(FLOW_DISSECTOR_KEY_META)|BIT(FLOW_DISSECTOR_KEY_BASIC)|
+  BIT(FLOW_DISSECTOR_KEY_IPV6_ADDRS)|BIT(FLOW_DISSECTOR_KEY_PORTS),
+  .meta={.ingress_ifindex=lan->netdev->ifindex},.meta_mask={.ingress_ifindex=-1},
+  .basic={.n_proto=htons(ETH_P_IPV6),.ip_proto=IPPROTO_TCP},
+  .basic_mask={.n_proto=65535,.ip_proto=255},
+  .ports={htons(53000),htons(443)},.ports_mask={65535,65535}};
+ for(unsigned int word=0;word<4;word++) {
+  base.ipv6.src.s6_addr32[word]=htonl(word?0x12345678+word*31:0x20010db8);
+  base.ipv6.dst.s6_addr32[word]=htonl(word?0xaabbccdd+word*37:0x20010db9);
+  base.ipv6_mask.src.s6_addr32[word]=base.ipv6_mask.dst.s6_addr32[word]=~0U;
+ }
+ lan->fe->naptv6=true;
+ for(unsigned int side=0;side<2;side++)for(unsigned int word=0;word<4;word++) {
+  struct flow_rule rule=base;struct nf_flow_rule nf={.rule=&rule};
+  unsigned int offset=(side?offsetof(struct ipv6hdr,daddr):offsetof(struct ipv6hdr,saddr))+4*word;
+  __be32 value=htonl(word?0x9abcdef1:0x20020db8);unsigned int mask=0;
+  flow_offload_mangle(flow_action_entry_next(&nf),FLOW_ACT_MANGLE_HDR_TYPE_IP6,offset,&value,&mask);
+  ethernet_actions(&nf,source,destination,pon->netdev);
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};struct rtl_fe_rule parsed={};
+  assert(!fe_parse(lan,&cls,&parsed));
+  const struct in6_addr *original=side?&base.ipv6.dst:&base.ipv6.src;
+  for(unsigned int i=0;i<3;i++)
+   assert(parsed.action.address6_high[i]==ntohl(i==word?value:original->s6_addr32[i]));
+  assert(parsed.action.address==ntohl(word==3?value:original->s6_addr32[3]));
+  assert(parsed.action.port==ntohs(side?base.ports.dst:base.ports.src));
+  assert(parsed.action.translate_ipv6 && parsed.action.translate_destination==side);
+  cases++;
+  rule.action.entries[0].mangle.mask=1;
+  memset(&parsed,0,sizeof(parsed));assert(fe_parse(lan,&cls,&parsed)==-EOPNOTSUPP);cases++;
+  rule.action.entries[0].mangle.mask=0;
+  if(!word) {
+   rule.action.entries[0].mangle.val=htonl(0xff020003);
+   memset(&parsed,0,sizeof(parsed));
+   assert(fe_parse(lan,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_NAT);cases++;
+  }
+  const unsigned int invalid_offsets[]={0,4,7,9,23,25,39,40,44,~0U};
+  rule.action.entries[0].mangle.val=value;
+  for(unsigned int i=0;i<sizeof(invalid_offsets)/sizeof(invalid_offsets[0]);i++) {
+   rule.action.entries[0].mangle.offset=invalid_offsets[i];
+   memset(&parsed,0,sizeof(parsed));assert(fe_parse(lan,&cls,&parsed)==-EOPNOTSUPP);cases++;
+  }
+ }
+ /* One 321-bit action carries exactly one translated address/port side.
+  * Opposite-side address or port edits cannot be silently discarded. */
+ for(unsigned int protocol=6;protocol<=17;protocol+=11)
+  for(unsigned int src_port=0;src_port<2;src_port++)for(unsigned int dst_port=0;dst_port<2;dst_port++) {
+   struct flow_rule rule=base;rule.basic.ip_proto=protocol;
+   struct nf_flow_rule nf={.rule=&rule};u32 mask=0,value;
+   if(!src_port) {
+    value=htonl(0x20020db8);
+    flow_offload_mangle(flow_action_entry_next(&nf),FLOW_ACT_MANGLE_HDR_TYPE_IP6,
+     offsetof(struct ipv6hdr,saddr),&value,&mask);
+   }
+   if(!dst_port) {
+    value=htonl(0x20030db8);
+    flow_offload_mangle(flow_action_entry_next(&nf),FLOW_ACT_MANGLE_HDR_TYPE_IP6,
+     offsetof(struct ipv6hdr,daddr),&value,&mask);
+   }
+   if(src_port||dst_port) {
+    __be16 pair[]={src_port?htons(12345):rule.ports.src,dst_port?htons(8443):rule.ports.dst};
+    memcpy(&value,pair,4);
+    flow_offload_mangle(flow_action_entry_next(&nf),protocol==IPPROTO_TCP?
+     FLOW_ACT_MANGLE_HDR_TYPE_TCP:FLOW_ACT_MANGLE_HDR_TYPE_UDP,0,&value,&mask);
+   }
+   ethernet_actions(&nf,source,destination,pon->netdev);
+   struct flow_cls_offload cls={.rule=&rule,.route_mtu=1400};struct rtl_fe_rule parsed={};
+   assert(fe_parse(lan,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_NAT);cases++;
+  }
+ lan->fe->naptv6=false;
+ return cases;
 }
 int main(void)
 {
@@ -475,6 +758,35 @@ int main(void)
   .ipv4={htonl(0x0a000002),htonl(0xc6336401)},.ipv4_mask={~0U,~0U},
   .ports={htons(53000),htons(443)},.ports_mask={65535,65535}};
  struct nf_flow_rule nf={.rule=&base};ethernet_actions(&nf,source,destination,&pon);
+ unsigned int same_uni_cases=same_uni_routes(&lp,source,destination);
+ unsigned int naptv6_cases=naptv6_routes(&lp,&pp,source,destination);
+ unsigned int naptv6_boundary_cases=naptv6_boundaries(&lp,&pp,source,destination);
+ /* Same-port eligibility is not a general hairpin/PON escape hatch. */
+ for(unsigned int source_port=0;source_port<8;source_port++)
+  for(unsigned int destination_port=0;destination_port<8;destination_port++) {
+   struct flow_rule rule=base;
+   struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
+   rule.action.entries[rule.action.num_entries-1].dev=&lan;
+   lp.source=source_port;lp.destination=destination_port;
+   int ret=fe_parse(&lp,&cls,&parsed);
+   if(source_port<5 && source_port==destination_port)assert(!ret);
+   else assert(ret==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_PORT);
+  }
+ lp.source=lp.destination=0;
+ {
+  struct flow_rule rule=base;
+  struct flow_cls_offload cls={.rule=&rule,.route_mtu=1500};struct rtl_fe_rule parsed={};
+  rule.meta.ingress_ifindex=pon.ifindex; /* same PON physical netdev */
+  assert(fe_parse(&pp,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_PORT);
+  rule=base;rule.action.entries[rule.action.num_entries-1].dev=&lan;
+  rule.used=BIT(FLOW_DISSECTOR_KEY_BASIC)|BIT(FLOW_DISSECTOR_KEY_ETH_ADDRS);
+  rule.basic.ip_proto=rule.basic_mask.ip_proto=0;
+  memcpy(rule.eth.src,source,6);memcpy(rule.eth.dst,destination,6);
+  memset(&rule.eth_mask,255,sizeof(rule.eth_mask));
+  rule.action.entries[0]=(struct flow_action_entry){.id=FLOW_ACTION_REDIRECT,.dev=&lan};
+  rule.action.num_entries=1;memset(&parsed,0,sizeof(parsed));
+  assert(fe_parse(&lp,&cls,&parsed)==-EOPNOTSUPP && parsed.reject_reason==FE_REJECT_PORT);
+ }
  /* The ordinary hash domain is unicast-only. A multicast IP MDB miss
   * must never find an installed ordinary route with the same IP tuple;
   * NAT cannot introduce a multicast/reserved endpoint either. Exercise
@@ -575,7 +887,7 @@ int main(void)
   if(!limits[i] || limits[i]>0x3fff)assert(ret==-EOPNOTSUPP);
   else assert(!ret && parsed.mtu==limits[i]);
  }
- printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, %u bidirectional PPPoE/QinQ and %u authorized bridge vectors; %u multicast/NAT endpoint rejections, 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,pppoe_cases,bridge_cases,multicast_cases);
+ printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, %u bidirectional PPPoE/QinQ and %u authorized bridge vectors; %u same-UNI routed vectors, %u NAPT6 original/reply vectors, %u NAPT6 boundary cases, %u multicast/NAT endpoint rejections, 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,pppoe_cases,bridge_cases,same_uni_cases,naptv6_cases,naptv6_boundary_cases,multicast_cases);
 }
 '''
 
@@ -589,7 +901,8 @@ parts += [function(native,n) for n in ('fe_vlan_tpid','fe_vlan_match')]
 parts += [(drivers / 'rtl9617c-fe-vlan.h').read_text()]
 parts += [function(native,n) for n in ('fe_parse_bridge','fe_parse')]
 for name in ('flow_action_entry_next','flow_offload_mangle','flow_offload_ipv4_snat',
-             'flow_offload_l4proto','flow_offload_port_snat'):
+             'flow_offload_ipv6_mangle','flow_offload_ipv6_snat','flow_offload_ipv6_dnat',
+             'flow_offload_l4proto','flow_offload_port_snat','flow_offload_port_dnat'):
     parts.append(function(upstream, name))
 parts.append(function(upstream,'nf_flow_rule_vlan_match'))
 parts.append(function(kernel_header,'nf_flow_tuple_encap_valid'))
@@ -600,16 +913,59 @@ parts.append(test)
 with tempfile.TemporaryDirectory(dir=root / 'artifacts',prefix='fe-parser-') as work:
     source = Path(work) / 'parser.c'
     binary = Path(work) / 'parser'
-    source.write_text('\n'.join(parts))
-    subprocess.run(['cc','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
-        '-I'+str(drivers),str(source),'-o',str(binary)],check=True)
-    subprocess.run([str(binary)],check=True)
+    production = '\n'.join(parts)
+    def run(candidate, mutant=None):
+        source.write_text(candidate)
+        subprocess.run(['cc','-g','-fsanitize=address,undefined','-fno-omit-frame-pointer',
+            '-I'+str(drivers),str(source),'-o',str(binary)],check=True)
+        result = subprocess.run([str(binary)],capture_output=bool(mutant),text=True)
+        if mutant:
+            if not result.returncode or 'Assertion' not in result.stderr:
+                raise AssertionError(f'{mutant}: no runtime semantic assertion: {result.stderr}')
+            print(f'PASS: actual parser rejected {mutant}')
+        else:
+            result.check_returncode()
+    run(production)
+    if args.mutants:
+        routed = function(native,'fe_parse')
+        bridge = function(native,'fe_parse_bridge')
+        mutations = {
+            'same-UNI-routes-still-rejected': (routed,
+                'if(!data->output)return -EOPNOTSUPP;',
+                'if(!data->output || data->input==data->output)return -EOPNOTSUPP;'),
+            'unknown-source-accepted-as-UNI': (routed,
+                'port->source>=FE_LAN_PORTS || ', ''),
+            'non-UNI-destination-accepted': (routed,
+                'port->destination!=port->source', 'false'),
+            'bridge-hairpin-accidentally-opened': (bridge,
+                '!data->output || data->input==data->output', '!data->output'),
+            'NAPT6-accepted-in-normal-cache-mode': (routed,
+                '!port->fe->naptv6', 'false'),
+            'IPv6-untouched-source-words-zeroed': (routed,
+                'new_source6[i]=addresses6.key->src.s6_addr32[i];', 'new_source6[i]=0;'),
+            'IPv6-high96-wrong-word-order': (routed,
+                'data->action.address6_high[i]=ntohl(address[i]);',
+                'data->action.address6_high[i]=ntohl(address[2-i]);'),
+            'opposite-NAT-side-silently-dropped': (routed,
+                'if(source_changed && destination_changed)return -EOPNOTSUPP;', ''),
+            'IPv6-partial-mask-silently-widened': (routed,
+                '!data->ipv6 || act->mangle.mask || (offset&3)', '!data->ipv6 || (offset&3)'),
+        }
+        for name,(body,old,new) in mutations.items():
+            if body.count(old)!=1:
+                raise AssertionError(f'{name}: mutation anchor is not unique')
+            run(production.replace(body,body.replace(old,new,1),1),name)
 (root / 'logs/fe-flow-parser.json').write_text(json.dumps({
     'production_source_sha256':hashlib.sha256(native.encode()).hexdigest(),
     'Linux_NAT_builder_sha256':hashlib.sha256(upstream.encode()).hexdigest(),
     'Linux_version':json.loads((root / 'port/sources.lock.json').read_text())['openwrt']['kernel'],
     'TCP_UDP_both_directions':True,
     'multicast_route_and_NAT_endpoints_fall_back':True,
+    'same_UNI_routed_VLAN_QinQ_vectors':2160,
+    'same_UNI_narrow_identity_and_bridge_guards':True,
+    'IPv6_NAT_addr_port_original_reply_vectors':960,
+    'IPv6_NAT_boundary_vectors':106,
+    'semantic_mutants':9 if args.mutants else 0,
     'vectors':1028,'IPv6_128bit_route_vectors':4,'Linux_VLAN_QinQ_vectors':288,'PPPoE_IPv4_IPv6_both_directions':128,'sanitizers':['ASan','UBSan'],
     'hardware_flowtable_acceptance':False,
 },indent=2)+'\n')

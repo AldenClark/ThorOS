@@ -116,7 +116,7 @@ static void transactions(void)
    assert(!fe_switch_hw_port_policy(&fe,&hw,learn,isolated));
    check_policy(learn,isolated);assert(hw.count==count);cpu_only();cases++;
   }
-  assert(fe_switch_hw_arm(&fe,&hw,ports,0,true));
+  assert(fe_switch_hw_arm(&fe,&hw,ports,0,true,true));
   unsigned int writes=model.writes;
   assert(fe_switch_hw_port_policy(&fe,&hw,0,0)==-EBUSY);
   assert(model.writes==writes); /* a live port cannot be rewritten */
@@ -138,7 +138,7 @@ static void zero_age_static_only(void)
   assert(!(hw.run_control&BIT(0)) && !(hw.requested_aging&0x7ffffU));
   assert(!fe_switch_hw_port_policy(&fe,&hw,0,0));
   check_policy(0,0);cpu_only();
-  assert(fe_switch_hw_arm(&fe,&hw,ports,0,true));
+  assert(fe_switch_hw_arm(&fe,&hw,ports,0,true,true));
   assert(!(model.reg[0x1c00/4]&BIT(0)));
   assert(model.reg[0x1c04/4]==(original.reg[0x1c04/4]&~0x7ffffU));
   check_policy(0,0);cases++;
@@ -150,7 +150,7 @@ static void zero_age_static_only(void)
 static void failed_policy(void)
 {
  assert(!hw.port_policy_ready && hw.prepared && hw.globals_owned);
- assert(!fe_switch_hw_arm(&fe,&hw,hw.ports,0,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,hw.ports,0,true,true));
  cpu_only();
 }
 
@@ -218,13 +218,13 @@ static void baseline_guards(void)
  /* Drift immediately before arm cannot reopen an invalid isolation policy. */
  begin(31,true);assert(!fe_switch_hw_port_policy(&fe,&hw,31,3));
  model.reg[0x160c/4]=0;
- assert(!fe_switch_hw_arm(&fe,&hw,31,0,true));assert(!hw.port_policy_ready);cpu_only();cases++;
+ assert(!fe_switch_hw_arm(&fe,&hw,31,0,true,true));assert(!hw.port_policy_ready);cpu_only();cases++;
 }
 
 static void route_policy(void)
 {
- /* L3 can remain enabled, but isolated/STP bridge policy may forbid its
-  * complete autonomous path, including the reverse PON connector. */
+ /* A global policy veto still closes every routed path. Native-only
+  * forwarding may remain available with its local traffic trapped. */
  reset();fe.enabled=fe.prepared=true;model.reg[0x160c/4]=1;
  assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,false));
  assert(hw.local_target==16 && !hw.route_policy_allowed);
@@ -232,22 +232,40 @@ static void route_policy(void)
                           RTL_L2_SPB_DESTINATION)==16);
  assert(!fe_switch_hw_port_policy(&fe,&hw,31,3));
  for(unsigned int p=0;p<5;p++)assert(!(model.rows[RTL_L2_TBL_PORT_MEMBERSHIP][p][0]&BIT(25)));
- assert(!fe_switch_hw_arm(&fe,&hw,31,0,true)); /* cannot arm a different policy */
- assert(!fe_switch_hw_arm(&fe,&hw,15,16,false)); /* policy forbids routed ingress */
- assert(fe_switch_hw_arm(&fe,&hw,31,0,false));
+ assert(!fe_switch_hw_arm(&fe,&hw,31,0,true,true)); /* cannot arm a different policy */
+ assert(!fe_switch_hw_arm(&fe,&hw,15,16,false,false)); /* policy forbids routed ingress */
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,false,false));
  assert(model.route_closed && fe.route_gate_verified && !model.route_arms);cases++;
  assert(!fe_switch_hw_drain(&fe,&hw));
  assert(!fe_switch_hw_restore(&fe,&hw));restored();
+ /* Port-local learning/isolation restrictions are different: the native
+  * group keeps shared local-MAC/SPB traffic on CPU16, while independently
+  * admitted physical ports may still use the ordinary routed path. This
+  * exercises the actual table writer/arm, not just the worker's masks. */
+ reset();fe.enabled=fe.prepared=true;model.reg[0x160c/4]=1;
+ assert(!fe_switch_hw_prepare(&fe,&hw,3,123,true,false));
+ assert(!fe_switch_hw_port_policy(&fe,&hw,2,1));
+ assert(!fe_switch_hw_arm(&fe,&hw,3,4,false,true));
+ assert(!fe_switch_hw_arm(&fe,&hw,3,4,true,true));
+ assert(fe_switch_hw_arm(&fe,&hw,3,4,true,false));
+ assert(!model.route_closed && model.route_arms==1 && hw.local_target==16 &&
+        !hw.route_policy_allowed && hw.learning_mask==2 && hw.isolated_mask==1);
+ assert(fe_switch_hw_field(model.rows[RTL_L2_TBL_SPB][hw.special_profile*32+12],
+                          RTL_L2_SPB_DESTINATION)==16);
+ for(unsigned int p=0;p<2;p++)
+  assert(!(model.rows[RTL_L2_TBL_PORT_MEMBERSHIP][p][0]&BIT(25)));
+ assert(!fe_switch_hw_drain(&fe,&hw));
+ assert(!fe_switch_hw_restore(&fe,&hw));restored();cases++;
  for(unsigned int pending=0;pending<2;pending++) {
   reset();fe.enabled=fe.prepared=true;model.reg[0x160c/4]=1;
   assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,false));
   fe.pending_withdrawals=pending;model.arm_failure=true;
-  assert(!fe_switch_hw_arm(&fe,&hw,31,0,false));
+  assert(!fe_switch_hw_arm(&fe,&hw,31,0,false,false));
   assert(!model.route_arms && !model.native_writes && !fe.route_gate_verified);cpu_only();cases++;
  }
  /* Native-only with no historical L3 owner is still usable. */
  reset();assert(!fe_switch_hw_prepare(&fe,&hw,31,123,true,false));
- assert(fe_switch_hw_arm(&fe,&hw,31,0,false));assert(!model.route_arms);cases++;
+ assert(fe_switch_hw_arm(&fe,&hw,31,0,false,false));assert(!model.route_arms);cases++;
 }
 
 static void fault_matrix(void)

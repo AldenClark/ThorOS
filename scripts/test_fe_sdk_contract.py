@@ -46,8 +46,8 @@ def compile_source(sdk):
                      common_h.index("} __attribute__((packed)) aal_hash_value_t;") +
                      len("} __attribute__((packed)) aal_hash_value_t;")]
     normal = hash_h[hash_h.index("typedef struct hash_action_flow_normal_mode_s"):
-                    hash_h.index("}__attribute__((packed)) hash_action_flow_normal_mode_t;") +
-                    len("}__attribute__((packed)) hash_action_flow_normal_mode_t;")]
+                    hash_h.index("}__attribute__((packed)) hash_action_flow_naptv6_mode_t;") +
+                    len("}__attribute__((packed)) hash_action_flow_naptv6_mode_t;")]
     crc = common_c[common_c.index("static unsigned short crctable_ccitt16"):
                    common_c.index("/* CCITT-CRC32 polynomial:")]
     # SDK reverse_n uses signed 64-bit literal shifts that trip hosted UBSan.
@@ -60,6 +60,7 @@ def compile_source(sdk):
         crc += "\n" + extract_function(common_c, signature)
     calculate = extract_function(common_c, "int hash_value_calculate(")
     convert = extract_function(sdk["aal_hash.c"], "static void convert_act_flow_nomal_mode(")
+    convert += "\n" + extract_function(sdk["aal_hash.c"], "static void convert_act_flow_naptv6_mode(")
     action_fields = re.findall(r"RTL_FE_(\w+),", header.split("enum rtl_fe_action_field {", 1)[1].split("};", 1)[0])[:-1]
     key_fields = re.findall(r"RTL_FE_KEY_(\w+),", header.split("enum rtl_fe_key_field {", 1)[1].split("};", 1)[0])[:-1]
     # Compile the actual runtime route-mask preparation, not a copied test mask.
@@ -125,6 +126,7 @@ TESTS = r'''
 _Static_assert(sizeof(aal_hash_key_t)==RTL_FE_KEY_WORDS*4,"SDK key width");
 _Static_assert(sizeof(aal_hash_mask_t)==28,"SDK mask width");
 _Static_assert(sizeof(hash_action_flow_normal_mode_t)==28,"SDK normal-action width");
+_Static_assert(sizeof(hash_action_flow_naptv6_mode_t)==41,"SDK 321-bit NAPTv6 action");
 static uint32_t random_state=0x9617c;
 static uint32_t next_random(void)
 {
@@ -135,15 +137,18 @@ static uint32_t next_random(void)
 }
 static void check_action_layout(void)
 {
- for(unsigned int field=0;field<RTL_FE_FIELD_COUNT;field++) {
+ for(unsigned int mode=0;mode<2;mode++) {
+ unsigned int fields=mode?RTL_FE_FIELD_COUNT:RTL_FE_IP_ADDR_H_96_VLD;
+ for(unsigned int field=0;field<fields;field++) {
   for(unsigned int bit=0;bit<32;bit++) {
    aal_hash_action_t input={0};
    hash_action_flow_normal_mode_t output={0};
-   unsigned int native[8]={0},expected[8]={0};
+   hash_action_flow_naptv6_mode_t wide={0};
+   unsigned int native[RTL_FE_NAPTV6_ACTION_WORDS]={0},expected[RTL_FE_NAPTV6_ACTION_WORDS]={0};
    unsigned int value=1U<<bit;
    vendor_action_set(&input,field,value);
-   convert_act_flow_nomal_mode(&input,&output);
-   memcpy(expected,&output,sizeof(output));
+   if(mode) {convert_act_flow_naptv6_mode(&input,&wide);memcpy(expected,&wide,sizeof(wide));}
+   else {convert_act_flow_nomal_mode(&input,&output);memcpy(expected,&output,sizeof(output));}
    rtl_fe_action_set(native,field,value);
    assert(!memcmp(native,expected,sizeof(native)));
   }
@@ -151,15 +156,36 @@ static void check_action_layout(void)
  for(unsigned int vector=0;vector<512;vector++) {
   aal_hash_action_t input={0};
   hash_action_flow_normal_mode_t output={0};
-  unsigned int native[8]={0},expected[8]={0};
-  for(unsigned int field=0;field<RTL_FE_FIELD_COUNT;field++) {
+  hash_action_flow_naptv6_mode_t wide={0};
+  unsigned int native[RTL_FE_NAPTV6_ACTION_WORDS]={0},expected[RTL_FE_NAPTV6_ACTION_WORDS]={0};
+  for(unsigned int field=0;field<fields;field++) {
    unsigned int value=next_random();
    vendor_action_set(&input,field,value);
    rtl_fe_action_set(native,field,value);
   }
-  convert_act_flow_nomal_mode(&input,&output);
-  memcpy(expected,&output,sizeof(output));
+  if(mode) {convert_act_flow_naptv6_mode(&input,&wide);memcpy(expected,&wide,sizeof(wide));}
+  else {convert_act_flow_nomal_mode(&input,&output);memcpy(expected,&output,sizeof(output));}
   assert(!memcmp(native,expected,sizeof(native)));
+ }
+ }
+ for(unsigned int vector=0;vector<512;vector++) {
+  struct rtl_fe_ipv4_action action={.translate=1,.translate_ipv6=1};
+  hash_action_flow_naptv6_mode_t reference={0};
+  unsigned int native[RTL_FE_NAPTV6_ACTION_WORDS],normal[RTL_FE_ACTION_WORDS];
+  action.address=next_random();action.port=next_random();
+  action.translate_destination=vector&1;
+  for(unsigned int i=0;i<3;i++)action.address6_high[i]=next_random();
+  memset(native,0xa5,sizeof(native));rtl_fe_ipv4_action(normal,&action);
+  memcpy(&reference,normal,sizeof(hash_action_flow_normal_mode_t));
+  reference.ip_addr_napt6=1;reference.ip_addr_h_96_vld=1;
+  reference.ip_addr_h_96_3=action.address6_high[0];
+  reference.ip_addr_h_96_2=action.address6_high[1];
+  reference.ip_addr_h_96_1=action.address6_high[2];
+  rtl_fe_naptv6_action(native,&action);
+  assert(!memcmp(native,&reference,sizeof(reference)));
+  assert(!(native[10]&~1U)&&!native[11]);
+  action.translate=0;rtl_fe_naptv6_action(native,&action);
+  assert(!(native[2]&(1U<<15))&&!native[7]&&!native[8]&&!native[9]&&!native[10]&&!native[11]);
  }
 }
 static void check_key_layout(void)
@@ -293,7 +319,7 @@ static void check_bridge_keys(void)
 int main(void)
 {
  check_action_layout();check_key_layout();check_route_mask();check_route_keys();check_bridge_keys();
- printf("Public SDK source parity: %u action fields x32 single-bit +512 random vectors; "
+ printf("Public SDK source parity: normal224 / NAPTv6-321 layouts, %u action fields, single-bit and 1024 random vectors +512 IPv6 builders; "
   "%u key fields x32 single-bit; 1024 IPv4/IPv6 TCP/UDP VLAN/QinQ/PPPoE keys +256 L2 keys; "
   "masked-key, CRC16/32, exception and TCP flag contracts PASS (no hardware test)\n",
   RTL_FE_FIELD_COUNT,RTL_FE_KEY_FIELD_COUNT);

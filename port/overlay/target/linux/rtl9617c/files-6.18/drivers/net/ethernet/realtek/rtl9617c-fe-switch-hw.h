@@ -103,7 +103,7 @@ struct rtl_fe_switch_hw {
 	bool rx_gate_verified;
 };
 
-static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
+static const char *fe_switch_hw_reason_text(unsigned int reason)
 {
 	static const char * const names[] = {
 		"ok", "requires-existing-svl", "priority-fdb-key", "tpid-profile",
@@ -117,7 +117,12 @@ static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
 		"ivl-parser-consumer-unverified",
 	};
 
-	return (unsigned int)hw->reason < ARRAY_SIZE(names) ? names[hw->reason] : "unknown";
+	return reason < ARRAY_SIZE(names) ? names[reason] : "unknown";
+}
+
+static const char *fe_switch_hw_reason_name(const struct rtl_fe_switch_hw *hw)
+{
+	return fe_switch_hw_reason_text(hw->reason);
 }
 
 /* No MAC TX disable: software forwarding must continue under a persistent
@@ -910,32 +915,18 @@ static int fe_switch_hw_limits(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw)
 	return 0;
 }
 
-static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
-			       unsigned int ports, unsigned long ageing,
-			       bool snooping, bool route_policy_allowed)
+/* Direct, read-only configuration evidence. This intentionally does not
+ * issue indirect table commands or touch PON consumers. A CPU-FDB veto must
+ * not hide an independent VLAN/hash/MRU contract failure from diagnostics.
+ * Passing this check is not table ownership or permission to enable RX. */
+static int fe_switch_hw_preflight(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
+				  unsigned int ports)
 {
-	struct rtl_dq_io io = fe_io(fe);
-	unsigned int words[RTL_L2_TABLE_MAX_WORDS], filter[RTL_L2_FDB_FILTER_WORDS];
-	unsigned int i, field;
-	int ret;
+	unsigned int i;
 
-	(void)snooping; /* Initial recipe traps MC; a separate snapshot may add MCE. */
 	hw->reason = FE_SW_HW_OK;
-	if (!ports || (ports & ~FE_SW_LAN_MASK) || ageing > 0x7ffffUL)
+	if (!ports || (ports & ~FE_SW_LAN_MASK))
 		return -EINVAL;
-	if (hw->globals_owned || hw->count || hw->prepared || hw->limits_owned ||
-	    hw->journal.quarantined || hw->journal.restoring)
-		return -EALREADY;
-	if (!hw->rows || !hw->journal.row_index ||
-	    hw->journal.capacity != FE_SW_SNAPSHOTS ||
-	    hw->journal.index_count != rtl_l2_journal_index_count())
-		return -EINVAL;
-	hw->route_policy_allowed = route_policy_allowed;
-	fe_switch_hw_gate(fe, hw);
-	if (!READ_ONCE(hw->rx_gate_verified) || !fe_switch_hw_route_closed(fe)) {
-		hw->reason = FE_SW_HW_ADMISSION;
-		return -EIO;
-	}
 	memset(&hw->observed, 0, sizeof(hw->observed));
 	hw->observed.source_port = hw->observed.source_logical = ~0U;
 	hw->observed.learning_port = hw->observed.learning_profile = ~0U;
@@ -985,6 +976,40 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 		hw->reason = FE_SW_HW_MTU;
 		return -EOPNOTSUPP;
 	}
+	return 0;
+}
+
+static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
+			       unsigned int ports, unsigned long ageing,
+			       bool snooping, bool route_policy_allowed)
+{
+	struct rtl_dq_io io = fe_io(fe);
+	unsigned int words[RTL_L2_TABLE_MAX_WORDS], filter[RTL_L2_FDB_FILTER_WORDS];
+	unsigned int i, field;
+	int ret;
+
+	(void)snooping; /* Initial recipe traps MC; a separate snapshot may add MCE. */
+	hw->reason = FE_SW_HW_OK;
+	if (!ports || (ports & ~FE_SW_LAN_MASK) || ageing > 0x7ffffUL)
+		return -EINVAL;
+	if (hw->globals_owned || hw->count || hw->prepared || hw->limits_owned ||
+	    hw->journal.quarantined || hw->journal.restoring)
+		return -EALREADY;
+	if (!hw->rows || !hw->journal.row_index ||
+	    hw->journal.capacity != FE_SW_SNAPSHOTS ||
+	    hw->journal.index_count != rtl_l2_journal_index_count())
+		return -EINVAL;
+	hw->route_policy_allowed = route_policy_allowed;
+	fe_switch_hw_gate(fe, hw);
+	if (!READ_ONCE(hw->rx_gate_verified) || !fe_switch_hw_route_closed(fe)) {
+		hw->reason = FE_SW_HW_ADMISSION;
+		return -EIO;
+	}
+	/* Recheck immediately before ownership; the earlier read-only worker
+	 * sample is evidence, never a cached permission to use shared state. */
+	ret = fe_switch_hw_preflight(fe, hw, ports);
+	if (ret)
+		return ret;
 	/* IPPB precedes the ILPB learning decision. A foreign physical source
 	 * aliasing a native LPID is not protected by that foreign LPID's STP.
 	 * Validate all mappings; never rewrite PON/CPU mappings to claim them. */
@@ -1238,7 +1263,8 @@ retained:
 
 static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 			    unsigned int native, unsigned int route,
-			    bool route_policy_allowed)
+			    bool route_policy_allowed,
+			    bool native_route_policy_allowed)
 {
 	unsigned int port, value;
 	bool withdrawing = READ_ONCE(fe->pending_withdrawals);
@@ -1247,7 +1273,8 @@ static bool fe_switch_hw_arm(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	    (native | route) & ~FE_SW_LAN_MASK || (native & route) ||
 	    (native && (!READ_ONCE(hw->prepared) || !READ_ONCE(hw->drained) ||
 			!READ_ONCE(hw->port_policy_ready) ||
-			hw->route_policy_allowed != route_policy_allowed ||
+			hw->route_policy_allowed != native_route_policy_allowed ||
+			(native_route_policy_allowed && !route_policy_allowed) ||
 			native != hw->ports)) ||
 	    (route && (!route_policy_allowed || !READ_ONCE(fe->enabled) ||
 		       !READ_ONCE(fe->prepared))))

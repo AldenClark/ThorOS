@@ -5,6 +5,7 @@ The backend represents hardware command outcomes, including a mutation whose
 completion times out. No policy/ownership logic is copied into the backend.
 The real table transport and SDK wire layout have separate regression gates.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -17,6 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVERS = ROOT / "port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/ethernet/realtek"
 SOURCE = DRIVERS / "rtl9617c-fe-switch.h"
 source = SOURCE.read_text()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--authority-only", action="store_true", help="Only CPU-owned feedback skip and rollback regressions")
+args = parser.parse_args()
 
 
 def function(name):
@@ -98,6 +102,8 @@ static int command_error,status_override;
 static bool pending,epoch_change,rtnl_held,relocate_delete,retain_delete;
 static bool policy_blocked;
 static unsigned int learn_calls,fail_learn_at,epoch_on_learn,epoch_after_learn,epoch_on_forget,protected_mac,unoffloads;
+static bool cpu_owned[256];
+static bool cpu_key(const u8 *address){return !address[4] && cpu_owned[address[5]];}
 static u64 nanoseconds,operation_ns;
 static unsigned long last_delay;
 static unsigned int max_slice_operations;
@@ -193,6 +199,7 @@ static int br_rtl9617c_fdb_learn_vid(struct net_device *dev,const u8 *address,un
  if(epoch_on_learn && learn_calls==epoch_on_learn)rtl9617c_switch_guard_invalidate(guard);
  if(generation!=guard->generation || !guard->owner->active)return -EAGAIN;
  if(fail_learn_at && learn_calls==fail_learn_at)return -ENOMEM;
+ if(cpu_key(address))return -EALREADY;
  events[event_count]=(struct feedback){.add=true,.port=dev->port,.vid=vid};
  memcpy(events[event_count++].mac,address,6);
  if(epoch_after_learn && learn_calls==epoch_after_learn)rtl9617c_switch_guard_invalidate(guard);
@@ -201,7 +208,7 @@ static int br_rtl9617c_fdb_learn_vid(struct net_device *dev,const u8 *address,un
 static bool br_rtl9617c_fdb_forget_vid(struct net_device *dev,const u8 *address,unsigned short vid){
  assert(sw.vlan_domain ? vid==10 || vid==20 : !vid);
  assert(rtnl_held && event_count<RTL_L2_FDB_ENTRIES*4);nanoseconds+=operation_ns;
- if(protected_mac && address[5]==protected_mac)return false;
+ if(cpu_key(address) || (protected_mac && address[5]==protected_mac))return false;
  if(epoch_on_forget){epoch_on_forget=0;rtl9617c_switch_guard_invalidate(&sw.guard);}
  events[event_count]=(struct feedback){.add=false,.port=dev->port,.vid=vid};
  memcpy(events[event_count++].mac,address,6);return true;
@@ -237,6 +244,7 @@ static void mod_delayed_work(unsigned int queue,struct delayed_work *work,unsign
 static void setup(void){
  memset(&fe,0,sizeof(fe));memset(&sw,0,sizeof(sw));memset(first,0,sizeof(first));memset(second,0,sizeof(second));
  memset(rows,0,sizeof(rows));memset(used,0,sizeof(used));
+ memset(cpu_owned,0,sizeof(cpu_owned));
  sw.fe=&fe;fe.bridge=&sw;fe.engine_ready=true;sw.requested=true;sw.guard.owner=&sw;sw.learned=first;sw.next=second;
  sw.native_mask=3;sw.active=true;sw.hw.owned=true;sw.hw.learning_mask=3;status_override=-1;
  scans=deletes=appends=fail_scan_at=fail_delete_at=event_count=0;
@@ -582,7 +590,40 @@ static void vlan_key_reconciliation(void){
  sw.domain_owned=true;mutex_lock(&fe.lock);assert(!fe_switch_restore_locked(&sw));mutex_unlock(&fe.lock);
  assert(!used[5] && used[50] && deletes==1);cases++;
 }
-int main(void){domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();learning_mask_policy();batch_fault_matrix();vlan_key_reconciliation();
+static void cpu_authority_skip(void){
+ const unsigned sizes[]={5,65};
+ for(unsigned s=0;s<2;s++){
+  unsigned count=sizes[s];setup();put_many(count);
+  cpu_owned[1]=cpu_owned[3]=cpu_owned[count]=true;finish_scan();
+  assert(sw.active && sw.polls==1 && sw.learned_count==count-3 && !sw.pending_count);
+  assert(!sw.scan_errors && !sw.guard.invalidations && !sw.work.queued && learn_calls==count && sw.learned_adds==count-3);
+  for(unsigned i=0;i<sw.learned_count;i++)assert(!cpu_key(sw.learned[i].address));
+  event_count=0;finish_scan();
+  assert(sw.active && sw.polls==2 && sw.learned_count==count-3 && !sw.scan_errors && !sw.guard.invalidations);
+  assert(event_count==count-3 && sw.learned_adds==2*(count-3));
+  event_count=0;rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+  assert(event_count==count-3 && !sw.learned_count && !sw.pending_count);
+  for(unsigned i=0;i<event_count;i++)assert(!events[i].add && !cpu_key(events[i].mac));
+  cases++;
+ }
+ /* A later true error retains only the successfully published compact
+  * prefix, not skipped CPU rows before/between those successful rows. */
+ setup();put_many(5);cpu_owned[1]=cpu_owned[3]=cpu_owned[5]=true;fail_learn_at=4;finish_scan();
+ assert(!sw.active && !sw.polls && sw.pending_count==1 && !sw.learned_count && sw.scan_errors==1);
+ assert(address_id(sw.next[0].address)==2 && event_count==1 && sw.guard.invalidations==1);
+ event_count=0;rtnl_lock();fe_switch_unoffload(&sw);rtnl_unlock();
+ assert(event_count==1 && !events[0].add && address_id(events[0].mac)==2);cases++;
+ /* CPU ownership can replace a formerly mirrored key. Its absence from
+  * the committed mirror must not cause an endless rebuild or later delete. */
+ setup();put_many(5);finish_scan();cpu_owned[1]=cpu_owned[3]=cpu_owned[5]=true;
+ event_count=0;finish_scan();assert(sw.active && sw.learned_count==2 && event_count==2 && !sw.scan_errors);
+ assert(address_id(sw.learned[0].address)==2 && address_id(sw.learned[1].address)==4);cases++;
+}
+int main(void){
+ if(getenv("THOROS_FDB_AUTHORITY_ONLY")){
+  cpu_authority_skip();printf("Native scanner CPU authority: %u benign-skip/compact-prefix/rollback cases PASS\n",cases);return 0;
+ }
+ domain_and_rollback();scan_reconciliation();bounded_scale_and_moves();bounded_time_and_generation();learning_mask_policy();batch_fault_matrix();vlan_key_reconciliation();cpu_authority_skip();
  printf("Native switch production FDB: %u rollback/status/batched-scan scenarios; full 4128-row capacity, timed slices, generation/rebuild restart, partial feedback ownership and MAC moves passed (max %u boundary operations/slice)\n",cases,max_slice_operations);
  return 0;}
 '''
@@ -595,6 +636,13 @@ functions = "\n".join(function(name) for name in [
     "fe_switch_feedback", "fe_switch_unoffload", "fe_switch_learned_compare", "fe_switch_scan",
 ])
 mutants = {
+    "cpu_owned_skip_rebuilds_forever": functions.replace(
+        "if (ret && ret != -EALREADY)", "if (ret)", 1),
+    "cpu_owned_skip_enters_rollback_prefix": functions.replace(
+        "if (!ret)\n\t\t\tsw->next[sw->pending_count++] = sw->next[sw->scan_cursor];",
+        "if (!ret || ret == -EALREADY)\n\t\t\tsw->next[sw->pending_count++] = sw->next[sw->scan_cursor];", 1),
+    "raw_scan_count_claimed_as_owned": functions.replace(
+        "sw->learned_count = sw->pending_count;", "sw->learned_count = sw->scan_count;", 1),
     "vlan_identity_removed_from_scan_sort": functions.replace(
         "\tif (left->vid != right->vid)\n\t\treturn left->vid < right->vid ? -1 : 1;\n", "", 1),
     "scan_ignores_learning_mask": functions.replace(
@@ -643,8 +691,13 @@ mutants = {
 for name, mutated in mutants.items():
     if mutated == functions:
         raise SystemExit(f"Mutation anchor missing: {name}")
+if args.authority_only:
+    mutants = {name: body for name, body in mutants.items() if name in {
+        "cpu_owned_skip_rebuilds_forever", "cpu_owned_skip_enters_rollback_prefix", "raw_scan_count_claimed_as_owned"}}
 environment = dict(os.environ)
 environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
+if args.authority_only:
+    environment["THOROS_FDB_AUTHORITY_ONLY"] = "1"
 with tempfile.TemporaryDirectory(prefix="l2-switch-fdb-") as directory:
     temporary = Path(directory)
     for name, candidate in {"production": functions, **mutants}.items():
@@ -660,6 +713,8 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-fdb-") as directory:
             if result.returncode != -6 or "Assertion" not in result.stderr:
                 raise SystemExit(f"{name}: expected a contract assertion, got {result.returncode}: {result.stderr}")
             print(f"Runtime regression mutant rejected: {name}", flush=True)
+if args.authority_only:
+    raise SystemExit(0)
 (ROOT / "artifacts").mkdir(exist_ok=True)
 (ROOT / "artifacts/l2-switch-fdb.json").write_text(json.dumps({
     "production_functions_sha256": hashlib.sha256(functions.encode()).hexdigest(),

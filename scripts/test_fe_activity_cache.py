@@ -21,6 +21,7 @@ struct rtl_fe_flow {
  unsigned int hash_index;
  unsigned long lastused;
  bool installed,published,deleting,activity_cached;
+ unsigned int activity_hits;
 };
 struct rtl_fe {struct rtl_fe_flow **hash_owners;};
 static struct rtl_fe_flow *owners[RTL_FE_HASH_ENTRIES];
@@ -43,10 +44,12 @@ static void active_budget(void) {
  for(unsigned int i=0;i<32;i++)put_nibble(hw.rows[2047],i,6);
  for(unsigned int i=0;i<32;i++)assert(!fe_refresh_activity(&fe,&flows[i]));
  assert(hw.commands==2 && hw.data_reads==4 && hw.data_writes==4);
+ for(unsigned int i=0;i<32;i++)assert(flows[i].activity_hits==1);
  for(unsigned int i=0;i<32;i++)assert(flows[i].activity_cached && flows[i].lastused==1000);
  jiffies=1050;
  for(unsigned int i=0;i<32;i++)assert(!fe_refresh_activity(&fe,&flows[i]));
  assert(hw.commands==2);
+ for(unsigned int i=0;i<32;i++)assert(flows[i].activity_hits==1);
  for(unsigned int i=0;i<32;i++)assert(flows[i].lastused==1000);
  /* Expiry is exact, and a formerly active but now idle row has no new lease. */
  jiffies=1100;
@@ -95,6 +98,7 @@ static void recycle_owner(void) {
  struct rtl_fe_flow replacement={.hash_index=160,.lastused=999,.installed=true,.published=true};
  owners[160]=&replacement;put_nibble(hw.rows[5],0,2);
  assert(!fe_refresh_activity(&fe,&replacement));
+ assert(replacement.activity_hits==1 && flows[0].activity_hits==1);
  assert(hw.commands==4 && replacement.activity_cached && replacement.lastused==1000);
  assert(fe_refresh_activity(&fe,&flows[0])==-EIO);
 }
@@ -103,6 +107,7 @@ static void failed_rows(void) {
   init(480);for(unsigned int i=0;i<32;i++)put_nibble(hw.rows[15],i,6);
   hw.fail_at=fail;
   assert(fe_refresh_activity(&fe,&flows[0])==-ETIMEDOUT);
+  for(unsigned int i=0;i<32;i++)assert(!flows[i].activity_hits);
   for(unsigned int i=0;i<32;i++)assert(!flows[i].activity_cached && flows[i].lastused==50);
   assert(fe_refresh_activity(&fe,&flows[1])==-ETIMEDOUT);
   complete_late(&hw);hw.fail_at=0;

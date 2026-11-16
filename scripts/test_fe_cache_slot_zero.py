@@ -38,12 +38,17 @@ model = r'''
 #include <stdio.h>
 #include <string.h>
 #include "rtl9617c-fe-table.h"
+#include "rtl9617c-fe-observe.h"
 #define BITS_PER_LONG (sizeof(unsigned long)*8)
-struct rtl_fe {unsigned long hashes[RTL_FE_HASH_ENTRIES/(sizeof(unsigned long)*8)];};
+struct rtl_fe {
+ unsigned long hashes[RTL_FE_HASH_ENTRIES/(sizeof(unsigned long)*8)];
+ struct rtl_fe_observe observe;unsigned long long next_flow_lease;
+};
 static int test_bit(unsigned int bit,const unsigned long *map){return !!(map[bit/BITS_PER_LONG]&(1UL<<(bit%BITS_PER_LONG)));}
 static void occupy(struct rtl_fe *fe,unsigned int bit){fe->hashes[bit/BITS_PER_LONG]|=1UL<<(bit%BITS_PER_LONG);}
 static int allocate(struct rtl_fe *fe,unsigned short crc16){
  unsigned int start=rtl_fe_hash_bucket(crc16),index;
+ struct rtl_fe_observe *observe __attribute__((unused))=&fe->observe;
 '''
 # SDK: jameywine/ca-network-drivers commit
 # 8b4f4882ff0e237a1fa558fb0838e4b680bd6bd0,

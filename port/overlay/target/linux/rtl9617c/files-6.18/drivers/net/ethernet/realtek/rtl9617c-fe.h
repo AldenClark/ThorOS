@@ -38,5 +38,8 @@ void rtl_fe_switch_rx(struct rtl_fe *fe, struct sk_buff *skb,
 int rtl_fe_mcast_rx(struct rtl_fe *fe, struct sk_buff *skb,
                    u32 header0, u32 header1, unsigned int *source);
 ssize_t rtl_fe_state(struct rtl_fe *fe, char *buffer);
+ssize_t rtl_fe_resource_state(struct rtl_fe *fe, char *buffer);
+ssize_t rtl_fe_admission_state(struct rtl_fe *fe, char *buffer);
+ssize_t rtl_fe_flow_evidence(struct rtl_fe *fe, char *buffer);
 ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer);
 #endif

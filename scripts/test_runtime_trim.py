@@ -112,7 +112,7 @@ p.write_text(json.dumps(data))
             manifest = root / 'release.manifest'
             needed = ('tyfza1-pon-control', 'luci-app-tyfza1-pon',
                       'kmod-tun', 'kmod-wireguard', 'kmod-nft-socket', 'kmod-nft-tproxy',
-                      'ppp', 'ppp-mod-pppoe', 'firewall4', 'dnsmasq')
+                      'ppp', 'ppp-mod-pppoe', 'firewall4', 'dnsmasq', 'ip-full', 'ip-bridge')
             manifest.write_text(''.join(name + ' 1\n' for name in needed))
             config = root / '.config'
             config.write_text('# CONFIG_BLK_DEV_DM is not set\nCONFIG_PHYLIB=y\n'
@@ -122,6 +122,15 @@ p.write_text(json.dumps(data))
             command = [sys.executable, str(ROOT / 'scripts/verify_release_kernel.py'),
                        '--kernel', str(root), '--manifest', str(manifest)]
             self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            # Both the requested config and the actual built manifest must
+            # contain the full JSON-capable ip and bridge tools. A seed alone
+            # does not prove that package resolution kept the diagnostics.
+            compat = (ROOT / 'port/configs/tyfza1-compat.config').read_text().splitlines()
+            for package in ('ip-full', 'ip-bridge'):
+                self.assertIn(f'CONFIG_PACKAGE_{package}=y', compat)
+                manifest.write_text(''.join(name + ' 1\n' for name in needed if name != package))
+                self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            manifest.write_text(''.join(name + ' 1\n' for name in needed))
             config.write_text('CONFIG_DM_VERITY=m\n')
             self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
             config.write_text('# CONFIG_BLK_DEV_DM is not set\n')

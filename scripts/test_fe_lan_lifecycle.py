@@ -85,7 +85,7 @@ struct rtl_fe {
  bool engine_ready,shutting_down;enum rtl_fe_mode desired_mode;
  struct spinlock route_lock;bool route_gate_ready,route_admitted,route_gate_verified,dma_exposed;
  unsigned int pending_withdrawals;
- bool base_ready,base_failed,native_mdb_profile;
+ bool base_ready,base_failed,native_mdb_profile,naptv6;
  struct rtl_l2_owner *l2_owner;struct rtl_fe_mcast *mcast;struct rtl_fe_mdb *mdb;
  unsigned int saved[64],lan_saved[5],mask_saved[8],classifier_saved[2][4][2][7],map_saved[2][4];
  unsigned int bridge_mask_saved[3][8],bridge_mask[3][8];
@@ -668,6 +668,28 @@ int main(void) {
  assert(rtl_fe_cpu_path(&f)==-EAGAIN && !f.prepared && !f.dma_exposed);
  assert(!rtl_fe_engine_resume(&f) && !f.prepared);
  assert(!rtl_fe_cpu_path(&f) && f.cpu_path);check_cpu_gate(&f);
+ /* Cold-selected action/cache geometry must survive every warm reopen;
+  * reject drift without rewriting a live profile or cache mode. */
+ for(unsigned int wide=0;wide<2;wide++) {
+  struct rtl_fe configured;
+  f=cold;f.naptv6=wide;assert(!rtl_fe_enable(&f));check_cpu_gate(&f);
+  assert(fe_read(&f,0x3724)==rtl_fe_action_profile(wide));
+  assert(fe_read(&f,0x38a0)==rtl_fe_cache_config(wide));configured=f;
+  assert(!rtl_fe_engine_suspend(&f));
+  unsigned int writes=f.base_writes;
+  assert(!rtl_fe_engine_resume(&f) && f.base_writes==writes && f.naptv6==wide);
+  const unsigned int registers[]={0x3724,0x3834,0x38a0};
+  const unsigned int masks[]={0x0fffffffU,0x300ffU,0x00070707U};
+  for(unsigned int reg=0;reg<3;reg++)for(unsigned int bit=0;bit<32;bit++) {
+   if(!(masks[reg]&BIT(bit)))continue;
+   f=configured;assert(!rtl_fe_engine_suspend(&f));writes=f.base_writes;
+   f.reg[registers[reg]/4]^=BIT(bit);
+   assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);
+   assert(f.base_rejected_register==registers[reg] && f.base_writes==writes);drifts++;
+  }
+  f=configured;assert(!rtl_fe_engine_suspend(&f));f.naptv6=!wide;
+  assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);drifts++;
+ }
  printf("FE lifetime base: ten CPU/HW/OFF cycles, warm OFF/CPU/HW reopen, %u faults and %u retained-state drifts passed\n",failures,drifts);
  puts("Base profile/DMA publication is permanent; no full L3 drain or per-flow retirement proof is claimed.");
 }

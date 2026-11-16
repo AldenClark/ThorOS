@@ -56,6 +56,12 @@ bool br_rtl9617c_l2_eligible(const struct net_device *master);
 bool br_rtl9617c_l2_port_eligible(const struct net_device *port);
 /* Additional admission for the native 802.1Q tagged-only IVL backend. */
 bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port);
+/* RTNL held. Read-only native-L2 preflight of CPU-authoritative dynamic
+ * entries in exactly one bridge/VID. No notifications, ownership changes
+ * or ageing refreshes. The driver's generation fence still guards replay
+ * and arm against concurrent CPU learning after this count. */
+int br_rtl9617c_fdb_cpu_count(const struct net_device *master, u16 vid,
+			    unsigned int *count);
 #else
 static inline bool br_rtl9617c_l2_eligible(const struct net_device *master)
 {
@@ -68,6 +74,11 @@ static inline bool br_rtl9617c_l2_port_eligible(const struct net_device *port)
 static inline bool br_rtl9617c_l2_vlan_port_eligible(const struct net_device *port)
 {
 	return false;
+}
+static inline int br_rtl9617c_fdb_cpu_count(const struct net_device *master,
+					 u16 vid, unsigned int *count)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 

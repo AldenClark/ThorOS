@@ -101,16 +101,56 @@ probe() {
 
 read_probe() {
     if [ -r "$1" ]; then
-        # One bounded process; do not launch cat through sh or collect an
-        # unbounded value in command substitution before truncating it.
+        # Explicit getline distinguishes an empty successful record from
+        # open/read failure. Passing the path as an ordinary awk input hid
+        # EAGAIN/EBUSY behind a generic process error on the lab BusyBox.
+        # ERRNO is optional across awk implementations; never invent it.
         probe awk '
-            { if (length($0)>4096 || NR>1024 || bytes+length($0)+1>16384) {
-                print "read_truncated=16384_bytes_1024_lines_4096_line_bytes"; exit;
+            function record(path) {
+              return path=="/dev/stdin" ? (getline line) : (getline line < path);
+            }
+            BEGIN {
+              path=ARGV[1]; ARGV[1]="";
+              while ((status=record(path))>0) {
+                if (length(line)>4096 || ++lines>1024 || bytes+length(line)+1>16384) {
+                  print "read_truncated=16384_bytes_1024_lines_4096_line_bytes";
+                  if (path!="/dev/stdin") close(path); exit;
+                }
+                bytes+=length(line)+1; gsub(/[^[:print:]\t\r]/,",",line); print line;
               }
-              bytes+=length($0)+1; gsub(/[^[:print:]\t\r]/,","); print; }' "$1"
+              if (status<0) {
+                error=ERRNO; gsub(/[^A-Za-z0-9_.-]/,"_",error);
+                if (error=="" || length(error)>120) error="not_exposed_by_awk";
+                printf "read_failed=source_read records=%d errno=%s\n",lines,error;
+                if (path!="/dev/stdin") close(path); exit 74;
+              }
+              if (path!="/dev/stdin") close(path);
+              if (!lines) print "read_empty=1";
+              exit;
+            }' "$1"
     else
         printf 'unavailable\n'
     fi
+}
+
+# Retry only cache/direct-CSR endpoints, never read-clear counters, indirect
+# tables or active sampling triggers. A failed attempt's partial bytes are
+# discarded; the successful attempt and its real clock bound remain explicit.
+read_cached_probe() {
+    read_attempt=0
+    while :; do
+        read_data=$(read_probe "$1")
+        case "$read_data" in
+            *read_failed=*|*probe_failed=*|*'reason=busy retryable=1'*) ;;
+            *) break ;;
+        esac
+        [ "$read_attempt" -lt 2 ] || break
+        read_attempt=$((read_attempt+1))
+        # Fractional sleeps are not a BusyBox capability requirement.
+        sleep 1 || break
+    done
+    [ "$read_attempt" = 0 ] || printf 'read_retries=%s\n' "$read_attempt"
+    printf '%s\n' "$read_data"
 }
 
 read_board_identity() {
@@ -144,11 +184,29 @@ fe_counters() {
     # not just its printed lines: piping a full table into head is NOT bounded.
     # New flows can still arrive after this check; the command timeout is a
     # second guard, not proof of a bounded kernel transaction.
+    # A plausible first line is not admission: a read can fail after that
+    # line, or be truncated before the rest of the state arrives. Inspect
+    # the complete final attempt before admitting any active table walk.
+    # A successful cached retry is valid; read_retries alone is not failure.
     flow_count=$(printf '%s\n' "$fe_state" | awk '
-        { for (i=1;i<=NF;i++) if ($i ~ /^flows=[0-9]+$/) {
-            sub(/^flows=/,"",$i); print $i; exit;
-        } }')
+        /(^|[[:space:]])(probe_(failed|skipped|unavailable)|read_(failed|truncated|empty)|truncated|skipped)=/ {invalid=1}
+        /^unavailable($|=)/ {invalid=1}
+        {
+            for (i=1;i<=NF;i++) {
+                if ($i ~ /^available=/ && $i != "available=1") invalid=1;
+                if ($i ~ /^flows=/) {
+                    count_fields++;
+                    if ($i ~ /^flows=[0-9]+$/) {count=$i; sub(/^flows=/,"",count);}
+                    else invalid=1;
+                }
+            }
+        }
+        END {
+            if (invalid || count_fields>1) print "incomplete";
+            else if (count_fields==1) print count;
+        }')
     case "$flow_count" in
+        incomplete) printf 'skipped=flow_state_incomplete\n'; return ;;
         ''|*[!0-9]*) printf 'skipped=flow_count_unknown\n'; return ;;
     esac
     if [ "${#flow_count}" -gt 2 ] || [ "$flow_count" -gt 64 ]; then
@@ -163,12 +221,17 @@ fe_counters() {
     # Named columns, not positional IP parsing. Deliberately omit tuples,
     # MACs, PPPoE session IDs and GEM identifiers from the default output.
     printf '%s\n' "$flow_data" | awk '
+        # Readers can fail before a header, or after emitting valid rows.
+        # Preserve exact diagnostic records independently of projection;
+        # never turn them into an unsupported header or a padded flow row.
+        /^probe_(skipped|unavailable|failed)=/ ||
+        /^read_(failed|truncated|empty)=/ ||
+        /^(unavailable|skipped|truncated)($|=)/ {print; next;}
+        !NF {next;}
         !header_seen {
-            if (!NF) next;
             header_seen=1;
             if ($1 != "hash") {
-                if ($0 == "unavailable" || $0 ~ /^probe_(skipped|unavailable|failed)=/) print;
-                else print "unavailable=unsupported_flow_header";
+                print "unavailable=unsupported_flow_header";
                 exit;
             }
             for(i=1;i<=NF;i++) column[$i]=i;
@@ -258,6 +321,16 @@ printf 'privacy=default_omits_flow_addresses_MACs_sessions_PON_identity_and_WAN_
 [ "$details" = 0 ] || printf 'warning=details_includes_flow_IP_MAC_ports_and_PPPoE_sessions;redact_before_sharing\n'
 [ "$active_diagnostics" = 0 ] || printf 'warning=active_diagnostics_invoke_indirect_table_reads_and_unproven_status_counter_read_semantics;not_an_unperturbed_capture\n'
 printf 'optional_probe_timeout_seconds=3 timeout_available=%s\n' "$has_timeout"
+printf 'cached_read_attempts=3 cached_retry_sleep_seconds=1 active_read_attempts=1\n'
+printf '\n[tool_capabilities]\n'
+for tool in bridge ip; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        printf '%s_available=1\n' "$tool"
+    else
+        printf '%s_available=0\n' "$tool"
+    fi
+done
+printf 'link_snapshot=sysfs ip_json_required=0 fractional_sleep_required=0 fdb_mdb_snapshot=not_collected\n'
 printf '\n[firmware]\n'
 uname -r 2>/dev/null || printf 'kernel=unavailable\n'
 if [ -r "$release_file" ]; then
@@ -307,7 +380,7 @@ snapshot() {
         fe_state_file="$pon_dir/fe"
     fi
     printf 'state_source=%s\n' "$fe_state_file"
-    fe_state=$(read_probe "$fe_state_file")
+    fe_state=$(read_cached_probe "$fe_state_file")
     printf '%s\n' "$fe_state"
     fe_counters
     printf '\n[fabric_sample]\n'
@@ -318,10 +391,10 @@ snapshot() {
     else
         printf 'skipped=active_diagnostics_not_requested\n'
     fi
-    for attribute in cold_bootstrap l2_switch l2_evidence lan_mib_evidence fabric_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
+    for attribute in l3_admission l3_flows cold_bootstrap l2_switch l2_evidence l2_resources lan_mib_evidence fabric_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
         printf '\n[%s]\n' "$attribute"
         if [ -n "$ni_dir" ]; then
-            read_probe "$ni_dir/$attribute"
+            read_cached_probe "$ni_dir/$attribute"
         else
             printf 'unavailable\n'
         fi

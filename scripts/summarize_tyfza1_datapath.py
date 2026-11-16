@@ -44,7 +44,7 @@ TM_BUFFER_STATUSES = ('private_empty_ports', 'eq_free', *(f'cos{i}_bufcnt' for i
 TM_BM_COUNTERS = ('bm_rx', 'bm_tx', 'bm_sb_drop', 'bm_hdr_drop', 'bm_te_drop',
                   'bm_err_drop', 'bm_nobuf_drop')
 TM_TE_COUNTERS = ('te_pol_drop', 'te_tail_drop', 'te_wred_y_drop', 'te_wred_g_drop')
-FAILURE_MARKER = re.compile(r"(?:probe_(?:failed|skipped|unavailable)|read_truncated|truncated|skipped)=")
+FAILURE_MARKER = re.compile(r"(?:probe_(?:failed|skipped|unavailable)|read_failed|read_empty|read_truncated|truncated|skipped)=")
 L2_HW_REASONS = ('ok', 'requires-existing-svl', 'priority-fdb-key', 'tpid-profile',
                  'cpu-egress-edit', 'queue-baseline', 'lan-source-map', 'foreign-source-alias',
                  'aging-timebase', 'foreign-classifier', 'foreign-learning', 'special-profile-capacity',
@@ -56,6 +56,32 @@ COLD_STAGES = ('none', 'global_snapshot', 'select_family', 'write_receive_gates'
                'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready')
 COLD_GATES = ((0x088c, 1, 'EPON_1G'), (0x10b4, 1 << 7, 'EPON_10G'),
               (0x6114, 1 << 1, 'GPON'), (0x4004, 3, 'XGPON'))
+INSTALL_STAGES = ('none', 'port', 'format', 'unicast', 'engine', 'policy', 'link', 'cookie',
+                  'hash_collision', 'hash_capacity', 'allocate', 'source_mac', 'destination_mac',
+                  'interface', 'mtu', 'counter', 'publish')
+ADMISSION_CATEGORIES = ('install_unavailable', 'install_duplicate', 'install_collision',
+                        'install_unsupported', 'install_no_space', 'install_no_memory',
+                        'install_io', 'install_other')
+ADMISSION_REJECTIONS = ('reject_unspecified', 'reject_keys', 'reject_meta', 'reject_control',
+                        'reject_protocol', 'reject_vlan', 'reject_action', 'reject_nat',
+                        'reject_port', 'reject_pon', 'reject_other_ingress')
+ADMISSION_COUNTERS = ('requests', 'parse_rejected', 'install_succeeded', 'install_failed',
+                      *ADMISSION_REJECTIONS, *ADMISSION_CATEGORIES,
+                      *(f'stage_{stage}_failed' for stage in INSTALL_STAGES))
+FLOW_NUMBERS = ('lease', 'hash', 'input_hw', 'output_hw', 'ipv6', 'protocol', 'installed',
+                'published', 'deleting', 'counted', 'counter', 'samples', 'sample_age_ms',
+                'age_hits', 'l3_bytes', 'packets')
+FLOW_BOOLEANS = ('ipv6', 'installed', 'published', 'deleting', 'counted')
+L2_COMPLETED_NUMBERS = ('l2_completed_valid', 'l2_completed_serial', 'l2_completed_generation',
+                        'l2_current_generation', 'l2_completed_reason', 'l2_completed_hw_reason',
+                        'l2_completed_armed', 'l2_cpu_fdb_count', 'l2_preflight_done',
+                        'l2_worker_busy', 'l2_worker_skips', 'l2_pending_reason')
+L2_COMPLETED_MASKS = ('l2_completed_ports', 'l2_completed_route_ports',
+                      'l2_completed_route_eligible_ports')
+L2_COMPLETED_ERRORS = ('l2_completed_error', 'l2_preflight_error', 'l2_pending_error')
+L2_HW_RAW = ('l2_hw_vlan_mode', 'l2_hw_hash_control', 'l2_hw_aging', 'l2_hw_packet_length',
+             'l2_hw_tpid0', 'l2_hw_tpid1', 'l2_hw_tpid2', 'l2_hw_tpid3', 'l2_hw_oversize_allow',
+             'l2_hw_source_port', 'l2_hw_source_logical', 'l2_hw_learning_port', 'l2_hw_learning_profile')
 
 
 def fields(lines):
@@ -312,19 +338,255 @@ def select_state(snapshot, name, keys):
 
 
 def select_fe_state(snapshot, keys):
-    result = select_state(snapshot, 'fe', keys)
     lines = snapshot.get('fe', [])
-    if faulty(lines):
-        return result
     raw = fields(lines)
+    # A trylock refusal is a valid unavailable response, not a zero verdict.
+    # R11 collectors may omit availability; keep that legacy format usable.
+    available = not faulty(lines) and ('available' not in raw or raw.get('available') == '1')
+    result = select_state(snapshot, 'fe', keys) if available else {}
+    if 'available' in raw:
+        result['fe_state_available'] = available
+        if not available:
+            result['fe_state_reason'] = ('busy' if raw.get('available') == '0' and
+                raw.get('reason') == 'busy' and raw.get('retryable') == '1' else 'unavailable_or_invalid')
+    resources = snapshot.get('l2_resources', [])
+    if resources and not faulty(resources):
+        raw_resources = fields(resources)
+        expected = {'schema': '1', 'available': '1', 'cached': '1', 'mmio_reads': '0', 'mmio_writes': '0'}
+        if all(raw_resources.get(key) == value for key, value in expected.items()):
+            extra = select_state(snapshot, 'l2_resources', keys)
+            legacy = raw if available else {}
+            for key in keys:
+                if key not in raw_resources:
+                    continue
+                if key in legacy and legacy[key] != raw_resources[key]:
+                    result.pop(key, None)
+                elif key in extra:
+                    result[key] = extra[key]
+                else:
+                    result.pop(key, None)
+    if not available:
+        return result
     if 'l2_hw_reason_name' not in raw:
         return result
     reason = number(raw.get('l2_hw_reason'))
     expected = L2_HW_REASONS[reason] if reason is not None and reason < len(L2_HW_REASONS) else None
+    # R11 has no sampling-validity field. R12 explicitly distinguishes a
+    # zero-initialized enum from a real preflight sample; zero is not HW OK.
+    if 'l2_hw_valid' in raw:
+        if raw.get('l2_hw_valid') == '0':
+            expected = 'not-sampled'
+        elif raw.get('l2_hw_valid') != '1':
+            expected = None
     # Do not echo arbitrary probe strings, addresses, or mismatched enum labels.
     result['l2_hw_reason_name_valid'] = expected is not None and raw.get('l2_hw_reason_name') == expected
     if result['l2_hw_reason_name_valid']:
         result['l2_hw_reason_name'] = expected
+    return result
+
+
+def l2_completed_sample(snapshot):
+    lines = snapshot.get('l2_evidence', [])
+    invalid = lambda reason: {'valid': False, 'reason': reason, 'hardware_forwarding_proven': False}
+    if not lines or faulty(lines):
+        return invalid('L2_completed_record_missing_or_incomplete')
+    raw = fields(lines)
+    if raw.get('l2_completed_valid') == '0':
+        return {'valid': True, 'completed': False, 'hw_reason_name': 'not-sampled',
+                'hardware_forwarding_proven': False}
+    if raw.get('l2_completed_valid') != '1':
+        return invalid('L2_completed_record_missing_or_invalid')
+    record = {key: number(raw.get(key)) for key in L2_COMPLETED_NUMBERS}
+    record.update({key: register(raw.get(key)) for key in L2_COMPLETED_MASKS})
+    record.update({key: signed32(raw.get(key)) for key in L2_COMPLETED_ERRORS})
+    if (any(value is None for value in record.values()) or not record['l2_completed_serial'] or
+            any(record[key] > 1 for key in ('l2_completed_armed', 'l2_preflight_done', 'l2_worker_busy')) or
+            any(record[key] > 31 for key in L2_COMPLETED_MASKS) or
+            record['l2_completed_hw_reason'] >= len(L2_HW_REASONS)):
+        return invalid('L2_completed_record_missing_or_invalid')
+    result = {'valid': True, 'completed': True, 'record': record,
+            'current_epoch': record['l2_completed_generation'] == record['l2_current_generation'],
+            'hw_reason_name': L2_HW_REASONS[record['l2_completed_hw_reason']]
+                              if record['l2_preflight_done'] else 'not-sampled',
+            'hardware_forwarding_proven': False,
+            'note': 'Last completed transaction, not an atomic live gate or hardware-hit proof.'}
+    if any(key in raw for key in L2_HW_RAW):
+        observed = {key: register(raw.get(key)) for key in L2_HW_RAW}
+        result['raw_configuration'] = ({'valid': False, 'reason': 'L2_raw_configuration_incomplete'}
+            if any(value is None for value in observed.values()) else
+            {'valid': True, 'sampled': bool(record['l2_preflight_done']), 'registers': observed})
+    return result
+
+
+def mce_sample(snapshot):
+    lines = snapshot.get('l2_evidence', [])
+    invalid = lambda reason: {'valid': False, 'reason': reason, 'hardware_forwarding_proven': False}
+    if not lines or faulty(lines):
+        return invalid('MCE_cached_preflight_missing_or_incomplete')
+    raw = fields(lines)
+    if raw.get('mce_preflight') == 'not-attempted' and raw.get('mce_sample_valid') == '0x0':
+        return invalid('MCE_preflight_not_attempted')
+    if raw.get('mce_preflight') != 'cached' or raw.get('mce_cold_handoff_verified') != '0':
+        return invalid('unsupported_MCE_cached_preflight')
+    keys = ('mce_missing_contracts', 'mce_sample_valid', 'mce_cold_reads', 'mce_cold_register',
+            'mce_cold_value', 'mce_xram_cfg', 'mce_stg0_ctrl', 'mce_hash_ini', 'mce_cache_ini',
+            'mce_cold_control', 'mce_capacity_fallbacks', 'mce_unpublished_aborts')
+    record = {key: register(raw.get(key)) for key in keys}
+    if any(value is None for value in record.values()) or record['mce_sample_valid'] > 31:
+        return invalid('MCE_cached_preflight_partial_or_invalid')
+    return {'valid': True, 'cached': True, 'record': record,
+            'all_registers_sampled': record['mce_sample_valid'] == 31,
+            'hardware_forwarding_proven': False, 'handoff_verified': False,
+            'note': 'Raw inherited configuration, not empty-table, ownership or retirement proof.'}
+
+
+def admission_sample(snapshot):
+    lines = snapshot.get('l3_admission', [])
+    invalid = lambda reason: {'valid': False, 'reason': reason, 'counts_are_packets': False}
+    if not lines or faulty(lines):
+        return invalid('L3_admission_missing_or_incomplete')
+    raw = fields(lines)
+    if raw.get('schema') == '1' and raw.get('available') == '0':
+        return invalid('L3_admission_busy' if raw.get('reason') == 'busy' else 'L3_admission_unavailable')
+    expected = {'schema': '1', 'available': '1', 'cached': '1', 'mmio_reads': '0',
+                'mmio_writes': '0', 'counts_are_packets': '0'}
+    if any(raw.get(key) != value for key, value in expected.items()):
+        return invalid('unsupported_L3_admission_schema')
+    counters = {key: number(raw.get(key)) for key in ADMISSION_COUNTERS}
+    last = {'request': number(raw.get('last_failure_request')),
+            'errno': signed32(raw.get('last_failure_errno')),
+            'rollback_errno': signed32(raw.get('last_rollback_errno'))}
+    stage = raw.get('last_failure_stage')
+    if (any(value is None for value in (*counters.values(), *last.values())) or
+            stage not in INSTALL_STAGES):
+        return invalid('L3_admission_values_missing_or_invalid')
+    if (last['request'] > counters['requests'] or last['errno'] > 0 or last['rollback_errno'] > 0 or
+            sum(counters[key] for key in ADMISSION_REJECTIONS) != counters['parse_rejected'] or
+            sum(counters[key] for key in ADMISSION_CATEGORIES) != counters['install_failed'] or
+            sum(counters[f'stage_{stage}_failed'] for stage in INSTALL_STAGES) != counters['install_failed'] or
+            counters['parse_rejected'] + counters['install_succeeded'] + counters['install_failed'] != counters['requests']):
+        return invalid('L3_admission_inconsistent_counts')
+    if ((counters['install_failed'] and (not last['request'] or not last['errno'])) or
+            (not counters['install_failed'] and (any(last.values()) or stage != 'none'))):
+        return invalid('L3_admission_inconsistent_last_failure')
+    last['stage'] = stage
+    return {'valid': True, 'cached': True, 'counts_are_packets': False, 'counters': counters,
+            'last_failure': last, 'hardware_forwarding_proven': False,
+            'note': 'Cumulative rule admission callbacks, not packet hits. No cross-instance delta is inferred.'}
+
+
+def flow_sample(snapshot):
+    """Decode bounded privacy-safe leases, never the legacy tuple dump."""
+    lines = [line.strip() for line in snapshot.get('l3_flows', []) if line.strip()]
+    invalid = lambda reason: {'valid': False, 'reason': reason}
+    if not lines:
+        return invalid('L3_flow_evidence_missing_or_incomplete')
+    # The producer's final truncated=0/1 is coverage metadata, unlike a
+    # collector read_truncated/probe_failed marker. Only this exact footer
+    # may contain it; glued error markers and duplicate keys still fail.
+    footer = fields(lines[-1:])
+    footer_shape = re.fullmatch(r'emitted=[0-9]{1,2}\s+truncated=[01]', lines[-1]) is not None
+    if footer_shape:
+        checked = lines[:-1]
+    else:
+        checked = lines
+    if faulty(checked):
+        return invalid('L3_flow_evidence_missing_or_incomplete')
+    header_lines = []
+    row_lines = []
+    for line in lines[:-1]:
+        if line.startswith('lease='):
+            row_lines.append(line)
+        elif row_lines:
+            return invalid('L3_flow_record_order_invalid')
+        else:
+            header_lines.append(line)
+    header = fields(header_lines if len(lines) > 1 else lines)
+    if header.get('schema') == '1' and header.get('available') == '0':
+        return invalid('L3_flow_evidence_busy' if header.get('reason') == 'busy' else 'L3_flow_evidence_unavailable')
+    expected = {'schema': '1', 'available': '1', 'cached': '1', 'mmio_reads': '0', 'mmio_writes': '0',
+                'identity': 'lease_since_fe_creation', 'max_records': '16', 'sampled_by': 'flow_stats'}
+    instance = number(header.get('instance_ns'))
+    if any(header.get(key) != value for key, value in expected.items()) or not instance:
+        return invalid('unsupported_L3_flow_schema_or_instance')
+    emitted = number(footer.get('emitted'))
+    if (not footer_shape or set(footer) != {'emitted', 'truncated'} or footer.get('truncated') not in ('0', '1') or
+            emitted is None or emitted > 16 or emitted != len(row_lines)):
+        return invalid('L3_flow_footer_missing_or_invalid')
+    rows = {}
+    for line in row_lines:
+        raw = fields([line])
+        row = {key: number(raw.get(key)) for key in FLOW_NUMBERS}
+        row['sample_errno'] = signed32(raw.get('sample_errno'))
+        if (any(value is None for value in row.values()) or not row['lease'] or
+                any(row[key] > 1 for key in FLOW_BOOLEANS) or row['hash'] >= 65536 or
+                any(row[key] > 63 for key in ('input_hw', 'output_hw')) or
+                row['protocol'] > 255 or row['counter'] >= 32 or row['sample_errno'] > 0 or
+                any(row[key] > 0xffffffff for key in ('samples', 'sample_age_ms', 'age_hits'))):
+            return invalid('L3_flow_record_missing_or_invalid')
+        if row['lease'] in rows:
+            return invalid('L3_flow_duplicate_lease')
+        if (not row['counted'] and (row['l3_bytes'] or row['packets']) or
+                not row['samples'] and row['sample_age_ms']):
+            return invalid('L3_flow_record_inconsistent')
+        # Row/header namespaces cannot be overlaid to conceal corruption.
+        if any(key in raw for key in (*expected, 'instance_ns', 'emitted', 'truncated')):
+            return invalid('L3_flow_record_shadows_metadata')
+        rows[row['lease']] = row
+    return {'valid': True, 'instance_ns': instance, 'coverage_complete': footer['truncated'] == '0',
+            'emitted': emitted, 'rows': rows}
+
+
+def flow_observations(before, after, window, lifecycle_ok):
+    b, a = flow_sample(before), flow_sample(after)
+    result = {'before': b, 'after': a, 'hardware_forwarding_proven': False, 'rates_available': False,
+              'note': 'Opaque boot/FE-instance/lease identity, never hash or counter-slot identity. '
+                      'sample_age_ms is time since the last stats attempt, not last traffic; zero with '
+                      'samples=0 is not a fresh observation. age_hits counts positive activity samples, '
+                      'not packets. Cached increments are not throughput or complete hardware-forwarding proof.'}
+    if not b['valid'] or not a['valid']:
+        result.update(valid=False, reason='L3_flow_endpoint_missing_or_invalid')
+        return result
+    result['coverage_complete'] = b['coverage_complete'] and a['coverage_complete']
+    if not window['valid']:
+        result.update(valid=False, reason='invalid_clock_or_boot_window')
+        return result
+    if b['instance_ns'] != a['instance_ns']:
+        result.update(valid=False, reason='FE_instance_changed_no_cross_instance_comparison')
+        return result
+    if not lifecycle_ok:
+        result.update(valid=False, reason='NI_lifecycle_not_stable_ready_at_endpoints')
+        return result
+    result.update(valid=True, reason='cached_flow_observations_only' if result['coverage_complete']
+                  else 'cached_flow_observations_partial_coverage', leases={})
+    for lease in sorted(set(b['rows']) | set(a['rows'])):
+        old, new = b['rows'].get(lease), a['rows'].get(lease)
+        item = {'valid': False}
+        reason = None
+        if old is None or new is None:
+            reason = 'lease_not_observed_in_both_snapshots'
+        elif any(old[key] != new[key] for key in ('hash', 'input_hw', 'output_hw', 'ipv6', 'protocol', 'counted', 'counter')):
+            reason = 'lease_resource_identity_changed'
+        elif any(not row['installed'] or not row['published'] or row['deleting'] for row in (old, new)):
+            reason = 'lease_not_live_at_both_endpoints'
+        elif any(row['sample_errno'] for row in (old, new)):
+            reason = 'stats_attempt_failed_old_cache_not_reused'
+        elif not old['samples'] or new['samples'] <= old['samples']:
+            reason = 'successful_sample_not_advanced_or_reset'
+        elif any(new[key] < old[key] for key in ('age_hits', 'l3_bytes', 'packets')):
+            reason = 'cached_counter_decreased_reset_or_wrap_not_guessed'
+        if reason:
+            item['reason'] = reason
+        else:
+            item.update(valid=True, successful_samples=new['samples'] - old['samples'],
+                        positive_activity_samples=new['age_hits'] - old['age_hits'],
+                        sample_age_ms={'before': old['sample_age_ms'], 'after': new['sample_age_ms']},
+                        sample_times_verified=False)
+            if new['counted']:
+                item['observed_increments'] = {key: new[key] - old[key] for key in ('l3_bytes', 'packets')}
+            else:
+                item['packet_totals_available'] = False
+        result['leases'][str(lease)] = item
     return result
 
 
@@ -379,8 +641,15 @@ def cold_sample(snapshot):
             before = extension[f'pon_gate{i}_before']
             requested = extension[f'pon_gate{i}_requested']
             readback = extension[f'pon_gate{i}_readback']
+            # R12 refuses inherited XG reset/flush commands before forming
+            # an RMW request. It legitimately records sampled but unwritten
+            # with requested=0, rather than replaying command bits.
+            command_refused = (i == 3 and before & 0xc0000000 and before != 0xffffffff and
+                               record['pon_stage'] == 3 and record['pon_error'] == -16 and
+                               not written & (1 << i) and requested == 0)
             if ((not sampled & (1 << i) and (before or requested or readback)) or
-                    (sampled & (1 << i) and before != 0xffffffff and requested != (before & ~mask))):
+                    (sampled & (1 << i) and before != 0xffffffff and not command_refused and
+                     requested != (before & ~mask))):
                 return invalid('cold_gate_extension_inconsistent')
             if written & (1 << i) and (before == 0xffffffff or not (before & mask) or
                     requested != (before & ~mask)):
@@ -412,12 +681,45 @@ def cold_sample(snapshot):
               'record': record, 'gate_extension_present': extension is not None}
     if extension is not None:
         result['gate_observations'] = extension
+    result['pon_cached_observations'] = pon_cached_observations(raw)
     if record['pon_error']:
         for address, mask, family in COLD_GATES:
             if record['pon_refused_register'] == address:
                 result['refused_receive_gate'] = {'family': family, 'register': address, 'mask': mask,
                                                   'last_gate_bits': record['pon_refused_value'] & mask}
     return result
+
+
+def pon_cached_observations(raw):
+    """Optional R12 historical ordering/clock samples, not readiness bits."""
+    prefixes = ('pon_before_', 'pon_after_')
+    registers = ('sampled', 'valid', 'refused_register', 'refused_value', 'control', 'epon', 'gpon',
+                 'psds_mode', 'psds_status', 'psds_gbox', 'pdc_control')
+    masks = ('pon_gate_closed_mask', 'pon_gate_reopened_mask', 'pon_gate_changed_mask')
+    counts = tuple(f'pon_gate{i}_{part}' for i in range(4) for part in ('first_closed_poll', 'changes'))
+    keys = (*masks, *counts, 'pon_observation_schema', 'pon_clock_observation_only',
+            *(prefix + suffix for prefix in prefixes for suffix in (*registers, 'stable', 'error')))
+    invalid = lambda reason: {'valid': False, 'reason': reason}
+    if not any(key in raw for key in keys):
+        return invalid('PON_cached_observations_unavailable')
+    if raw.get('pon_observation_schema') != '1' or raw.get('pon_clock_observation_only') != '1':
+        return invalid('unsupported_PON_observation_schema')
+    values = {key: register(raw.get(key)) for key in masks}
+    values.update({key: number(raw.get(key)) for key in counts})
+    for prefix in prefixes:
+        values.update({prefix + key: register(raw.get(prefix + key)) for key in registers})
+        values[prefix + 'stable'] = number(raw.get(prefix + 'stable'))
+        values[prefix + 'error'] = signed32(raw.get(prefix + 'error'))
+    if (any(value is None for value in values.values()) or any(values[key] > 15 for key in masks) or
+            any(values[key] > 0xffffffff for key in counts)):
+        return invalid('PON_observation_extension_partial_or_invalid')
+    for prefix in prefixes:
+        if (values[prefix + 'sampled'] > 127 or values[prefix + 'valid'] & ~values[prefix + 'sampled'] or
+                values[prefix + 'stable'] > 1 or values[prefix + 'error'] > 0):
+            return invalid('PON_observation_extension_inconsistent')
+    return {'valid': True, 'historical': True, 'clock_ready_proven': False,
+            'register_observations': values,
+            'note': 'Before/after cached observations of one cold attempt, not live PON status or a clock/retirement ACK.'}
 
 
 def mib_sample(snapshot):
@@ -673,15 +975,20 @@ def summarize(text):
               "notes": ["No measured ASIC hit rate or LAN forwarding throughput is inferred.",
                         "Linux netdev and QM CPU counters describe host traffic, not ASIC LAN MIBs.",
                         "Two non-atomic observations cannot exclude intervening resets or policy ABA.",
-                        "FE rows are not differenced without a stable per-flow/counter generation.",
+                        "FE observations compare only same-boot FE-instance/lease records; hash and counter slots are not identity.",
                         "MAC raw observations have unverified counter mode; no MAC delta or rate is calculated.",
                         "Cold-bootstrap records are historical, not proof of a new power cycle or current RX gates."],
               "states": {}, "qm_cpu": {}, "qm_buffer": {}, "qm_multicast": {},
               "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
-              "cold_bootstrap_history": {}}
-    fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_error", "l2_ports",
+              "cold_bootstrap_history": {}, "l2_completed": {}, "mce_cached": {},
+              "l3_admission": {}, "l3_flows_cached": {}}
+    fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_hw_valid", "l2_worker_busy", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
                "l2_route_policy_allowed", "l2_flow_allowed", "l2_local_target", "l2_rx_gate_verified",
+               "l2_route_eligible_ports", "l2_native_route_policy_allowed",
+               "naptv6_configured", "action_bits", "cache_entries", "cache_action_bits",
+               "action_mode_runtime_change", "mdb_cpu_entries", "mdb_folded_entries",
+               "mdb_overlap_cpu", "mdb_capacity_cpu", "mdb_dynamic_rows",
                "l2_learning_ports", "l2_isolated_ports", "l2_static_published",
                "l2_journal_used", "l2_journal_capacity", "l2_journal_quarantined",
                "lan_admission_valid", "lan_cpu_mask",
@@ -691,11 +998,29 @@ def summarize(text):
                "pon_lan_rules", "lan_lan_route_rules", "rule_counts_are_hits",
                "route_hash_templates_config", "wan_arb_pdpid_config",
                "sdk_wan_arb_pdpid", "wan_arb_board_contract_verified",
-               "programming_metadata_is_readback")
+               "programming_metadata_is_readback", "route_withdrawals_pending",
+               "mce_owner", "mce_contract_ready", "mce_cold_handoff_verified", "mce_error",
+               "mce_missing_contracts", "mce_groups", "mce_tokens", "mce_publications", "mce_fallbacks",
+               "mce_rx_copies", "mce_rx_rejected", "mce_rx_no_memory", "mdb_owner", "mdb_active",
+               "mdb_error", "mdb_register", "mdb_value", "mdb_generation", "mdb_records", "mdb_planned",
+               "mdb_used", "mdb_exposed", "mdb_guards", "mdb_guard_exposed", "mdb_window", "mdb_steer",
+               "mdb_attempts", "mdb_publications", "mdb_withdrawals", "l2_owner_unavailable",
+               "l2_owner_sealed", "l2_owner_ready", "l2_owner_quarantined", "l2_owner_error",
+               "l2_owner_reads", "l2_owner_publications", "l2_owner_withdrawals", "l2_owner_aborts", "l2_owner_failures",
+               *(f'l2_bank_{bank}_{field}' for bank in range(3)
+                 for field in ('capacity', 'leased', 'verified_available')))
     for which, snapshot in snapshots.items():
         result["states"][which] = {"fe": select_fe_state(snapshot, fe_keys),
                                     "ni": select_state(snapshot, "xram_state", LIFECYCLE)}
         result['cold_bootstrap_history'][which] = cold_sample(snapshot)
+        result['l2_completed'][which] = l2_completed_sample(snapshot)
+        result['mce_cached'][which] = mce_sample(snapshot)
+        result['l3_admission'][which] = admission_sample(snapshot)
+    before, after = (snapshots[key] for key in ("before", "after"))
+    ni_before, ni_after = (result["states"][key]["ni"] for key in ("before", "after"))
+    expected = dict(zip(LIFECYCLE, ("1", "1", "0", "1", "0")))
+    result['l3_flows_cached'] = flow_observations(before, after, window,
+                                                ni_before == expected and ni_after == expected)
     if not window["valid"]:
         result["qm_cpu"] = {"valid": False, "reason": "invalid_clock_window"}
         result["qm_buffer"] = {"valid": False, "reason": "invalid_clock_window"}
@@ -705,9 +1030,6 @@ def summarize(text):
         result["fabric_cached"] = {"valid": False, "reason": "invalid_clock_window"}
         return result
 
-    before, after = (snapshots[key] for key in ("before", "after"))
-    ni_before, ni_after = (result["states"][key]["ni"] for key in ("before", "after"))
-    expected = dict(zip(LIFECYCLE, ("1", "1", "0", "1", "0")))
     result["physical_mac_cached"] = mib_observations(before, after, ni_before == expected and ni_after == expected)
     result["fabric_cached"] = tm_observations(before, after, ni_before == expected and ni_after == expected,
                                                mode == 'active_diagnostics')

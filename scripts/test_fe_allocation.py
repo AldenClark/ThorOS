@@ -39,6 +39,8 @@ struct rtl_fe {
  void *registers,*memory,*debug,*bridge;
  struct rtl_fe_flow **hash_owners;
  uintptr_t dma;
+ unsigned long long evidence_instance_ns;
+ bool naptv6;
  unsigned int fdb_cmd_mode_saved,cache_target;
  int lock,route_lock;
  void (*cleanup_work)(void);
@@ -46,8 +48,10 @@ struct rtl_fe {
  struct rb_root cookies,destinations;
 };
 static bool fail_map,fail_owner,fail_dma,fail_index,fail_bridge;
+static bool naptv6;
 static unsigned int allocations,releases,debug_created,debug_removed,reo_writes,boot_control;
 static unsigned int reo[64];
+static unsigned long long ktime_get_ns(void) {return 314159265ULL;}
 static int fe_counters_fops,fe_cache_target_fops,fe_cache_snapshot_fops;
 static void *allocate(size_t count,size_t size,bool fail) {
  if(fail)return NULL;
@@ -89,6 +93,8 @@ static void debugfs_create_file(const char *name,unsigned int mode,void *dir,voi
 }
 static void debugfs_remove_recursive(void *dir) {assert(dir==(void *)1);debug_removed++;}
 static void *fe_bridge_start(struct rtl_fe *fe) {
+ assert(fe->naptv6==naptv6); /* Mode is frozen before any bridge worker can run. */
+ assert(fe->evidence_instance_ns==314159265ULL);
  assert(fe->lock==1 && fe->route_lock==2 && fe->cleanup_work==fe_cleanup_work);
  assert(fe->ports.next==&fe->ports && fe->flows.next==&fe->flows);
  assert(fe->blocks.next==&fe->blocks && fe->retries.next==&fe->retries);
@@ -112,8 +118,10 @@ int main(void) {
  /* Mapping failure, owner OOM, coherent DMA OOM, optional-index OOM and
   * bridge failure combinations. Success is released by the test; actual
   * teardown ordering/quarantine is covered by test_fe_teardown_quarantine. */
+ for(unsigned int wide=0;wide<2;wide++)
  for(unsigned int boot_cmd=0;boot_cmd<2;boot_cmd++)
  for(unsigned int scenario=0;scenario<7;scenario++) {
+  naptv6=wide;
   boot_control=(boot_cmd?BIT(31):0)|0x12345678;
   fail_map=scenario==0;fail_owner=scenario==1;fail_dma=scenario==2;
   fail_index=scenario==3 || scenario==5;fail_bridge=scenario==4 || scenario==5;

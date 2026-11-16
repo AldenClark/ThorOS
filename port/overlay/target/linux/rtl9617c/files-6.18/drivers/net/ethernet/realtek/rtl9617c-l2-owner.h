@@ -431,7 +431,7 @@ static inline int rtl_l2_owner_vlan_install(struct rtl_l2_owner *owner,
 		const struct rtl_dq_io *io, unsigned int vid, const unsigned int words[2])
 {
 	struct rtl_l2_snapshot *fib_before, *map_before;
-	unsigned int fib, current, index_word, value[2], group;
+	unsigned int fib, live_index, index_word, value[2], group;
 	int ret;
 
 	if (!owner || !rtl_l2_io_valid(io) || !words || !vid ||
@@ -448,10 +448,10 @@ static inline int rtl_l2_owner_vlan_install(struct rtl_l2_owner *owner,
 	    rtl_l2_owner_lease(owner, RTL_L2_SHARED_MC_VECTOR, group) ||
 	    !rtl_l2_owner_has(owner->installed[RTL_L2_SHARED_MC_VECTOR], group)))
 		return -EOPNOTSUPP;
-	ret = rtl_l2_table_read(io, RTL_L2_TBL_VLAN_LAN_INDEX, vid, &current);
+	ret = rtl_l2_table_read(io, RTL_L2_TBL_VLAN_LAN_INDEX, vid, &live_index);
 	if (ret)
 		return rtl_l2_owner_fault(owner, ret);
-	if (current & 1U)
+	if (live_index & 1U)
 		return rtl_l2_owner_fault(owner, -EADDRINUSE);
 	ret = rtl_l2_journal_snapshot(&owner->journal, io, owner->rows, &owner->count,
 				      RTL_L2_TBL_VLAN_FIB, fib, &fib_before);
@@ -486,7 +486,7 @@ static inline int rtl_l2_owner_vlan_retire(struct rtl_l2_owner *owner,
 					 const struct rtl_dq_io *io, unsigned int vid)
 {
 	struct rtl_l2_snapshot *original;
-	unsigned int fib, current, group;
+	unsigned int fib, live_index, group;
 	int ret;
 
 	if (!owner || !rtl_l2_io_valid(io) || !vid || vid >= RTL_L2_VLAN_IDS - 1 ||
@@ -498,10 +498,10 @@ static inline int rtl_l2_owner_vlan_retire(struct rtl_l2_owner *owner,
 		return ret;
 	if (!owner->active[RTL_L2_SHARED_VLAN_FIB][fib])
 		return 0;
-	ret = rtl_l2_table_read(io, RTL_L2_TBL_VLAN_LAN_INDEX, vid, &current);
+	ret = rtl_l2_table_read(io, RTL_L2_TBL_VLAN_LAN_INDEX, vid, &live_index);
 	if (ret)
 		return rtl_l2_owner_fault(owner, ret);
-	if (!(current & 1U) || ((current >> 1) & 127U) != fib)
+	if (!(live_index & 1U) || ((live_index >> 1) & 127U) != fib)
 		return rtl_l2_owner_fault(owner, -EUCLEAN);
 	ret = rtl_l2_journal_find(&owner->journal, owner->rows, owner->count,
 				 RTL_L2_TBL_VLAN_LAN_INDEX, vid, &original);
