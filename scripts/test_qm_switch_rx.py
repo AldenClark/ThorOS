@@ -199,9 +199,11 @@ attribute_names = re.findall(r'&dev_attr_(\w+)\.attr',
 attribute_definitions = []
 for attribute in attribute_names:
     mode = re.search(r'DEVICE_ATTR_(RO|RW)\(' + attribute + r'\)', xram)
-    assert mode is not None, f'attribute mode not modeled: {attribute}'
+    explicit = re.search(r'DEVICE_ATTR\(' + attribute + r',\s*(0[0-7]{3}),', xram)
+    assert mode is not None or explicit is not None, f'attribute mode not modeled: {attribute}'
     attribute_definitions.append('static struct device_attribute dev_attr_' + attribute +
-                                 ' = {{' + ('0444' if mode[1] == 'RO' else '0644') + '}};')
+                                 ' = {{' + ((('0444' if mode[1] == 'RO' else '0644')
+                                            if mode is not None else explicit[1])) + '}};')
 visibility_test = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -218,7 +220,7 @@ static struct rtl_xram *netdev_priv(struct rtl_xram *priv){return priv;}
 int main(void){
  struct rtl_xram priv={0};struct device dev={&priv};struct kobject kobj={&dev};
  struct attribute *fe_only[]={&dev_attr_l2_switch.attr,&dev_attr_l2_state.attr,
-                             &dev_attr_l2_evidence.attr};
+                             &dev_attr_l2_evidence.attr,&dev_attr_mce_inherited.attr};
  struct attribute *qm_only[]={&dev_attr_qm_pool.attr,&dev_attr_qm_voqs.attr,
   &dev_attr_rx_prefetch.attr,&dev_attr_pppoe_rx_checksum.attr,&dev_attr_pon_deepq.attr,
   &dev_attr_qm_trace.attr,&dev_attr_qm_wait.attr,&dev_attr_qm_es.attr,&dev_attr_qm_buffer.attr};
@@ -226,6 +228,7 @@ int main(void){
                             &dev_attr_rx_bypass.attr,&dev_attr_lan_mib_evidence.attr};
  assert(dev_attr_l2_switch.attr.mode==0644);
  assert(dev_attr_l2_state.attr.mode==0444 && dev_attr_l2_evidence.attr.mode==0444);
+ assert(dev_attr_mce_inherited.attr.mode==0400);
  assert(dev_attr_lan_mib_evidence.attr.mode==0444);
  for(unsigned int fe=0;fe<2;fe++)for(unsigned int qm=0;qm<2;qm++){
   priv.fe=fe?&priv:0;priv.qm_rx=qm?&priv:0;

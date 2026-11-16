@@ -25,7 +25,7 @@ topology = ('dev=lan1 ifindex=3 iflink=3 mtu=1500 operstate=up carrier=1 speed=1
 def capture(*, after_boot=boot, times=('10.00', '11.00', '21.00', '22.00'),
             q_before='9007199254740993', q_after='9007199254741193',
             ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None, cold=None,
-            admission=None, flow=None, completed=None, resources=None):
+            admission=None, flow=None, completed=None, resources=None, mce_direct=None):
     result = 'schema=tyfza1-datapath-v3 mode=passive interval_seconds=10 details=0 active_diagnostics=0\n'
     for index, which in enumerate(('before', 'after') if after else ('before',)):
         identity = boot if index == 0 else after_boot
@@ -42,6 +42,8 @@ PRIVATE_TUPLE=192.0.2.1:1234
 {resources[index] if resources else 'unavailable'}
 [l2_evidence]
 {completed[index] if completed else 'unavailable'}
+[mce_inherited]
+{mce_direct[index] if mce_direct else 'unavailable'}
 [l3_admission]
 {admission[index] if admission else 'unavailable'}
 [l3_flows]
@@ -240,12 +242,36 @@ admission_values.update(requests=10, parse_rejected=3, install_succeeded=5, inst
     stage_format_failed=1, stage_hash_collision_failed=1)
 admission = ('schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n' +
     ' '.join(f'{key}={value}' for key, value in admission_values.items()) + '\n' +
+    ' '.join(f'{key}={0}' for key in module.FDB_MODE_COUNTERS) + '\n' +
+    'fdb_mode_last_reason=ready fdb_mode_last_error=0 '
+    'fdb_mode_last_control_sampled=0 fdb_mode_last_control=0x00000000\n' +
     'last_failure_request=10 last_failure_stage=hash_collision last_failure_errno=-95 last_rollback_errno=0')
 parsed = module.summarize(capture(admission=(admission, admission)))['l3_admission']['after']
 assert parsed['valid'] and not parsed['counts_are_packets'] and not parsed['hardware_forwarding_proven']
 assert parsed['counters']['install_collision'] == 1 and parsed['counters']['install_unsupported'] == 1
 assert parsed['counters']['stage_hash_collision_failed'] == 1
 assert parsed['last_failure'] == {'request': 10, 'stage': 'hash_collision', 'errno': -95, 'rollback_errno': 0}
+assert parsed['fdb_mode']['last_reason'] == 'ready' and parsed['fdb_mode']['last_error'] == 0
+mode_refusal = (admission.replace('stage_hash_collision_failed=1', 'stage_hash_collision_failed=0')
+    .replace('stage_fdb_mode_failed=0', 'stage_fdb_mode_failed=1')
+    .replace('fdb_mode_cmd_disabled=0', 'fdb_mode_cmd_disabled=1')
+    .replace('fdb_mode_last_reason=ready fdb_mode_last_error=0 '
+             'fdb_mode_last_control_sampled=0 fdb_mode_last_control=0x00000000',
+             'fdb_mode_last_reason=cmd_disabled fdb_mode_last_error=-95 '
+             'fdb_mode_last_control_sampled=1 fdb_mode_last_control=0x1ca00ff9')
+    .replace('last_failure_stage=hash_collision', 'last_failure_stage=fdb_mode'))
+mode_record = module.admission_sample({'l3_admission': mode_refusal.splitlines()})
+assert mode_record['valid'] and mode_record['last_failure']['stage'] == 'fdb_mode'
+assert mode_record['fdb_mode']['last_control'] == 0x1ca00ff9
+assert mode_record['fdb_mode']['fdb_mode_cmd_disabled'] == 1
+# Historical R12 evidence lacks both the new stage and its diagnostic rows.
+legacy_admission = admission.replace(' stage_fdb_mode_failed=0', '')
+legacy_admission = '\n'.join(line for line in legacy_admission.splitlines()
+    if not line.startswith('fdb_mode_') and not line.startswith('fdb_mode_last_'))
+legacy_admission = legacy_admission.replace('fdb_mode_ready=0 ', '').replace('fdb_mode_last_reason=ready ', '')
+assert module.admission_sample({'l3_admission': legacy_admission.splitlines()})['valid']
+# A partially observed R13 extension is neither complete nor a legacy sample.
+assert not module.admission_sample({'l3_admission': admission.replace('fdb_mode_read_error=0', '').splitlines()})['valid']
 assert not module.summarize(capture())['l3_admission']['after']['valid']
 for old, new in (('mmio_reads=0', 'mmio_reads=1'), ('counts_are_packets=0', 'counts_are_packets=1'),
                  ('install_unsupported=1', 'install_unsupported=0'),
@@ -263,7 +289,8 @@ for key in (*module.ADMISSION_COUNTERS, 'last_failure_stage', 'last_failure_errn
     assert not result['valid'], key
 assert module.admission_sample({'l3_admission': ['schema=1 available=0 reason=busy retryable=1']})['reason'] == 'L3_admission_busy'
 for reason in module.ADMISSION_REJECTIONS:
-    values = dict.fromkeys(module.ADMISSION_COUNTERS, 0)
+    values = dict.fromkeys((key for key in module.ADMISSION_COUNTERS
+        if key != 'stage_fdb_mode_failed'), 0)
     values.update(requests=1, parse_rejected=1)
     values[reason] = 1
     record = ('schema=1 available=1 cached=1 mmio_reads=0 mmio_writes=0 counts_are_packets=0\n' +
@@ -419,6 +446,48 @@ assert parsed['l2_completed']['after']['valid'] and parsed['mce_cached']['after'
 assert parsed['mce_cached']['after']['record']['mce_cold_control'] == 0xabcdef01
 assert 'mce_control' not in parsed['mce_cached']['after']['record']
 
+# A successfully read *live* inherited root is not a cold ownership sample;
+# it cannot turn MCE admission on, even with all words readable. Older
+# captures with no optional R13 endpoint still parse the other sections.
+live = ('schema=1 available=1 scope=runtime_direct clock=monotonic begin_ns=10 end_ns=20 '
+        'mmio_reads=5 mmio_writes=0 atomic_snapshot=0 clock_verified=0 handoff_verified=0 retirement_verified=0 '
+        'instance_ns=1 engine_ready=1 fabric_ready=0 mce_owner=0 owner_generation_valid=0 '
+        'owner_generation=0 missing_contracts=0x1f sample_valid=0x1f sample_reads=5 '
+        'sample_error=0 bad_register=0x0 bad_value=0x0 xram_cfg=0x12345600 '
+        'stg0_ctrl=0x12345601 hash_ini=0x12345602 cache_ini=0x12345603 '
+        'mce_control=0x12345604')
+observed = module.mce_inherited_sample({'mce_inherited': live.splitlines()})
+assert observed['valid'] and observed['all_registers_sampled']
+assert observed['runtime_direct_only'] and not observed['handoff_verified']
+assert not observed['hardware_forwarding_proven'] and not observed['retirement_verified']
+combined = module.summarize(capture(mce_direct=(live, live), completed=(mce, mce)))
+assert combined['mce_inherited']['after']['valid'] and combined['mce_cached']['after']['valid']
+assert combined['mce_inherited']['after']['record']['mce_control'] == 0x12345604
+assert combined['mce_cached']['after']['record']['mce_cold_control'] == 0
+assert not module.summarize(capture())['mce_inherited']['after']['valid']
+assert module.mce_inherited_sample({'mce_inherited':
+    ['skipped=requires_details;raw_MCE_internal_configuration']})['reason'] == 'MCE_live_direct_probe_requires_explicit_details'
+for invalid in (live.replace('sample_valid=0x1f', 'sample_valid=0x1'),
+                live.replace('sample_reads=5', 'sample_reads=0'),
+                live.replace('mmio_writes=0', 'mmio_writes=1'),
+                live.replace('clock_verified=0', 'clock_verified=1'),
+                live.replace('handoff_verified=0', 'handoff_verified=1'),
+                live.replace('missing_contracts=0x1f', 'missing_contracts=0x0'),
+                live.replace('instance_ns=1', 'instance_ns=30'),
+                live.replace('owner_generation=0', 'owner_generation=5'),
+                live.replace('sample_error=0', 'sample_error=-5'),
+                live + ' xram_cfg=0x0'):
+    assert not module.mce_inherited_sample({'mce_inherited': invalid.splitlines()})['valid']
+failed_word = (live.replace('sample_valid=0x1f', 'sample_valid=0x17')
+               .replace('sample_error=0', 'sample_error=-5')
+               .replace('cache_ini=0x12345603', 'cache_ini=0xffffffff')
+               .replace('bad_register=0x0 bad_value=0x0',
+                        'bad_register=0x38a0 bad_value=0xffffffff'))
+assert module.mce_inherited_sample({'mce_inherited': failed_word.splitlines()})['valid']
+assert not module.mce_inherited_sample({'mce_inherited': failed_word.splitlines()})['all_registers_sampled']
+assert not module.mce_inherited_sample({'mce_inherited': failed_word.replace('bad_register=0x38a0', 'bad_register=0xaa28').splitlines()})['valid']
+assert not module.mce_inherited_sample({'mce_inherited': failed_word.replace('cache_ini=0xffffffff', 'cache_ini=0x1').splitlines()})['valid']
+
 # Policy/capacity state is diagnostic evidence, never a packet hit counter or
 # proof that all bridge capabilities are implemented. Preserve integers and
 # reject malformed/duplicate fields without echoing arbitrary payloads.
@@ -492,7 +561,7 @@ cold_legacy = ('schema=1 cached=1 historical=1 requested=0 attempted=1 managed=0
 assert module.cold_sample({'cold_bootstrap': [cold_legacy]})['reason'] == 'cold_handoff_not_requested'
 for old, new, reason in (
     ('schema=1', 'schema=2', 'unsupported_cold_record_schema'),
-    ('pon_stage=4', 'pon_stage=8', 'cold_record_missing_or_invalid_value'),
+    ('pon_stage=4', 'pon_stage=9', 'cold_record_missing_or_invalid_value'),
     ('result=-5', 'result=-2147483649', 'cold_record_missing_or_invalid_value'),
     ('pon_refused_value=0xa2', 'pon_refused_value=0x100000000', 'cold_record_missing_or_invalid_value'),
     ('requested=1', 'requested=2', 'cold_record_missing_or_invalid_value'),
@@ -537,6 +606,41 @@ for extension in ('pon_gate_polls=1', cold_extension.replace('pon_gate3_readback
     assert not record['valid'] and record['reason'] == 'cold_gate_extension_partial_or_invalid'
 for marker in ('probe_failed=awk', 'read_truncated=16384_bytes', 'truncated=max_lines'):
     assert not module.cold_sample({'cold_bootstrap': [cold_old + marker]})['valid']
+# R13 cold stage 8 is a real clock-precondition refusal, not an out-of-range
+# legacy enum. The R12 observed 0x4000 lacks RX/TX/MPCP CKRDY (0x1c00).
+# A pre-gate refusal must carry zero sampled/written gate activity and must
+# never be confused with the later normal PON SerDes O5 ready state.
+clock_refused = (cold_old.replace('result=-5', 'result=-11')
+    .replace('pon_stage=4', 'pon_stage=8').replace('pon_error=-5', 'pon_error=-11')
+    .replace('pon_control=0x200', 'pon_control=0x204')
+    .replace('pon_refused_register=0x4004', 'pon_refused_register=0xa060')
+    .replace('pon_refused_value=0xa2', 'pon_refused_value=0x4000') +
+    'pon_clock_guard=xgpon_only pon_clock_required=0x1c00 pon_clock_samples=1 '
+    'pon_clock_valid=1 pon_clock_ready=0 pon_clock_first=0x4000 pon_clock_last=0x4000\n' +
+    'pon_gate_written_mask=0x0 pon_gate_sampled_mask=0x0 pon_gate_polls=0 pon_gate_stable=0\n' +
+    ''.join(f'pon_gate{i}_before=0x0 pon_gate{i}_requested=0x0 pon_gate{i}_readback=0x0\n'
+            for i in range(4)))
+clock_result = module.cold_sample({'cold_bootstrap': clock_refused.splitlines()})
+assert clock_result['valid'] and clock_result['stage_name'] == 'clock_precondition'
+assert clock_result['reason'] == 'clock_guard_refused_before_receive_gate_write'
+assert clock_result['clock_observations']['pon_clock_last'] == 0x4000
+assert clock_result['clock_ready_proven'] is False
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_clock_valid=1', 'pon_clock_valid=0').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_clock_required=0x1c00', 'pon_clock_required=0x0').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_clock_ready=0', 'pon_clock_ready=1').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_clock_last=0x4000', '').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_clock_last=0x4000', 'pon_clock_last=0x5c00').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_gated_mask=0x8', 'pon_gated_mask=0x4').splitlines()})['valid']
+assert not module.cold_sample({'cold_bootstrap': clock_refused.replace('pon_control=0x204', 'pon_control=0x200').splitlines()})['valid']
+clock_reset_held = (clock_refused.replace('pon_control=0x204', 'pon_control=0x200')
+    .replace('pon_clock_samples=1', 'pon_clock_samples=0')
+    .replace('pon_clock_valid=1', 'pon_clock_valid=0')
+    .replace('pon_clock_first=0x4000', 'pon_clock_first=0x0')
+    .replace('pon_clock_last=0x4000', 'pon_clock_last=0x0')
+    .replace('pon_refused_register=0xa060', 'pon_refused_register=0xf4320094')
+    .replace('pon_refused_value=0x4000', 'pon_refused_value=0x200'))
+assert module.cold_sample({'cold_bootstrap': clock_reset_held.splitlines()})['valid']
+assert module.cold_sample({'cold_bootstrap': cold_old.splitlines()})['valid']
 assert not module.summarize(capture())['cold_bootstrap_history']['after']['valid']
 assert 'PRIVATE_' not in json.dumps(module.cold_sample({'cold_bootstrap': [cold_old + ' PRIVATE_ADDRESS=192.0.2.1']}))
 for suffix in ('requested=', 'pon_error=', 'schema=', 'pon_stage='):

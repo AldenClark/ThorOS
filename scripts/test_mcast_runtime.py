@@ -95,6 +95,15 @@ static void handoff_contract(void) {
  fresh();struct rtl_mcast_handoff observed;
  for(unsigned i=0;i<5;i++)m.regs[registers[i]/4]=0x12345600U+i;
  unsigned commands=m.command,writes=direct_writes;
+
+ /* A read-only observer is allowed to sample the five direct CSR words
+  * before any MCE owner or table-command window has been established.
+  * Sampling is deliberately not an ownership or retirement ACK. */
+ const struct rtl_dq_io read_only={NULL,mm_read,NULL,NULL};
+ assert(rtl_mcast_handoff_sample(&observed,&read_only)==0);
+ assert(observed.valid_mask==31&&observed.missing==31&&observed.reads==5);
+ assert(rtl_mcast_handoff_probe(&observed,&read_only)==-EOPNOTSUPP);
+ assert(m.command==commands&&direct_writes==writes);
  assert(rtl_mcast_handoff_probe(&observed,&cold_io)==-EOPNOTSUPP);
  assert(observed.valid_mask==31&&observed.missing==31&&observed.reads==5);
  for(unsigned i=0;i<5;i++)assert(observed.value[i]==0x12345600U+i);
@@ -104,6 +113,8 @@ static void handoff_contract(void) {
   * independent samples or clear any unproven retirement contract. */
  for(unsigned failed=0;failed<5;failed++) {
   m.regs[registers[failed]/4]=~0U;
+  assert(rtl_mcast_handoff_sample(&observed,&read_only)==-EIO);
+  assert(observed.valid_mask==(31U^(1U<<failed))&&observed.missing==31);
   assert(rtl_mcast_handoff_probe(&observed,&cold_io)==-EIO);
   assert(observed.valid_mask==(31U^(1U<<failed))&&observed.missing==31);
   assert(observed.bad_register==registers[failed]&&observed.bad_value==~0U);
@@ -122,7 +133,9 @@ static void handoff_contract(void) {
  }
  assert(rtl_mcast_handoff_probe(NULL,&cold_io)==-EINVAL);
  assert(rtl_mcast_handoff_probe(&observed,NULL)==-EINVAL);
- test_cases+=12;
+ assert(rtl_mcast_handoff_sample(NULL,&read_only)==-EINVAL);
+ assert(rtl_mcast_handoff_sample(&observed,NULL)==-EINVAL);
+ test_cases+=21;
 }
 static void matrix(void) {
  ready();unsigned short ids[5][32]={{0}};

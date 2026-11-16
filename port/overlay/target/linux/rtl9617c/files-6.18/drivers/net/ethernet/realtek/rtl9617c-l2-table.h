@@ -25,12 +25,18 @@ static inline int rtl_l2_io_valid(const struct rtl_dq_io *io)
 static inline int rtl_l2_fdb_control_read(const struct rtl_dq_io *io,
 					unsigned int *control)
 {
-	unsigned int value;
+	unsigned int value, access, limit;
 
 	if (!rtl_l2_io_valid(io) || !control)
 		return -EINVAL;
-	if ((io->read(io->context, RTL_L2_FDB_ACCESS) |
-	     io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS)) & RTL_L2_ACCESS_BUSY)
+	access = io->read(io->context, RTL_L2_FDB_ACCESS);
+	limit = io->read(io->context, RTL_L2_FDB_LIMIT_ACCESS);
+	/* An inaccessible aperture commonly reads as all-ones, whose BUSY bit
+	 * would otherwise mislabel a broken window as a live command. Never
+	 * allow either condition to advance the mode/ownership transaction. */
+	if (access == ~0U || limit == ~0U)
+		return -EIO;
+	if ((access | limit) & RTL_L2_ACCESS_BUSY)
 		return -EBUSY;
 	value = io->read(io->context, RTL_L2_FDB_CONTROL);
 	if (value == ~0U)

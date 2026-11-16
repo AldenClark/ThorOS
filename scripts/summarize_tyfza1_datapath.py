@@ -53,12 +53,17 @@ L2_HW_REASONS = ('ok', 'requires-existing-svl', 'priority-fdb-key', 'tpid-profil
                  'port-policy-transaction', 'isolation-baseline', 'redirect-baseline',
                  'admission-readback', 'ivl-parser-consumer-unverified')
 COLD_STAGES = ('none', 'global_snapshot', 'select_family', 'write_receive_gates',
-               'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready')
+               'receive_gate_readback', 'PDC_FIFO_drain', 'final_verify', 'ready',
+               'clock_precondition')
 COLD_GATES = ((0x088c, 1, 'EPON_1G'), (0x10b4, 1 << 7, 'EPON_10G'),
               (0x6114, 1 << 1, 'GPON'), (0x4004, 3, 'XGPON'))
 INSTALL_STAGES = ('none', 'port', 'format', 'unicast', 'engine', 'policy', 'link', 'cookie',
-                  'hash_collision', 'hash_capacity', 'allocate', 'source_mac', 'destination_mac',
+                  'fdb_mode', 'hash_collision', 'hash_capacity', 'allocate', 'source_mac', 'destination_mac',
                   'interface', 'mtu', 'counter', 'publish')
+LEGACY_INSTALL_STAGES = tuple(stage for stage in INSTALL_STAGES if stage != 'fdb_mode')
+FDB_MODE_REASONS = ('ready', 'fabric_unready', 'owner_unready', 'owner_fault',
+                    'window_busy', 'info_init', 'cmd_disabled', 'read_error')
+FDB_MODE_COUNTERS = tuple(f'fdb_mode_{reason}' for reason in FDB_MODE_REASONS)
 ADMISSION_CATEGORIES = ('install_unavailable', 'install_duplicate', 'install_collision',
                         'install_unsupported', 'install_no_space', 'install_no_memory',
                         'install_io', 'install_other')
@@ -440,6 +445,68 @@ def mce_sample(snapshot):
             'note': 'Raw inherited configuration, not empty-table, ownership or retirement proof.'}
 
 
+def mce_inherited_sample(snapshot):
+    """R13 optional live *direct* CSR probe, independent of MCE cold owner.
+
+    This is not the cold-time snapshot. Never join its words with a previously
+    completed L2 transaction or infer producer quiescence from a stable value.
+    R11/R12 captures legitimately lack this optional diagnostic section.
+    """
+    lines = snapshot.get('mce_inherited', [])
+    invalid = lambda reason: {'valid': False, 'reason': reason, 'hardware_forwarding_proven': False}
+    if lines == ['skipped=requires_details;raw_MCE_internal_configuration']:
+        return invalid('MCE_live_direct_probe_requires_explicit_details')
+    if not lines or faulty(lines):
+        return invalid('MCE_live_direct_probe_missing_or_incomplete')
+    raw = fields(lines)
+    if raw.get('schema') == '1' and raw.get('available') == '0':
+        return invalid('MCE_live_direct_probe_busy' if raw.get('reason') == 'busy'
+                       else 'MCE_live_direct_probe_unavailable')
+    expected = {'schema': '1', 'available': '1', 'scope': 'runtime_direct',
+                'clock': 'monotonic', 'mmio_reads': '5', 'mmio_writes': '0',
+                'atomic_snapshot': '0', 'clock_verified': '0',
+                'handoff_verified': '0', 'retirement_verified': '0'}
+    if any(raw.get(key) != value for key, value in expected.items()):
+        return invalid('unsupported_MCE_live_direct_schema')
+    numbers = ('begin_ns', 'end_ns', 'instance_ns', 'engine_ready', 'fabric_ready',
+               'mce_owner', 'owner_generation_valid', 'owner_generation', 'sample_reads')
+    words = ('missing_contracts', 'sample_valid', 'bad_register', 'bad_value',
+             'xram_cfg', 'stg0_ctrl', 'hash_ini', 'cache_ini', 'mce_control')
+    record = {key: number(raw.get(key)) for key in numbers}
+    record.update({key: register(raw.get(key)) for key in words})
+    record['sample_error'] = signed32(raw.get('sample_error'))
+    if (any(value is None for value in record.values()) or
+            not 0 < record['instance_ns'] <= record['begin_ns'] <= record['end_ns'] or
+            record['sample_reads'] != 5 or
+            record['sample_valid'] > 31 or record['missing_contracts'] != 31 or
+            any(record[key] > 1 for key in ('engine_ready', 'fabric_ready', 'mce_owner',
+                                           'owner_generation_valid')) or
+            record['engine_ready'] != 1 or
+            (record['owner_generation_valid'] == 0 and record['owner_generation'] != 0) or
+            (record['owner_generation_valid'] == 1 and record['owner_generation'] == 0) or
+            record['sample_error'] not in (0, -5) or
+            (record['sample_error'] == 0) != (record['sample_valid'] == 31) or
+            (record['sample_error'] == 0 and (record['bad_register'] or record['bad_value']))):
+        return invalid('MCE_live_direct_probe_partial_or_invalid')
+    offsets = (0xaa28, 0x3400, 0x3834, 0x38a0, 0xaa60)
+    actual = (record['xram_cfg'], record['stg0_ctrl'], record['hash_ini'],
+              record['cache_ini'], record['mce_control'])
+    observed_mask = sum(1 << index for index, value in enumerate(actual)
+                        if value != 0xffffffff)
+    if record['sample_valid'] != observed_mask:
+        return invalid('MCE_live_direct_validity_mask_mismatch')
+    if record['sample_error'] == -5:
+        first_error = next((offset for offset, value in zip(offsets, actual)
+                            if value == 0xffffffff), None)
+        if record['bad_register'] != first_error or record['bad_value'] != 0xffffffff:
+            return invalid('MCE_live_direct_error_location_mismatch')
+    return {'valid': True, 'runtime_direct_only': True, 'record': record,
+            'all_registers_sampled': record['sample_valid'] == 31,
+            'hardware_forwarding_proven': False, 'handoff_verified': False,
+            'retirement_verified': False,
+            'note': 'Live, sequential direct CSR reads without command transactions or ownership; never cold handoff/retirement proof.'}
+
+
 def admission_sample(snapshot):
     lines = snapshot.get('l3_admission', [])
     invalid = lambda reason: {'valid': False, 'reason': reason, 'counts_are_packets': False}
@@ -452,18 +519,46 @@ def admission_sample(snapshot):
                 'mmio_writes': '0', 'counts_are_packets': '0'}
     if any(raw.get(key) != value for key, value in expected.items()):
         return invalid('unsupported_L3_admission_schema')
-    counters = {key: number(raw.get(key)) for key in ADMISSION_COUNTERS}
+    # R13 adds an explicit pre-reservation stage and diagnostics. R11/R12
+    # captures have neither; a partially populated R13 record is invalid.
+    fdb_extension_keys = (*FDB_MODE_COUNTERS, 'fdb_mode_last_reason',
+                          'fdb_mode_last_error', 'fdb_mode_last_control_sampled',
+                          'fdb_mode_last_control')
+    fdb_extended = any(key in raw for key in fdb_extension_keys)
+    active_stages = INSTALL_STAGES if fdb_extended else LEGACY_INSTALL_STAGES
+    if fdb_extended and any(key not in raw for key in fdb_extension_keys):
+        return invalid('L3_fdb_mode_extension_partial')
+    if not fdb_extended and 'stage_fdb_mode_failed' in raw:
+        return invalid('L3_fdb_mode_extension_partial')
+    required = tuple(key for key in ADMISSION_COUNTERS if key != 'stage_fdb_mode_failed' or fdb_extended)
+    counters = {key: number(raw.get(key)) for key in required}
+    if not fdb_extended:
+        counters['stage_fdb_mode_failed'] = 0
     last = {'request': number(raw.get('last_failure_request')),
             'errno': signed32(raw.get('last_failure_errno')),
             'rollback_errno': signed32(raw.get('last_rollback_errno'))}
     stage = raw.get('last_failure_stage')
     if (any(value is None for value in (*counters.values(), *last.values())) or
-            stage not in INSTALL_STAGES):
+            stage not in active_stages):
         return invalid('L3_admission_values_missing_or_invalid')
+    fdb_mode = None
+    if fdb_extended:
+        fdb_mode = {key: number(raw.get(key)) for key in FDB_MODE_COUNTERS}
+        fdb_mode['last_reason'] = raw.get('fdb_mode_last_reason')
+        fdb_mode['last_error'] = signed32(raw.get('fdb_mode_last_error'))
+        fdb_mode['last_control_sampled'] = number(raw.get('fdb_mode_last_control_sampled'))
+        fdb_mode['last_control'] = register(raw.get('fdb_mode_last_control'))
+        if (any(value is None for value in fdb_mode.values()) or
+                fdb_mode['last_reason'] not in FDB_MODE_REASONS or
+                fdb_mode['last_control_sampled'] not in (0, 1) or
+                fdb_mode['last_error'] > 0 or
+                (fdb_mode['last_control_sampled'] == 0 and fdb_mode['last_control'] != 0) or
+                (fdb_mode['last_reason'] == 'ready' and fdb_mode['last_error'] != 0)):
+            return invalid('L3_fdb_mode_extension_invalid')
     if (last['request'] > counters['requests'] or last['errno'] > 0 or last['rollback_errno'] > 0 or
             sum(counters[key] for key in ADMISSION_REJECTIONS) != counters['parse_rejected'] or
             sum(counters[key] for key in ADMISSION_CATEGORIES) != counters['install_failed'] or
-            sum(counters[f'stage_{stage}_failed'] for stage in INSTALL_STAGES) != counters['install_failed'] or
+            sum(counters[f'stage_{stage}_failed'] for stage in active_stages) != counters['install_failed'] or
             counters['parse_rejected'] + counters['install_succeeded'] + counters['install_failed'] != counters['requests']):
         return invalid('L3_admission_inconsistent_counts')
     if ((counters['install_failed'] and (not last['request'] or not last['errno'])) or
@@ -471,6 +566,7 @@ def admission_sample(snapshot):
         return invalid('L3_admission_inconsistent_last_failure')
     last['stage'] = stage
     return {'valid': True, 'cached': True, 'counts_are_packets': False, 'counters': counters,
+            'fdb_mode': fdb_mode,
             'last_failure': last, 'hardware_forwarding_proven': False,
             'note': 'Cumulative rule admission callbacks, not packet hits. No cross-instance delta is inferred.'}
 
@@ -621,6 +717,42 @@ def cold_sample(snapshot):
                                    record['result'] or not record['pon_snapshot_ready']))):
         return invalid('cold_record_inconsistent_state')
 
+    clock_names = ('pon_clock_guard', 'pon_clock_required', 'pon_clock_samples',
+                   'pon_clock_valid', 'pon_clock_ready', 'pon_clock_first', 'pon_clock_last')
+    clock_extension = None
+    if any(key in raw for key in clock_names):
+        clock_extension = {key: number(raw.get(key)) for key in
+                           ('pon_clock_samples', 'pon_clock_valid', 'pon_clock_ready')}
+        clock_extension.update({key: register(raw.get(key)) for key in
+                                ('pon_clock_required', 'pon_clock_first', 'pon_clock_last')})
+        clock_extension['guard'] = raw.get('pon_clock_guard')
+        if (any(value is None for value in clock_extension.values()) or
+                clock_extension['guard'] != 'xgpon_only' or
+                clock_extension['pon_clock_required'] not in (0, 0x1c00) or
+                clock_extension['pon_clock_valid'] not in (0, 1) or
+                clock_extension['pon_clock_ready'] not in (0, 1) or
+                (clock_extension['pon_clock_samples'] == 0 and
+                 any(clock_extension[key] for key in ('pon_clock_valid', 'pon_clock_ready',
+                        'pon_clock_first', 'pon_clock_last'))) or
+                (clock_extension['pon_clock_samples'] > 0 and
+                 (clock_extension['pon_clock_required'] != 0x1c00 or
+                  not (record['pon_control'] & (1 << 2)) or
+                  clock_extension['pon_clock_valid'] !=
+                  (clock_extension['pon_clock_last'] != 0xffffffff))) or
+                (clock_extension['pon_clock_required'] == 0x1c00 and
+                 not (record['pon_gated_mask'] & 0x8)) or
+                (clock_extension['pon_clock_ready'] !=
+                 (clock_extension['pon_clock_valid'] == 1 and
+                  (clock_extension['pon_clock_last'] & 0x1c00) == 0x1c00)) or
+                (record['pon_stage'] == 8 and
+                 (clock_extension['pon_clock_required'] != 0x1c00 or
+                  clock_extension['pon_clock_ready'] or
+                  record['pon_refused_register'] not in (0xa060, 0xf4320094) or
+                  record['pon_error'] not in (-11, -5)))):
+            return invalid('cold_clock_extension_partial_or_invalid')
+    elif record['pon_stage'] == 8:
+        return invalid('cold_clock_extension_missing')
+
     gate_fields = tuple(f'pon_gate{i}_{part}' for i in range(4)
                         for part in ('before', 'requested', 'readback'))
     gate_masks = ('pon_gate_written_mask', 'pon_gate_sampled_mask')
@@ -669,6 +801,10 @@ def cold_sample(snapshot):
         diagnosis = 'cold_handoff_not_requested'
     elif not record['attempted']:
         diagnosis = 'cold_handoff_not_attempted'
+    elif record['pon_stage'] == 8 and record['pon_error'] in (-11, -5):
+        diagnosis = ('clock_guard_refused_before_receive_gate_write'
+                     if not extension or not extension['pon_gate_written_mask']
+                     else 'clock_guard_lost_during_cold_handoff')
     elif record['pon_error'] and record['pon_stage'] == 4 and not record['pon_fifo_polls']:
         diagnosis = 'receive_gate_readback_refused_before_FIFO'
     elif record['pon_error']:
@@ -681,6 +817,10 @@ def cold_sample(snapshot):
               'record': record, 'gate_extension_present': extension is not None}
     if extension is not None:
         result['gate_observations'] = extension
+    result['clock_extension_present'] = clock_extension is not None
+    if clock_extension is not None:
+        result['clock_observations'] = clock_extension
+        result['clock_ready_proven'] = False  # cached CKRDY bits are not a MAC gate ACK
     result['pon_cached_observations'] = pon_cached_observations(raw)
     if record['pon_error']:
         for address, mask, family in COLD_GATES:
@@ -981,7 +1121,7 @@ def summarize(text):
               "states": {}, "qm_cpu": {}, "qm_buffer": {}, "qm_multicast": {},
               "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
               "cold_bootstrap_history": {}, "l2_completed": {}, "mce_cached": {},
-              "l3_admission": {}, "l3_flows_cached": {}}
+              "l3_admission": {}, "l3_flows_cached": {}, "mce_inherited": {}}
     fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_hw_valid", "l2_worker_busy", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
                "l2_route_policy_allowed", "l2_flow_allowed", "l2_local_target", "l2_rx_gate_verified",
@@ -1015,6 +1155,7 @@ def summarize(text):
         result['cold_bootstrap_history'][which] = cold_sample(snapshot)
         result['l2_completed'][which] = l2_completed_sample(snapshot)
         result['mce_cached'][which] = mce_sample(snapshot)
+        result['mce_inherited'][which] = mce_inherited_sample(snapshot)
         result['l3_admission'][which] = admission_sample(snapshot)
     before, after = (snapshots[key] for key in ("before", "after"))
     ni_before, ni_after = (result["states"][key]["ni"] for key in ("before", "after"))

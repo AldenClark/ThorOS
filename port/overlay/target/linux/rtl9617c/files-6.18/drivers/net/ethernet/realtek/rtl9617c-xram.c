@@ -1601,6 +1601,16 @@ static ssize_t l2_evidence_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RO(l2_evidence);
 
+static ssize_t mce_inherited_show(struct device *dev, struct device_attribute *attr,
+				  char *buf)
+{
+	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(dev));
+
+	return rtl_fe_mce_inherited_evidence(priv->fe, buf);
+}
+/* Inherited FE configuration is privileged even without address tuples. */
+static DEVICE_ATTR(mce_inherited, 0400, mce_inherited_show, NULL);
+
 static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *attr,
 				   char *buf)
 {
@@ -1615,6 +1625,8 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 		"pon_snapshot_ready=%u pon_stage=%u pon_error=%d pon_pdc_active=%u pon_gated_mask=0x%x pon_fifo=0x%x pon_fifo_polls=%u "
 		"pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n"
 		"pon_gate_written_mask=0x%x pon_gate_sampled_mask=0x%x pon_gate_polls=%u pon_gate_stable=%u\n"
+		"pon_clock_guard=xgpon_only pon_clock_required=0x%x pon_clock_samples=%u "
+		"pon_clock_valid=%u pon_clock_ready=%u pon_clock_first=0x%08x pon_clock_last=0x%08x\n"
 		"pon_gate0_before=0x%08x pon_gate0_requested=0x%08x pon_gate0_readback=0x%08x\n"
 		"pon_gate1_before=0x%08x pon_gate1_requested=0x%08x pon_gate1_readback=0x%08x\n"
 		"pon_gate2_before=0x%08x pon_gate2_requested=0x%08x pon_gate2_readback=0x%08x\n"
@@ -1637,6 +1649,8 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 		cold->gpon_control, cold->refused_register, cold->refused_value,
 		cold->gate_written_mask, cold->gate_sampled_mask, cold->gate_polls,
 		cold->gate_stable,
+		cold->clock_required, cold->clock_samples, cold->clock_valid,
+		cold->clock_ready, cold->clock_first, cold->clock_last,
 		cold->gate_before[0], cold->gate_requested[0], cold->gate_readback[0],
 		cold->gate_before[1], cold->gate_requested[1], cold->gate_readback[1],
 		cold->gate_before[2], cold->gate_requested[2], cold->gate_readback[2],
@@ -1840,6 +1854,7 @@ static struct attribute *rtl_native_attrs[] = {
 	&dev_attr_l2_resources.attr,
 	&dev_attr_l3_flows.attr,
 	&dev_attr_l2_evidence.attr,
+	&dev_attr_mce_inherited.attr,
 	&dev_attr_cold_bootstrap.attr,
 	&dev_attr_lan_mib_evidence.attr,
 	&dev_attr_fabric_sample.attr,
@@ -1851,7 +1866,8 @@ static umode_t rtl_native_visible(struct kobject *kobj, struct attribute *attr, 
 	struct rtl_xram *priv = netdev_priv(dev_get_drvdata(kobj_to_dev(kobj)));
 
 	if ((attr == &dev_attr_l2_switch.attr || attr == &dev_attr_l2_state.attr ||
-	     attr == &dev_attr_l2_evidence.attr || attr == &dev_attr_l3_admission.attr ||
+	     attr == &dev_attr_l2_evidence.attr || attr == &dev_attr_mce_inherited.attr ||
+	     attr == &dev_attr_l3_admission.attr ||
 	     attr == &dev_attr_l3_flows.attr || attr == &dev_attr_l2_resources.attr) &&
 	    !priv->fe)
 		return 0;

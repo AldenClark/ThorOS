@@ -160,6 +160,11 @@ int main(void) {
  fe.observe.install_collision=3;fe.observe.install_unsupported=7;
  fe.observe.reason[FE_REJECT_OTHER_INGRESS]=11;
  for(unsigned i=0;i<FE_INSTALL_STAGE_COUNT;i++)fe.observe.stage_failed[i]=~0ULL;
+ for(unsigned i=0;i<FE_FDB_MODE_REASON_COUNT;i++)fe.observe.fdb_mode_reason[i]=~0ULL;
+ fe.observe.last_fdb_mode_reason=FE_FDB_MODE_CMD_DISABLED;
+ fe.observe.last_fdb_mode_error=-EOPNOTSUPP;
+ fe.observe.last_fdb_mode_sampled=1;
+ fe.observe.last_fdb_mode_control=0x1ca00ff9U;
  fe.observe.last_failure_stage=FE_INSTALL_DESTINATION_MAC;
  fe.observe.last_failure_error=-EOPNOTSUPP;fe.observe.last_rollback_error=-ETIMEDOUT;
  assert(rtl_fe_admission_state(&fe,output)>0);
@@ -167,6 +172,10 @@ int main(void) {
  assert(strstr(output,"install_collision=3 install_unsupported=7"));
  assert(strstr(output,"reject_other_ingress=11"));
  assert(strstr(output,"last_failure_stage=destination_mac last_failure_errno=-95 last_rollback_errno=-110"));
+ assert(strstr(output,"fdb_mode_cmd_disabled=18446744073709551615"));
+ assert(strstr(output,"fdb_mode_last_reason=cmd_disabled fdb_mode_last_error=-95 "));
+ assert(strstr(output,"fdb_mode_last_control_sampled=1 fdb_mode_last_control=0x1ca00ff9"));
+ assert(strstr(output,"stage_fdb_mode_failed=18446744073709551615"));
  assert(strstr(output,"stage_publish_failed=18446744073709551615"));
  assert(strstr(output,"mmio_reads=0 mmio_writes=0"));
  assert(rtl_fe_flow_evidence(&fe,output)>0 && strstr(output,"emitted=0 truncated=0"));

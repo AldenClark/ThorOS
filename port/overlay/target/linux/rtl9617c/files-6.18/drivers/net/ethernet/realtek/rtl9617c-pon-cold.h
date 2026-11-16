@@ -58,6 +58,10 @@
 #define RTL_PON_COLD_PSDS_MODE 0xa02cU
 #define RTL_PON_COLD_PSDS_STATUS 0xa060U
 #define RTL_PON_COLD_PSDS_GBOX 0xa064U
+/* RTL8277C PSDS_RGB8, verified against the pinned generated register
+ * header and the normal PON driver's __psds_sync() readiness predicate.
+ * These are MAC clock prerequisites, NOT a write-ACK or in-flight fence. */
+#define RTL_PON_COLD_PSDS_CLOCKS_READY ((1U << 10) | (1U << 11) | (1U << 12))
 /* These are commands, NOT mac_en acknowledgement bits. A full-word RMW
  * must not replay an inherited TCONT flush or a PMAC software reset. */
 #define RTL_PON_COLD_XGPON_COMMANDS ((1U << 30) | (1U << 31))
@@ -82,6 +86,8 @@ enum rtl_pon_cold_stage {
 	RTL_PON_COLD_FIFO,
 	RTL_PON_COLD_VERIFY,
 	RTL_PON_COLD_READY,
+	/* Keep historical R11/R12 stage values stable for offline collectors. */
+	RTL_PON_COLD_CLOCK,
 };
 
 enum rtl_pon_cold_sample_id {
@@ -115,10 +121,11 @@ struct rtl_pon_cold_state {
 	unsigned int gate_closed_mask, gate_reopened_mask, gate_changed_mask;
 	unsigned int gate_first_closed_poll[RTL_PON_COLD_GATE_COUNT];
 	unsigned int gate_changes[RTL_PON_COLD_GATE_COUNT];
+	unsigned int clock_required, clock_first, clock_last, clock_samples;
 	unsigned int refused_register, refused_value;
 	struct rtl_pon_cold_snapshot before, after;
 	int error;
-	unsigned char pdc_active, stage, ready;
+	unsigned char pdc_active, stage, ready, clock_valid, clock_ready;
 };
 
 static const struct {
@@ -227,6 +234,59 @@ static inline int rtl_pon_cold_gate_command_check(struct rtl_pon_cold_state *sta
 	return 0;
 }
 
+/* R12 board evidence: the NI cold attempt happened at boot 0.831s with
+ * PSDS_RGB8=0x4000 (all three CKRDY bits clear); the PON owner completed its
+ * SerDes profile only at 19.682s with CKRDY bits asserted. Do not issue a
+ * speculative XGPON mac_en write across an unready MAC clock domain. The
+ * same read-only guard is reapplied during gate settling and after the
+ * fabric transaction. Other PON families have not yet supplied a matching
+ * chip-specific clock-read contract, so their existing admission remains.
+ * No fixed delay, reset, live-O5 retry or optical side effect is authorized.
+ */
+static inline int rtl_pon_cold_clock_check(const struct rtl_dq_io *io,
+					 struct rtl_pon_cold_state *state)
+{
+	unsigned int value;
+	unsigned char stage;
+	int ret;
+
+	if (!(state->gated_mask & (1U << RTL_PON_COLD_GATE_XGPON)))
+		return 0;
+	stage = state->stage;
+	state->clock_required = RTL_PON_COLD_PSDS_CLOCKS_READY;
+	if (!(state->control & RTL_PON_COLD_PSDS_CSR_RELEASED)) {
+		state->stage = RTL_PON_COLD_CLOCK;
+		return rtl_pon_cold_error(state, -EAGAIN,
+			RTL_PON_COLD_CONTROL, state->control);
+	}
+	ret = rtl_pon_cold_globals_match(io, state);
+	if (ret)
+		return ret;
+	value = io->read(io->context, RTL_PON_COLD_PSDS_STATUS);
+	state->clock_samples++;
+	if (state->clock_samples == 1)
+		state->clock_first = value;
+	state->clock_last = value;
+	state->clock_valid = value != ~0U;
+	state->clock_ready = state->clock_valid &&
+		(value & state->clock_required) == state->clock_required;
+	if (!state->clock_valid) {
+		state->stage = RTL_PON_COLD_CLOCK;
+		return rtl_pon_cold_error(state, -EIO,
+			RTL_PON_COLD_PSDS_STATUS, value);
+	}
+	if (!state->clock_ready) {
+		state->stage = RTL_PON_COLD_CLOCK;
+		return rtl_pon_cold_error(state, -EAGAIN,
+			RTL_PON_COLD_PSDS_STATUS, value);
+	}
+	ret = rtl_pon_cold_globals_match(io, state);
+	if (ret)
+		return ret;
+	state->stage = stage;
+	return 0;
+}
+
 /* A completed MMIO transaction need not prove that a MAC has already
  * acknowledged the new admission state. Write each gate only once, then
  * observe a bounded number of stable, all-closed sweeps. The probe budget
@@ -245,6 +305,9 @@ static inline int rtl_pon_cold_wait_gates(const struct rtl_dq_io *io,
 	if (!state->gated_mask)
 		return 0;
 	for (poll = 0; poll < RTL_PON_COLD_GATE_POLLS; poll++) {
+		ret = rtl_pon_cold_clock_check(io, state);
+		if (ret)
+			return ret;
 		closed = 1;
 		state->gate_polls++;
 		for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
@@ -276,8 +339,12 @@ static inline int rtl_pon_cold_wait_gates(const struct rtl_dq_io *io,
 			}
 		}
 		state->gate_stable = closed ? state->gate_stable + 1 : 0;
-		if (state->gate_stable == RTL_PON_COLD_GATE_STABLE)
+		if (state->gate_stable == RTL_PON_COLD_GATE_STABLE) {
+			ret = rtl_pon_cold_clock_check(io, state);
+			if (ret)
+				return ret;
 			return 0;
+		}
 		if (poll + 1 < RTL_PON_COLD_GATE_POLLS)
 			usleep_range(100, 200);
 	}
@@ -316,6 +383,9 @@ static inline int rtl_pon_cold_verify(const struct rtl_dq_io *io,
 	ret = rtl_pon_cold_globals_match(io, state);
 	if (ret)
 		return ret;
+	ret = rtl_pon_cold_clock_check(io, state);
+	if (ret)
+		return ret;
 	for (i = 0; i < RTL_PON_COLD_GATE_COUNT; i++) {
 		if (!(state->gated_mask & (1U << i)))
 			continue;
@@ -337,6 +407,9 @@ static inline int rtl_pon_cold_verify(const struct rtl_dq_io *io,
 		}
 	}
 	if (state->pdc_active) {
+		ret = rtl_pon_cold_clock_check(io, state);
+		if (ret)
+			return ret;
 		ret = rtl_pon_cold_globals_match(io, state);
 		if (ret)
 			return ret;
@@ -423,6 +496,9 @@ static inline int rtl_pon_cold_quiesce(const struct rtl_dq_io *io,
 		if (children & RTL_PON_COLD_XGPON_RELEASED)
 			state->gated_mask |= 1U << RTL_PON_COLD_GATE_XGPON;
 	}
+	ret = rtl_pon_cold_clock_check(io, state);
+	if (ret)
+		return ret;
 	/* Gate every RELEASED MAC in the selected family. This also handles
 	 * SDK's temporary GPON+XG release and EPON's simultaneous 1G/10G
 	 * release, without touching the unused, held-reset opposite family. */
@@ -445,6 +521,9 @@ static inline int rtl_pon_cold_quiesce(const struct rtl_dq_io *io,
 			return ret;
 		state->gate_requested[i] = value & ~rtl_pon_cold_gates[i].mask;
 		if (value & rtl_pon_cold_gates[i].mask) {
+			ret = rtl_pon_cold_clock_check(io, state);
+			if (ret)
+				return ret;
 			ret = rtl_pon_cold_globals_match(io, state);
 			if (ret)
 				return ret;
@@ -457,8 +536,14 @@ static inline int rtl_pon_cold_quiesce(const struct rtl_dq_io *io,
 	ret = rtl_pon_cold_wait_gates(io, state);
 	if (ret)
 		return ret;
+	ret = rtl_pon_cold_clock_check(io, state);
+	if (ret)
+		return ret;
 	state->stage = RTL_PON_COLD_FIFO;
 	for (i = 0; i < RTL_PON_COLD_FIFO_POLLS; i++) {
+		ret = rtl_pon_cold_clock_check(io, state);
+		if (ret)
+			return ret;
 		ret = rtl_pon_cold_globals_match(io, state);
 		if (ret)
 			return ret;

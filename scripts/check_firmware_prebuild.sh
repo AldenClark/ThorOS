@@ -19,6 +19,7 @@ python3 scripts/test_fe_lan_lifecycle.py --mutants
 python3 scripts/test_fe_route_fallback.py
 python3 scripts/test_fe_cache_slot_zero.py
 python3 scripts/test_fe_hash_collision.py --mutants
+python3 scripts/test_fe_fdb_mode_preflight.py
 python3 scripts/test_fe_source_cam_timeout.py
 python3 scripts/test_fe_destination_timeout.py
 python3 scripts/test_fe_destination_status.py
@@ -59,6 +60,7 @@ python3 scripts/test_l2_static_fdb.py --sanitize --mutants
 python3 scripts/test_fe_observe.py
 python3 scripts/test_l3_evidence.py
 python3 scripts/test_fe_diagnostic_budget.py
+python3 scripts/test_fe_mce_inherited.py
 python3 scripts/test_fe_callback_lifecycle.py
 python3 scripts/test_fe_teardown_quarantine.py
 python3 scripts/test_ni_fe_engine_lifecycle.py --mutants
