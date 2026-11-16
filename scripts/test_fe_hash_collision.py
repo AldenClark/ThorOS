@@ -66,6 +66,9 @@ static unsigned int rd(void *p,unsigned int r){(void)p;(void)r;mmio++;return 0;}
 static void wr(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;mmio++;}
 static int access_ok(void *p,unsigned int r,unsigned int v){(void)p;(void)r;(void)v;mmio++;return 0;}
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,wr,access_ok};}
+/* The actual FDB-mode helper is executed in test_fe_fdb_mode_preflight.py;
+ * this fixture isolates HASH and action conversion on an admitted owner. */
+static int fe_destination_mode_preflight(struct rtl_fe *f){(void)f;return 0;}
 /* Successful unrelated owners are test doubles. The allocator, CRC, DDR
  * publication, action conversion and age publication below are production. */
 static int fe_source_get(struct rtl_fe *f,const u8 *a,unsigned int *i){(void)f;(void)a;*i=0;return 0;}

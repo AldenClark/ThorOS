@@ -33,6 +33,7 @@ enum rtl_fe_install_stage {
  FE_INSTALL_POLICY,
  FE_INSTALL_LINK,
  FE_INSTALL_COOKIE,
+ FE_INSTALL_FDB_MODE,
  FE_INSTALL_HASH_COLLISION,
  FE_INSTALL_HASH_CAPACITY,
  FE_INSTALL_ALLOCATE,
@@ -49,11 +50,36 @@ static inline const char *rtl_fe_install_stage_name(unsigned int stage)
 {
  static const char *const names[]={
   "none","port","format","unicast","engine","policy","link","cookie",
-  "hash_collision","hash_capacity","allocate","source_mac","destination_mac",
+  "fdb_mode","hash_collision","hash_capacity","allocate","source_mac","destination_mac",
   "interface","mtu","counter","publish",
  };
 
  return stage<FE_INSTALL_STAGE_COUNT?names[stage]:"invalid";
+}
+
+/* Command-mode ownership is a prerequisite for routed destination-MAC
+ * publication, not evidence of a hardware-installed flow. Keep the reason
+ * separate from the later destination FDB command's own race protection. */
+enum rtl_fe_fdb_mode_reason {
+ FE_FDB_MODE_READY,
+ FE_FDB_MODE_FABRIC_UNREADY,
+ FE_FDB_MODE_OWNER_UNREADY,
+ FE_FDB_MODE_OWNER_FAULT,
+ FE_FDB_MODE_WINDOW_BUSY,
+ FE_FDB_MODE_INFO_INIT,
+ FE_FDB_MODE_CMD_DISABLED,
+ FE_FDB_MODE_READ_ERROR,
+ FE_FDB_MODE_REASON_COUNT,
+};
+
+static inline const char *rtl_fe_fdb_mode_reason_name(unsigned int reason)
+{
+ static const char *const names[]={
+  "ready","fabric_unready","owner_unready","owner_fault",
+  "window_busy","info_init","cmd_disabled","read_error",
+ };
+
+ return reason<FE_FDB_MODE_REASON_COUNT?names[reason]:"invalid";
 }
 
 struct rtl_fe_observe {
@@ -62,10 +88,24 @@ struct rtl_fe_observe {
  unsigned long long install_unavailable, install_duplicate, install_collision;
  unsigned long long install_unsupported, install_no_space, install_no_memory, install_io, install_other;
  unsigned long long stage_failed[FE_INSTALL_STAGE_COUNT];
+ unsigned long long fdb_mode_reason[FE_FDB_MODE_REASON_COUNT];
  unsigned long long last_failure_request;
  unsigned int stage, last_failure_stage;
+ unsigned int last_fdb_mode_reason, last_fdb_mode_sampled, last_fdb_mode_control;
+ int last_fdb_mode_error;
  int last_failure_error, rollback_error, last_rollback_error;
 };
+
+static inline void rtl_fe_observe_fdb_mode(struct rtl_fe_observe *observe,
+ unsigned int reason, int error, unsigned int control, unsigned int sampled)
+{
+ if(reason>=FE_FDB_MODE_REASON_COUNT)reason=FE_FDB_MODE_READ_ERROR;
+ observe->fdb_mode_reason[reason]++;
+ observe->last_fdb_mode_reason=reason;
+ observe->last_fdb_mode_error=error;
+ observe->last_fdb_mode_sampled=!!sampled;
+ observe->last_fdb_mode_control=sampled?control:0;
+}
 
 static inline void rtl_fe_observe_parse(struct rtl_fe_observe *observe,
  unsigned int reason)

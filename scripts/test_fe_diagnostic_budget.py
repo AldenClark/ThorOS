@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Conservative byte proof for the four complete FE sysfs diagnostic pages.
+"""Conservative byte proof for all five complete FE sysfs diagnostic pages.
 
 This is not a simulated execution of the getters. It reads their actual format
 literals and output-helper closure. All mutually exclusive branches/returns are
@@ -106,6 +106,7 @@ FILES = {
     'rtl_fe_resource_state': 'rtl9617c-fe.c',
     'rtl_fe_admission_state': 'rtl9617c-fe.c',
     'rtl_fe_l2_evidence': 'rtl9617c-fe.c',
+    'rtl_fe_mce_inherited_evidence': 'rtl9617c-fe.c',
     'fe_mcast_stats': 'rtl9617c-fe.c',
     'fe_mdb_stats': 'rtl9617c-fe-mdb.h',
     'fe_mcast_evidence': 'rtl9617c-fe-mcast.h',
@@ -172,12 +173,14 @@ NO_OUTPUT = {
     'list_for_each_entry', 'jiffies_to_msecs', 'fe_read', 'FE_LAN_RX_CTRL', 'BIT',
     'rtl_fabric_native_mtu_compatible', 'rtl_l2_shared_capacity',
     'rtl_l2_shared_leased', 'rtl_l2_shared_available', 'rtl_fe_install_stage_name',
+    'rtl_fe_fdb_mode_reason_name',
     'RTL_L2_EVIDENCE_NAME', 'RTL_L2_EVIDENCE_REGISTERS', 'ktime_get_ns',
     'spin_lock_irqsave', 'spin_unlock_irqrestore', 'rtl_l2_evidence_read',
+    'rtl_mcast_handoff_sample',
     'rtl9617c_switch_guard_generation', 'fe_switch_hw_reason_name',
     'fe_switch_hw_reason_text', 'fe_mdb_reason_name',
 }
-STRING_CALLS = {'rtl_fe_install_stage_name', 'fe_mdb_reason_name',
+STRING_CALLS = {'rtl_fe_install_stage_name', 'rtl_fe_fdb_mode_reason_name', 'fe_mdb_reason_name',
                 'fe_switch_hw_reason_text', 'fe_switch_hw_reason_name'}
 
 
@@ -262,6 +265,7 @@ def function_bound(name, stack=()):
 PAGES = {
     'l2_state': 'rtl_fe_state', 'l2_resources': 'rtl_fe_resource_state',
     'l3_admission': 'rtl_fe_admission_state', 'l2_evidence': 'rtl_fe_l2_evidence',
+    'mce_inherited': 'rtl_fe_mce_inherited_evidence',
 }
 budgets = {page: function_bound(function) for page, function in PAGES.items()}
 for page, size in budgets.items():
@@ -290,4 +294,4 @@ functions['rtl_fe_resource_state'] = original
 print('FE diagnostic upper bounds (bytes excluding NUL; all branches summed, %s <= 64): ' +
       ', '.join(f'{page}={size}' for page, size in budgets.items()))
 print('Production loop bounds: ' + ', '.join(f'{name}={count}' for name, count in BOUNDS.items()))
-print('All four complete pages fit 4096 bytes; six independent negative controls rejected')
+print('All five complete pages fit 4096 bytes; six independent negative controls rejected')

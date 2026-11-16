@@ -35,6 +35,7 @@
 #include "rtl9617c-fe-observe.h"
 #include "rtl9617c-l2-evidence.h"
 #include "rtl9617c-l2-owner.h"
+#include "rtl9617c-mcast-handoff.h"
 #include "rtl9617c-fabric.h"
 #include "rtl9617c-pon-path.h"
 #include <linux/rtl9617c-bridge.h>
@@ -275,6 +276,48 @@ static int fe_access(void *context,unsigned int address,unsigned int value)
 static struct rtl_dq_io fe_io(struct rtl_fe *fe)
 {
  return (struct rtl_dq_io){fe,fe_read,fe_write,fe_access};
+}
+
+/* A routed destination-MAC pin also uses the shared FDB command window.
+ * Check the published cold owner and its LIVE mode before reserving a Hash,
+ * source CAM or counter. This is read-only; an absent owner must never be
+ * repaired by a per-flow global CMD_MODE RMW. The command itself rechecks
+ * the mode after this preflight, protecting against foreign mode changes. */
+static int fe_destination_mode_preflight(struct rtl_fe *fe)
+{
+ struct rtl_fe_observe *observe=&fe->observe;
+ unsigned int control=0,sampled=0;
+ enum rtl_fe_fdb_mode_reason reason=FE_FDB_MODE_READY;
+ int ret=0;
+
+ if(fe->fabric.poisoned ||
+    (fe->l2_owner && (fe->l2_owner->ledger.quarantined ||
+                     fe->l2_owner->journal.quarantined))) {
+  reason=FE_FDB_MODE_OWNER_FAULT;
+  ret=-EIO;
+ } else if(!fe->fabric.ready) {
+  reason=FE_FDB_MODE_FABRIC_UNREADY;
+  ret=-EAGAIN;
+ } else if(!fe->l2_owner || !fe->l2_owner->sealed) {
+  reason=FE_FDB_MODE_OWNER_UNREADY;
+  ret=-EAGAIN;
+ } else {
+  struct rtl_dq_io io=fe_io(fe);
+
+  ret=rtl_l2_fdb_control_read(&io,&control);
+  if(ret==-EBUSY)reason=FE_FDB_MODE_WINDOW_BUSY;
+  else if(ret==-EOPNOTSUPP)reason=FE_FDB_MODE_INFO_INIT;
+  else if(ret)reason=FE_FDB_MODE_READ_ERROR;
+  else {
+   sampled=1;
+   if(!(control&RTL_L2_FDB_CMD_MODE)) {
+    reason=FE_FDB_MODE_CMD_DISABLED;
+    ret=-EOPNOTSUPP;
+   }
+  }
+ }
+ rtl_fe_observe_fdb_mode(observe,reason,ret,control,sampled);
+ return ret;
 }
 
 static bool __maybe_unused fe_native_l2_ivl(const struct rtl_fe *fe)
@@ -1716,6 +1759,13 @@ static int fe_install(struct rtl_fe_port *port,struct rtl_fe_rule data,unsigned 
     !netif_carrier_ok(data.input->netdev) || !netif_carrier_ok(data.output->netdev))return -EAGAIN;
  observe->stage=FE_INSTALL_COOKIE;
  if(fe_flow(fe,cookie))return -EEXIST;
+ /* The R12 board has FDB CMD_MODE=0 after cold fabric refusal. In that
+  * state thousands of callbacks reached destination_mac only after Hash
+  * bookkeeping, memory allocation and source-MAC ownership. Fail before
+  * any of those mutations, with a dedicated stage and refusal reason. */
+ observe->stage=FE_INSTALL_FDB_MODE;
+ ret=fe_destination_mode_preflight(fe);
+ if(ret)return ret;
  if(data.bridge)rtl_fe_bridge_key(words,data.source,data.destination,data.ethernet_protocol,
   data.key.ingress,data.key.llid,data.key.mask);
  else if(data.ipv6)rtl_fe_ipv6_key(words,&data.key6);
@@ -2857,6 +2907,18 @@ ssize_t rtl_fe_admission_state(struct rtl_fe *fe,char *buffer)
   o->install_no_space,o->install_no_memory,o->install_io,o->install_other,
   o->last_failure_request,rtl_fe_install_stage_name(o->last_failure_stage),
   o->last_failure_error,o->last_rollback_error);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "fdb_mode_ready=%llu fdb_mode_fabric_unready=%llu fdb_mode_owner_unready=%llu "
+  "fdb_mode_owner_fault=%llu fdb_mode_window_busy=%llu fdb_mode_info_init=%llu "
+  "fdb_mode_cmd_disabled=%llu fdb_mode_read_error=%llu\n"
+  "fdb_mode_last_reason=%s fdb_mode_last_error=%d fdb_mode_last_control_sampled=%u "
+  "fdb_mode_last_control=0x%08x\n",
+  o->fdb_mode_reason[FE_FDB_MODE_READY],o->fdb_mode_reason[FE_FDB_MODE_FABRIC_UNREADY],
+  o->fdb_mode_reason[FE_FDB_MODE_OWNER_UNREADY],o->fdb_mode_reason[FE_FDB_MODE_OWNER_FAULT],
+  o->fdb_mode_reason[FE_FDB_MODE_WINDOW_BUSY],o->fdb_mode_reason[FE_FDB_MODE_INFO_INIT],
+  o->fdb_mode_reason[FE_FDB_MODE_CMD_DISABLED],o->fdb_mode_reason[FE_FDB_MODE_READ_ERROR],
+  rtl_fe_fdb_mode_reason_name(o->last_fdb_mode_reason),o->last_fdb_mode_error,
+  o->last_fdb_mode_sampled,o->last_fdb_mode_control);
  for(i=0;i<FE_INSTALL_STAGE_COUNT;i++)
   length+=scnprintf(buffer+length,PAGE_SIZE-length,"stage_%s_failed=%llu\n",
    rtl_fe_install_stage_name(i),o->stage_failed[i]);
@@ -2952,6 +3014,65 @@ ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer)
    (sample.lan_rx[i]>>16)&63U);
  length+=fe_bridge_evidence(fe->bridge,buffer+length,PAGE_SIZE-length);
  length+=fe_mcast_evidence(fe,buffer+length,PAGE_SIZE-length);
+ mutex_unlock(&fe->lock);
+ return length;
+}
+
+/* The MCE cold owner is absent in an R12-style NI gate refusal, so its
+ * owner-dependent preflight never runs. Preserve that admission refusal,
+ * while letting the lab examine five inherited *direct* FE config words
+ * after the FE clock is usable. This diagnostic does not touch the DMALSO
+ * aperture, DDR pointers, indirect windows, or any producer/flush controls.
+ * The pinned SDK maps these five words to engine configuration fields, not
+ * direct IP/MAC tuples. Their raw internal state is still privileged; sysfs
+ * exposes this node to root only and raw bundles require review before share. */
+ssize_t rtl_fe_mce_inherited_evidence(struct rtl_fe *fe, char *buffer)
+{
+ struct rtl_mcast_handoff sample;
+ struct rtl_dq_io io;
+ unsigned long flags;
+ unsigned int owner_generation_valid;
+ unsigned long long owner_generation;
+ int ret;
+ u64 begin, end;
+ ssize_t length;
+
+ if(!fe)return sysfs_emit(buffer,"schema=1 available=0 reason=no_fe\n");
+ if(!mutex_trylock(&fe->lock))
+  return sysfs_emit(buffer,"schema=1 available=0 reason=busy retryable=1\n");
+ if(!fe->engine_ready || fe->shutting_down) {
+  mutex_unlock(&fe->lock);
+  return sysfs_emit(buffer,"schema=1 available=0 reason=engine_down\n");
+ }
+ io=(struct rtl_dq_io){.context=fe,.read=fe_read};
+ owner_generation_valid=fe->l2_owner && fe->l2_owner->ledger.generation;
+ owner_generation=owner_generation_valid ? fe->l2_owner->ledger.generation : 0;
+ begin=ktime_get_ns();
+ /* A short bounded sample under the same software route lock as the L2
+  * owner, but still NOT an atomic snapshot of foreign silicon producers. */
+ spin_lock_irqsave(&fe->route_lock,flags);
+ ret=rtl_mcast_handoff_sample(&sample,&io);
+ spin_unlock_irqrestore(&fe->route_lock,flags);
+ end=ktime_get_ns();
+ length=sysfs_emit(buffer,
+  "schema=1 available=1 scope=runtime_direct clock=monotonic begin_ns=%llu end_ns=%llu "
+  "mmio_reads=%u mmio_writes=0 atomic_snapshot=0 clock_verified=0 "
+  "handoff_verified=0 retirement_verified=0\n",
+  (unsigned long long)begin,(unsigned long long)end,sample.reads);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "instance_ns=%llu engine_ready=1 fabric_ready=%u mce_owner=%u "
+  "owner_generation_valid=%u owner_generation=%llu missing_contracts=0x%x "
+  "sample_valid=0x%x sample_reads=%u sample_error=%d "
+  "bad_register=0x%x bad_value=0x%08x\n",
+  (unsigned long long)fe->evidence_instance_ns,fe->fabric.ready,
+  !!fe->mcast,owner_generation_valid,owner_generation,sample.missing,
+  sample.valid_mask,sample.reads,ret,sample.bad_register,sample.bad_value);
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "xram_cfg=0x%08x stg0_ctrl=0x%08x hash_ini=0x%08x "
+  "cache_ini=0x%08x mce_control=0x%08x\n",
+  sample.value[RTL_MCAST_HANDOFF_XRAM],sample.value[RTL_MCAST_HANDOFF_STG0],
+  sample.value[RTL_MCAST_HANDOFF_HASH],sample.value[RTL_MCAST_HANDOFF_CACHE],
+  sample.value[RTL_MCAST_HANDOFF_MCE]);
  mutex_unlock(&fe->lock);
  return length;
 }

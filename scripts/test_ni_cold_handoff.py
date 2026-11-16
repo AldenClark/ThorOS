@@ -161,7 +161,7 @@ static struct resource resources[4];
 static unsigned int pon_mac[0xc000/4],pon_global[3];
 static bool claimed[4],mapped[4];
 static int map_fault,map_fault_index,sysfs_result;
-static bool stuck_pon_gate,stuck_fifo,post_fabric_drift;
+static bool stuck_pon_gate,stuck_fifo,post_fabric_drift,post_fabric_clock_drop;
 static unsigned int map_calls,unmap_calls,pon_reads,pon_writes;
 static unsigned int pon_psds_reads,pon_pdc_control_reads;
 static unsigned int ni_reads,ni_writes,ni_init_writes;
@@ -266,6 +266,8 @@ static u32 readl(void *address){
  if(offset==0xa02c || offset==0xa060 || offset==0xa064){
   assert((pon_global[0]&0x204)==0x204);pon_psds_reads++;
  }
+ if(offset==0xa060 && post_fabric_clock_drop && fe.fabric.ready)
+  return *(u32 *)address & ~RTL_PON_COLD_PSDS_CLOCKS_READY;
  if(offset==0x9014){assert(pon_global[0]&0x200);pon_pdc_control_reads++;}
  if(offset==RTL_PON_COLD_PDC_FIFO_STATUS && stuck_fifo)return 1;
  return *(u32 *)address;
@@ -415,7 +417,7 @@ static void init(struct rtl_xram *priv,bool required){
  pon_global[0]=RTL_PON_COLD_PDC_RELEASED|RTL_PON_COLD_EPON_MODE;
  pon_global[1]=RTL_PON_COLD_EPON_RELEASED|RTL_PON_COLD_EPON_1G_RELEASED|RTL_PON_COLD_EPON_10G_RELEASED;
  pon_global[2]=0;pon_mac[0x088c/4]=1;pon_mac[0x10b4/4]=1U<<7;
- map_fault=map_fault_index=sysfs_result=0;stuck_pon_gate=stuck_fifo=post_fabric_drift=false;
+ map_fault=map_fault_index=sysfs_result=0;stuck_pon_gate=stuck_fifo=post_fabric_drift=post_fabric_clock_drop=false;
  map_calls=unmap_calls=pon_reads=pon_writes=registrations=sysfs_calls=mib_calls=exposes=opens=dma_starts=qm_starts=0;
  pon_psds_reads=pon_pdc_control_reads=0;
  ni_reads=ni_writes=ni_init_writes=0;
@@ -472,6 +474,12 @@ static void cached_snapshot(struct rtl_xram *priv){
           cold->gate_closed_mask,cold->gate_reopened_mask,cold->gate_changed_mask);
  assert(strstr(cached,expected));
  assert(strstr(cached,"pon_clock_observation_only=1"));
+ snprintf(expected,sizeof(expected),
+          "pon_clock_guard=xgpon_only pon_clock_required=0x%x pon_clock_samples=%u "
+          "pon_clock_valid=%u pon_clock_ready=%u pon_clock_first=0x%08x pon_clock_last=0x%08x\n",
+          cold->clock_required,cold->clock_samples,cold->clock_valid,
+          cold->clock_ready,cold->clock_first,cold->clock_last);
+ assert(strstr(cached,expected));
  for(unsigned phase=0;phase<2;phase++){
   const char *name=phase?"after":"before";
   const struct rtl_pon_cold_snapshot *snapshot=phase?&cold->after:&cold->before;
@@ -661,11 +669,54 @@ int main(void){
  assert(priv.fabric_error==-ETIMEDOUT && !priv.fabric_managed && !m.writes && !m.scans);
  assert(priv.pon_cold.gate_before[3]==0x61 && priv.pon_cold.gate_requested[3]==0x60);
  assert(priv.pon_cold.gate_readback[3]==0x61 && !priv.pon_cold.gate_closed_mask);
- assert(pon_psds_reads==6 && pon_pdc_control_reads==2 && pon_writes==1);
+ assert(pon_psds_reads==6+priv.pon_cold.clock_samples && pon_pdc_control_reads==2 && pon_writes==1);
+ assert(priv.pon_cold.clock_samples>2 && priv.pon_cold.clock_ready);
  assert(priv.pon_cold.before.valid_mask==0x7f && priv.pon_cold.after.valid_mask==0x7f);
  assert(priv.pon_cold.before.stable && priv.pon_cold.after.stable);
  assert(priv.pon_cold.before.value[4]==0x9c00 && priv.pon_cold.after.value[4]==0x9c00);
  cached_snapshot(&priv);done(&priv);cases++;
+ /* R12 silicon's cold PSDS_RGB8=0x4000 cannot permit a speculative
+  * XGPON admission write; the software LAN fallback is still published. */
+ init(&priv,true);pon_global[0]=0x30e;pon_global[1]=0x30000;pon_global[2]=0x205;
+ pon_mac[0x4004/4]=0x61;pon_mac[0xa060/4]=0x4000;
+ assert(!probe_publication_tail(&platform));normal_lan(&priv);
+ assert(priv.fabric_error==-EAGAIN && !priv.fabric_managed);
+ assert(priv.pon_cold.stage==RTL_PON_COLD_CLOCK && priv.pon_cold.clock_samples==1);
+ assert(priv.pon_cold.clock_valid && !priv.pon_cold.clock_ready);
+ assert(priv.pon_cold.refused_register==RTL_PON_COLD_PSDS_STATUS);
+ assert(priv.pon_cold.gate_written_mask==0 && !priv.pon_cold.gate_sampled_mask);
+ assert(!pon_writes && !m.writes && !m.scans && priv.pon_cold.fifo_polls==0);
+ assert(priv.pon_cold.before.value[RTL_PON_COLD_SAMPLE_PSDS_STATUS]==0x4000);
+ assert(priv.pon_cold.after.value[RTL_PON_COLD_SAMPLE_PSDS_STATUS]==0x4000);
+ assert(pon_psds_reads==7 && pon_pdc_control_reads==2);
+ done(&priv);cases++;
+ /* Invalid/unmapped PSDS clock status remains a bounded I/O refusal. */
+ init(&priv,true);pon_global[0]=0x30e;pon_global[1]=0x30000;pon_global[2]=0x205;
+ pon_mac[0x4004/4]=0x61;pon_mac[0xa060/4]=~0U;
+ assert(!probe_publication_tail(&platform));normal_lan(&priv);
+ assert(priv.fabric_error==-EIO && priv.pon_cold.stage==RTL_PON_COLD_CLOCK);
+ assert(priv.pon_cold.clock_samples==1 && !priv.pon_cold.clock_valid);
+ assert(!pon_writes && !m.writes && !m.scans);
+ done(&priv);cases++;
+ /* A reset-held PSDS CSR is NOT permission to sample its status or MAC. */
+ init(&priv,true);pon_global[0]=0x30a;pon_global[1]=0x30000;pon_global[2]=0x205;
+ pon_mac[0x4004/4]=0x61;
+ assert(!probe_publication_tail(&platform));normal_lan(&priv);
+ assert(priv.fabric_error==-EAGAIN && priv.pon_cold.stage==RTL_PON_COLD_CLOCK);
+ assert(!priv.pon_cold.clock_samples && !pon_psds_reads && !pon_writes);
+ assert(!m.writes && !m.scans && !priv.fabric_managed);
+ done(&priv);cases++;
+ /* If the clock disappears after the fabric transaction, the owner must
+  * quarantine instead of publishing LAN/provider state. */
+ init(&priv,true);pon_global[0]=0x30e;pon_global[1]=0x30000;pon_global[2]=0x205;
+ pon_mac[0x4004/4]=0x61;pon_mac[0xa060/4]=0x1c00;
+ post_fabric_clock_drop=true;
+ assert(probe_publication_tail(&platform)<0);no_publication(&priv);
+ assert(priv.fabric_error==-EAGAIN && priv.engine_poisoned && !priv.fabric_managed);
+ assert(priv.pon_cold.stage==RTL_PON_COLD_CLOCK);
+ assert(priv.pon_cold.clock_samples>2 && !priv.pon_cold.clock_ready);
+ assert(pon_writes==1 && m.writes>0 && owner.exposed);
+ done(&priv);cases++;
  /* Actual FE adapter distinguishes verified refusal from ambiguous failure. */
  for(unsigned int kind=0;kind<7;kind++){
   init(&priv,true);

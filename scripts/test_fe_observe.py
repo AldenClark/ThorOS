@@ -23,6 +23,7 @@ fixture = r'''
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include "rtl9617c-fe-observe.h"
 struct rtl_fe_flow {bool deleting;};
 struct rtl_fe {struct rtl_fe_observe observe;};
@@ -83,6 +84,23 @@ int main(void){
  rtl_fe_observe_install(&fe.observe,-EIO);
  assert(fe.observe.last_failure_stage==FE_INSTALL_NONE);
  assert(fe.observe.last_rollback_error==-ETIMEDOUT);
+ /* An unowned/wrong-mode FDB command must have a distinct pre-allocation
+  * stage and typed, read-only dependency evidence. Neither a mode refusal
+  * nor an unowned fabric may be mislabeled as a hash collision. */
+ fe.observe.stage=FE_INSTALL_FDB_MODE;
+ rtl_fe_observe_install(&fe.observe,-EAGAIN);
+ assert(fe.observe.stage_failed[FE_INSTALL_FDB_MODE]==1);
+ assert(fe.observe.install_unavailable==3);
+ assert(fe.observe.last_failure_stage==FE_INSTALL_FDB_MODE);
+ rtl_fe_observe_fdb_mode(&fe.observe,FE_FDB_MODE_FABRIC_UNREADY,-EAGAIN,~0U,0);
+ assert(fe.observe.last_fdb_mode_reason==FE_FDB_MODE_FABRIC_UNREADY);
+ assert(!fe.observe.last_fdb_mode_sampled && !fe.observe.last_fdb_mode_control);
+ assert(!strcmp(rtl_fe_fdb_mode_reason_name(fe.observe.last_fdb_mode_reason),"fabric_unready"));
+ rtl_fe_observe_fdb_mode(&fe.observe,FE_FDB_MODE_CMD_DISABLED,-EOPNOTSUPP,0x1ca00ff9U,1);
+ assert(fe.observe.last_fdb_mode_control==0x1ca00ff9U);
+ assert(fe.observe.fdb_mode_reason[FE_FDB_MODE_FABRIC_UNREADY]==1 &&
+        fe.observe.fdb_mode_reason[FE_FDB_MODE_CMD_DISABLED]==1);
+ assert(fe.observe.install_collision==1);
  puts("FE admission: every unsupported predicate/PON rejection recorded; install errors classified separately; success is not a packet-hit claim");
 }
 '''

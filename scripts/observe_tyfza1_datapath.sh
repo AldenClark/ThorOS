@@ -318,7 +318,7 @@ printf 'offload_note=enabled_installs_and_HW_OFFLOAD_do_not_prove_two_direction_
 printf 'l2_note=requested_is_not_active;LAN_LAN_known_unicast_and_routed_WAN_are_separate_test_paths\n'
 printf 'fabric_note=passive_reads_cache_only;active_sample_has_one_NI_owner;TE_direct_counter_mode_and_board_mapping_remain_unverified\n'
 printf 'privacy=default_omits_flow_addresses_MACs_sessions_PON_identity_and_WAN_credentials\n'
-[ "$details" = 0 ] || printf 'warning=details_includes_flow_IP_MAC_ports_and_PPPoE_sessions;redact_before_sharing\n'
+[ "$details" = 0 ] || printf 'warning=details_includes_flow_IP_MAC_ports_PPPoE_sessions_and_MCE_internal_configuration;redact_before_sharing\n'
 [ "$active_diagnostics" = 0 ] || printf 'warning=active_diagnostics_invoke_indirect_table_reads_and_unproven_status_counter_read_semantics;not_an_unperturbed_capture\n'
 printf 'optional_probe_timeout_seconds=3 timeout_available=%s\n' "$has_timeout"
 printf 'cached_read_attempts=3 cached_retry_sleep_seconds=1 active_read_attempts=1\n'
@@ -391,9 +391,13 @@ snapshot() {
     else
         printf 'skipped=active_diagnostics_not_requested\n'
     fi
-    for attribute in l3_admission l3_flows cold_bootstrap l2_switch l2_evidence l2_resources lan_mib_evidence fabric_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
+    for attribute in l3_admission l3_flows cold_bootstrap l2_switch l2_evidence l2_resources mce_inherited lan_mib_evidence fabric_evidence xram_state rx_bypass idle_poll_ms rx_prefetch pppoe_rx_checksum qm_voqs; do
         printf '\n[%s]\n' "$attribute"
-        if [ -n "$ni_dir" ]; then
+        if [ "$attribute" = mce_inherited ] && [ "$details" = 0 ]; then
+            # Five inherited SDK configuration words are privileged raw state.
+            # Only an explicitly opted-in private lab capture contains them.
+            printf 'skipped=requires_details;raw_MCE_internal_configuration\n'
+        elif [ -n "$ni_dir" ]; then
             read_cached_probe "$ni_dir/$attribute"
         else
             printf 'unavailable\n'

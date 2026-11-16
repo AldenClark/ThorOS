@@ -42,4 +42,6 @@ ssize_t rtl_fe_resource_state(struct rtl_fe *fe, char *buffer);
 ssize_t rtl_fe_admission_state(struct rtl_fe *fe, char *buffer);
 ssize_t rtl_fe_flow_evidence(struct rtl_fe *fe, char *buffer);
 ssize_t rtl_fe_l2_evidence(struct rtl_fe *fe, char *buffer);
+/* Root-only, sequential direct CSR evidence; not an MCE admission/retirement. */
+ssize_t rtl_fe_mce_inherited_evidence(struct rtl_fe *fe, char *buffer);
 #endif

@@ -183,7 +183,7 @@ def sdk_oracle(path):
  assert(RTL_PON_COLD_PDC_CONTROL==PDC_CTRL-0xf5500000U);
  PSDS_RGB8_t clocks={.wrd=0};
  clocks.bf.CKRDY_RX=1;clocks.bf.CKRDY_TX=1;clocks.bf.CKRDY_MPCP=1;
- assert(clocks.wrd==0x1c00U);
+ assert(clocks.wrd==RTL_PON_COLD_PSDS_CLOCKS_READY);
 #endif
 }
 '''
@@ -212,6 +212,7 @@ static unsigned drift_index,drift_on_read,drift_mask,drift_on_wait;
 static unsigned drift_mac_index,drift_mac_read,drift_fifo_read;
 static unsigned gate_reads[4],gate_writes[4],gate_delay[4],gate_due[4],gate_requested[4];
 static unsigned gate_pending,gate_waits,ones_index,ones_on_read,fifo_ones_on_read;
+static unsigned psds_reads,psds_allones_on_read,psds_clock_drop_on_read;
 static unsigned flicker_index,change_index,change_wait,change_mask;
 static int observed_snapshot_drift;
 static int expected_error,fifo_stuck,fifo_flicker,verify_busy;
@@ -238,6 +239,14 @@ static unsigned read_reg(void *ctx,unsigned reg) {
   if(drift_index==i && global_reads[i]==drift_on_read)global[i]^=drift_mask;
   if(global[i]!=initial[i])observed_snapshot_drift=1;
   return global[i];
+ }
+ if(reg==RTL_PON_COLD_PSDS_STATUS) {
+  assert((initial[0]&0x204)==0x204 && (allowed&(1U<<RTL_PON_COLD_GATE_XGPON)));
+  psds_reads++;
+  if(psds_clock_drop_on_read && psds_reads==psds_clock_drop_on_read)
+   regs[RTL_PON_COLD_PSDS_STATUS/4]&=~RTL_PON_COLD_PSDS_CLOCKS_READY;
+  if(psds_allones_on_read && psds_reads==psds_allones_on_read)return ~0U;
+  return regs[RTL_PON_COLD_PSDS_STATUS/4];
  }
  /* Reject access to every held-reset PDC or unsupported/ambiguous mode. */
  assert((initial[0]&0x200) && !expected_error && !observed_snapshot_drift);
@@ -284,6 +293,8 @@ static void setup(unsigned control,unsigned epon,unsigned gpon,unsigned seed) {
  for(unsigned i=0;i<sizeof(regs)/sizeof(regs[0]);i++)regs[i]=(i*2654435761U)^seed;
  for(unsigned i=0;i<4;i++)regs[offsets[i]/4]|=masks[i];
  regs[0x4004/4]&=~0xc0000000U; /* command-busy fixtures are separate. */
+ if((control&0x204)==0x204 && !(control&1) && (gpon&4))
+  regs[RTL_PON_COLD_PSDS_STATUS/4]=RTL_PON_COLD_PSDS_CLOCKS_READY;
  memcpy(saved,regs,sizeof(regs));
  writes=mac_reads=fifo_reads=busy_left=waits=0;allowed=0;expected_error=0;
  memset(gate_reads,0,sizeof(gate_reads));memset(gate_writes,0,sizeof(gate_writes));
@@ -291,6 +302,7 @@ static void setup(unsigned control,unsigned epon,unsigned gpon,unsigned seed) {
  memset(gate_requested,0,sizeof(gate_requested));gate_pending=gate_waits=0;
  ones_index=flicker_index=change_index=4;ones_on_read=fifo_ones_on_read=0;
  change_wait=change_mask=0;observed_snapshot_drift=0;
+ psds_reads=psds_allones_on_read=psds_clock_drop_on_read=0;
  fifo_stuck=fifo_flicker=verify_busy=0;stuck_index=4;stuck_mask=0;
  drift_index=3;drift_on_read=drift_on_wait=0;drift_mask=0;
  drift_mac_index=4;drift_mac_read=drift_fifo_read=0;
@@ -335,6 +347,11 @@ static void valid_case(struct rtl_pon_cold_state *state) {
   assert(state->gate_first_closed_poll[i]==!!(allowed&(1U<<i)));
  }
  assert(state->pdc_active==!!(initial[0]&0x200));
+ if(allowed&(1U<<RTL_PON_COLD_GATE_XGPON)) {
+  assert(state->clock_required==RTL_PON_COLD_PSDS_CLOCKS_READY);
+  assert(state->clock_valid && state->clock_ready && state->clock_samples>2);
+  assert(state->clock_first==RTL_PON_COLD_PSDS_CLOCKS_READY);
+ } else assert(!state->clock_samples && !state->clock_required);
  assert(state->fifo_polls==fifo_reads);
  if(!state->pdc_active)assert(!mac_reads && !writes && !fifo_reads && !waits);
  unchanged_except_gates();
@@ -429,6 +446,54 @@ int main(void) {
  struct rtl_pon_cold_state state={0};unsigned cases=0;
  sdk_oracle();
  cases+=snapshot_cases();
+ /* R12 hardware observation: the NI executes its cold attempt before PON
+  * SerDes reports CKRDY RX/TX/MPCP. Never write mac_en in this state. */
+ setup(0x30e,0x30000,0x205,0);
+ regs[0x4004/4]=saved[0x4004/4]=0x61;
+ regs[RTL_PON_COLD_PSDS_STATUS/4]=0x4000;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+ assert(state.stage==RTL_PON_COLD_CLOCK && state.refused_register==RTL_PON_COLD_PSDS_STATUS);
+ assert(state.clock_required==RTL_PON_COLD_PSDS_CLOCKS_READY && state.clock_first==0x4000);
+ assert(state.clock_samples==1 && state.clock_valid && !state.clock_ready);
+ assert(!writes && !mac_reads && !fifo_reads && !waits);cases++;
+ /* An all-ones PSDS status is an unmapped/broken domain, not clocks-ready. */
+ setup(0x30e,0x30000,0x205,0);psds_allones_on_read=1;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EIO);
+ assert(state.stage==RTL_PON_COLD_CLOCK && state.clock_samples==1 && !state.clock_valid);
+ assert(!writes && !mac_reads && !fifo_reads);cases++;
+ /* A ready first observation followed by a lost clock before gate write
+  * is not permission to touch that MAC. */
+ setup(0x30e,0x30000,0x205,0);psds_clock_drop_on_read=2;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+ assert(state.clock_samples==2 && state.clock_valid && !state.clock_ready);
+ assert(!writes && !fifo_reads);cases++;
+ /* A clock-domain regression while waiting for MAC acknowledgement
+  * terminates the transaction before accepting a fabricated closed gate. */
+ setup(0x30e,0x30000,0x205,0);psds_clock_drop_on_read=3;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+ assert(state.clock_samples==3 && writes==1 && !fifo_reads);
+ assert(state.stage==RTL_PON_COLD_CLOCK);cases++;
+ /* Post-quiesce, post-fabric revalidation must refuse a lost PSDS clock. */
+ setup(0x30e,0x30000,0x205,0);
+ assert(!rtl_pon_cold_quiesce(&io,&state));
+ unsigned observed=psds_reads,before_writes=writes;
+ regs[RTL_PON_COLD_PSDS_STATUS/4]&=~RTL_PON_COLD_PSDS_CLOCKS_READY;
+ assert(rtl_pon_cold_verify(&io,&state)==-EAGAIN);
+ assert(state.stage==RTL_PON_COLD_CLOCK && psds_reads==observed+1 && writes==before_writes);
+ cases++;
+ /* A loss at the first FIFO preflight must refuse before any FIFO read. */
+ setup(0x30e,0x30000,0x205,0);psds_clock_drop_on_read=8;
+ assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+ assert(state.stage==RTL_PON_COLD_CLOCK && state.clock_samples==8);
+ assert(writes==1 && !fifo_reads);cases++;
+ /* The verify-time FIFO guard is independently necessary even when the
+  * earlier MAC gate read succeeded; don't accept an unready clock. */
+ setup(0x30e,0x30000,0x205,0);assert(!rtl_pon_cold_quiesce(&io,&state));
+ observed=psds_reads;unsigned before_fifo=fifo_reads;
+ psds_clock_drop_on_read=observed+2;
+ assert(rtl_pon_cold_verify(&io,&state)==-EAGAIN);
+ assert(state.stage==RTL_PON_COLD_CLOCK && fifo_reads==before_fifo);
+ cases++;
  /* R11 real failure values: a refused low-bit clear stays a failure, with
   * no FIFO/fabric access and no fabricated retry or command completion. */
  setup(0x30e,0x30000,0x205,0);
@@ -483,6 +548,14 @@ int main(void) {
    assert(!state.ready && state.stage==RTL_PON_COLD_SELECT);
    assert(!writes && !mac_reads && !fifo_reads && !waits);
    assert(!memcmp(regs,saved,sizeof(regs)));
+  }else if(pdc && !mode && (gp&5)==5) {
+   /* PSDS CSR is held in reset in these generated combinations. The
+    * released XGPON MAC is therefore not authorized for a gate write. */
+   assert(rtl_pon_cold_quiesce(&io,&state)==-EAGAIN);
+   assert(state.stage==RTL_PON_COLD_CLOCK && !state.clock_samples);
+   assert(state.clock_required==RTL_PON_COLD_PSDS_CLOCKS_READY);
+   assert(state.refused_register==RTL_PON_COLD_CONTROL);
+   assert(!writes && !mac_reads && !fifo_reads);
   }else valid_case(&state);
   cases++;
  }
@@ -788,7 +861,9 @@ def variants(header):
     guarded_read = ('ret = rtl_pon_cold_globals_match(io, state);\n'
                     '\t\t\tif (ret)\n\t\t\t\treturn ret;\n'
                     '\t\t\tvalue = io->read(io->context, rtl_pon_cold_gates[i].reg);')
-    guarded_fifo = ('ret = rtl_pon_cold_globals_match(io, state);\n'
+    guarded_fifo = ('ret = rtl_pon_cold_clock_check(io, state);\n'
+                    '\t\tif (ret)\n\t\t\treturn ret;\n'
+                    '\t\tret = rtl_pon_cold_globals_match(io, state);\n'
                     '\t\tif (ret)\n\t\t\treturn ret;\n'
                     '\t\tvalue = io->read(io->context, RTL_PON_COLD_PDC_FIFO_STATUS);')
     scoped = (

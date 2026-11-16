@@ -81,6 +81,14 @@ with tempfile.TemporaryDirectory(prefix='datapath-observer-') as temporary:
                         'l2_owner_sealed=1 l2_owner_ready=0x1 l2_owner_quarantined=0\n'
                         'mce_owner=1 mce_contract_ready=0 mce_missing_contracts=0x1f\n'
                         'mdb_state=cold-mce-contract mdb_error=-95\n',
+        'mce_inherited': 'schema=1 available=1 scope=runtime_direct clock=monotonic begin_ns=100 end_ns=110 '
+                         'mmio_reads=5 mmio_writes=0 atomic_snapshot=0 clock_verified=0 '
+                         'handoff_verified=0 retirement_verified=0\n'
+                         'instance_ns=10 engine_ready=1 fabric_ready=0 mce_owner=0 '
+                         'owner_generation_valid=0 owner_generation=0 missing_contracts=0x1f '
+                         'sample_valid=0x1f sample_reads=5 sample_error=0 bad_register=0x0 bad_value=0x0\n'
+                         'xram_cfg=0x00000000 stg0_ctrl=0x00000000 hash_ini=0x00000000 '
+                         'cache_ini=0x00000000 mce_control=0x00000000\n',
         'lan_mib_evidence': 'schema=1 cached=1 clock=boottime raw=1 reset_tracking=0 l2_attribution=0 atomic_hardware_snapshot=0 read_opcode=0 counter_mode_verified=0 capture_ns=5000000000 registered_mask=0x1\n'
                             'port=0 ifindex=3 registered=1 valid=1 error=0 seq=5 attempts=5 begin_ns=4000000000 end_ns=4000000001 rx_bytes=9999 tx_bytes=8888\n',
         'xram_state': 'base_ready=1 dma_exposed=1 engine_poisoned=0 host_active=1 reboot_required=0\n',
@@ -235,6 +243,8 @@ exit 0
     assert output.count('[l2_resources]\nschema=1 available=1 cached=1') == 2
     assert output.count('mce_missing_contracts=0x1f') == 2
     assert trace.count(str(ni / 'l2_resources')) == 2
+    assert output.count('[mce_inherited]\nskipped=requires_details;raw_MCE_internal_configuration') == 2
+    assert str(ni / 'mce_inherited') not in trace
     assert 'ip_json_required=0 fractional_sleep_required=0' in output
     assert 'timeout -s KILL 3 sh ' not in trace
     assert all(path.read_bytes() == value for path, value in original_files.items())
@@ -256,6 +266,9 @@ exit 0
 
     output, _, _ = run('1', '--details')
     assert '192.0.2.12:51000' not in output
+    assert output.count('[mce_inherited]\nschema=1 available=1 scope=runtime_direct') == 2
+    assert output.count('sample_valid=0x1f sample_reads=5 sample_error=0') == 2
+    assert 'MCE_internal_configuration;redact_before_sharing' in output
     assert output.count('[fe_flow_counters]\nskipped=active_diagnostics_not_requested') == 2
     output, trace, _ = run('1', '--active-diagnostics')
     assert trace.count(str(ni / 'fabric_sample')) == 2

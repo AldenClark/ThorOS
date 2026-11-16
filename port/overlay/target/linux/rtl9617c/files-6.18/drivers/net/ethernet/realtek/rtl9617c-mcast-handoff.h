@@ -37,16 +37,20 @@ struct rtl_mcast_handoff {
  * entries, not a disabled table. Preserve refusal while exposing all
  * actual samples (including independent validity) for the next lab run.
  */
-static inline int rtl_mcast_handoff_probe(struct rtl_mcast_handoff *state,
+/* Only direct register reads are required for this observation.  The NI
+ * diagnostic reader must not be given write or indirect-table callbacks just
+ * to inspect inherited configuration.  A complete observation still grants
+ * no ownership or retirement authority. */
+static inline int rtl_mcast_handoff_sample(struct rtl_mcast_handoff *state,
 		const struct rtl_dq_io *io)
 {
 	static const unsigned int registers[RTL_MCAST_HANDOFF_SAMPLES] = {
 		0xaa28, 0x3400, 0x3834, 0x38a0, 0xaa60,
 	};
 	unsigned int i, value;
-	int ret = -EOPNOTSUPP;
+	int ret = 0;
 
-	if (!state || !rtl_l2_io_valid(io))
+	if (!state || !io || !io->read)
 		return -EINVAL;
 	*state = (struct rtl_mcast_handoff) {
 		.missing = RTL_MCAST_HANDOFF_MISSING,
@@ -66,6 +70,17 @@ static inline int rtl_mcast_handoff_probe(struct rtl_mcast_handoff *state,
 		}
 	}
 	return ret;
+}
+
+/* The cold admission deliberately remains closed even if every inherited
+ * configuration word was sampled: the five producer/fence/retirement
+ * contracts are not supplied by these reads. */
+static inline int rtl_mcast_handoff_probe(struct rtl_mcast_handoff *state,
+		const struct rtl_dq_io *io)
+{
+	int ret = rtl_mcast_handoff_sample(state, io);
+
+	return ret ? ret : -EOPNOTSUPP;
 }
 
 #endif
