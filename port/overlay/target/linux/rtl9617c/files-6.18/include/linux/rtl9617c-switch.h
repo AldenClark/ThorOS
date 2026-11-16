@@ -62,6 +62,13 @@ static inline bool br_rtl9617c_l2_port_eligible(const struct net_device *port)
 #endif
 
 #if IS_REACHABLE(CONFIG_BRIDGE)
+/* RTNL held; raw jiffies, matching bridge FDB hold_time(), including
+ * topology-change forward_delay. The caller's generation gate provides
+ * consistency with concurrent STP timer/BPDU writers. Zero disables dynamic
+ * learning, not permanent ownership of previously learned entries. Do not
+ * round a positive sub-second interval to the special zero policy. */
+int br_rtl9617c_fdb_hold_time(const struct net_device *master,
+				unsigned long *ticks);
 /* Delete only a still-owned dynamic HW-learned VID-0 entry.  Unlike a broad
  * DEL_TO_BRIDGE event this must never remove a newer user/static/local row.
  */
@@ -71,6 +78,11 @@ int br_rtl9617c_fdb_learn(const struct net_device *port,
 			 const unsigned char *addr,
 			 struct rtl9617c_switch_guard *guard, u64 generation);
 #else
+static inline int br_rtl9617c_fdb_hold_time(const struct net_device *master,
+					 unsigned long *ticks)
+{
+	return -EOPNOTSUPP;
+}
 static inline bool br_rtl9617c_fdb_forget(const struct net_device *port,
 				       const unsigned char *addr)
 {

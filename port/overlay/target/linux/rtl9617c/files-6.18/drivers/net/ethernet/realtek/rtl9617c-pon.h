@@ -19,6 +19,7 @@ struct rtl_itu_path_state {
 };
 
 struct platform_device;
+struct net;
 
 enum rtl_gpon_drain_phase {
 	RTL_GPON_DRAIN_IDLE, RTL_GPON_DRAIN_INVALIDATE, RTL_GPON_DRAIN_PORT, RTL_GPON_DRAIN_ALLOC,
@@ -237,6 +238,8 @@ ssize_t rtl_pon_ploam_receive(struct rtl9617c_pon *pon, char *buf, size_t count)
 ssize_t rtl_pon_ploam_transmit(struct rtl9617c_pon *pon, const char *buf, size_t count,
 			     bool default_key);
 int rtl_pon_epon_traffic(struct rtl9617c_pon *pon, bool enable);
+/* pon->lock held. END uses rtl9617c_switch_policy_end(); NULL is balanced. */
+void rtl_pon_policy_begin(struct rtl9617c_pon *pon, struct net **policy);
 int rtl_pon_mpcp_init(struct rtl9617c_pon *pon, int irq);
 int rtl_pon_mpcp_stop(struct rtl9617c_pon *pon);
 int rtl_pon_mpcp_configure(struct rtl9617c_pon *pon);

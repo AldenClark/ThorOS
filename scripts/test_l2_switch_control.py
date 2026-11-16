@@ -48,6 +48,8 @@ typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define FE_LAN_PORTS 5
 #define FE_SW_SNAPSHOTS 256
 #define BIT(n) (1U << (n))
+#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
+#define fallthrough __attribute__((fallthrough))
 #define ETH_ALEN 6
 #define GFP_KERNEL 0
 #define system_long_wq 7
@@ -79,7 +81,7 @@ struct rtl_fe_bridge;
 struct rtl_fe {bool lock,shutting_down,engine_ready;int error;unsigned pending_withdrawals;struct rtl_fe_bridge *bridge;};
 struct switchdev_notifier_info {struct net_device *dev;const void *ctx;};
 enum {NETDEV_UP=1,NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_CHANGE,NETDEV_CHANGEADDR,
- NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_UNREGISTER,NETDEV_PRECHANGEUPPER};
+ NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_UNREGISTER,NETDEV_PRECHANGEUPPER,NETDEV_CHANGEMTU};
 struct netdev_notifier_info {struct net_device *dev;};
 struct netdev_notifier_changeupper_info {struct netdev_notifier_info info;bool linking;};
 static struct net_device *netdev_notifier_info_to_dev(void *p){return ((struct netdev_notifier_info *)p)->dev;}
@@ -105,7 +107,7 @@ static unsigned int init_net;
 BACKEND = r'''
 static struct rtl_fe fe;
 static struct rtl_fe_bridge *live;
-static struct net_device ports[5],master,foreign;
+static struct net_device ports[5],master,foreign,pon[3];
 static struct {void *pointer;bool freed;} allocations[7];
 static unsigned int allocated,allocation_calls,fail_allocation,registration_calls,fail_registration;
 static bool registered[4],rtnl_held;
@@ -158,7 +160,7 @@ static void rtl9617c_switch_guard_unregister(struct rtl9617c_switch_guard *guard
  assert(guard==&live->guard && guard->registered);unregister_callback(3);guard->registered=false;
 }
 static void rtl9617c_switch_guard_invalidate(struct rtl9617c_switch_guard *guard){
- assert(guard==&live->guard && guard->registered);invalidates++;
+ assert(guard==&live->guard && guard->registered);invalidates++;guard->generation++;
 }
 static bool rtl9617c_switch_guard_blocked(struct rtl9617c_switch_guard *guard){return guard->blocked;}
 static u64 rtl9617c_switch_guard_generation(struct rtl9617c_switch_guard *guard){return guard->generation;}
@@ -306,7 +308,7 @@ static void netdev_notifications(void){
  sw->master=&master;
  struct netdev_notifier_changeupper_info event={.info={.dev=&ports[0]},.linking=true};
  const unsigned int changes[]={NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_UP,NETDEV_CHANGE,
-  NETDEV_CHANGEADDR,NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA};
+  NETDEV_CHANGEADDR,NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_CHANGEMTU};
  /* Synchronous invalidation must happen in the early GOING_DOWN callback,
   * not just after ndo_stop in DOWN. Actual gate MMIO/races have own tests. */
  for(unsigned int i=0;i<sizeof(changes)/sizeof(changes[0]);i++){
@@ -327,6 +329,59 @@ static void netdev_notifications(void){
  assert(gates==2 && unoffloads==2 && !sw->ports[0]);
  rtnl_unlock();restore_error=0;
  assert(!fe_bridge_stop(sw) && !live && freed==7);cases++;
+}
+static void pon_route_notifications(void){
+ reset();struct rtl_fe_bridge *sw=fe_bridge_start(&fe);assert(!IS_ERR(sw));fe.bridge=sw;
+ for(unsigned int i=0;i<5;i++)sw->ports[i]=&ports[i];
+ sw->master=&master;sw->offloaded=31;sw->published_count=7;
+ const unsigned int destinations[]={8,12,63};
+ const unsigned int changes[]={NETDEV_GOING_DOWN,NETDEV_DOWN,NETDEV_UP,NETDEV_CHANGE,
+  NETDEV_CHANGEADDR,NETDEV_CHANGEUPPER,NETDEV_CHANGEINFODATA,NETDEV_CHANGEMTU,
+  NETDEV_PRECHANGEUPPER,NETDEV_UNREGISTER};
+ rtnl_lock();
+ for(unsigned int p=0;p<ARRAY_SIZE(pon);p++){
+  mutex_lock(&fe.lock);fe_switch_track_port_locked(&fe,&pon[p],destinations[p],true);mutex_unlock(&fe.lock);
+  assert(fe_switch_owns_device(sw,&pon[p]) && !fe_switch_owns_device(sw,&foreign));
+  struct netdev_notifier_changeupper_info event={.info={.dev=&pon[p]},.linking=false};
+  for(unsigned int i=0;i<ARRAY_SIZE(changes);i++){
+   unsigned int before=invalidates;u64 generation=sw->guard.generation;
+   /* No native journal withdrawal or cached LAN pointer clearing is
+    * allowed merely because a routed PON endpoint is unregistering. */
+   assert(!fe_switch_netdev_event(&sw->netdev_nb,changes[i],&event));
+   assert(invalidates==before+1 && sw->guard.generation==generation+1);
+   assert(!fe.lock && !gates && !unoffloads && sw->master==&master);
+   assert(sw->offloaded==31 && sw->published_count==7);
+   for(unsigned int n=0;n<5;n++)assert(sw->ports[n]==&ports[n]);
+   assert(sw->owned_devices[destinations[p]]==&pon[p]);cases++;
+  }
+  unsigned int before=invalidates;event.linking=true;
+  assert(!fe_switch_netdev_event(&sw->netdev_nb,NETDEV_PRECHANGEUPPER,&event));
+  assert(invalidates==before);
+  event.info.dev=&foreign;
+  for(unsigned int i=0;i<ARRAY_SIZE(changes);i++)
+   assert(!fe_switch_netdev_event(&sw->netdev_nb,changes[i],&event));
+  assert(invalidates==before && !gates && !unoffloads);
+  mutex_lock(&fe.lock);
+  fe_switch_track_port_locked(&fe,&foreign,destinations[p],false);
+  assert(sw->owned_devices[destinations[p]]==&pon[p]);
+  fe_switch_track_port_locked(&fe,&pon[p],destinations[p],false);
+  mutex_unlock(&fe.lock);
+  assert(!sw->owned_devices[destinations[p]] && !fe_switch_owns_device(sw,&pon[p]));
+  before=invalidates;event.info.dev=&pon[p];event.linking=false;
+  /* The FE owner may retire first; late/repeated unregister/linkwatch
+   * callbacks then compare identities only and must ignore the device. */
+  for(unsigned int i=0;i<ARRAY_SIZE(changes);i++)
+   assert(!fe_switch_netdev_event(&sw->netdev_nb,changes[i],&event));
+  assert(invalidates==before && !gates && !unoffloads);cases++;
+ }
+ unsigned int before=invalidates;
+ mutex_lock(&fe.lock);fe_switch_track_port_locked(&fe,&foreign,64,true);mutex_unlock(&fe.lock);
+ assert(invalidates==before && !fe_switch_owns_device(sw,&foreign));
+ sw->stopping=true;
+ struct netdev_notifier_info event={.dev=&ports[0]};
+ assert(!fe_switch_netdev_event(&sw->netdev_nb,NETDEV_CHANGE,&event) && invalidates==before);
+ sw->stopping=false;rtnl_unlock();
+ assert(!fe_bridge_stop(sw) && !live && freed==7);
 }
 static void request_snapshot(struct rtl_fe_bridge *sw,bool requested){
  fe.error=0;fe.pending_withdrawals=0;fe.shutting_down=false;fe.engine_ready=true;
@@ -395,7 +450,7 @@ static void repeated_requests(void){
  mutex_unlock(&fe.lock);rtnl_unlock();
  assert(!fe_bridge_stop(sw) && !live && freed==7);
 }
-int main(void){construction_and_stop();notifier_and_replay();netdev_notifications();repeated_requests();
+int main(void){construction_and_stop();notifier_and_replay();netdev_notifications();pon_route_notifications();repeated_requests();
  printf("Native switch production control: %u lifetime/replay/request scenarios; 2048 learning notifications and 200 healthy same-value requests do not rebuild; error/epoch/dirty ownership retries preserved PASS\n",cases);return 0;}
 '''
 
@@ -407,7 +462,7 @@ definitions = "\n".join(re.search(pattern, source, re.S)[0] for pattern in [
 ])
 functions = "\n".join(function(name) for name in [
     "fe_switch_queue", "fe_switch_reconcile_locked", "fe_switch_request_current", "fe_switch_request_locked",
-    "fe_switch_port_index", "fe_switch_replay_fdb",
+    "fe_switch_track_port_locked", "fe_switch_owns_device", "fe_switch_port_index", "fe_switch_replay_fdb",
     "fe_switch_atomic_event", "fe_switch_blocking_event", "fe_switch_netdev_event", "fe_bridge_start", "fe_bridge_stop",
 ])
 with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
@@ -416,6 +471,7 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
     environment = dict(os.environ)
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
     stop = function("fe_bridge_stop")
+    netdev = function("fe_switch_netdev_event")
     mutations = {
         "stop_before_rtnl": (
             "\trtnl_lock();\n\tWRITE_ONCE(sw->stopping, true);",
@@ -425,12 +481,23 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
         "retain_ports_after_stop": ("\t\tWRITE_ONCE(sw->ports[port], NULL);", "\t\t(void)sw->ports[port];"),
         "lose_fdb_cookie_withdrawal": ("\tfe_switch_unoffload(sw);", "\t(void)sw;"),
     }
-    for name in ["production", *mutations]:
+    netdev_mutations = {
+        "owned_pon_ignored": ("if (!native && !fe_switch_owns_device(sw, dev))",
+                              "if (!native)"),
+        "pon_detach_withdraws_native": ("if (native && detaching)", "if (detaching)"),
+        "pon_pre_unlink_not_invalidated": ("case NETDEV_PRECHANGEUPPER:\n\t\tif (upper->linking)",
+                                            "case NETDEV_PRECHANGEUPPER:\n\t\tif (true || upper->linking)"),
+    }
+    for name in ["production", *mutations, *netdev_mutations]:
         body = functions
-        if name != "production":
+        if name in mutations:
             old, new = mutations[name]
             assert old in stop, name
             body = functions.replace(stop, stop.replace(old, new))
+        elif name in netdev_mutations:
+            old, new = netdev_mutations[name]
+            assert old in netdev, name
+            body = functions.replace(netdev, netdev.replace(old, new))
         c_file = temporary / (name + ".c")
         binary = temporary / name
         c_file.write_text(COMMON + definitions + BACKEND + body + TEST)
@@ -454,5 +521,7 @@ with tempfile.TemporaryDirectory(prefix="l2-switch-control-") as directory:
     "request_health_and_recovery_scenarios": 40,
     "error_generation_and_retained_owner_retries": True,
     "stop_lifetime_mutants_rejected": list(mutations),
+    "owned_pon_route_notifications": 30,
+    "owned_pon_notifier_mutants_rejected": list(netdev_mutations),
     "hardware_verified": False,
 }, indent=2) + "\n")

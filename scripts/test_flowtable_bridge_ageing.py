@@ -40,6 +40,7 @@ if args.before and "flow_offload_refresh_bridge" in offload:
         has_ppp_policy = "ppp_flow_policy_allows(" in (kernel / "drivers/net/ppp/ppp_generic.c").read_text()
         later = []
         for marker, source, name in [
+            ("netdev_ppp_path_advance(", "include/linux/netdevice.h", "235-ppp-flow-namespace-fence.patch"),
             ("try_cmpxchg(&flow->timeout", "net/netfilter/nf_flow_table_core.c", "230-flowtable-refresh-timeout-order.patch"),
             ("NF_FLOW_INITIALIZING", "include/net/netfilter/nf_flow_table.h", "229-flowtable-initial-publication.patch"),
             ("try_cmpxchg(&offload->flow->timeout", "net/netfilter/nf_flow_table_offload.c", "228-flowtable-stats-timeout-wrap.patch"),

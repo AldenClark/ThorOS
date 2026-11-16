@@ -195,6 +195,13 @@ struct rtl_fe_bridge {
 	u32 replay_ports;
 	unsigned int (*rules)[RTL_L2_FDB_WORDS];
 	unsigned int rule_count, local_target, retry_count;
+	/* A sticky/static destination outside this generation's forwarding
+	 * subset must still pin its MAC against autonomous SA learning. Such
+	 * rules trap to CPU16, where the current Linux port/STP state decides
+	 * forwarding, and are deliberately never published as offloaded. Keep
+	 * this bitmap independent of both the hardware-key scratch buffer and
+	 * the compact publication journal. One bit per physical FDB slot. */
+	unsigned int replay_traps[(RTL_L2_FDB_ENTRIES + 31) / 32];
 	/* Separate from rules[], which domain_flush reuses. A failed publish
 	 * must still withdraw every successful prefix by its unique FDB cookie. */
 	struct fe_switch_published *published;
@@ -628,23 +635,27 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	struct rtl_l2_fdb_entry entry = { 0 }, previous;
 	unsigned int words[RTL_L2_FDB_WORDS], i;
 	int port = fe_switch_port_index(sw, info->info.dev);
+	bool trap;
 
 	if (info->vid || switchdev_fdb_is_dynamically_learned(info))
-		return 0;
-	/* A full-bridge replay includes offline members too. Their old rows
-	 * were flushed before this generation; do not recreate an output which
-	 * the snapshot deliberately excluded. Local MACs still belong to CPU.
-	 */
-	if (!info->is_local && port >= 0 && !(sw->replay_ports & BIT(port)))
 		return 0;
 	if (info->locked || (!info->is_local && port < 0) ||
 	    !is_valid_ether_addr(info->addr))
 		return -EOPNOTSUPP;
+	/* Omitting an offline/STP-blocked static destination would leave its
+	 * MAC free for hardware SA learning on another, forwarding port. The
+	 * next DA lookup could then bypass Linux's sticky destination policy.
+	 * Protect the key with a static CPU trap instead: do not forward to an
+	 * excluded physical egress, and do not send this bridged fallback into
+	 * L3 connector25 even when ordinary local MACs use that connector.
+	 */
+	trap = !info->is_local && !(sw->replay_ports & BIT(port));
 	ether_addr_copy(entry.mac, info->addr);
 	entry.is_static = 1;
 	entry.valid = 1;
 	entry.sa_permit = entry.da_permit = 1;
-	entry.destination = info->is_local ? sw->local_target : (unsigned int)port;
+	entry.destination = info->is_local ? sw->local_target :
+		trap ? 16 : (unsigned int)port;
 	if (rtl_l2_fdb_encode(words, &entry))
 		return -EINVAL;
 	/* Replay covers the entire bridge for each port. Deduplicate keys, not
@@ -658,6 +669,10 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 	if (i == RTL_L2_FDB_ENTRIES)
 		return -ENOSPC;
 	memcpy(sw->rules[i], words, sizeof(words));
+	if (trap)
+		sw->replay_traps[i / 32] |= BIT(i % 32);
+	else
+		sw->replay_traps[i / 32] &= ~BIT(i % 32);
 	if (i == sw->rule_count)
 		WRITE_ONCE(sw->rule_count, sw->rule_count + 1);
 	return 0;
@@ -669,15 +684,20 @@ static int fe_switch_replay_fdb(struct rtl_fe_bridge *sw,
 static void fe_switch_static_stage(struct rtl_fe_bridge *sw)
 {
 	struct rtl_l2_fdb_entry entry;
-	unsigned int i;
+	unsigned int i, count = 0;
 
 	for (i = 0; i < sw->rule_count; i++) {
+		/* Trap-only protection does not implement the configured output.
+		 * Leave that Linux FDB entry software-owned and unoffloaded. */
+		if (sw->replay_traps[i / 32] & BIT(i % 32))
+			continue;
 		rtl_l2_fdb_decode(sw->rules[i], &entry);
-		ether_addr_copy(sw->published[i].address, entry.mac);
-		sw->published[i].destination = entry.destination;
-		sw->published[i].cookie = 0;
+		ether_addr_copy(sw->published[count].address, entry.mac);
+		sw->published[count].destination = entry.destination;
+		sw->published[count].cookie = 0;
+		count++;
 	}
-	WRITE_ONCE(sw->published_count, sw->rule_count);
+	WRITE_ONCE(sw->published_count, count);
 }
 
 /* RTNL, but not FE mutex. The bridge serializes with its FDB hash lock and
@@ -830,17 +850,24 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 	struct rtl_fe_bridge *sw = container_of(nb, struct rtl_fe_bridge, netdev_nb);
 	struct net_device *dev = netdev_notifier_info_to_dev(pointer);
 	struct netdev_notifier_changeupper_info *upper = pointer;
-	bool detaching;
+	bool detaching, native;
 	int port, ret = 0;
 
 	if (READ_ONCE(sw->stopping))
 		return NOTIFY_DONE;
 	port = fe_switch_port_index(sw, dev);
-	if (port < 0 && dev != READ_ONCE(sw->master))
+	native = port >= 0 || dev == READ_ONCE(sw->master);
+	/* Routing also owns PON logical netdevices, which are deliberately not
+	 * native LAN bridge ports. Their carrier/address/MTU/upper changes must
+	 * invalidate the route generation too, including linkwatch events that
+	 * do not enter a bridge callback. Keep the ownership test identity-only:
+	 * rtl_fe_remove_port() clears its entry before releasing that owner.
+	 */
+	if (!native && !fe_switch_owns_device(sw, dev))
 		return NOTIFY_DONE;
 	detaching = event == NETDEV_UNREGISTER ||
 		(event == NETDEV_PRECHANGEUPPER && !upper->linking);
-	if (detaching) {
+	if (native && detaching) {
 		/* PRECHANGEUPPER still has a live br_port for unoffload. The core
 		 * pre-publication gate has already closed ingress; restore before
 		 * borrowing pointers can end or the netdevice can be freed.
@@ -857,6 +884,10 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 		}
 	}
 	switch (event) {
+	case NETDEV_PRECHANGEUPPER:
+		if (upper->linking)
+			break;
+		fallthrough;
 	case NETDEV_UP:
 	/* __dev_close_many() sends this before clearing RUNNING and before
 	 * ndo_stop disables the MAC. Do not leave other ports forwarding to an
@@ -865,6 +896,7 @@ static int fe_switch_netdev_event(struct notifier_block *nb,
 	case NETDEV_DOWN:
 	case NETDEV_CHANGE:
 	case NETDEV_CHANGEADDR:
+	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGEUPPER:
 	case NETDEV_CHANGEINFODATA:
 	case NETDEV_UNREGISTER:
@@ -881,8 +913,7 @@ static void fe_switch_work(struct work_struct *work)
 	struct rtl_fe_bridge *sw = container_of(work, struct rtl_fe_bridge, work);
 	struct rtl_fe *fe = sw->fe;
 	struct fe_switch_plan plan;
-	clock_t age_ticks;
-	unsigned long seconds;
+	unsigned long age_ticks, seconds;
 	unsigned int i;
 	u32 native_ports;
 	u64 generation;
@@ -968,20 +999,21 @@ static void fe_switch_work(struct work_struct *work)
 	 */
 	if (sw->reason != FE_SWITCH_OK)
 		goto arm;
-	age_ticks = br_get_ageing_time(sw->master);
-	/* Linux exposes USER_HZ ticks; hardware exposes whole 19-bit seconds.
-	 * Do not silently wrap jiffies_to_msecs() or round a sub-second policy.
+	ret = br_rtl9617c_fdb_hold_time(sw->master, &age_ticks);
+	/* Read the actual FDB hold_time in jiffies, including topology-change
+	 * forward_delay. Hardware exposes whole 19-bit seconds. In particular,
+	 * never round a positive sub-second policy into no-learning zero.
 	 */
-	if (age_ticks <= 0 || age_ticks % USER_HZ ||
-	    age_ticks / USER_HZ > GENMASK(18, 0)) {
+	if (ret || age_ticks % HZ || age_ticks / HZ > GENMASK(18, 0)) {
 		/* This timer belongs to autonomous L2 learning only. The earlier
 		 * route-policy checks still govern independently authorized L3
 		 * flows, just as for an unsupported native VLAN/bridge topology.
 		 */
 		sw->reason = FE_SWITCH_AGING_UNSUPPORTED;
+		ret = 0;
 		goto arm;
 	}
-	seconds = age_ticks / USER_HZ;
+	seconds = age_ticks / HZ;
 	native_ports = fe_switch_forwarding_ports(&plan);
 	sw->rule_count = 0;
 	sw->replay_error = 0;
@@ -1027,7 +1059,10 @@ static void fe_switch_work(struct work_struct *work)
 		goto failure;
 	}
 	ret = fe_switch_hw_port_policy(fe, &sw->hw,
-		fe_switch_flag_ports(&plan, native_ports, BR_LEARNING),
+		/* Linux hold_time()==0 means always flood dynamic destinations:
+		 * br_fdb_update() must not learn. Static/local keys remain useful,
+		 * so retain exact unicast offload with every native SA learner off. */
+		seconds ? fe_switch_flag_ports(&plan, native_ports, BR_LEARNING) : 0,
 		fe_switch_flag_ports(&plan, native_ports, BR_ISOLATED));
 	if (ret) {
 		if (ret == -EOPNOTSUPP)

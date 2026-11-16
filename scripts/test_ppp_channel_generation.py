@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run real PPP handoff, path capture and late-HW-ADD functions on a host model.
 
-Requires a kernel prepared through patch 224. Production functions are extracted
+Requires a kernel prepared through patch 235. Production functions are extracted
 unchanged; locks, devices, routes and MMIO admission are explicit test backends.
 This does not establish silicon performance or full PPP protocol-policy support.
 """
@@ -83,10 +83,12 @@ typedef uint8_t u8; typedef uint16_t u16,__u16,__be16; typedef uint32_t u32;
 #define READ_ONCE(x) (x)
 #define WARN_ON_ONCE(x) assert(!(x))
 #define smp_rmb() atomic_thread_fence(memory_order_seq_cst)
+#define smp_load_acquire(p) (*(p))
 typedef _Atomic unsigned int atomic_t;
 #define atomic_read(p) atomic_load_explicit((p),memory_order_seq_cst)
 #define atomic_set(p,v) atomic_store_explicit((p),(unsigned int)(v),memory_order_seq_cst)
 static inline unsigned int atomic_inc_return(atomic_t *p){return atomic_fetch_add_explicit(p,1,memory_order_seq_cst)+1U;}
+static inline bool atomic_try_cmpxchg(atomic_t *p,int *old,int next){unsigned int expected=(unsigned int)*old;bool changed=atomic_compare_exchange_strong_explicit(p,&expected,(unsigned int)next,memory_order_seq_cst,memory_order_seq_cst);*old=(int)expected;return changed;}
 struct lock {pthread_mutex_t m;pthread_t owner;bool held;};
 static _Thread_local unsigned int held_locks;
 static void init_lock(struct lock *l){pthread_mutex_init(&l->m,NULL);l->held=false;}
@@ -102,7 +104,7 @@ static bool lock_owned(struct lock *l){return l->held&&pthread_equal(l->owner,pt
 #define lockdep_is_held(l) lock_owned(l)
 #define lockdep_assert_held(l) assert(lock_owned(l))
 struct net {unsigned int unused;};
-struct net_device {unsigned int type,addr_len,ifindex,refs;unsigned long priv_flags;int hard_header_len;atomic_t ppp_channel_generation;struct net *net;};
+struct net_device {unsigned int type,addr_len,ifindex,refs;unsigned long priv_flags;int hard_header_len;atomic_t ppp_channel_generation;struct net *net;bool moving_ns;};
 static struct net net;
 struct gate {pthread_mutex_t lock;unsigned int active,begins,ends;bool open;};
 static struct gate gate={.lock=PTHREAD_MUTEX_INITIALIZER};
@@ -146,7 +148,9 @@ static void setup(void){device=(struct net_device){.type=ARPHRD_PPP,.addr_len=0,
 static void channel_init(struct channel *c,struct ppp_channel *driver){memset(c,0,sizeof(*c));init_lock(&c->upl);init_lock(&c->downl);c->chan=driver;c->chan_net=&net;c->file.hdrlen=8;}
 '''
 
-NET_HELPERS = function(netdev, "netdev_ppp_path_cookie") + function(netdev, "netdev_ppp_path_valid")
+NET_HELPERS = "\n".join(function(netdev, name) for name in [
+    "netdev_ppp_path_advance", "netdev_ppp_path_cookie", "netdev_ppp_path_valid",
+])
 PPP_FUNCTIONS = "\n".join(function(ppp, n) for n in [
     "ppp_flow_change_begin", "ppp_flow_change_end", "ppp_channel_unpublish",
     "ppp_connect_channel", "ppp_disconnect_channel",
@@ -270,7 +274,7 @@ mutations = {
         "if(false){ret=-EAGAIN;break;}"),
     "missing_callback_device_reference": ("dev_hold(dev);", "(void)dev;"),
     "resurrect_wrapped_cookie": (
-        "if (atomic_read(&ppp->dev->ppp_channel_generation))", "if (true)"),
+        "while (old) {", "while (old || step) {"),
     "skip_ppp_cpu_gc_validation": (
         "if ((tuple->out.ppp_cookie ||", "if (false && (tuple->out.ppp_cookie ||"),
 }

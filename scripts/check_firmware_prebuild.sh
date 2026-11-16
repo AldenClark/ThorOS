@@ -23,6 +23,8 @@ python3 scripts/test_fe_source_cam_timeout.py
 python3 scripts/test_fe_destination_timeout.py
 python3 scripts/test_fe_destination_status.py
 python3 scripts/test_fe_fdb_domain.py
+python3 scripts/test_fe_fdb_shared_owner.py
+python3 scripts/test_fe_fdb_cold_lifecycle.py --mutants
 python3 scripts/test_fe_window_idle.py
 python3 scripts/test_ni_oam_owner.py
 python3 scripts/test_l2_table_transactions.py
@@ -35,6 +37,7 @@ python3 scripts/test_l2_es_cold.py
 python3 scripts/test_fabric_baseline.py
 python3 scripts/test_pon_cold_handoff.py
 python3 scripts/test_pon_probe_unwind.py --mutants
+python3 scripts/test_pon_transactions.py --case address --case epon-policy --mutants
 python3 scripts/test_pon_dma_owner.py --mutants
 python3 scripts/test_ni_cold_handoff.py --mutants
 python3 scripts/test_l2_policy_races.py
@@ -44,6 +47,7 @@ python3 scripts/test_l2_switch_control.py
 python3 scripts/test_l2_switch_worker.py
 python3 scripts/test_l2_switch_fdb.py
 python3 scripts/test_l2_switch_topology.py
+python3 scripts/test_l2_effective_ageing.py
 python3 scripts/test_l2_evidence.py
 python3 scripts/test_l2_bridge_eligibility.py
 python3 scripts/test_l2_static_fdb.py --sanitize --mutants
@@ -59,6 +63,7 @@ python3 scripts/test_pon_table_staging.py
 python3 scripts/test_pon_reconfigure_guard.py
 python3 scripts/test_gpon_queue_recovery.py
 python3 scripts/test_pon_data_path.py
+python3 scripts/test_pon_pdc_map.py --mutants
 python3 scripts/test_omci_compatibility.py
 python3 scripts/test_itu_pppoe_datapath.py
 python3 scripts/test_bridge_learning.py
@@ -67,8 +72,11 @@ python3 scripts/test_fe_evto_dependencies.py
 python3 scripts/test_qm_cached_epp.py
 python3 scripts/test_qm_rx_bounds.py
 python3 scripts/test_qm_switch_rx.py
+python3 scripts/test_qm_rx_fairness.py --mutants
+python3 scripts/test_mcast_observe.py --mutants
 python3 scripts/test_qm_table_staging.py
-python3 scripts/test_qm_refill_credit.py
+python3 scripts/test_qm_refill_credit.py --mutants
+python3 scripts/test_qm_startup_faults.py --mutants
 python3 scripts/test_qm_resources.py --mutants
 python3 scripts/test_dma_tx_fastpath.py
 python3 scripts/test_xram_tx_copy.py --mutants
@@ -84,6 +92,8 @@ python3 scripts/test_fe_age_batch.py --mutants
 python3 scripts/test_fe_activity_cache.py --mutants
 python3 scripts/test_fe_allocation.py --mutants
 python3 scripts/test_fe_cleanup_isolation.py
+# Encapsulation and PPP namespace oracles require the complete applied Linux
+# tree and run in check_flowtable_contracts.sh, after kernel object compilation.
 python3 scripts/test_release_uboot_archive.py
 python3 scripts/test_datapath_observer.py
 python3 scripts/test_datapath_summary.py

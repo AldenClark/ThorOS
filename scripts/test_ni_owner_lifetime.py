@@ -48,7 +48,8 @@ functions = '\n'.join(function(source, name) for name in names)
 dma_functions = '\n'.join(function(dma_source, name) for name in
                           ('rtl_dma_vp', 'rtl_dma_tx_quiesce'))
 qm_start = function(qm_source, 'rtl_qm_rx_start')
-qm_tail = ('static int rtl_qm_start_admission_tail(struct rtl_qm_rx *rx,void *ni) {\n' +
+qm_tail = (function(qm_source, 'rtl_qm_rmw') + '\n' +
+           'static int rtl_qm_start_admission_tail(struct rtl_qm_rx *rx,void *ni) { int ret;u32 value;\n' +
            qm_start[qm_start.index('\t/* Stock aal_l3_te_init'):])
 # These publication/removal boundaries are not replaced by a test-only API.
 probe = function(source, 'rtl_probe')
@@ -475,8 +476,8 @@ if args.mutants:
         ('clear_tombstone', text.replace('if (!owner || READ_ONCE(owner->exposed))', 'if (!owner)', 1), False),
         ('cold_gate_override', text.replace('rx->deepq_configured = true;',
             'writel(readl(ni+0x610c)|0xffffU,ni+0x610c); rx->deepq_configured = true;', 1), False),
-        ('ignore_reset_gate', text.replace('writel(readl(ni + 0x610c) & ~0xffffU, ni + 0x610c);',
-            '(void)ni;', 1), False),
+        ('ignore_reset_gate', text.replace('ret = rtl_qm_rmw(ni + 0x610c, 0xffffU, 0);',
+            'ret = 0;', 1), False),
     ])
 with tempfile.TemporaryDirectory(prefix='ni-owner-lifetime-') as directory:
     directory = Path(directory)

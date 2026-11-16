@@ -408,6 +408,19 @@ static void guards(void)
  reset(); model.reg[0x1414/4]&=~1U;
  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP && !hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"requires-existing-svl"));cases++;
+ /* A failed isolated mode read still has its SVL bit set. It must not
+  * authorize a native domain in unknown (possibly IVL/PON-owned) state.
+  * Likewise report unknown hash policy as retryable I/O, not capability. */
+ const unsigned int lookup_regs[]={RTL_L2_VLAN_MODE_CONTROL,RTL_L2_FDB_HASH_CONTROL};
+ for(unsigned int i=0;i<ARRAY_SIZE(lookup_regs);i++) {
+  reset();model.corrupt_read_address=lookup_regs[i];model.corrupt_read_value=~0U;
+  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EIO);
+  assert(!hw.globals_owned && !hw.count && !hw.prepared && !hw.limits_owned);
+  assert(!model.commands && !memcmp(model.rows,original.rows,sizeof(model.rows)));
+  assert(model.reg[RTL_L2_VLAN_MODE_CONTROL/4]==original.reg[RTL_L2_VLAN_MODE_CONTROL/4]);
+  assert(model.reg[RTL_L2_FDB_HASH_CONTROL/4]==original.reg[RTL_L2_FDB_HASH_CONTROL/4]);
+  cpu_only();cases++;
+ }
  reset();model.rows[RTL_L2_TBL_IPPB][7][0]=0;
  assert(fe_switch_hw_prepare(&fe,&hw,3,300,false,true)==-EOPNOTSUPP&&!hw.globals_owned);
  assert(!strcmp(fe_switch_hw_reason_name(&hw),"foreign-source-alias"));cases++;
@@ -916,6 +929,11 @@ def main():
                 "!= RTL_NI_FRAME_WIRE_BYTES", "> 9201", 1),
             "missing_svl_guard": production.replace(
                 "!(hw->observed.vlan_mode & RTL_L2_VLAN_MODE_SVL)", "false", 1),
+            "unknown_lookup_mode_admitted": production.replace(
+                "hw->observed.vlan_mode == ~0U", "false"),
+            "unknown_hash_control_is_capability": production.replace(
+                "return hw->observed.hash_control == ~0U ? -EIO : -EOPNOTSUPP;",
+                "return -EOPNOTSUPP;", 1),
             "outside_learning_left_enabled": production.replace(
                 "rtl_l2_field_set(words, RTL_L2_ILPB_STP, stp & ~1U);", "/* omitted deliberately */", 1),
             "missing_reverse_route_gate": production.replace(
@@ -949,6 +967,8 @@ def main():
         }
         assert all(value != production for value in mutations.values())
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        environment = dict(os.environ)
+        environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
         for name, contents in [("production", production), *mutations.items()]:
             (build / HEADER.name).write_text(contents)
             subprocess.run([compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-O1", "-g",
@@ -956,7 +976,7 @@ def main():
                             "-fno-omit-frame-pointer", "-no-pie", "-I", str(build),
                             "-I", str(DRIVERS), str(build / "test.c"),
                             "-o", str(build / "test")], check=True)
-            result = subprocess.run([str(build / "test")], text=True, capture_output=True)
+            result = subprocess.run([str(build / "test")], env=environment, text=True, capture_output=True)
             if name == "production":
                 if result.returncode:
                     raise AssertionError(result.stderr)

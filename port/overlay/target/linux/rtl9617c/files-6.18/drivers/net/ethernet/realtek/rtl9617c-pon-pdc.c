@@ -3,6 +3,7 @@
 #include <linux/bitfield.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/rtl9617c-switch.h>
 #include "rtl9617c-pon.h"
 #include "rtl9617c-pon-data.h"
 
@@ -11,6 +12,8 @@
 #define PDC_ACCESS 0x9020
 #define PDC_DATA1 0x9024
 #define PDC_DATA0 0x9028
+#define PDC_EPON_LLID_TABLE 0x0064
+#define PDC_EPON_LLID_ACCESS 0x0168
 
 static int rtl_pdc_access(struct rtl9617c_pon *pon, unsigned int index, bool write)
 {
@@ -35,30 +38,44 @@ static int rtl_pdc_write(struct rtl9617c_pon *pon, unsigned int index,
 
 int rtl_pon_pdc_refresh(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
 	unsigned int index, bank;
-	int ret;
+	int ret = 0;
 
 	lockdep_assert_held(&pon->lock);
 	if (!pon->pdc_configured || !rtl_pon_mode_is_epon(pon->mode))
 		return 0;
 	for (index = 0; index < 64; index++) {
-		u32 source = rtl_pon_data_source(index, readl(pon->mac + 0x64 + index * 4));
+		u32 entry = readl(pon->mac + PDC_EPON_LLID_TABLE + index * 4);
+		u32 source;
+
+		if (entry == ~0U) {
+			ret = -EIO;
+			goto failed;
+		}
+		source = rtl_pon_data_source(index, entry);
 
 		if (pon->pdc_source[index] == source)
 			continue;
+		rtl_pon_policy_begin(pon, &policy);
 		for (bank = 0; bank < 2; bank++) {
 			ret = rtl_pdc_write(pon, index | (bank << 7),
 				(pon->fe_enabled ? 24 : 16) << 3 | (7 << 9) |
 				(pon->fe_enabled ? 0 : BIT(15)), (source - 32) << 4);
-			if (ret) {
-				pon->pdc_error = ret;
-				pon->pdc_configured = false;
-				return ret;
-			}
+			if (ret)
+				goto failed;
 		}
 		pon->pdc_source[index] = source;
 	}
-	return 0;
+	goto out;
+failed:
+	rtl_pon_policy_begin(pon, &policy);
+	pon->pdc_error = ret;
+	pon->pdc_configured = false;
+	rtl_pon_oam_carrier(pon);
+out:
+	rtl9617c_switch_policy_end(policy);
+	return ret;
 }
 
 static int rtl_pdc_itu_configure(struct rtl9617c_pon *pon)
@@ -87,7 +104,10 @@ static int rtl_pdc_itu_configure(struct rtl9617c_pon *pon)
 
 int rtl_pon_pdc_configure_locked(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
+	u32 llids[64], status;
 	unsigned int index;
+	bool epon_rebuild = false;
 	int ret = 0;
 
 	lockdep_assert_held(&pon->control_lock);
@@ -96,8 +116,8 @@ int rtl_pon_pdc_configure_locked(struct rtl9617c_pon *pon)
 		ret = -EAGAIN;
 		goto unlock;
 	}
-	pon->pdc_configured = false;
 	if (!rtl_pon_mode_is_epon(pon->mode)) {
+		pon->pdc_configured = false;
 		/* Prepare the original-packet CPU miss before admitting ITU data.
 		 * OMCI retains its dedicated CPU16 header container. */
 		if (!pon->fe_enabled) {
@@ -110,12 +130,29 @@ int rtl_pon_pdc_configure_locked(struct rtl9617c_pon *pon)
 		pon->pdc_configured = !ret;
 		goto unlock;
 	}
+	rtl_pon_policy_begin(pon, &policy);
+	epon_rebuild = true;
+	pon->pdc_configured = false;
+	/* A prior LLID timeout can complete after its caller returned. Do not
+	 * clear the sticky mapping fault merely because PDC itself is idle. */
+	status = readl(pon->mac + PDC_EPON_LLID_ACCESS);
+	if (status == ~0U || (status & BIT(0))) {
+		ret = status == ~0U ? -EIO : -EBUSY;
+		goto unlock;
+	}
+	for (index = 0; index < 64; index++) {
+		llids[index] = readl(pon->mac + PDC_EPON_LLID_TABLE + index * 4);
+		if (llids[index] == ~0U) {
+			ret = -EIO;
+			goto unlock;
+		}
+	}
 	/* CRC stays on the wire only; PDC inserts its original 16-byte control header. */
 	rtl_pon_update(pon->mac + PDC_CTRL, GENMASK(2, 0) | GENMASK(25, 16), 7);
 	for (index = 0; index < 256; index++) {
 		unsigned int entry = index & 63;
 		unsigned int source = index & BIT(6) ? 7 :
-			rtl_pon_data_source(entry, readl(pon->mac + 0x64 + entry * 4));
+			rtl_pon_data_source(entry, llids[entry]);
 		u32 data0 = (16 << 3) | (7 << 9) | BIT(15);
 
 		if (index & BIT(6))
@@ -130,11 +167,29 @@ int rtl_pon_pdc_configure_locked(struct rtl9617c_pon *pon)
 		if (ret)
 			goto unlock;
 	}
+	/* Neither a late command nor autonomous registration may change the
+	 * snapshot during reconstruction. Keep all data carriers down on a
+	 * mismatch; an ordinary MPCP refresh deliberately does not clear it. */
+	status = readl(pon->mac + PDC_EPON_LLID_ACCESS);
+	if (status == ~0U || (status & BIT(0))) {
+		ret = status == ~0U ? -EIO : -EBUSY;
+		goto unlock;
+	}
+	for (index = 0; index < 64; index++) {
+		status = readl(pon->mac + PDC_EPON_LLID_TABLE + index * 4);
+		if (status == ~0U || status != llids[index]) {
+			ret = status == ~0U ? -EIO : -EAGAIN;
+			goto unlock;
+		}
+	}
 	rtl_pon_update(pon->mac + PDC_COUNTER, GENMASK(2, 0), 0);
 	pon->pdc_configured = true;
 	dev_info(pon->dev, "PDC: 256 downstream map entries configured for native CPU16\n");
 unlock:
 	pon->pdc_error = ret;
+	if (epon_rebuild)
+		rtl_pon_oam_carrier(pon);
+	rtl9617c_switch_policy_end(policy);
 	mutex_unlock(&pon->lock);
 	return ret;
 }

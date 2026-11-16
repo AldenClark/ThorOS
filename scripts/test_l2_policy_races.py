@@ -558,9 +558,54 @@ static void namespace_move(void) {
  test_rtnl = false; cases++;
 }
 
+static void cross_namespace_upper(void) {
+ struct net fabric={0},other={0};
+ const struct Qdisc_ops noop={.id="noqueue"};struct Qdisc plain={.ops=&noop};
+ struct net_device lan={.net=&fabric,.qdisc=&plain};
+ struct net_device vlan={.net=&fabric,.qdisc=&plain},stacked={.net=&fabric,.qdisc=&plain};
+ struct switch_model model={.owned=&lan,.arm_succeeds=true};
+ struct rtl9617c_switch_guard guard={0};
+ lan.upper[0]=&vlan;lan.upper_count=1;vlan.lower[0]=&lan;vlan.lower_count=1;
+ vlan.upper[0]=&stacked;vlan.upper_count=1;stacked.lower[0]=&vlan;stacked.lower_count=1;
+ assert(!rtl9617c_switch_guard_register(&guard,&fabric,&scoped_operations,&model));
+ fresh_arm(&guard,&model);test_rtnl=true;
+ assert(!rtl9617c_switch_device_has_policy(&lan));
+ /* A movable VLAN upper retains an immutable physical lower. The core
+  * namespace move fence closes the old fabric BEFORE dev_net_set(). */
+ assert(rtl9617c_switch_move_begin(&vlan,&other)==&fabric);
+ assert(!model.open && fabric.rtl9617c_switch.active==1 && other.rtl9617c_switch.active==1);
+ vlan.net=&other;
+ rtl9617c_switch_policy_end(&other);rtl9617c_switch_policy_end(&fabric);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ model.arm_succeeds=!rtl9617c_switch_device_has_policy(&lan);
+ assert(!rtl9617c_switch_guard_try_arm(&guard,rtl9617c_switch_guard_generation(&guard)));
+ assert(!model.open);
+ /* A hook in the foreign namespace is not tracked by the fabric's guard;
+  * the structural veto must persist even when that namespace is idle. */
+ rtl9617c_switch_nf_block(&other);
+ assert(rtl9617c_switch_device_has_policy(&lan));rtl9617c_switch_nf_unblock(&other);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ assert(rtl9617c_switch_move_begin(&vlan,&fabric)==&other);vlan.net=&fabric;
+ rtl9617c_switch_policy_end(&fabric);rtl9617c_switch_policy_end(&other);
+ model.arm_succeeds=!rtl9617c_switch_device_has_policy(&lan);assert(model.arm_succeeds);
+ fresh_arm(&guard,&model);
+ /* Reject nested foreign uppers too, not only the immediate VLAN. After
+  * guarded unlink, an unrelated foreign device must not veto the fabric. */
+ assert(rtl9617c_switch_move_begin(&stacked,&other)==&fabric);stacked.net=&other;
+ rtl9617c_switch_policy_end(&other);rtl9617c_switch_policy_end(&fabric);
+ assert(rtl9617c_switch_device_has_policy(&lan));
+ struct net *scope=rtl9617c_switch_policy_begin(&vlan);assert(scope==&fabric);
+ vlan.upper_count=0;stacked.lower_count=0;rtl9617c_switch_policy_end(scope);
+ assert(!rtl9617c_switch_device_has_policy(&lan));model.arm_succeeds=true;
+ fresh_arm(&guard,&model);rtl9617c_switch_guard_unregister(&guard);
+ assert(!fabric.rtl9617c_switch.active && !other.rtl9617c_switch.active && !test_rcu_depth);
+ assert(!atomic_load(&fabric.references));test_rtnl=false;cases+=9;
+}
+
 int main(void) {
  basic_and_nested(); persistent_vetoes(); feedback_publication(); namespaces_and_poison();
  threaded_interleavings(); qdisc_policy(); device_scope(); ppp_without_adjacency(); namespace_move();
+ cross_namespace_upper();
  assert(list_empty(&rtl9617c_switch_guards));
  printf("L2 production gate: %u lifecycle/policy cases including 80 actual two-thread interleavings; stale epochs, nested scopes, late probe, persistent vetoes and namespace isolation PASS\n", cases);
  return 0;
@@ -578,6 +623,7 @@ def main():
         "stale_fdb_publish": ("state->generation == generation", "((void)generation, true)"),
         "unrelated_device_closes_all": ("if (!rtl9617c_switch_related(net, dev))", "if (!rtl9617c_switch_related(net, dev) && false)"),
         "upper_device_policy_bypassed": ("policy = netdev_walk_all_upper_dev_rcu", "policy = false && netdev_walk_all_upper_dev_rcu"),
+        "cross_namespace_upper_bypassed": ("dev_net(dev) != priv->data ||", "((void)priv, false) ||"),
     }
     environment = dict(os.environ)
     environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")

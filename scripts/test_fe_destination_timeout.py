@@ -97,6 +97,20 @@ static int req(void *p,unsigned int reg,unsigned int value){
  return 0;
 }
 static struct rtl_dq_io fe_io(struct rtl_fe *f){return (struct rtl_dq_io){f,rd,wr,req};}
+static void prepare_fdb_owner(struct rtl_fe *f){
+ struct rtl_dq_io io=fe_io(f);
+ /* This focused destination test starts after the global cold owner has
+  * stopped learning. Establish CMD through its real handoff helper, then
+  * resume learning: ordinary destination operations do not own this mode. */
+ assert(rtl_l2_fdb_command_mode(&io)==-EBUSY);
+ assert(!f->control && !f->writes && !f->commands);
+ wr(f,RTL_L2_FDB_CONTROL,RTL_L2_FDB_LEARN_DISABLE);
+ assert(!rtl_l2_fdb_command_mode(&io));
+ assert(f->control==(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE));
+ wr(f,RTL_L2_FDB_CONTROL,f->control&~RTL_L2_FDB_LEARN_DISABLE);
+ assert(f->writes==3 && !f->commands);
+ f->writes=f->commands=0; /* The fault oracle starts after owner handoff. */
+}
 '''
 test = r'''
 static bool ready(struct rtl_fe_flow *flow){
@@ -133,6 +147,7 @@ static void retiring_shared_owner(void){
  for(unsigned int retiring_first=0;retiring_first<2;retiring_first++)
  for(unsigned int permutation=0;permutation<6;permutation++) {
   struct rtl_fe f={0};struct rtl_fe_flow flows[3]={0};unsigned int original[4];
+  prepare_fdb_owner(&f);
   init(&f.flows);add(&flows[0].list,&f.flows);add(&flows[1].list,&f.flows);add(&flows[2].list,&f.flows);
   rtl_fe_fdb_key(original,mac);original[0]=(original[0]&~(255U<<11))|(37U<<11)|BIT(6);
   memcpy(f.table,original,sizeof(original));f.exists=existing;
@@ -164,6 +179,7 @@ static void retiring_shared_owner(void){
   * lookup/APPEND. A ready retiring row and an uncertain row both refuse. */
  for(unsigned int is_ready=0;is_ready<2;is_ready++) {
   struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};
+  prepare_fdb_owner(&f);
   init(&f.flows);add(&a.list,&f.flows);add(&b.list,&f.flows);
   assert(!fe_destination_get(&f,&a,mac));
 #ifdef INDEXED_DESTINATIONS
@@ -184,6 +200,7 @@ int main(void){
  const u8 mac[]={2,1,2,3,4,5};
  for(unsigned int existing=0;existing<2;existing++){
   struct rtl_fe f={0};struct rtl_fe_flow a={0},b={0};unsigned int original[4];
+  prepare_fdb_owner(&f);
   init(&f.flows);add(&a.list,&f.flows);add(&b.list,&f.flows);
   rtl_fe_fdb_key(original,mac);
   /* A legitimate old private reference may have refreshed/changed ageing

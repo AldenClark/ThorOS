@@ -48,7 +48,7 @@ COMMON = r'''
 typedef uint32_t u32;typedef uint64_t u64;typedef unsigned char u8;
 #define FE_LAN_PORTS 5
 #define ETH_ALEN 6
-#define HZ 100
+#define HZ 250
 #define USER_HZ 100
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h)))&(~0U<<(l)))
@@ -241,7 +241,9 @@ static void synchronize_net(void){assert(rtnl_held && !fe.lock && !sw.hw.open);s
 static int fe_switch_flush_routes_locked(struct rtl_fe *owner){
  assert(owner==&fe && fe.lock && rtnl_held && !sw.hw.open);route_flushes++;return flush_error;
 }
-static clock_t br_get_ageing_time(struct net_device *dev){assert(dev==&master);return ageing;}
+static int br_rtl9617c_fdb_hold_time(struct net_device *dev,unsigned long *ticks){
+ assert(dev==&master && ticks);if(ageing<0)return -EINVAL;*ticks=ageing;return 0;
+}
 static bool br_multicast_enabled(struct net_device *dev){assert(dev==&master);return true;}
 static int switchdev_bridge_port_offload(struct net_device *dev,struct net_device *brport,void *context,
  struct notifier_block *atomic,struct notifier_block *blocking,bool tx_fwd_offload,void *extack){
@@ -274,7 +276,7 @@ static int switchdev_bridge_port_offload(struct net_device *dev,struct net_devic
 }
 static int fe_switch_hw_prepare(struct rtl_fe *owner,struct rtl_fe_switch_hw *hw,u32 native,unsigned long seconds,bool snooping,bool route_allowed){
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && !hw->open && !sw.active);
- assert(fe.engine_ready && native==expected_native_ports() && seconds==(unsigned long)(ageing/USER_HZ) && snooping);prepares++;
+ assert(fe.engine_ready && native==expected_native_ports() && seconds==(unsigned long)(ageing/HZ) && snooping);prepares++;
  assert(route_allowed==sw.route_policy_allowed);
  hw->owned=true;hw->ports=native;return hw_error;
 }
@@ -282,7 +284,7 @@ static int fe_switch_hw_port_policy(struct rtl_fe *owner,struct rtl_fe_switch_hw
  assert(owner==&fe && hw==&sw.hw && fe.lock && rtnl_held && hw->owned && !hw->open && !sw.active);
  unsigned int expected_learning=0,expected_isolated=0;
  for(unsigned int i=0;i<5;i++)if(hw->ports&BIT(i)){
-  if(configured_flags[i]&BR_LEARNING)expected_learning|=BIT(i);
+  if(ageing && (configured_flags[i]&BR_LEARNING))expected_learning|=BIT(i);
   if(configured_flags[i]&BR_ISOLATED)expected_isolated|=BIT(i);
  }
  assert(learning==expected_learning && isolated==expected_isolated);port_policies++;
@@ -314,7 +316,7 @@ static void setup(void){
  for(unsigned int i=0;i<5;i++){ports[i].index=i;configured_flags[i]=BR_LEARNING;configured_states[i]=BR_STATE_FORWARDING;}
  bridge_count=publish_calls=publish_successes=unpublish_calls=rules_reuses=port_policies=0;
  fail_publish_at=change_before_publish_at=change_after_publish_at=publish_change=extra_replay_rows=0;next_cookie=0;
- policy_reason=FE_SWITCH_OK;ageing=300*USER_HZ;
+ policy_reason=FE_SWITCH_OK;ageing=300*HZ;
  closures=restores=unoffloads=snapshots=syncs=route_flushes=offloads=prepares=claims=appends=arms=scheduled=last_delay=0;
  restore_fail_at=offload_fail_at=append_fail_at=replay_error_at=change_in_sync=change_in_replay=0;
  hw_error=domain_error=flush_error=port_policy_error=0;rtnl_held=arm_failure=epoch_during_append=additional_policy=false;
@@ -330,7 +332,7 @@ TEST = r'''
 static void success_and_policy(void){
  setup();run();assert(sw.active && sw.hw.open && sw.flow_allowed && fe.route_admitted);
  assert(sw.native_mask==3 && sw.route_mask==28 && sw.armed_route_mask==28 && sw.offloaded==3);
- assert(prepares==1 && claims==1 && appends==2 && route_flushes==1 && sw.rebuilds==1 && last_delay==HZ && sw.local_target==25);
+ assert(prepares==1 && claims==1 && appends==3 && route_flushes==1 && sw.rebuilds==1 && last_delay==HZ && sw.local_target==25);
  assert(port_policies==1 && sw.published_count==2 && publish_successes==2 && bridge_owned_count()==2);
  assert(sw.route_generation_valid && sw.route_generation==1);
  run();assert(sw.active && sw.rebuilds==2 && route_flushes==1); /* Same epoch does not churn routed owners. */
@@ -375,17 +377,20 @@ static void success_and_policy(void){
 static void replay_to_publication(void){
  /* First activation must install both the local row and the allowed
   * sticky/static destination; clearing native_mask must not discard it. */
- setup();run();assert(appends==2 && sw.native_mask==3 && !invalidates);
+ setup();run();assert(appends==3 && sw.native_mask==3 && !invalidates);
  assert(installed[0].mac[5]==10 && installed[0].destination==25);
  assert(installed[1].mac[5]==11 && installed[1].destination==1);
- for(unsigned int i=0;i<2;i++)assert(installed[i].valid && installed[i].is_static);
+ assert(installed[2].mac[5]==12 && installed[2].destination==16);
+ assert(!bridge_rows[2].cookie && sw.rule_count==3 && sw.published_count==2);
+ for(unsigned int i=0;i<3;i++)assert(installed[i].valid && installed[i].is_static);
  /* New snapshot moves the static output and excludes the old/down port;
   * switchdev still replays the down port's entry for every online port. */
  online_ports=5;static_port=2;offline_port=1;sw.guard.generation++;run();
- assert(appends==4 && sw.native_mask==5 && sw.offloaded==5 && !invalidates);
- assert(installed[2].mac[5]==10 && installed[2].destination==25);
- assert(installed[3].mac[5]==11 && installed[3].destination==2);
- for(unsigned int i=0;i<appends;i++)assert(installed[i].mac[5]!=12 && installed[i].mac[5]!=13);
+ assert(appends==6 && sw.native_mask==5 && sw.offloaded==5 && !invalidates);
+ assert(installed[3].mac[5]==10 && installed[3].destination==25);
+ assert(installed[4].mac[5]==11 && installed[4].destination==2);
+ assert(installed[5].mac[5]==12 && installed[5].destination==16 && !bridge_rows[2].cookie);
+ for(unsigned int i=0;i<appends;i++)assert(installed[i].mac[5]!=13);
  /* A later failed rebuild cannot publish the pending mask or retain an
   * earlier active generation merely because its first local row worked. */
  append_fail_at=appends+2;sw.guard.generation++;run();
@@ -402,8 +407,8 @@ static void transaction_failures(void){
  setup();sw.hw.owned=sw.domain_owned=true;restore_fail_at=1;run();
  assert(sw.hw.owned && sw.domain_owned && !sw.hw.open && !snapshots && !arms && sw.error==-ETIMEDOUT);
  setup();flush_error=-ETIMEDOUT;run();assert(!sw.hw.open && !prepares && !arms && sw.error==-ETIMEDOUT);
- const clock_t invalid_age[]={0,-1,USER_HZ-1,((clock_t)1<<19)*USER_HZ};
- for(unsigned int i=0;i<4;i++){
+ const clock_t invalid_age[]={-1,1,HZ-1,((clock_t)1<<19)*HZ};
+ for(unsigned int i=0;i<ARRAY_SIZE(invalid_age);i++){
   setup();ageing=invalid_age[i];run();
   assert(sw.hw.open && sw.flow_allowed && !sw.active && !prepares && !claims && !offloads &&
    arms==1 && sw.armed_route_mask==31 && sw.reason==FE_SWITCH_AGING_UNSUPPORTED && !sw.error);
@@ -416,7 +421,7 @@ static void transaction_failures(void){
   assert(!sw.hw.open && !sw.flow_allowed && !sw.active && !offloads && sw.error==-EAGAIN &&
    sw.reason==FE_SWITCH_GUARDED && fe_switch_needs_recovery(&fe));
  }
- const clock_t valid_age[]={USER_HZ,((clock_t)((1U<<19)-1))*USER_HZ};
+ const clock_t valid_age[]={0,HZ,((clock_t)((1U<<19)-1))*HZ};
  for(unsigned int i=0;i<ARRAY_SIZE(valid_age);i++){
   setup();ageing=valid_age[i];run();assert(sw.hw.open && sw.active && prepares==1 && sw.reason==FE_SWITCH_OK);
  }
@@ -468,7 +473,7 @@ static void independent_port_policies(void){
  }
  /* Keep every online member in the route-policy snapshot, but replay and
   * prepare only the forwarding subset. Local MACs remain CPU reachable;
-  * a blocked port's static destination must not enter the silicon table. */
+  * a blocked port's static key must instead pin a CPU-only trap. */
  for(unsigned int blocked=0;blocked<5;blocked++)for(unsigned int state=0;state<=BR_STATE_BLOCKING;state++){
   if(state==BR_STATE_FORWARDING)continue;
   setup();online_ports=31;configured_states[blocked]=state;run();
@@ -476,9 +481,11 @@ static void independent_port_policies(void){
   assert(sw.active && sw.native_mask==expected && sw.offloaded==expected && sw.hw.ports==expected);
   assert(sw.hw.learning_mask==expected && !sw.hw.isolated_mask && !sw.route_policy_allowed);
   assert(!sw.flow_allowed && !fe.route_admitted && !sw.route_mask && !sw.armed_route_mask && sw.local_target==16);
-  assert(appends==count && publish_successes==count && sw.published_count==count && offloads==4);
+  assert(appends==3 && publish_successes==count && sw.published_count==count && offloads==4);
   assert(installed[0].destination==16);
   for(unsigned int i=1;i<appends;i++)assert(installed[i].destination!=blocked);
+  assert(installed[1].destination==(blocked==static_port?16U:static_port));
+  assert(installed[2].destination==(blocked==offline_port?16U:offline_port));
  }
  for(unsigned int restriction=0;restriction<3;restriction++){
   setup();sw.requested=false;
@@ -491,6 +498,14 @@ static void independent_port_policies(void){
  assert(sw.reason==FE_SWITCH_NO_BRIDGE && !arms && !offloads && !sw.active && !sw.flow_allowed);
  setup();configured_states[1]=BR_STATE_BLOCKING+1;run();
  assert(sw.reason==FE_SWITCH_PORT_POLICY && !arms && !offloads && !sw.active && !sw.flow_allowed);
+ /* ageing_time=0 is a supported static-only hardware bridge, not
+  * infinite-lifetime dynamic learning. Every transition is rebuilt. */
+ setup();run();assert(sw.hw.learning_mask==3);
+ ageing=0;sw.guard.generation++;run();
+ assert(sw.active && sw.native_mask==3 && !sw.hw.learning_mask && sw.flow_allowed);
+ assert(sw.rule_count==3 && sw.published_count==2 && bridge_owned_count()==2);
+ ageing=15*HZ;sw.guard.generation++;run();
+ assert(sw.active && sw.hw.learning_mask==3 && sw.published_count==2);
 }
 static void static_feedback_ownership(void){
  for(unsigned int failure=1;failure<=2;failure++){
@@ -534,22 +549,22 @@ static void static_feedback_ownership(void){
 static void static_capacity_boundaries(void){
  const unsigned int sizes[]={4095,4096,4097,RTL_L2_FDB_ENTRIES};
  for(unsigned int i=0;i<ARRAY_SIZE(sizes);i++){
-  setup();extra_replay_rows=sizes[i]-2;run();
+  setup();online_ports=31;extra_replay_rows=sizes[i]-3;run();
   assert(sw.active && sw.rule_count==sizes[i] && sw.published_count==sizes[i] && appends==sizes[i]);
-  assert(publish_successes==sizes[i] && bridge_owned_count()==sizes[i] && offloads==2);
+  assert(publish_successes==sizes[i] && bridge_owned_count()==sizes[i] && offloads==5);
   for(unsigned int slot=0;slot<sw.published_count;slot++)assert(published[slot].cookie);
   /* Existing large tables are restored before a policy-only CPU fallback,
    * and withdrawal never decodes the overwritten rules scratch buffer. */
   sw.requested=false;run();assert(!sw.active && !sw.published_count && unpublish_calls==sizes[i] && !bridge_owned_count());
  }
- setup();extra_replay_rows=RTL_L2_FDB_ENTRIES-1;run();
+ setup();online_ports=31;extra_replay_rows=RTL_L2_FDB_ENTRIES-2;run();
  assert(!sw.active && !sw.hw.open && !prepares && !claims && !appends && !publish_calls && !sw.offloaded);
  assert(sw.error==-ENOSPC && sw.reason==FE_SWITCH_FDB_CAPACITY);
  /* The rollback prefix itself crosses the 4096 boundary, not only the
   * successful append/publication path. Every acquired cookie is released. */
  const unsigned int failures[]={4096,RTL_L2_FDB_ENTRIES};
  for(unsigned int i=0;i<ARRAY_SIZE(failures);i++){
-  setup();extra_replay_rows=RTL_L2_FDB_ENTRIES-2;fail_publish_at=failures[i];run();
+  setup();online_ports=31;extra_replay_rows=RTL_L2_FDB_ENTRIES-3;fail_publish_at=failures[i];run();
   assert(!sw.active && !sw.hw.open && !sw.offloaded && !sw.published_count && !bridge_owned_count());
   assert(appends==RTL_L2_FDB_ENTRIES && publish_successes==failures[i]-1 && unpublish_calls==failures[i]-1);
   assert(rules_reuses==1 && !scheduled && !sw.rebuilds && sw.error==-ENOMEM);
@@ -637,8 +652,8 @@ mutants = {
     "rebuild_retains_same_generation_scan": functions.replace(
         "\tfe_switch_scan_reset(sw);", "\tif (0) fe_switch_scan_reset(sw);"),
     "native_aging_disables_independent_routing": functions.replace(
-        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tgoto arm;",
-        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tgoto unlock;", 1),
+        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tret = 0;\n\t\tgoto arm;",
+        "\t\tsw->reason = FE_SWITCH_AGING_UNSUPPORTED;\n\t\tret = 0;\n\t\tgoto unlock;", 1),
     "native_capability_disables_routing": replace_once(
         functions, route_assignment,
         "\tsw->route_policy_allowed = fe_switch_route_plan_validate(&plan) == FE_SWITCH_OK && sw->reason == FE_SWITCH_OK;"),
@@ -660,13 +675,24 @@ mutants = {
         functions, "\t\tBR_BPDU_FILTER;", "\t\tBR_BPDU_FILTER | BR_ISOLATED;"),
     "learning_off_authorizes_route_bypass": replace_once(
         functions, "\t\t    !(plan->flags[port] & BR_LEARNING) ||\n", ""),
+    "zero_age_still_learns": replace_once(
+        functions, "\t\tseconds ? fe_switch_flag_ports(&plan, native_ports, BR_LEARNING) : 0,",
+        "\t\tfe_switch_flag_ports(&plan, native_ports, BR_LEARNING),"),
     "failed_port_policy_ignored": replace_once(
         functions, "\t\tfe_switch_flag_ports(&plan, native_ports, BR_ISOLATED));\n\tif (ret) {",
         "\t\tfe_switch_flag_ports(&plan, native_ports, BR_ISOLATED));\n\tret = 0;\n\tif (ret) {"),
     "static_stage_not_called": replace_once(
         functions, "\tfe_switch_static_stage(sw);", "\tif (0) fe_switch_static_stage(sw);"),
     "static_stage_reuses_old_cookie": replace_once(
-        functions, "\t\tsw->published[i].cookie = 0;\n", ""),
+        functions, "\t\tsw->published[count].cookie = 0;\n", ""),
+    "blocked_static_key_omitted": replace_once(
+        functions, "\ttrap = !info->is_local && !(sw->replay_ports & BIT(port));",
+        "\ttrap = !info->is_local && !(sw->replay_ports & BIT(port));\n\tif (trap) return 0;"),
+    "blocked_static_key_sent_to_l3": replace_once(
+        functions, "\t\ttrap ? 16 : (unsigned int)port;", "\t\ttrap ? sw->local_target : (unsigned int)port;"),
+    "trap_only_static_falsely_published": replace_once(
+        functions, "\t\tif (sw->replay_traps[i / 32] & BIT(i % 32))",
+        "\t\tif (false && (sw->replay_traps[i / 32] & BIT(i % 32)))"),
     "static_publication_decodes_reused_rules": replace_once(
         functions, "\t\tstruct fe_switch_published *row = &sw->published[i];",
         "\t\tstruct fe_switch_published *row = &sw->published[i];\n"

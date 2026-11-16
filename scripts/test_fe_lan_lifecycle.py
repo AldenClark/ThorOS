@@ -78,7 +78,7 @@ struct rtl_fe {
  unsigned int commands,fail_command,base_writes;
  unsigned int bus_fault_register,bus_fault_nth,bus_fault_reads,bus_fault_writes;
  bool bus_fault_seen;
- int switch_error;bool switch_recovery;
+ int switch_error;bool switch_recovery,switch_returns_cmd;
  unsigned int expected_lan[5];
 };
 static unsigned int fe_read(void *ctx,unsigned int reg){
@@ -158,7 +158,9 @@ static int rtl_fabric_check(const struct rtl_dq_io *io,struct rtl_fabric *fabric
  (void)io;fabric->checks++;return fabric->check_error;
 }
 static __attribute__((unused)) int fe_switch_quiesce_locked(struct rtl_fe *f){
- assert(f->lock.held);f->switch_quiesces++;return f->switch_error;
+ assert(f->lock.held);f->switch_quiesces++;
+ if(!f->switch_error && f->switch_returns_cmd)f->fabric.check_error=0;
+ return f->switch_error;
 }
 static __attribute__((unused)) void fe_switch_reconcile_locked(struct rtl_fe *f){
  assert(f->lock.held);f->switch_reconciles++;
@@ -522,6 +524,28 @@ int main(void) {
  unsigned int fabric_writes=f.base_writes;
  assert(rtl_fe_engine_resume(&f)==-EIO);check_poisoned(&f);
  assert(f.fabric.checks==1 && f.base_writes==fabric_writes);drifts++;
+ /* A native owner can retain a late limit command over a failed suspend.
+  * Resume must give that owner recovery before checking the shared CMD
+  * baseline, even if ACCESS became idle but its mode0 lease is retained. */
+ f=base;f.fabric.ready=true;f.switch_error=-EBUSY;
+ assert(rtl_fe_engine_suspend(&f)==-EBUSY && !f.engine_ready);
+ f.fabric.check_error=-EOPNOTSUPP;
+ unsigned int before_checks=f.fabric.checks,before_writes=f.base_writes;
+ assert(rtl_fe_engine_resume(&f)==-EBUSY);
+ assert(f.fabric.checks==before_checks && f.base_writes==before_writes);
+ assert(!f.base_failed && !f.shutting_down && !f.engine_ready);
+ f.switch_error=0;f.switch_returns_cmd=true;
+ assert(!rtl_fe_engine_resume(&f) && f.engine_ready);
+ assert(!f.base_failed && !f.shutting_down && f.fabric.checks>before_checks);
+ failures++;
+ /* An observer finding a currently busy owner also leaves recovery live;
+  * it may gate packets, but cannot mark its base permanently invalid. */
+ f=base;assert(!rtl_fe_engine_suspend(&f));f.fabric.ready=true;f.fabric.check_error=-EBUSY;
+ before_writes=f.base_writes;
+ assert(rtl_fe_engine_resume(&f)==-EBUSY && !f.engine_ready);
+ assert(!f.base_failed && !f.shutting_down && f.base_writes==before_writes);
+ check_cpu_gate(&f);f.fabric.check_error=0;
+ assert(!rtl_fe_engine_resume(&f));failures++;
  f=cold;f.fabric.poisoned=true;
  assert(rtl_fe_enable(&f)==-EIO && !f.prepared && !f.base_writes);failures++;
  f=cold;f.fabric.ready=true;

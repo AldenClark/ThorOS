@@ -90,6 +90,7 @@ struct rtl_fe {struct list_head ports;bool enabled;};
 struct rtl_fe_bridge {
  struct rtl_fe *fe;struct net_device *ports[5],*master;u32 route_mask,native_mask,replay_ports;
  unsigned int local_target,rule_count,rules[RTL_L2_FDB_ENTRIES][RTL_L2_FDB_WORDS];
+ unsigned int replay_traps[(RTL_L2_FDB_ENTRIES+31)/32];
 };
 struct switchdev_notifier_info {struct net_device *dev;};
 struct switchdev_notifier_fdb_info {
@@ -222,22 +223,27 @@ static void replay_mask(void){
   setup(31,5);expect(FE_SWITCH_OK,5,5);sw.replay_ports=plan.ports;
   u8 mac[6]={2,0,0,0,0,(u8)(port+1)};
   struct switchdev_notifier_fdb_info info={.info={.dev=&lan[port]},.added_by_user=true,.addr=mac};
-  assert(!fe_switch_replay_fdb(&sw,&info));assert(sw.rule_count==!!(5&BIT(port)));
-  if(sw.rule_count){rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==port);}
+  assert(!fe_switch_replay_fdb(&sw,&info));assert(sw.rule_count==1);
+  rtl_l2_fdb_decode(sw.rules[0],&decoded);
+  assert(decoded.destination==((5&BIT(port))?port:16));
+  assert(decoded.valid && decoded.is_static);
+  assert(!!(sw.replay_traps[0]&1)==!(5&BIT(port)));
   /* A local address remains CPU-owned even when its physical member is
    * offline; omitting it could instead make it a hardware UC destination. */
   sw.rule_count=0;info.is_local=true;assert(!fe_switch_replay_fdb(&sw,&info));
-  assert(sw.rule_count==1);rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==25);cases++;
+  assert(sw.rule_count==1 && !(sw.replay_traps[0]&1));
+  rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==25);cases++;
  }
  setup(31,1);expect(FE_SWITCH_NO_BRIDGE,1,1);sw.replay_ports=0;
  u8 mac[6]={2,0,0,0,0,1};
  struct switchdev_notifier_fdb_info info={.info={.dev=&lan[0]},.added_by_user=true,.addr=mac};
- assert(!fe_switch_replay_fdb(&sw,&info) && !sw.rule_count);
+ assert(!fe_switch_replay_fdb(&sw,&info) && sw.rule_count==1);
+ rtl_l2_fdb_decode(sw.rules[0],&decoded);assert(decoded.destination==16 && (sw.replay_traps[0]&1));
  info.info.dev=&foreign;assert(fe_switch_replay_fdb(&sw,&info)==-EOPNOTSUPP);
  info.info.dev=&lan[0];info.is_local=true;assert(!fe_switch_replay_fdb(&sw,&info) && sw.rule_count==1);cases++;
 }
 int main(void){online_matrix();topology_and_policy();replay_mask();
- printf("Production L2 topology: %u snapshots/replay cases; online membership, STP forwarding subset, independent route veto and offline FDB exclusion passed\n",cases);return 0;}
+ printf("Production L2 topology: %u snapshots/replay cases; online membership, STP forwarding subset, independent route veto and offline static-key CPU protection passed\n",cases);return 0;}
 '''
 
 declarations = re.search(r"enum fe_switch_reason \{.*?\n\};", source, re.S).group()

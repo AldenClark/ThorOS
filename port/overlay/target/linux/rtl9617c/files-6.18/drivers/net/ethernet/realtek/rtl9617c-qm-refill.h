@@ -7,14 +7,17 @@
 struct rtl_qm_refill {
 	unsigned int address[RTL_QM_CPU_EQ_COUNT][RTL_QM_REFILL_SIZE];
 	unsigned int head[RTL_QM_CPU_EQ_COUNT], count[RTL_QM_CPU_EQ_COUNT], pending;
-	unsigned int retries, returned, peak;
+	unsigned long long retries, returned;
+	unsigned int peak;
 	/* All counters are NAPI-owner only. Per-EQ pressure distinguishes a
 	 * single starved pool from global CPU/BID exhaustion; the aggregate
 	 * counts alone cannot identify the blocked physical return path. */
-	unsigned int eq_retries[RTL_QM_CPU_EQ_COUNT];
-	unsigned int eq_returned[RTL_QM_CPU_EQ_COUNT];
+	unsigned long long eq_retries[RTL_QM_CPU_EQ_COUNT];
+	unsigned long long eq_returned[RTL_QM_CPU_EQ_COUNT];
 	unsigned int eq_peak[RTL_QM_CPU_EQ_COUNT];
-	unsigned int eq_full_stalls[RTL_QM_CPU_EQ_COUNT];
+	unsigned long long eq_full_stalls[RTL_QM_CPU_EQ_COUNT];
+	unsigned long long eq_bad_credit[RTL_QM_CPU_EQ_COUNT];
+	unsigned long long eq_bad_ready[RTL_QM_CPU_EQ_COUNT];
 	unsigned int credit[RTL_QM_CPU_EQ_COUNT];
 };
 

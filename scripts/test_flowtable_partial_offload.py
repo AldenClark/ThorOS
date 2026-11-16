@@ -61,6 +61,7 @@ enum {IPS_OFFLOAD_BIT,IPS_HW_OFFLOAD_BIT};
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define atomic_read(p) (*(p))
 #define smp_rmb() __asm__ __volatile__("" ::: "memory")
+#define smp_load_acquire(p) (*(p))
 #define BIT(n) (1UL<<(n))
 #define test_bit(n,p) (!!(*(p)&BIT(n)))
 #define set_bit(n,p) (*(p)|=BIT(n))
@@ -78,7 +79,7 @@ static bool try_cmpxchg(u32 *p,u32 *old,u32 value){if(*p==*old){*p=value;return 
 #define jiffies fixture_jiffies()
 struct netlink_ext_ack {int unused;};
 struct flow_stats {u64 lastused,pkts,bytes;};
-struct net_device {unsigned type,ppp_channel_generation,references;};
+struct net_device {unsigned type,ppp_channel_generation,references;bool moving_ns;};
 struct dst_entry {struct net_device *dev;};
 struct flow_offload_tuple {unsigned dir,xmit_type,mtu;
  struct {struct dst_entry *route_dst;u32 ppp_cookie;}out;};

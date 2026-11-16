@@ -2,6 +2,7 @@
 #ifndef RTL9617C_FE_PIPELINE_H
 #define RTL9617C_FE_PIPELINE_H
 #include "rtl9617c-fe-table.h"
+#include "rtl9617c-l2-table.h"
 
 struct rtl_fe_cam_protocol {
  unsigned int saved[5];
@@ -265,33 +266,43 @@ static inline void rtl_fe_fdb_key(unsigned int words[4],const unsigned char mac[
  /* CPU is a defensive destination only, never the domain-isolation guard. */
  words[0]=RTL_FE_FDB_PIN_PORT|(1U<<9)|(255U<<11)|(1U<<19)|(1U<<20)|(1U<<21);
 }
+/* Final FE-owner handback only, after every exposure and callback owner is
+ * gone. This is never an ordinary flow or warm-mode operation. Preserve live
+ * scan edges and validate both shared windows before/after a mode write. */
+static inline int rtl_fe_fdb_restore_mode(const struct rtl_dq_io *io,
+                                         unsigned int saved_mode)
+{
+ unsigned int control,expected;
+ int ret=rtl_l2_fdb_control_read(io,&control);
+
+ if(ret)return ret;
+ expected=(control&~RTL_L2_FDB_CMD_MODE)|(saved_mode&RTL_L2_FDB_CMD_MODE);
+ if(expected==control)return 0;
+ if(!(control&RTL_L2_FDB_LEARN_DISABLE))return -EBUSY;
+ io->write(io->context,RTL_L2_FDB_CONTROL,expected);
+ return rtl_l2_fdb_mode_verify(io,expected);
+}
+
 static inline int rtl_fe_fdb_command(const struct rtl_dq_io *io,unsigned int command,unsigned int words[4],unsigned int *result)
 {
- unsigned int i,control;
- int ret=rtl_fe_window_idle(io,0x1ca0);
+ struct rtl_l2_fdb_result next;
+ unsigned int i;
+ int ret;
+
+ if(!words || !result)return -EINVAL;
+ /* The shared cold fabric owner establishes CMD mode before publishing
+  * either L2 or L3. Ordinary route installs must not acquire a second,
+  * stateless mode lease: an unchecked RMW can steal an indirect MAC-limit
+  * transaction, and replaying its old control word can retrigger an age
+  * scan. Reuse the same validated command path as native switching. It
+  * permits live autonomous learning, but rejects wrong/unknown mode and
+  * preserves the current scan-toggle without ANY global control writes.
+  * Only the fabric owner may recover mode after a late limit operation. */
+ ret=rtl_l2_fdb_command(io,(enum rtl_l2_fdb_command)command,0,words,&next);
  if(ret)return ret;
- /* The MAC-limit window leases the same cpu_opt_mode in indirect mode.
-  * A late limit command remains active after its owner drops the mutex;
-  * neither the mode nor FDB DATA may be changed until both windows idle. */
- ret=rtl_fe_window_idle(io,0x1cb4);
- if(ret)return ret;
- control=io->read(io->context,0x1c00);
- io->write(io->context,0x1c00,control|0x80000000U);
- for(i=0;i<4;i++)io->write(io->context,0x1cb0-i*4,words[i]);
- io->write(io->context,0x1c2c,0);
- ret=io->indirect(io->context,0x1ca0,0x80000000U|command);
- if(ret)return ret;
- /* A timeout is not cancellation: switching cpu_opt_mode while the FDB
-  * command is still running changes the interpretation of its shared window.
-  * The fabric owner retains the original mode across a failed transaction;
-  * this stateless helper must not guess it during a later retry. */
- ret=rtl_fe_window_idle(io,0x1ca0);
- if(ret)return ret;
- ret=rtl_fe_window_idle(io,0x1cb4);
- if(ret)return ret;
- io->write(io->context,0x1c00,control);
- *result=io->read(io->context,0x1c2c);
- for(i=0;i<4;i++)words[i]=io->read(io->context,0x1cb0-i*4);
+ if(command==RTL_L2_FDB_READ && next.status==RTL_L2_FDB_STATUS_HIT)
+  for(i=0;i<RTL_L2_FDB_WORDS;i++)words[i]=next.words[i];
+ *result=next.raw;
  return 0;
 }
 #endif

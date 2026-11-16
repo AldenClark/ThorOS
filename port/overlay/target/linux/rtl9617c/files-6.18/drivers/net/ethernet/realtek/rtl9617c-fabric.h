@@ -53,14 +53,20 @@ static inline int rtl_fabric_match(const struct rtl_dq_io *io,
 static inline int rtl_fabric_check(const struct rtl_dq_io *io,
 				   struct rtl_fabric *fabric)
 {
-	unsigned int i;
+	unsigned int i, control;
 	int ret;
 
 	if (!rtl_l2_io_valid(io) || !fabric)
 		return -EINVAL;
 	if (!fabric->ready || fabric->poisoned)
 		return -EIO;
-	ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, 0x1fU,
+	/* Native L2 may enable autonomous learning, but the FE lifetime keeps
+	 * CMD mode. Never recover a late MAC-limit lease from a warm observer. */
+	ret = rtl_l2_fdb_control_read(io, &control);
+	if (!ret && !(control & RTL_L2_FDB_CMD_MODE))
+		ret = -EOPNOTSUPP;
+	if (!ret)
+		ret = rtl_fabric_match(io, fabric, RTL_L2_VLAN_MODE_CONTROL, 0x1fU,
 			       fabric->vlan_mode);
 	if (!ret)
 		ret = rtl_fabric_match(io, fabric, RTL_FABRIC_FRAME_LENGTH,
@@ -420,11 +426,15 @@ restore:
 		if (cleanup)
 			fabric->poisoned = 1;
 	}
-	/* A successful shared baseline keeps learning stopped. The native
-	 * owner may later enable only its prepared ports; software-only paths
-	 * remain on CPU bypass. Failed acquisition restores inherited policy. */
+	/* Successful cold handoff belongs to the FE lifetime, including route-
+	 * only configurations which never prepare native L2. Keep CMD leased
+	 * while learning is stopped and both windows are idle. Native L2 takes
+	 * its later snapshot from this CMD baseline and returns to it on exit.
+	 * Only final, proven-unexposed FE release may return the boot CMD bit.
+	 * Failed acquisition still restores inherited policy, not the new lease. */
 	if (lease && !fabric->poisoned && rtl_fabric_restore_command(io, fabric, ret ?
-		fabric->saved_control : fabric->saved_control | RTL_L2_FDB_LEARN_DISABLE))
+		fabric->saved_control : fabric->saved_control |
+		RTL_L2_FDB_LEARN_DISABLE | RTL_L2_FDB_CMD_MODE))
 		fabric->poisoned = 1;
 	if (fabric->poisoned) {
 		fabric->error = ret ? ret : -EIO;
@@ -435,7 +445,8 @@ restore:
 	fabric->vlan_mode = fabric->original_vlan_mode | RTL_L2_VLAN_MODE_SVL;
 	fabric->ready = 1;
 	fabric->changed = !!(vlan_written || frame_written || oversize_written ||
-		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE));
+		selector_changed || !(fabric->saved_control & RTL_L2_FDB_LEARN_DISABLE) ||
+		!(fabric->saved_control & RTL_L2_FDB_CMD_MODE));
 	for (i = 0; i < RTL_FABRIC_LAN_PORTS; i++)
 		fabric->changed |= !!(fabric->original_mac_rx[i] & RTL_FABRIC_RX_MAC_ENABLE);
 	fabric->error = 0;

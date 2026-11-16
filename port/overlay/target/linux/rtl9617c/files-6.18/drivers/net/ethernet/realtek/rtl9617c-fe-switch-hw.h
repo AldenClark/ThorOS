@@ -811,13 +811,18 @@ static int fe_switch_hw_prepare(struct rtl_fe *fe, struct rtl_fe_switch_hw *hw,
 	 * this from ILPB PVID fields or from a late classifier tag redirect.
 	 * Preserve PON's global mode: an existing IVL engine is unsupported,
 	 * never silently converted and never globally flushed. */
-	if (!(hw->observed.vlan_mode & RTL_L2_VLAN_MODE_SVL)) {
+	if (hw->observed.vlan_mode == ~0U ||
+	    !(hw->observed.vlan_mode & RTL_L2_VLAN_MODE_SVL)) {
 		hw->reason = FE_SW_HW_VLAN_MODE;
-		return -EOPNOTSUPP;
+		/* All-ones is not proof of SVL merely because that bit is set.
+		 * Unknown shared lookup state is a retryable read failure, never
+		 * permission to own the VID0 namespace or rewrite global mode. */
+		return hw->observed.vlan_mode == ~0U ? -EIO : -EOPNOTSUPP;
 	}
-	if (hw->observed.hash_control & RTL_L2_FDB_HASH_USE_PRIORITY) {
+	if (hw->observed.hash_control == ~0U ||
+	    (hw->observed.hash_control & RTL_L2_FDB_HASH_USE_PRIORITY)) {
 		hw->reason = FE_SW_HW_PRIORITY_KEY;
-		return -EOPNOTSUPP;
+		return hw->observed.hash_control == ~0U ? -EIO : -EOPNOTSUPP;
 	}
 	/* ILPB match bits1..3 select fixed 88a8/9100/8100 recognisers.
 	 * All are enabled by native_ilpb, regardless of the user comparator

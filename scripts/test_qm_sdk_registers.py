@@ -56,6 +56,7 @@ names = [f'QM_QM_CFG{i}_EQ0_t' for i in range(5)] + [
     'QM_QM_UPPER_LDPID_MAP_t', 'QM_QM_CPU_EPP_FIFO_CFG_profile0_t',
     'QM_QM_CPU_EPP_FIFO0_0_CFG_t', 'QM_QM_AXI_ATTRIBUTE_DATA0_t',
     'QM_QM_AXI_ATTRIBUTE_DATA1_t', 'QM_QM_AXI_ATTRIBUTE_ACCESS_t',
+    'QM_QM_EQM_PA_REQ0_t', 'QM_QM_CPU_PUSH_RDY0_t',
     'TE_CB_PORT_THRSH_PROFILE0_t', 'TE_CB_PORT_FREECNT_MEM_DATA_t',
     'TE_CB_VOQ_THRSH_PROFILE_MEM_DATA0_t',
     'TE_CB_VOQ_THRSH_PROFILE_MEM_DATA1_t',
@@ -67,6 +68,8 @@ addresses = {
     'QM_QM_CPU_EPP_FIFO_CFG_profile0': 0x657c, 'QM_QM_CPU_EPP_FIFO0_0_CFG': 0x65a4,
     'QM_QM_AXI_ATTRIBUTE_ACCESS': 0x66a4, 'QM_QM_AXI_ATTRIBUTE_DATA1': 0x66a8,
     'QM_QM_AXI_ATTRIBUTE_DATA0': 0x66ac,
+    'QM_QM_EQM_PA_REQ0': 0x6328, 'QM_QM_CPU_PUSH_RDY0': 0x6368,
+    'QM_QM_CPU_PUSH_PADDR0': 0x636c,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_WRPTR': 0x7000,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_RDPTR': 0x7100,
     'QM_QM_CPUEPP_POINTER_CPUEPP64_FIFO_PADDR_START': 0x7200,
@@ -121,13 +124,19 @@ eq_start = source.index('\t/* Distinct EQ4/EQ5:')
 eq_end = source.index('\tret = rtl_qm_deepq_prepare(', eq_start)
 epp_start = source.index('\twritel(0, ni + 0x6558);')
 epp_end = source.index('\tfor (i = 0; i < RTL_QM_BUFFERS; i++)', epp_start)
-production += 'static void cpu_setup(struct rtl_qm_rx *rx) { void *ni=rx->ni;unsigned i;\n'
-production += source[eq_start:eq_end] + source[epp_start:epp_end] + '}\n'
+production += 'static int cpu_setup(struct rtl_qm_rx *rx) { void *ni=rx->ni;unsigned i;u32 value;\n'
+production += source[eq_start:eq_end] + source[epp_start:epp_end] + 'return 0;}\n'
 cases = r'''
 int main(void) {
  struct rtl_qm_rx rx={.ni=regs,.ring_dma=0x06000000};
  const struct rtl_dq_io io={&rx,rtl_dq_read,rtl_dq_write,rtl_dq_indirect};
- regs[0x68b0/4]=~0U;regs[0x610c/4]=~0U;
+ for(unsigned bit=0;bit<32;bit++) {
+  QM_QM_EQM_PA_REQ0_t request={.wrd=1U<<bit};
+  QM_QM_CPU_PUSH_RDY0_t ready={.wrd=1U<<bit};
+  assert(request.bf.inactive_bid_cntr==(bit<14?1U<<bit:0));
+  assert(request.bf.req==(bit==31) && ready.bf.rdy==(bit==31));
+ }
+ regs[0x68b0/4]=0xc8000000U;regs[0x610c/4]=0xa5a5ffffU;
  assert(!rtl_qm_deepq_prepare(&io,0x12000000));
  assert(!(regs[0x610c/4]&0xffff));
  for(unsigned pool=0;pool<2;pool++) {
@@ -162,7 +171,7 @@ int main(void) {
   assert(dest.bf.profile_sel==1 && credit.bf.cnt0==1024 && credit.bf.cnt1==1024 && credit.bf.cnt0_msb && credit.bf.cnt1_msb);
   for(unsigned q=p*8;q<p*8+8;q++)assert(voq[q]==3);
  }
- regs[(0x657c+4*4)/4]=0xe0008001;cpu_setup(&rx);
+ regs[(0x657c+4*4)/4]=0xe0008001;assert(!cpu_setup(&rx));
  for(unsigned pool=0;pool<2;pool++) {
   unsigned cfg=(0x61e8+(pool+4)*20)/4;
   QM_QM_CFG1_EQ0_t b={.wrd=regs[cfg+1]};QM_QM_CFG2_EQ0_t c={.wrd=regs[cfg+2]};

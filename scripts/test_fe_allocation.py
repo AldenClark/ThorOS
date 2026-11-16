@@ -46,7 +46,7 @@ struct rtl_fe {
  struct rb_root cookies,destinations;
 };
 static bool fail_map,fail_owner,fail_dma,fail_index,fail_bridge;
-static unsigned int allocations,releases,debug_created,debug_removed,reo_writes;
+static unsigned int allocations,releases,debug_created,debug_removed,reo_writes,boot_control;
 static unsigned int reo[64];
 static int fe_counters_fops,fe_cache_target_fops,fe_cache_snapshot_fops;
 static void *allocate(size_t count,size_t size,bool fail) {
@@ -78,7 +78,7 @@ static void fe_cleanup_work(void) {}
 #define INIT_DELAYED_WORK(work,fn) (*(work)=(fn))
 static void INIT_LIST_HEAD(struct list_head *head) {head->next=head->prev=head;}
 static unsigned int fe_read(struct rtl_fe *fe,unsigned int reg) {
- assert(fe->device && fe->registers && reg==0x1c00);return BIT(31)|0x12345678;
+ assert(fe->device && fe->registers && reg==0x1c00);return boot_control;
 }
 #define dma_wmb() ((void)0)
 static void *debugfs_create_dir(const char *name,void *parent) {
@@ -93,7 +93,7 @@ static void *fe_bridge_start(struct rtl_fe *fe) {
  assert(fe->ports.next==&fe->ports && fe->flows.next==&fe->flows);
  assert(fe->blocks.next==&fe->blocks && fe->retries.next==&fe->retries);
  assert(!fe->cookies.node && !fe->destinations.node);
- assert(fe->cache_target==RTL_FE_HASH_ENTRIES && fe->fdb_cmd_mode_saved==BIT(31));
+ assert(fe->cache_target==RTL_FE_HASH_ENTRIES && fe->fdb_cmd_mode_saved==(boot_control&BIT(31)));
  assert((fe->hash_owners==NULL)==fail_index);
  if(fe->hash_owners)for(unsigned int i=0;i<RTL_FE_HASH_ENTRIES;i++)assert(!fe->hash_owners[i]);
  return fail_bridge?ERR_PTR(-EIO):(void *)2;
@@ -112,7 +112,9 @@ int main(void) {
  /* Mapping failure, owner OOM, coherent DMA OOM, optional-index OOM and
   * bridge failure combinations. Success is released by the test; actual
   * teardown ordering/quarantine is covered by test_fe_teardown_quarantine. */
+ for(unsigned int boot_cmd=0;boot_cmd<2;boot_cmd++)
  for(unsigned int scenario=0;scenario<7;scenario++) {
+  boot_control=(boot_cmd?BIT(31):0)|0x12345678;
   fail_map=scenario==0;fail_owner=scenario==1;fail_dma=scenario==2;
   fail_index=scenario==3 || scenario==5;fail_bridge=scenario==4 || scenario==5;
   allocations=releases=debug_created=debug_removed=reo_writes=0;

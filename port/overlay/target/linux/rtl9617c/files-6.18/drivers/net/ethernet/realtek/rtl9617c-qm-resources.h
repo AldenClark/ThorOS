@@ -29,6 +29,7 @@
 #define RTL_QM_RING_BYTES 2048
 #define RTL_QM_COMMAND_BYTES 8
 #define RTL_QM_VOQS 8
+#define RTL_QM_RX_QUANTUM (RTL_QM_REFILL_RESERVE / RTL_QM_VOQS)
 #define RTL_QM_RING_COMMANDS (RTL_QM_RING_BYTES / RTL_QM_COMMAND_BYTES)
 #define RTL_QM_RING_MEMORY_BYTES (RTL_QM_RING_BYTES * RTL_QM_VOQS)
 #define RTL_QM_PAYLOAD_BYTES (RTL_QM_BUFFERS * RTL_QM_RESOURCE_BUFFER_BYTES)
@@ -77,6 +78,9 @@
     RTL_QM_RING_BYTES > 0x1000000 || RTL_QM_RING_BYTES / 16 > 0x1fffff || \
     RTL_QM_PAYLOAD_OFFSET % RTL_QM_RESOURCE_BUFFER_BYTES
 #error "EPP rings must fit the hardware size/pointer fields and DMA alignment"
+#endif
+#if !RTL_QM_RX_QUANTUM || RTL_QM_RX_QUANTUM * RTL_QM_VOQS > RTL_QM_REFILL_RESERVE
+#error "Every nonempty VOQ must receive a bounded visit within one default NAPI poll"
 #endif
 #if RTL_QM_RESOURCE_BUFFER_BYTES != 2048 || RTL_DQ_BUFFERS * 4 / 3 >= RTL_QM_BID_LIMIT
 #error "QM buffer-size and DQ admission fields must remain encodable"

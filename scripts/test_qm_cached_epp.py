@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix='cached-epp-', dir=root/'artifacts') as 
 
 # Execute the native stop and ring reinitialization across repeated opens.
 start=source.index('\t/* Hardware write pointers survive ndo_stop/open;')
-end=source.index('\n\trx->trace_count = 0;', start)+len('\n\trx->trace_count = 0;')
+end=source.index('\n\trx->next_voq = RTL_QM_VOQS - 1;', start)+len('\n\trx->next_voq = RTL_QM_VOQS - 1;')
 stop=source.index('void rtl_qm_rx_stop(')
 stop_end=source.index('\nvoid rtl_qm_rx_free(', stop)
 lifecycle=r'''
@@ -76,7 +76,9 @@ lifecycle=r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 typedef uint32_t u32;
+#define __iomem
 #define BIT(n) (1U<<(n))
 #include "rtl9617c-qm-resources.h"
 #define DMA_FROM_DEVICE 2
@@ -85,7 +87,7 @@ typedef uint32_t u32;
 #define CB_CTRL 0x950c
 #define RMU_CTRL 0x6104
 #define ES_CTRL 0x6108
-struct rtl_qm_rx {void *ni,*device,*ring_memory,*memory;unsigned ring_dma,memory_dma,read[8],trace_count;bool deepq_configured;};
+struct rtl_qm_rx {void *ni,*device,*ring_memory,*memory;unsigned ring_dma,memory_dma,read[8],trace_count,next_voq;bool deepq_configured;};
 static unsigned char registers[65536],cpu[RTL_QM_RING_MEMORY_BYTES],hardware[RTL_QM_RING_MEMORY_BYTES];
 static unsigned synced,retired,reordered;
 static u32 readl(void *p){u32 v;memcpy(&v,p,4);return v;}
@@ -97,22 +99,24 @@ static void dma_sync_single_for_device(void *d,unsigned address,unsigned bytes,i
  else assert(address==0x4000000&&bytes==RTL_QM_MEMORY_BYTES);
 }
 '''
-lifecycle+=source[stop:stop_end]
+rmw_start=source.index('static int rtl_qm_rmw(')
+rmw_end=source.index('\nstatic int rtl_qm_window_idle(', rmw_start)
+lifecycle+=source[rmw_start:rmw_end]+source[stop:stop_end]
 # This low-level test covers independent cold-start pointer/cache states,
 # not ordinary NI reopen. test_ni_owner_lifetime proves warm reopen must not
 # execute this reset/republish sequence against an already-exposed owner.
-lifecycle+='static void cold_prepare(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;\n'+source[start:end]+'\n}\n'
+lifecycle+='static int cold_prepare(struct rtl_qm_rx *rx){void *ni=rx->ni;unsigned i;u32 value;\n'+source[start:end]+'\nreturn 0;}\n'
 lifecycle+=r'''
 int main(void){
  struct rtl_qm_rx rx={.ni=registers,.ring_memory=cpu,.ring_dma=0x6000000,.memory_dma=0x4000000};
  for(unsigned epoch=0;epoch<4;epoch++){
   memset(cpu,0xcc+epoch,sizeof(cpu));memset(hardware,0x55+epoch,sizeof(hardware));
   for(unsigned i=0;i<8;i++){writel((epoch*79+i*47)%RTL_QM_RING_COMMANDS*8,registers+EPP_WRITE+i*4);rx.read[i]=0;}
-  writel(~0U,registers+CB_CTRL);writel(~0U,registers+RMU_CTRL);writel(~0U,registers+ES_CTRL);writel(~0U,registers+0x610c);
+  writel(0x8fff1234U,registers+CB_CTRL);writel(0x8fff1234U,registers+RMU_CTRL);writel(0x8fff1234U,registers+ES_CTRL);writel(0xa5a5ffffU,registers+0x610c);
   rx.deepq_configured=true;rtl_qm_rx_stop(&rx);
   assert(!rx.deepq_configured&&!(readl(registers+CB_CTRL)&BIT(31))&&!(readl(registers+RMU_CTRL)&BIT(31))&&!(readl(registers+ES_CTRL)&BIT(31))&&!(readl(registers+0x610c)&0xffff));
-  synced=retired=reordered=0;rx.trace_count=99;cold_prepare(&rx);
-  assert(synced==1&&rx.trace_count==0);
+  synced=retired=reordered=0;rx.trace_count=99;assert(!cold_prepare(&rx));
+  assert(synced==1&&rx.trace_count==0&&rx.next_voq==7);
   for(unsigned i=0;i<8;i++)assert(rx.read[i]==readl(registers+EPP_WRITE+i*4)&&rx.read[i]==readl(registers+EPP_READ+i*4));
   for(unsigned i=0;i<sizeof(hardware);i++)assert(hardware[i]==0);
  }

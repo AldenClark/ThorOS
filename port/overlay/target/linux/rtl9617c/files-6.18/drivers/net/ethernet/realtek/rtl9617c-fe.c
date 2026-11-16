@@ -2294,6 +2294,14 @@ static int fe_base_require_locked(struct rtl_fe *fe)
   struct rtl_dq_io io=fe_io(fe);
   ret=rtl_fabric_check(&io,&fe->fabric);
   if(ret) {
+   /* A timed-out shared FDB/limit command may still be owned by the
+    * native recovery path. Keep admission closed, but do not destroy its
+    * recovery lifetime merely because a warm observer found it busy. */
+   if(ret==-EBUSY) {
+    fe_route_gate(fe);
+    fe_lan_restore_locked(fe);
+    return ret;
+   }
    fe_base_quarantine_locked(fe);
    return ret;
   }
@@ -2477,6 +2485,11 @@ int rtl_fe_engine_resume(struct rtl_fe *fe)
  if(fe->shutting_down){ret=-ENODEV;goto unlock;}
  if(!list_empty(&fe->flows)){ret=-EBUSY;goto unlock;}
  if(fe->prepared) {
+  /* A previous native limit operation may have completed after suspend
+   * failed. Its retained owner, not the generic warm observer, must drain
+   * and return the shared CMD lease before validating the permanent base. */
+  ret=fe_switch_quiesce_locked(fe);
+  if(ret)goto unlock;
   ret=fe_base_require_locked(fe);
   if(ret)goto unlock;
  }
@@ -2523,12 +2536,7 @@ bool rtl_fe_free(struct rtl_fe *fe)
  if(!ret && (fe->dma_exposed || fe->prepared || fe->base_failed || fe->fabric.poisoned))ret=-EBUSY;
  if(!ret && !bound && list_empty(&fe->blocks) && list_empty(&fe->flows)) {
   struct rtl_dq_io io=fe_io(fe);
-  ret=rtl_fe_window_idle(&io,0x1ca0);
-  if(!ret)ret=rtl_fe_window_idle(&io,0x1cb4);
-  if(!ret) {
-   fe_write(fe,0x1c00,(fe_read(fe,0x1c00)&~BIT(31))|fe->fdb_cmd_mode_saved);
-   fe_read(fe,0x1c00);
-  }
+  ret=rtl_fe_fdb_restore_mode(&io,fe->fdb_cmd_mode_saved);
  }
  fe->error=ret;
  /* Failure can leave Hash/Cache DMA using this memory. A removed callback

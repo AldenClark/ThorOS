@@ -136,7 +136,21 @@ static inline void late_completion(struct rtl_fe *fe){
 '''
 
 tests = r'''
-static void init_fe(struct rtl_fe *fe){memset(fe,0,sizeof(*fe));INIT_LIST_HEAD(&fe->flows);}
+static void init_fe(struct rtl_fe *fe){
+ memset(fe,0,sizeof(*fe));INIT_LIST_HEAD(&fe->flows);
+ struct rtl_dq_io io=fe_io(fe);
+ /* The focused scale/fault fixture receives a cold, quiesced owner.
+  * Exercise its actual handoff instead of fabricating CMD mode. Active
+  * destination transactions run with learning resumed and never lease it. */
+ assert(rtl_l2_fdb_command_mode(&io)==-EBUSY);
+ assert(!fe->control && !fe->writes && !fe->commands);
+ write_register(fe,RTL_L2_FDB_CONTROL,RTL_L2_FDB_LEARN_DISABLE);
+ assert(!rtl_l2_fdb_command_mode(&io));
+ assert(fe->control==(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE));
+ write_register(fe,RTL_L2_FDB_CONTROL,fe->control&~RTL_L2_FDB_LEARN_DISABLE);
+ assert(fe->writes==3 && !fe->commands);
+ fe->writes=fe->commands=0; /* Do not count cold handoff as flow MMIO. */
+}
 static void mac_for(unsigned int id,u8 mac[ETH_ALEN]){
  memcpy(mac,(u8[]){2,16,32,0,0,0},ETH_ALEN);
  mac[3]=id>>16;mac[4]=id>>8;mac[5]=id;

@@ -4,6 +4,7 @@
 #include <linux/io.h>
 #include <linux/netdevice.h>
 #include <linux/rcupdate.h>
+#include <linux/rtl9617c-switch.h>
 #include <linux/rtnetlink.h>
 #include "rtl9617c-pon.h"
 #include "rtl9617c-ni.h"
@@ -224,6 +225,7 @@ static void rtl_oam_wake(struct rtl9617c_ni_endpoint *endpoint)
 
 void rtl_pon_oam_carrier(struct rtl9617c_pon *pon)
 {
+	struct net *policy = NULL;
 	u32 status = readl(pon->mac + 0x10);
 	bool synced = !(status & BIT(0)) &&
 		(status & (pon->mode == RTL_PON_EPON_1G ? BIT(2) : BIT(1)));
@@ -242,27 +244,42 @@ void rtl_pon_oam_carrier(struct rtl9617c_pon *pon)
 		}
 		dev = rcu_dereference(pon->data_devices[i]);
 		if (dev) {
-			if (pon->traffic_enabled && pon->mpcp_enabled && pon->pdc_configured &&
+			bool up = pon->traffic_enabled && pon->mpcp_enabled && pon->pdc_configured &&
 			    pon->puc_configured && (synced || (pon->epon_holdover_active & BIT(i))) &&
-			    (pon->registered & BIT(i)))
+			    (pon->registered & BIT(i));
+
+			/* Linkwatch notifications are deferred. Fence the shared FE
+			 * before publishing a changed business carrier, including
+			 * traffic disable and holdover expiry without registration IRQ.
+			 * No-change polls must not invalidate working route state. */
+			if (up != netif_carrier_ok(dev) && !policy)
+				policy = rtl9617c_switch_policy_begin(dev);
+			if (up)
 				netif_carrier_on(dev);
 			else
 				netif_carrier_off(dev);
 		}
 	}
 	rcu_read_unlock();
+	rtl9617c_switch_policy_end(policy);
 }
 
 static void rtl_port_address(struct net_device *dev, const u8 *base, unsigned int index)
 {
+	struct net *policy;
 	u8 mac[ETH_ALEN];
 
 	ether_addr_copy(mac, base);
 	eth_addr_add(mac, index);
 	netdev_lock(dev);
+	/* Factory MAC updates bypass netif_set_mac_address(). Fence the shared
+	 * FE before publishing a new identity, not merely at the later notifier.
+	 * The scope only gates/queues work and never waits under these locks. */
+	policy = rtl9617c_switch_policy_begin(dev);
 	eth_hw_addr_set(dev, mac);
 	dev->addr_assign_type = NET_ADDR_SET;
 	call_netdevice_notifiers(NETDEV_CHANGEADDR, dev);
+	rtl9617c_switch_policy_end(policy);
 	netdev_unlock(dev);
 }
 
@@ -311,6 +328,10 @@ static struct net_device *rtl_oam_allocate(struct rtl9617c_pon *pon, unsigned in
 	dev->netdev_ops = control ? &rtl_oam_ops : &rtl_data_ops;
 	dev->sysfs_groups[0] = &rtl_oam_group;
 	dev->max_mtu = ETH_DATA_LEN;
+	/* LAN and every PON role share one NI/FE/QM ownership domain and a
+	 * single init_net policy guard. Moving one LLID or OAM endpoint alone
+	 * would detach its namespace's firewall/TC/XDP vetoes from that guard. */
+	dev->netns_immutable = true;
 	if (control)
 		dev->flags |= IFF_NOARP;
 	/* Factory identity is supplied before netifd. Until then the zero

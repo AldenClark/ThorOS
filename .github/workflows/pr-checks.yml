@@ -101,4 +101,6 @@ jobs:
             artifacts/kernel-objects/config.seed
             artifacts/kernel-objects/kernel.config
             logs/ni-kconfig-test.json
+            logs/flowtable-encap-skb.json
             artifacts/fabric-frame-contract.json
+            artifacts/ppp-namespace-fence.json

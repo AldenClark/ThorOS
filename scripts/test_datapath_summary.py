@@ -112,6 +112,85 @@ assert module.summarize(pressure_capture(pressure_before,
 assert module.summarize(pressure_capture(pressure_before,
     pressure_after.replace('refill_eq5_retries=6', 'refill_eq5_retries=1')))['qm_buffer']['reason'] == \
     'per_EQ_refill_counter_reset_or_invalid'
+assert pressure['refill_faults']['reason'] == 'refill_mmio_evidence_unavailable'
+assert pressure['voq_service']['reason'] == 'voq_service_evidence_unavailable'
+
+
+def service_record(epoch, cursor):
+    base = (1 << 53) + epoch * 3
+    values = {f'refill_eq{eq}_{name}': base + eq for eq in (4, 5)
+              for name in ('bad_credit', 'bad_ready')}
+    values.update({f'voq{voq}_yields': base + voq for voq in range(8)})
+    values['next_voq'] = cursor
+    return ' '.join(f'{key}={value}' for key, value in values.items())
+
+
+service_before, service_after = service_record(0, 7), service_record(1, 0)
+
+
+def service_pressure(before=service_before, after=service_after):
+    return module.summarize(pressure_capture(pressure_before + ' ' + before,
+                                            pressure_after + ' ' + after))['qm_buffer']
+
+
+service = service_pressure()
+assert service['valid'] and service['refill_faults']['valid'] and service['voq_service']['valid']
+assert service['refill_faults']['eq']['eq4']['bad_credit']['delta'] == 3
+assert service['refill_faults']['eq']['eq5']['bad_ready']['delta'] == 3
+assert service['voq_service']['next_voq'] == {'before': 7, 'after': 0}
+assert service['voq_service']['yields']['voq7_yields']['delta'] == 3
+assert 'delta' not in service['voq_service']['next_voq']
+assert service_pressure(after='')['refill_faults']['reason'] == 'refill_mmio_evidence_incomplete'
+assert service_pressure(after='')['voq_service']['reason'] == 'voq_service_evidence_incomplete'
+assert service_pressure(after=service_after.replace('next_voq=0', 'next_voq=8'))['voq_service']['reason'] == \
+    'voq_cursor_out_of_range'
+assert service_pressure(after=service_after + ' next_voq=1')['voq_service']['reason'] == \
+    'voq_service_evidence_incomplete'
+assert service_pressure(after=re.sub(r'refill_eq4_bad_ready=\d+', 'refill_eq4_bad_ready=1',
+                                    service_after))['refill_faults']['reason'] == \
+    'refill_mmio_counter_reset_or_invalid'
+assert service_pressure(after=re.sub(r'voq3_yields=\d+', 'voq3_yields=1',
+                                    service_after))['voq_service']['reason'] == \
+    'voq_service_counter_reset_or_invalid'
+corrupted_service = service_pressure(after=service_after + ' refill_eq5_bad_credit=PRIVATE_192.0.2.1')
+assert corrupted_service['valid'] and not corrupted_service['refill_faults']['valid']
+assert corrupted_service['voq_service']['valid'] and 'PRIVATE' not in json.dumps(corrupted_service)
+for orphan in ('refill_eq4_bad_credit=1', 'refill_eq5_bad_ready=BAD',
+               'voq7_yields=5', 'next_voq=0', service_after):
+    for before, after in (('', orphan), (orphan, ''), (orphan, orphan)):
+        orphaned = module.summarize(pressure_capture(before, after))['qm_buffer']
+        assert not orphaned['valid'] and orphaned['reason'] == 'per_EQ_refill_evidence_incomplete'
+        assert 'BAD' not in json.dumps(orphaned)
+
+
+def multicast_record(epoch, header):
+    counters = ' '.join(f'{key}={(1 << 53) + epoch * 5}' for key in module.MC_RX_COUNTERS)
+    return counters + f' mc_rx_last_header={header} mc_rx_forwarding_proven=0'
+
+
+mc_before = multicast_record(0, '0A00000080003600')
+mc_after = multicast_record(1, '0b00000080003600')
+
+
+def multicast_summary(before=mc_before, after=mc_after):
+    return module.summarize(pressure_capture(before, after))['qm_multicast']
+
+
+mc = multicast_summary()
+assert mc['valid'] and mc['hardware_forwarding_proven'] is False
+assert all(value['delta'] == 5 for value in mc['observed_counters'].values())
+assert mc['last_candidate_header_raw']['before'] == '0a00000080003600'
+assert module.summarize(capture())['qm_multicast']['reason'] == 'multicast_metadata_evidence_unavailable'
+assert multicast_summary(after='')['reason'] == 'multicast_metadata_evidence_incomplete'
+assert multicast_summary(after=mc_after.replace('forwarding_proven=0', 'forwarding_proven=1'))['reason'] == \
+    'unverified_multicast_forwarding_claim'
+assert multicast_summary(after=mc_after.replace('0b00000080003600', 'PRIVATE_192.0.2.1'))['reason'] == \
+    'multicast_metadata_header_incomplete'
+assert multicast_summary(after=re.sub(r'mc_rx_source27=\d+', 'mc_rx_source27=1', mc_after))['reason'] == \
+    'multicast_metadata_counter_reset_or_invalid'
+assert multicast_summary(after=mc_after + ' mc_rx_last_header=ffffffffffffffff')['reason'] == \
+    'multicast_metadata_header_incomplete'
+assert 'PRIVATE' not in json.dumps(multicast_summary(after=mc_after.replace('0b00000080003600', 'PRIVATE')))
 
 # Match the real driver's numeric enum/name table, not a separately invented
 # textual l2_reason (the generic l2_reason itself remains numeric).

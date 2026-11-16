@@ -72,6 +72,7 @@ typedef u32 atomic_t;
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define atomic_read(p) (*(p))
 #define smp_rmb() ((void)0)
+#define smp_load_acquire(p) (*(p))
 #define lockdep_assert_held(p) assert(*(p))
 #define ppp_lock(p) do {assert(!(p)->wlock && !(p)->rlock);(p)->wlock=(p)->rlock=true;}while(0)
 #define ppp_unlock(p) do {assert((p)->wlock && (p)->rlock);(p)->wlock=(p)->rlock=false;}while(0)
@@ -88,7 +89,9 @@ enum {PPPIOCSFLAGS=1,PPPIOCGNPMODE,PPPIOCSNPMODE,PPPIOCSPASS,PPPIOCSACTIVE,PPPIO
 enum ip_conntrack_dir {IP_CT_DIR_ORIGINAL,IP_CT_DIR_REPLY};
 struct net {unsigned int dummy;};
 struct ppp;
-struct net_device {atomic_t ppp_channel_generation;struct ppp *priv;};
+struct net_device {atomic_t ppp_channel_generation;struct ppp *priv;struct net *net;bool moving_ns;};
+#define dev_net(d) ((d)->net)
+#define net_eq(a,b) ((a)==(b))
 struct bpf_prog {unsigned int id;};
 struct npioctl {int protocol;enum NPmode mode;};
 struct ppp_option_data {u8 *ptr;unsigned int length;int transmit;};
@@ -106,7 +109,7 @@ struct ppp_channel_ops {int (*fill_forward_path)(struct net_device_path_ctx *,st
 struct ppp_channel {const struct ppp_channel_ops *ops;};
 struct channel {struct ppp_channel *chan;};
 struct ppp {
- struct net_device *dev;int flags;bool wlock,rlock;unsigned int nextseq,xstate,rstate;
+ struct net_device *dev;struct net *ppp_net;int flags;bool wlock,rlock;unsigned int nextseq,xstate,rstate;
  enum NPmode npmode[NUM_NP];struct channel *channels;
  void *xc_state,*rc_state;struct compressor *xcomp,*rcomp;
  struct bpf_prog *pass_filter,*active_filter;
@@ -140,7 +143,7 @@ static void rtl9617c_switch_policy_end(struct net *policy){
  assert(policy==&net && unit.wlock && unit.rlock && begins==ends+1 && gated);
  assert(!(device.ppp_channel_generation&1));ends++;
 }
-static u32 atomic_inc_return(atomic_t *v){assert(v==&device.ppp_channel_generation && unit.wlock && unit.rlock && gated);return ++*v;}
+static bool atomic_try_cmpxchg(atomic_t *v,int *old,int next){assert(v==&device.ppp_channel_generation && unit.wlock && unit.rlock && gated);if(*v!=(u32)*old){*old=(int)*v;return false;}*v=(u32)next;return true;}
 static int copy_from_user(void *to,const void *from,size_t n){if(copy_failure)return 1;memcpy(to,from,n);return 0;}
 static int copy_to_user(void *to,const void *from,size_t n){return copy_from_user(to,from,n);}
 #define get_user(value,p) (copy_failure?1:((value)=*(p),0))
@@ -174,7 +177,7 @@ static int dev_fill_forward_path(struct net_device_path_ctx *ctx,struct net_devi
 }
 '''
 
-functions = "\n".join(function(netdev, name) for name in ["netdev_ppp_path_cookie", "netdev_ppp_path_valid"])
+functions = "\n".join(function(netdev, name) for name in ["netdev_ppp_path_advance", "netdev_ppp_path_cookie", "netdev_ppp_path_valid"])
 functions += "\n".join(function(ppp, name) for name in [
     "ppp_flow_change_begin", "ppp_flow_change_end", "ppp_flow_policy_allows",
     "ppp_flow_set_flags", "ppp_flow_set_npmode", "ppp_flow_replace_compressor",
@@ -199,8 +202,8 @@ static int real_ioctl_cases(struct ppp *ppp,unsigned int cmd,void *argp){
 
 TEST = r'''
 static void setup(void){
- unit=(struct ppp){.dev=&device,.channels=&channel_owner};
- device=(struct net_device){.priv=&unit,.ppp_channel_generation=2};
+ unit=(struct ppp){.dev=&device,.ppp_net=&net,.channels=&channel_owner};
+ device=(struct net_device){.priv=&unit,.ppp_channel_generation=2,.net=&net};
  for(unsigned int i=0;i<NUM_NP;i++)unit.npmode[i]=NPMODE_PASS;
  begins=ends=forwarded=freed_filters=freed_states=module_puts=wakes=0;
  copy_failure=alloc_failure=missing_compressor=filter_failure=gated=false;
@@ -239,6 +242,15 @@ static void flags_cases(void){
  device.ppp_channel_generation=0xfffffffeU;flags=SC_LOOP_TRAFFIC;assert(!real_ioctl_cases(&unit,PPPIOCSFLAGS,&flags));
  assert(!device.ppp_channel_generation && !netdev_ppp_path_valid(&device,2));
  flags=0;assert(!real_ioctl_cases(&unit,PPPIOCSFLAGS,&flags));assert(!device.ppp_channel_generation);
+}
+static void namespace_cases(void){
+ setup();struct net other_net={0};u32 cookie=netdev_ppp_path_cookie(&device);
+ assert(allows(ETH_P_IP) && allows(ETH_P_IPV6) && netdev_ppp_path_valid(&device,cookie));
+ device.moving_ns=true;
+ assert(!netdev_ppp_path_cookie(&device) && !netdev_ppp_path_valid(&device,cookie));
+ device.net=&other_net;device.moving_ns=false;
+ assert(!allows(ETH_P_IP) && !allows(ETH_P_IPV6));
+ device.net=&net;assert(allows(ETH_P_IP) && allows(ETH_P_IPV6));
 }
 static void np_cases(void){
  for(unsigned int proto=0;proto<2;proto++)for(int mode=NPMODE_PASS;mode<=NPMODE_QUEUE;mode++){
@@ -313,7 +325,7 @@ static void family_propagation(void){
  setup();unit.channels=NULL;assert(!allows(ETH_P_IP));unit.channels=&channel_owner;
  channel_owner.chan=NULL;assert(!allows(ETH_P_IP));
 }
-int main(void){flags_cases();np_cases();compression_cases();family_propagation();
+int main(void){flags_cases();namespace_cases();np_cases();compression_cases();family_propagation();
 #ifdef CONFIG_PPP_FILTER
  filter_cases();
 #endif
@@ -321,6 +333,7 @@ int main(void){flags_cases();np_cases();compression_cases();family_propagation()
 '''
 
 mutants = {
+    "bypass_cross_namespace_scrub": functions.replace("!net_eq(ppp->ppp_net, dev_net(ppp->dev))", "false", 1),
     "ignore_loop_policy": functions.replace("SC_MULTILINK | SC_LOOP_TRAFFIC |", "SC_MULTILINK |", 1),
     "require_both_ip_families_pass": functions.replace(
         "return READ_ONCE(ppp->npmode[index]) == NPMODE_PASS;",

@@ -202,7 +202,7 @@ int main(void) {
  unsigned total_commands=0;
  for(unsigned i=0;i<sizeof(valid_dq)/sizeof(*valid_dq);i++) {
   struct mmio m={0};struct rtl_dq_io io={&m,read_reg,write_reg,indirect};
-  m.regs[0x610c/4]=~0U;
+  m.regs[0x610c/4]=0xa5a5ffffU;
   assert(!rtl_qm_deepq_prepare(&io,valid_dq[i]));check_dq(&m,valid_dq[i]);
   total_commands=m.commands;cases++;
  }
@@ -210,10 +210,20 @@ int main(void) {
  assert(total_commands==145);
  for(unsigned fail=1;fail<=total_commands;fail++) {
   struct mmio m={.fail_at=fail};struct rtl_dq_io io={&m,read_reg,write_reg,indirect};
-  m.regs[0x610c/4]=~0U;
+  m.regs[0x610c/4]=0xa5a5ffffU;
   assert(rtl_qm_deepq_prepare(&io,0x12000000)==-ETIMEDOUT);
   assert(m.commands==fail && !(m.regs[0x610c/4]&0xffff));cases++;
  }
+ /* Failed shared RMW reads must be rejected before even one DQ write. */
+ const unsigned shared[]={0x610c,0x68f8,0x68b0};
+ for(unsigned i=0;i<sizeof(shared)/sizeof(*shared);i++) {
+  struct mmio m={0};struct rtl_dq_io io={&m,read_reg,write_reg,indirect};
+  m.regs[shared[i]/4]=~0U;
+  assert(rtl_qm_deepq_prepare(&io,0x12000000)==-EIO);
+  assert(m.reads==3 && !m.writes && !m.commands);cases++;
+ }
+ assert(rtl_qm_deepq_prepare(NULL,0x12000000)==-EINVAL);
+ struct rtl_dq_io invalid={0};assert(rtl_qm_deepq_prepare(&invalid,0x12000000)==-EINVAL);
  printf("QM resources: %u allocation/address/DQ-fault cases; 3072 disjoint BIDs, 6MiB payload, 256 commands/VOQ and exact unwind passed\n",cases);
 }
 '''

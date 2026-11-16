@@ -11,6 +11,7 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned lo
 #define FIELD_GET(mask,x) (((x)&(mask))>>__builtin_ctz(mask))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define READ_ONCE(x) (x)
+#define WRITE_ONCE(x,v) ((x)=(v))
 #define lower_32_bits(x) ((u32)(x))
 #define dma_rmb() ((void)0)
 #define mb() ((void)0)
@@ -34,16 +35,18 @@ typedef uint8_t u8;typedef uint16_t u16;typedef uint32_t u32;typedef unsigned lo
 #define EPP_WRITE 0x7000
 #define EPP_READ 0x7100
 #include "rtl9617c-qm-refill.h"
+#include "rtl9617c-mcast-observe.h"
 struct net_device {bool running;struct {u64 rx_errors,rx_dropped,rx_packets,rx_bytes;} stats;};
 struct napi_struct {struct net_device *dev;};
 struct sk_buff {u8 storage[128],*data;unsigned len,priority,protocol,ip_summed;struct net_device *dev;};
 struct rtl9617c_ni_endpoint {void (*receive)(struct rtl9617c_ni_endpoint *,struct napi_struct *,struct sk_buff *,unsigned);};
 struct rtl_fe {unsigned int unused;};
 struct rtl_qm_rx {
- void *ni,*ring_memory,*memory,*device;dma_addr_t memory_dma,ring_dma;unsigned read[8];
+ void *ni,*ring_memory,*memory,*device;dma_addr_t memory_dma,ring_dma;unsigned read[8],next_voq;
  u32 last_address,last_size,last_header[2],trace[32][7];unsigned trace_count;
  struct rtl_qm_refill refill;struct rtl9617c_ni_endpoint *pon;struct net_device *lan[5];struct rtl_fe *fe;bool profile;
- u64 host_poll_ns,host_polls,voq_packets[8],poll_budget_hits;
+ struct rtl_mcast_observe mcast_observe;
+ u64 host_poll_ns,host_polls,voq_packets[8],voq_yields[8],poll_budget_hits;
  u64 cpu_packets,cpu_bytes,ring_errors,buffer_errors;
  bool rx_prefetch,pppoe_rx_checksum;
 };

@@ -41,7 +41,7 @@ def function(source, name):
 
 source = read('rtl9617c-qm.c')
 production = ''.join(function(source, name) for name in (
-    'rtl_qm_window_idle', 'rtl_qm_indirect', 'rtl_qm_attribute',
+    'rtl_qm_rmw', 'rtl_qm_window_idle', 'rtl_qm_indirect', 'rtl_qm_attribute',
     'rtl_qm_pon_destination_map', 'rtl_qm_ingress', 'rtl_qm_cpu_credits',
     'rtl_dq_read', 'rtl_dq_write', 'rtl_dq_indirect'))
 start = source.index('\t/* The vendor credit table marks counter MSBs valid')
@@ -56,6 +56,7 @@ fixture = r'''
 #include <string.h>
 #include <errno.h>
 typedef uint32_t u32;
+#define __iomem
 #define BIT(n) (1U<<(n))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
 #define EQ_ID 4

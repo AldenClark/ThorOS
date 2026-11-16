@@ -125,6 +125,28 @@ static void transactions(void)
  }
 }
 
+static void zero_age_static_only(void)
+{
+ /* Execute the exact prepare -> port-policy -> arm sequence used by the
+  * worker for Linux hold_time()==0. Neither the bridge-learning flag nor
+  * a zero timer with an enabled SA learner may create immortal entries.
+  * Preserve the shared hardware divisor and all foreign/PON row owners. */
+ for(unsigned int l3=0;l3<2;l3++)for(unsigned int ports=1;ports<32;ports++) {
+  reset();fe.enabled=fe.prepared=l3;model.reg[0x160c/4]=0xa5000001;
+  assert(!fe_switch_hw_prepare(&fe,&hw,ports,0,true,true));
+  assert(model.reg[0x1c04/4]==original.reg[0x1c04/4]);
+  assert(!(hw.run_control&BIT(0)) && !(hw.requested_aging&0x7ffffU));
+  assert(!fe_switch_hw_port_policy(&fe,&hw,0,0));
+  check_policy(0,0);cpu_only();
+  assert(fe_switch_hw_arm(&fe,&hw,ports,0,true));
+  assert(!(model.reg[0x1c00/4]&BIT(0)));
+  assert(model.reg[0x1c04/4]==(original.reg[0x1c04/4]&~0x7ffffU));
+  check_policy(0,0);cases++;
+  assert(!fe_switch_hw_drain(&fe,&hw));
+  assert(!fe_switch_hw_restore(&fe,&hw));restored();
+ }
+}
+
 static void failed_policy(void)
 {
  assert(!hw.port_policy_ready && hw.prepared && hw.globals_owned);
@@ -265,7 +287,7 @@ static void fault_matrix(void)
 
 int main(void)
 {
- pure_matrix();transactions();baseline_guards();route_policy();fault_matrix();
+ pure_matrix();transactions();zero_age_static_only();baseline_guards();route_policy();fault_matrix();
  printf("{\"pure_mask_cases\":%u,\"transaction_cases\":%u,\"fault_cases\":%u,\"sdk_oracle_cases\":%u}\n",
         pure_cases,cases,fault_cases,sdk_cases);
  return 0;
@@ -363,6 +385,8 @@ def main():
     hw, policy = HW.read_text(), POLICY.read_text()
     mutations = {
         "always_learn": (hw, policy.replace("RTL_L2_STP_FORWARD_NO_LEARN;", "RTL_L2_STP_FORWARD_AND_LEARN;", 1)),
+        "zero_age_keeps_hardware_aging": (hw.replace("if (ageing)\n\t\thw->run_control |= BIT(0);",
+                                                    "if (true)\n\t\thw->run_control |= BIT(0);", 1), policy),
         "symmetric_isolation_misapplied": (hw, policy.replace("if (isolated & (1U << source))", "if (isolated)", 1)),
         "isolated_peers_allowed": (hw, policy.replace("destinations &= ~isolated;", "destinations |= isolated;", 1)),
         "cpu_fallback_removed": (hw, policy.replace("destinations | (1U << RTL_L2_POLICY_CPU) |", "destinations |", 1)),
@@ -379,6 +403,8 @@ def main():
     }
     assert all(value != (hw, policy) for value in mutations.values())
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    environment = dict(os.environ)
+    environment.setdefault("ASAN_OPTIONS", "detect_leaks=0")
     with tempfile.TemporaryDirectory(prefix="thoros-l2-policy-") as temporary:
         build = Path(temporary)
         (build / "linux").mkdir()
@@ -392,7 +418,7 @@ def main():
                             "-Wno-unused-function", "-O1", "-g", "-fsanitize=address,undefined",
                             "-fno-omit-frame-pointer", "-no-pie", "-I", str(build), "-I", str(DRIVERS),
                             str(build / "test.c"), "-o", str(build / "test")], check=True)
-            result = subprocess.run([str(build / "test")], capture_output=True, text=True)
+            result = subprocess.run([str(build / "test")], env=environment, capture_output=True, text=True)
             if name == "production":
                 assert result.returncode == 0, result.stderr
                 evidence = json.loads(result.stdout)

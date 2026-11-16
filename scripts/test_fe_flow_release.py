@@ -163,6 +163,18 @@ static struct rtl_dq_io fe_io(struct rtl_fe *fe){return (struct rtl_dq_io){fe,fe
 test = r'''
 static void initialize(struct rtl_fe *fe){
  memset(fe,0,sizeof(*fe));init_list(&fe->flows);init_list(&fe->ports);init_list(&fe->retries);
+ struct rtl_dq_io io=fe_io(fe);
+ /* This teardown fixture receives the established cold owner. The complete
+  * cold-prepare lifecycle has a separate oracle; here its real CMD handoff
+  * still runs with learning stopped, then ordinary traffic resumes. */
+ assert(rtl_l2_fdb_command_mode(&io)==-EBUSY);
+ assert(!fe_read(fe,RTL_L2_FDB_CONTROL));
+ fe_write(fe,RTL_L2_FDB_CONTROL,RTL_L2_FDB_LEARN_DISABLE);
+ assert(!rtl_l2_fdb_command_mode(&io));
+ assert(fe_read(fe,RTL_L2_FDB_CONTROL)==(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE));
+ fe_write(fe,RTL_L2_FDB_CONTROL,fe_read(fe,RTL_L2_FDB_CONTROL)&~RTL_L2_FDB_LEARN_DISABLE);
+ assert(!fe->deletes_FDB && !fe->restores_CAM && !fe->restores_IF && !fe->cache_invalidates);
+ fe->deletes_FDB=fe->restores_CAM=fe->restores_IF=fe->cache_invalidates=0;
  fe->memory=calloc(1,RTL_FE_MEMORY_BYTES);assert(fe->memory);
  fe->enabled=fe->prepared=fe->engine_ready=fe->route_gate_ready=true;
  assert(fe_route_arm(fe) && fe->route_admitted && !fe->route_gate_verified);

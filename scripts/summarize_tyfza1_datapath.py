@@ -25,6 +25,9 @@ MIB_COUNTERS = ("rx_bytes", "tx_bytes", "rx_uc", "rx_mc", "rx_bc", "tx_uc", "tx_
 MAX_MIB_AGE_NS = 3_000_000_000
 QM_EQ_GAUGES = ("pending", "peak")
 QM_EQ_COUNTERS = ("retries", "returned", "full_stalls")
+QM_EQ_FAULT_COUNTERS = ("bad_credit", "bad_ready")
+MC_RX_COUNTERS = ("mc_rx_hdr_bum", "mc_rx_source27", "mc_rx_source27_cpu",
+                  "mc_rx_source27_ptp", "mc_rx_source27_pol", "mc_rx_source27_mirror")
 TM_CONFIGS = ('tm_clear_control', 'bm_control', 'buffer_config', 'eq_config', 'private_config',
               'es_control', 'es_lan0', 'es_lan1', 'es_lan2', 'es_lan3', 'es_lan4',
               'es_l3wan10', 'es_oam12', 'es_l3lan13', 'te_control', 'fc_control',
@@ -175,7 +178,11 @@ def qm_buffer_pressure(before, after, window):
     """
     keys = [f"refill_eq{eq}_{name}" for eq in (4, 5)
             for name in QM_EQ_GAUGES + QM_EQ_COUNTERS]
-    if not any(key in before or key in after for key in keys):
+    extensions = [f"refill_eq{eq}_{name}" for eq in (4, 5) for name in QM_EQ_FAULT_COUNTERS]
+    extensions += [f"voq{voq}_yields" for voq in range(8)] + ["next_voq"]
+    # An orphaned new-format field is evidence of a partial capture, not
+    # evidence that an old firmware omitted the entire optional interface.
+    if not any(key in before or key in after for key in keys + extensions):
         return {"valid": False, "reason": "per_EQ_refill_evidence_unavailable"}
     if any(number(before.get(key)) is None or number(after.get(key)) is None for key in keys):
         return {"valid": False, "reason": "per_EQ_refill_evidence_incomplete"}
@@ -192,7 +199,69 @@ def qm_buffer_pressure(before, after, window):
         if not all(value["valid"] for value in counters.values()):
             return {"valid": False, "reason": "per_EQ_refill_counter_reset_or_invalid"}
         result["eq"][f"eq{eq}"] = {"gauges": gauges, "counters": counters}
+    # Each additive extension is checked separately. An R8 capture still has
+    # valid refill evidence even though it predates MMIO/fair-service counters.
+    result["refill_faults"] = qm_refill_faults(before, after, window)
+    result["voq_service"] = qm_voq_service(before, after, window)
     return result
+
+
+def qm_refill_faults(before, after, window):
+    keys = [f"refill_eq{eq}_{name}" for eq in (4, 5) for name in QM_EQ_FAULT_COUNTERS]
+    if not any(key in before or key in after for key in keys):
+        return {"valid": False, "reason": "refill_mmio_evidence_unavailable"}
+    if any(number(before.get(key)) is None or number(after.get(key)) is None for key in keys):
+        return {"valid": False, "reason": "refill_mmio_evidence_incomplete"}
+    result = {"valid": True, "eq": {}}
+    for eq in (4, 5):
+        counters = {name: delta(before[f"refill_eq{eq}_{name}"],
+                                after[f"refill_eq{eq}_{name}"], window)
+                    for name in QM_EQ_FAULT_COUNTERS}
+        if not all(value["valid"] for value in counters.values()):
+            return {"valid": False, "reason": "refill_mmio_counter_reset_or_invalid"}
+        result["eq"][f"eq{eq}"] = counters
+    return result
+
+
+def qm_voq_service(before, after, window):
+    keys = [f"voq{voq}_yields" for voq in range(8)]
+    if not any(key in before or key in after for key in (*keys, "next_voq")):
+        return {"valid": False, "reason": "voq_service_evidence_unavailable"}
+    if any(number(before.get(key)) is None or number(after.get(key)) is None
+           for key in (*keys, "next_voq")):
+        return {"valid": False, "reason": "voq_service_evidence_incomplete"}
+    next_voq = {"before": int(before["next_voq"]), "after": int(after["next_voq"])}
+    if any(value > 7 for value in next_voq.values()):
+        return {"valid": False, "reason": "voq_cursor_out_of_range"}
+    counters = {key: delta(before[key], after[key], window) for key in keys}
+    if not all(value["valid"] for value in counters.values()):
+        return {"valid": False, "reason": "voq_service_counter_reset_or_invalid"}
+    return {"valid": True, "next_voq": next_voq, "yields": counters,
+            "note": "Service-quantum yields are not drops or proof of hardware forwarding."}
+
+
+def qm_mcast_observation(before, after, window):
+    """Observed HeaderA patterns, never original-source or replicated-set proof."""
+    keys = (*MC_RX_COUNTERS, "mc_rx_last_header", "mc_rx_forwarding_proven")
+    if not any(key in before or key in after for key in keys):
+        return {"valid": False, "reason": "multicast_metadata_evidence_unavailable"}
+    if any(number(snapshot.get(key)) is None for snapshot in (before, after)
+           for key in MC_RX_COUNTERS):
+        return {"valid": False, "reason": "multicast_metadata_evidence_incomplete"}
+    if any(snapshot.get("mc_rx_forwarding_proven") != "0" for snapshot in (before, after)):
+        return {"valid": False, "reason": "unverified_multicast_forwarding_claim"}
+    raw = [snapshot.get("mc_rx_last_header") for snapshot in (before, after)]
+    if any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{16}", value)
+           for value in raw):
+        return {"valid": False, "reason": "multicast_metadata_header_incomplete"}
+    counters = {key: delta(before[key], after[key], window) for key in MC_RX_COUNTERS}
+    if not all(value["valid"] for value in counters.values()):
+        return {"valid": False, "reason": "multicast_metadata_counter_reset_or_invalid"}
+    return {"valid": True, "observed_counters": counters, "hardware_forwarding_proven": False,
+            "last_candidate_header_raw": {"before": raw[0].lower(), "after": raw[1].lower()},
+            "note": "HeaderA fields are overloaded; source27, CPU format, token and mirror do not prove "
+                    "replication, original ingress, group membership, generation or drain. The last "
+                    "header may predate this window; the counters are not an atomic snapshot."}
 
 
 def netdev(lines):
@@ -607,7 +676,8 @@ def summarize(text):
                         "FE rows are not differenced without a stable per-flow/counter generation.",
                         "MAC raw observations have unverified counter mode; no MAC delta or rate is calculated.",
                         "Cold-bootstrap records are historical, not proof of a new power cycle or current RX gates."],
-              "states": {}, "qm_cpu": {}, "qm_buffer": {}, "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
+              "states": {}, "qm_cpu": {}, "qm_buffer": {}, "qm_multicast": {},
+              "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
               "cold_bootstrap_history": {}}
     fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
@@ -629,6 +699,7 @@ def summarize(text):
     if not window["valid"]:
         result["qm_cpu"] = {"valid": False, "reason": "invalid_clock_window"}
         result["qm_buffer"] = {"valid": False, "reason": "invalid_clock_window"}
+        result["qm_multicast"] = {"valid": False, "reason": "invalid_clock_window"}
         result["netdev_host"] = {"valid": False, "reason": "invalid_clock_window"}
         result["physical_mac_cached"] = {"valid": False, "reason": "invalid_clock_window"}
         result["fabric_cached"] = {"valid": False, "reason": "invalid_clock_window"}
@@ -643,14 +714,17 @@ def summarize(text):
     if ni_before != expected or ni_after != expected:
         result["qm_cpu"] = {"valid": False, "reason": "NI_lifecycle_not_stable_ready_at_endpoints"}
         result["qm_buffer"] = {"valid": False, "reason": "NI_lifecycle_not_stable_ready_at_endpoints"}
+        result["qm_multicast"] = {"valid": False, "reason": "NI_lifecycle_not_stable_ready_at_endpoints"}
     elif any(faulty(snapshot.get("qm_voqs", [])) for snapshot in (before, after)):
         result["qm_cpu"] = {"valid": False, "reason": "QM_sample_incomplete"}
         result["qm_buffer"] = {"valid": False, "reason": "QM_sample_incomplete"}
+        result["qm_multicast"] = {"valid": False, "reason": "QM_sample_incomplete"}
     else:
         qb, qa = (fields(snapshot.get("qm_voqs", [])) for snapshot in (before, after))
         result["qm_cpu"] = {key: delta(qb.get(key), qa.get(key), window) for key in
                             ("cpu_bytes", "cpu_packets", "ring_errors", "buffer_errors", "budget_hits")}
         result["qm_buffer"] = qm_buffer_pressure(qb, qa, window)
+        result["qm_multicast"] = qm_mcast_observation(qb, qa, window)
 
     lb, la = (links(snapshot.get("wired_link_state", [])) for snapshot in (before, after))
     nb, na = (netdev(snapshot.get("netdev_counters", [])) for snapshot in (before, after))

@@ -68,6 +68,7 @@ python3 scripts/test_fabric_sdk_framing.py --sdk-ni "$work/aal_ni_l2.c" \
     --sdk-eth "$work/sdk/${sdk_path%/*}/cortina-api/eth_port.c" \
     --fc-acl "$work/rtk_fc_acl.c" --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_l2_evidence.py --registers "$work/rtl8277c_registers.h"
+python3 scripts/test_mcast_observe.py --sdk "$work/sdk" --mutants
 python3 scripts/test_ni_mib_evidence.py --sdk-ni "$work/aal_ni_l2.c" \
     --registers "$work/rtl8277c_registers.h"
 python3 scripts/test_tm_evidence.py --registers "$work/rtl8277c_registers.h" \

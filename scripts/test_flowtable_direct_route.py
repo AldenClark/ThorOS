@@ -78,7 +78,8 @@ struct net {unsigned int id;};
 typedef unsigned int atomic_t;
 #define atomic_read(p) (*(p))
 #define smp_rmb() ((void)0)
-struct net_device {unsigned int ifindex,type,addr_len;atomic_t ppp_channel_generation;};
+#define smp_load_acquire(p) (*(p))
+struct net_device {unsigned int ifindex,type,addr_len;atomic_t ppp_channel_generation;bool moving_ns;};
 struct neighbour {u8 ha[ETH_ALEN],nud_state;unsigned int refs,lock;};
 struct dst_entry {
  struct net_device *dev;struct neighbour *neigh;

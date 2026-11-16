@@ -39,6 +39,7 @@ model = r'''
 typedef unsigned char u8;
 #define READ_ONCE(value) (value)
 struct net_device {int unused;};
+struct net {int unused;};
 struct device_attribute {int unused;};
 struct rtl9617c_pon {
  int lock, control_lock, effects, cleanup_error;
@@ -64,6 +65,9 @@ struct device {struct rtl9617c_pon *pon;};
 static struct rtl9617c_pon *dev_get_drvdata(struct device *dev) {return dev->pon;}
 static void mutex_lock(int *lock) {assert(!*lock); *lock=1;}
 static void mutex_unlock(int *lock) {assert(*lock); *lock=0;}
+static void rtl_pon_policy_begin(struct rtl9617c_pon *pon,struct net **policy)
+{assert(pon->lock);*policy=NULL;}
+static void rtl9617c_switch_policy_end(struct net *policy) {(void)policy;}
 static int kstrtobool(const char *s, bool *value) {*value=s[0]=='1'; return 0;}
 static int kstrtouint(const char *s, int base, unsigned int *value)
 {(void)base; return sscanf(s,"%u",value)==1 ? 0 : -EINVAL;}

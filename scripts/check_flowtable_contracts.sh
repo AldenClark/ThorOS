@@ -17,7 +17,10 @@ for test in fe_flow_parser fe_cookie_index fe_pppoe_cleanup \
             flowtable_work_lifetime flowtable_bridge_policy flowtable_partial_offload \
             flowtable_direct_route l2_policy_noop ppp_channel_generation \
             ppp_flow_policy flowtable_mtu_lifetime flowtable_timeout_order \
-            flowtable_initial_publication; do
+            flowtable_initial_publication l2_effective_ageing; do
     python3 "scripts/test_$test.py" --kernel "$kernel"
 done
 python3 scripts/test_fe_destination_index.py --kernel "$kernel" --mutants
+python3 scripts/test_flowtable_encap_skb.py --kernel "$kernel" --mutants
+python3 scripts/test_flowtable_encap_actions.py --kernel "$kernel" --mutants
+python3 scripts/test_ppp_namespace_fence.py --kernel "$kernel" --mutants

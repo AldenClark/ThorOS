@@ -220,7 +220,7 @@ static void setup(unsigned int seed) {
 static void command_restored(const struct rtl_fabric *f) {
  assert(m.reg[RTL_L2_FDB_CONTROL/4]==((m.original[RTL_L2_FDB_CONTROL/4]^
   ((m.scan_toggles&1)?RTL_L2_FDB_SW_AGE_SCAN:0))|
-  (f->ready?RTL_L2_FDB_LEARN_DISABLE:0)));
+  (f->ready?(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE):0)));
  for(unsigned i=0;i<RTL_L2_FDB_FILTER_WORDS;i++)
   assert(m.reg[(RTL_L2_FDB_FILTER_WORD0-i*4)/4]==
          m.original[(RTL_L2_FDB_FILTER_WORD0-i*4)/4]);
@@ -434,10 +434,12 @@ int main(void) {
   assert(f.poisoned && !f.ready && m.vlan_writes==1);cases++;
  }
  {
-  struct rtl_fabric f={};setup(0);
-  m.drop_reg=RTL_L2_FDB_CONTROL;m.drop_occurrence=3;
+  struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=RTL_L2_VLAN_MODE_SVL;
+  /* Existing SVL does not use a SCAN lease: the final cold handoff is
+   * its first CMD acquisition and must verify that posted mode write. */
+  m.drop_reg=RTL_L2_FDB_CONTROL;m.drop_occurrence=2;
   assert(rtl_fabric_cold_prepare(&io,&f)==-EIO);
-  assert(f.poisoned && !f.ready && m.vlan_writes==1);cases++;
+  assert(f.poisoned && !f.ready && !m.vlan_writes);cases++;
  }
  for(unsigned kind=0;kind<8;kind++) {
   struct rtl_fabric f={};setup(kind);assert(!rtl_fabric_cold_prepare(&io,&f));
@@ -545,7 +547,8 @@ int main(void) {
  /* Reserved bits and an already-managed baseline are retained exactly. */
  {
   struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=1;
-  m.reg[0xa034/4]=0x804005f6;m.reg[0x1c00/4]|=RTL_L2_FDB_LEARN_DISABLE;
+  m.reg[0xa034/4]=0x804005f6;
+  m.reg[0x1c00/4]|=RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE;
   for(unsigned port=0;port<5;port++) {
    m.reg[RTL_FABRIC_RX(port)/4]=RTL_FABRIC_RX_CPU;
    m.reg[RTL_FABRIC_RX_MAC(port)/4]&=~RTL_FABRIC_RX_MAC_ENABLE;
@@ -554,6 +557,41 @@ int main(void) {
   assert(!rtl_fabric_cold_prepare(&io,&f) && f.ready && !f.changed);
   assert(!m.frame_writes && !m.vlan_writes && !settles);
   baseline_preserved(&f);cases++;
+ }
+ /* A baseline differing only in CMD mode is still a material ownership
+  * handoff. Both originally-live and originally-stopped learners acquire
+  * the same permanent CMD lease before route-only operation can begin. */
+ for(unsigned int boot_cmd=0;boot_cmd<2;boot_cmd++)
+  for(unsigned int boot_learning=0;boot_learning<2;boot_learning++) {
+   struct rtl_fabric f={};setup(0);m.reg[0x1414/4]|=1;
+   m.reg[0xa034/4]=0x804005f6;
+   m.reg[0x1c00/4]&=~(RTL_L2_FDB_LEARN_DISABLE|RTL_L2_FDB_CMD_MODE);
+   if(boot_cmd)m.reg[0x1c00/4]|=RTL_L2_FDB_CMD_MODE;
+   if(!boot_learning)m.reg[0x1c00/4]|=RTL_L2_FDB_LEARN_DISABLE;
+   for(unsigned port=0;port<5;port++) {
+    m.reg[RTL_FABRIC_RX(port)/4]=RTL_FABRIC_RX_CPU;
+    m.reg[RTL_FABRIC_RX_MAC(port)/4]&=~RTL_FABRIC_RX_MAC_ENABLE;
+   }
+   memcpy(m.original,m.reg,sizeof(m.reg));
+   assert(!rtl_fabric_cold_prepare(&io,&f) && f.ready);
+   assert(f.changed==(!boot_cmd || boot_learning));
+   command_restored(&f);assert(!rtl_fabric_check(&io,&f));cases++;
+  }
+ for(unsigned int fault=0;fault<7;fault++) {
+  struct rtl_fabric f={};setup(0);assert(!rtl_fabric_cold_prepare(&io,&f));
+  int expected=0;
+  switch(fault) {
+  case 0:m.reg[RTL_L2_FDB_CONTROL/4]&=~RTL_L2_FDB_LEARN_DISABLE;break;
+  case 1:m.reg[RTL_L2_FDB_CONTROL/4]^=RTL_L2_FDB_SW_AGE_SCAN;break;
+  case 2:m.reg[RTL_L2_FDB_CONTROL/4]&=~RTL_L2_FDB_CMD_MODE;expected=-EOPNOTSUPP;break;
+  case 3:m.reg[RTL_L2_FDB_CONTROL/4]=~0U;expected=-EIO;break;
+  case 4:m.reg[RTL_L2_FDB_CONTROL/4]|=RTL_L2_FDB_INFO_INIT;expected=-EOPNOTSUPP;break;
+  case 5:m.reg[RTL_L2_FDB_ACCESS/4]=RTL_L2_ACCESS_BUSY;expected=-EBUSY;break;
+  case 6:m.reg[RTL_L2_FDB_LIMIT_ACCESS/4]=RTL_L2_ACCESS_BUSY;expected=-EBUSY;break;
+  }
+  unsigned int writes=m.writes;
+  assert(rtl_fabric_check(&io,&f)==expected && m.writes==writes);
+  assert(!f.poisoned);cases++;
  }
  /*SDK_RUN*/
  printf("{\"cases\":%u,\"hardware_timing_verified\":false,\"managed_uni_max_frame\":1526,\"tpids_or_storage_written\":false}\n",cases);
@@ -572,6 +610,9 @@ def main():
                          r"\t\tfabric->cold_rx_gated \|= 1U << i;\n\t\}", production, re.S)
     assert mac_gate
     mutants = {
+        "cold_cmd_not_retained": production.replace(
+            "RTL_L2_FDB_LEARN_DISABLE | RTL_L2_FDB_CMD_MODE))",
+            "RTL_L2_FDB_LEARN_DISABLE))", 1),
         "bypass_is_not_mac_rx_gate": production.replace(mac_gate.group(), "/* RX gate omitted */", 1),
         "missing_mac_rx_readback": production.replace(
             "ret = rtl_fabric_match(io, fabric, reg, RTL_FABRIC_RX_MAC_ENABLE, 0);", "ret = 0;", 1),
@@ -630,6 +671,7 @@ def main():
     }
     assert all(text != production for text in mutants.values())
     expected_assertions = {
+        "cold_cmd_not_retained": "m.reg[RTL_L2_FDB_CONTROL/4]",
         "bypass_is_not_mac_rx_gate": "!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)",
         "missing_mac_rx_readback": "!(m.reg[RTL_FABRIC_RX_MAC(i)/4]&RTL_FABRIC_RX_MAC_ENABLE)",
         "ignored_mac_gate_poisoned": "!f.poisoned && f.refusal && !f.ready && !m.scans && !m.pp_reads",

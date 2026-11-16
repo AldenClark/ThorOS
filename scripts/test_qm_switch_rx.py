@@ -126,15 +126,28 @@ int main(void) {
   assert(owner.stats.rx_dropped==1 && retired==1 && pushed==1);
   cleanup(&rx);cases++;
  }
- const unsigned other_sources[]={5,6,7,31,32,63};
+ const unsigned other_sources[]={5,6,7,27,31,32,63};
  struct rtl9617c_ni_endpoint endpoint={.receive=pon_receive};
  for(unsigned i=0;i<ARRAY_SIZE(other_sources);i++) {
   unsigned p=other_sources[i];setup(&rx,&owner,ports,&fe,p,1,2,3,1);rx.pon=&endpoint;
   assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && !hook_calls && !lan_calls);
   assert(pon_calls==(p==7 || p>=32));
   assert(owner.stats.rx_dropped==(p!=7 && p<32));
+  assert(rx.mcast_observe.source27==(p==27));
+  if(p==27) {
+   assert(rx.mcast_observe.source27_cpu==1 && !rx.mcast_observe.source27_ptp);
+   assert(rx.mcast_observe.source27_pol_nonzero==1 && rx.mcast_observe.source27_mirror==1);
+   assert(rx.mcast_observe.last_source27_header==((u64)wanted_h0<<32|wanted_h1));
+  }
   cleanup(&rx);cases++;
  }
+ /* A malformed source27 header is not evidence of a valid CPU copy. */
+ setup(&rx,&owner,ports,&fe,27,1,2,3,1);
+ put(__builtin_bswap32((wanted_h1 & ~(0x3fffU<<15)) | (7U<<15)),
+     rx.memory+RTL_QM_PAYLOAD_OFFSET+RTL_QM_HEADROOM+4);
+ assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && !hook_calls && !lan_calls && !pon_calls);
+ assert(owner.stats.rx_errors==1 && !rx.mcast_observe.source27 && !rx.mcast_observe.hdr_bum);
+ assert(retired==1 && pushed==1);cleanup(&rx);cases++;
  /* FE-less native mode still passes valid bytes/metadata to its no-op API. */
  setup(&rx,&owner,ports,0,4,0,0,0,0);
  assert(rtl_qm_rx_poll(&rx,&napi,64)==1 && hook_calls==1 && lan_calls==1);

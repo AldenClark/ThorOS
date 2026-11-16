@@ -20,13 +20,23 @@ static inline int rtl_qm_deepq_prepare(const struct rtl_dq_io *io, unsigned int 
 	unsigned int count = RTL_DQ_BUFFERS;
 	unsigned int low = (count * 2) / 3;
 	unsigned int high = low * 2;
+	unsigned int ports, port_map, packing;
 	int ret;
 
+	if (!io || !io->read || !io->write || !io->indirect)
+		return -EINVAL;
 	if (!rtl_qm_dma_range_valid(address, RTL_DQ_MEMORY_BYTES, RTL_DQ_BUFFER_BYTES))
 		return -ERANGE;
+	/* All shared RMW inputs must be valid before publishing any DQ pool.
+	 * A failed read is not an all-ports enable or a valid port-map word. */
+	ports = io->read(io->context, 0x610c);
+	port_map = io->read(io->context, 0x68f8);
+	packing = io->read(io->context, 0x68b0);
+	if (ports == ~0U || port_map == ~0U || packing == ~0U)
+		return -EIO;
 
 	/* Keep PUC dequeue disabled until the native pools and credits are ready. */
-	io->write(io->context, 0x610c, io->read(io->context, 0x610c) & ~0xffffU);
+	io->write(io->context, 0x610c, ports & ~0xffffU);
 	for (pool = 0; pool < RTL_DQ_POOL_COUNT; pool++) {
 		unsigned int eq = RTL_DQ_EQ_PRIVATE + pool;
 		unsigned int cfg = 0x61e8 + eq * 20;
@@ -39,9 +49,9 @@ static inline int rtl_qm_deepq_prepare(const struct rtl_dq_io *io, unsigned int 
 		io->write(io->context, cfg + 16, 2);
 	}
 	io->write(io->context, 0x612c, RTL_DQ_EQ_PRIVATE | (RTL_DQ_EQ_SHARED << 4));
-	io->write(io->context, 0x68f8, (io->read(io->context, 0x68f8) & ~15U) | 10);
+	io->write(io->context, 0x68f8, (port_map & ~15U) | 10);
 	/* Stock TYFZA1 selects ordinary 2KiB buffers, without jumbo packing. */
-	io->write(io->context, 0x68b0, io->read(io->context, 0x68b0) & ~0xc8000000U);
+	io->write(io->context, 0x68b0, packing & ~0xc8000000U);
 	io->write(io->context, 0x958c, low | (high << 16));
 	io->write(io->context, 0x959c, 0x3fff3fff); /* Group admission thresholds disabled. */
 	io->write(io->context, 0x95a4, ~0U); /* PON DQ ports16..31 use port profile3. */

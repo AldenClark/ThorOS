@@ -419,13 +419,18 @@ static bool rtl9617c_switch_device_policy(const struct net_device *dev)
 static int rtl9617c_switch_upper_policy(struct net_device *dev,
 					struct netdev_nested_priv *priv)
 {
-	(void)priv;
-	return rtl9617c_switch_device_policy(dev);
+	/* Physical NI/PON endpoints cannot change namespace, but VLAN/macvlan
+	 * uppers can. A guard only owns one namespace's persistent NF/TCX/XDP
+	 * vetoes, so a cross-namespace upper must keep the whole fabric on CPU.
+	 * A successful move is fenced by switch_move_begin() in both namespaces;
+	 * this snapshot veto prevents the worker from reopening under old policy.
+	 */
+	return dev_net(dev) != priv->data || rtl9617c_switch_device_policy(dev);
 }
 
 bool rtl9617c_switch_device_has_policy(const struct net_device *dev)
 {
-	struct netdev_nested_priv priv = {};
+	struct netdev_nested_priv priv = { .data = dev_net(dev) };
 	bool policy;
 
 	ASSERT_RTNL();

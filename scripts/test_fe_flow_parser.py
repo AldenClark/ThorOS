@@ -24,6 +24,7 @@ kernel = args.kernel or Path(subprocess.check_output([
     '--kernel-directory', str(root / 'sources/openwrt')], text=True).strip())
 upstream_path = kernel / 'net/netfilter/nf_flow_table_offload.c'
 upstream = upstream_path.read_text()
+kernel_header = (kernel / 'include/net/netfilter/nf_flow_table.h').read_text()
 
 def function(source, name):
     start = re.search(r'^.*\b' + re.escape(name) + r'\([^;]*?\)\s*\{', source, re.M).start()
@@ -65,7 +66,9 @@ typedef uint8_t u8;typedef uint16_t u16,__be16;typedef uint32_t u32;
 #define VLAN_HLEN 4
 #define BIT(n) (1U<<(n))
 #define BIT_ULL(n) (1ULL<<(n))
-#define NF_FLOW_RULE_ACTION_MAX 16
+#define NF_FLOW_RULE_ACTION_MAX 24
+#define NF_FLOW_TABLE_ENCAP_MAX 3
+#define NF_FLOW_TABLE_VLAN_MAX 2
 #define unlikely(x) (x)
 enum {FLOW_DISSECTOR_KEY_META,FLOW_DISSECTOR_KEY_BASIC,FLOW_DISSECTOR_KEY_IPV4_ADDRS,
  FLOW_DISSECTOR_KEY_PORTS,FLOW_DISSECTOR_KEY_VLAN,FLOW_DISSECTOR_KEY_CVLAN,FLOW_DISSECTOR_KEY_ENC_CONTROL,FLOW_DISSECTOR_KEY_IPV6_ADDRS,FLOW_DISSECTOR_KEY_PPPOE,FLOW_DISSECTOR_KEY_CONTROL,FLOW_DISSECTOR_KEY_TCP,FLOW_DISSECTOR_KEY_ETH_ADDRS,FLOW_DISSECTOR_KEY_IP,FLOW_DISSECTOR_KEY_MAX};
@@ -144,7 +147,7 @@ struct flow_offload_tuple {u8 l4proto;struct in_addr src_v4,dst_v4;__be16 src_po
  struct in6_addr src_v6,dst_v6;
  unsigned int encap_num,in_vlan_ingress,mtu,l3proto,iifidx,xmit_type;
  struct {unsigned int iifidx;} tc;
- struct {unsigned short id;__be16 proto;} encap[2];};
+ struct {unsigned short id;__be16 proto;} encap[NF_FLOW_TABLE_ENCAP_MAX];};
 struct flow_offload {struct {struct flow_offload_tuple tuple;} tuplehash[2];};
 struct nf_flow_rule {struct flow_rule *rule;};
 struct nf_flow_key {
@@ -270,14 +273,14 @@ int main(void)
      flow.tuplehash[0].tuple.encap_num=input;flow.tuplehash[1].tuple.encap_num=output;
      for(unsigned int tag=0;tag<input;tag++) {
       flow.tuplehash[0].tuple.encap[tag].id=(id+tag)&4095;
-      flow.tuplehash[0].tuple.encap[tag].proto=htons(ETH_P_8021Q);
+      flow.tuplehash[0].tuple.encap[tag].proto=htons(vector&BIT(tag)?ETH_P_8021AD:ETH_P_8021Q);
       rule.used|=1U<<(tag?FLOW_DISSECTOR_KEY_CVLAN:FLOW_DISSECTOR_KEY_VLAN);
       nf_flow_rule_vlan_match(tag?&rule.cvlan:&rule.vlan,tag?&rule.cvlan_mask:&rule.vlan_mask,
-                             (id+tag)&4095,htons(ETH_P_8021Q));
+                             (id+tag)&4095,flow.tuplehash[0].tuple.encap[tag].proto);
      }
      for(unsigned int tag=0;tag<output;tag++) {
       flow.tuplehash[1].tuple.encap[tag].id=(4095-id+tag)&4095;
-      flow.tuplehash[1].tuple.encap[tag].proto=htons(ETH_P_8021Q);
+      flow.tuplehash[1].tuple.encap[tag].proto=htons(vector&BIT(tag+2)?ETH_P_8021AD:ETH_P_8021Q);
      }
      assert(!linux_vlan_actions(&flow,0,&nf));
      ethernet_actions(&nf,source,destination,&pon);
@@ -287,10 +290,10 @@ int main(void)
      assert(parsed.action.vlan_set==(input!=0||output!=0));
      assert(parsed.ethernet_bytes==14+4*output);
      for(unsigned int tag=0;tag<input;tag++)
-      assert(parsed.vlan[tag].vid==((id+tag)&4095) && parsed.vlan[tag].tpid==1);
-     /* Linux pushes the encap array in order; last push is outermost. */
+      assert(parsed.vlan[tag].vid==((id+tag)&4095) && parsed.vlan[tag].tpid==(vector&BIT(tag)?2:1));
+     /* Core stores outermost first; reverse PUSH must preserve wire order. */
      for(unsigned int tag=0;tag<output;tag++)
-      assert(parsed.action.vlan[tag].vid==((4095-id+output-1-tag)&4095) && parsed.action.vlan[tag].tpid==1);
+      assert(parsed.action.vlan[tag].vid==((4095-id+tag)&4095) && parsed.action.vlan[tag].tpid==(vector&BIT(tag+2)?2:1));
      unsigned int packed[8],key[23];rtl_fe_ipv4_action(packed,&parsed.action);
      rtl_fe_ipv4_key(key,&parsed.key);rtl_fe_vlan_key(key,parsed.vlan,parsed.vlan_count);
      assert((packed[5]&12)==(output<<2)); /* Literal group20 final VLAN count at162. */
@@ -303,15 +306,19 @@ int main(void)
      }
      vlan_cases++;
     }
+ unsigned int pppoe_cases=0;
  for(unsigned int direction=0;direction<2;direction++)
   for(unsigned int ipv6=0;ipv6<2;ipv6++)
+   for(unsigned int protocol=6;protocol<=17;protocol+=11)
+    for(unsigned int tags=1;tags<=2;tags++)
+     for(unsigned int tpids=0;tpids<4;tpids++)
    for(unsigned int sid=1;sid<=0xabcd;sid+=0xabcc) {
     struct flow_offload flow={};
     flow.tuplehash[0].tuple.mtu=1492;
     flow.tuplehash[1].tuple.mtu=1500;
     for(unsigned int dir=0;dir<2;dir++) {
      struct flow_offload_tuple *t=&flow.tuplehash[dir].tuple;
-     t->iifidx=dir?4:2;t->l3proto=ipv6?AF_INET6:AF_INET;t->l4proto=IPPROTO_TCP;
+     t->iifidx=dir?4:2;t->l3proto=ipv6?AF_INET6:AF_INET;t->l4proto=protocol;
      t->src_v4.s_addr=htonl(dir?0x74e46f76:0x0a172a01);
      t->dst_v4.s_addr=htonl(dir?0xc0a8471c:0x74e46f76);
      t->src_port=htons(dir?443:53123);t->dst_port=htons(dir?12341:443);
@@ -321,11 +328,13 @@ int main(void)
      }
     }
     struct flow_offload_tuple *input=&flow.tuplehash[1].tuple;
-    flow.tuplehash[1].tuple.encap_num=2;
-    flow.tuplehash[1].tuple.encap[0].proto=htons(ETH_P_PPP_SES);
-    flow.tuplehash[1].tuple.encap[0].id=sid;
-    flow.tuplehash[1].tuple.encap[1].proto=htons(ETH_P_8021Q);
-    flow.tuplehash[1].tuple.encap[1].id=100;
+    flow.tuplehash[1].tuple.encap_num=tags+1;
+    for(unsigned int tag=0;tag<tags;tag++) {
+     flow.tuplehash[1].tuple.encap[tag].proto=htons(tpids&BIT(tag)?ETH_P_8021AD:ETH_P_8021Q);
+     flow.tuplehash[1].tuple.encap[tag].id=100+tag;
+    }
+    flow.tuplehash[1].tuple.encap[tags].proto=htons(ETH_P_PPP_SES);
+    flow.tuplehash[1].tuple.encap[tags].id=sid;
     struct nf_flow_match match={};
     assert(!nf_flow_rule_match(&match,input,NULL));
     assert(match.dissector.used_keys&BIT_ULL(FLOW_DISSECTOR_KEY_PPPOE));
@@ -343,6 +352,7 @@ int main(void)
      .ipv6=match.key.ipv6,.ipv6_mask=match.mask.ipv6,
      .ports=match.key.tp,.ports_mask=match.mask.tp,
      .vlan=match.key.vlan,.vlan_mask=match.mask.vlan,
+     .cvlan=match.key.cvlan,.cvlan_mask=match.mask.cvlan,
      .pppoe=match.key.pppoe,.pppoe_mask=match.mask.pppoe};
     struct nf_flow_rule nf={.rule=&rule};struct flow_cls_offload cls={.rule=&rule,.route_mtu=direction?1500:1492};
     struct rtl_fe_rule parsed={};unsigned int words[8];
@@ -359,7 +369,14 @@ int main(void)
     assert(parsed.pppoe_session==(direction?sid:0));
     assert(parsed.egress_pppoe==(direction?0:3U|sid<<2));
     assert(parsed.mtu==(direction?1500:1492));
-    assert(parsed.ethernet_bytes==(direction?14:26));
+    assert(parsed.ethernet_bytes==(direction?14:22+4*tags));
+    assert(parsed.vlan_count==(direction?tags:0));
+    assert(parsed.action.vlan_count==(direction?0:tags));
+    for(unsigned int tag=0;tag<tags;tag++) {
+     const struct rtl_fe_vlan *v=direction?&parsed.vlan[tag]:&parsed.action.vlan[tag];
+     assert(v->vid==100+tag && v->tpid==(tpids&BIT(tag)?2:1));
+    }
+    pppoe_cases++;
     for(unsigned int llid=0;llid<32;llid++) {
      pp.llid=llid;pp.destination=32+llid;
      memset(&parsed,0,sizeof(parsed));
@@ -517,10 +534,15 @@ int main(void)
   if(!limits[i] || limits[i]>0x3fff)assert(ret==-EOPNOTSUPP);
   else assert(!ret && parsed.mtu==limits[i]);
  }
- printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, 8 bidirectional PPPoE and %u authorized bridge vectors; 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,bridge_cases);
+ printf("Native flow parser: %u NAT/IPv6, %u VLAN/QinQ, %u bidirectional PPPoE/QinQ and %u authorized bridge vectors; 20 widened-rule rejections, 8 TCP masks, valid checksum actions and per-route MTU limits passed\n",cases,vlan_cases,pppoe_cases,bridge_cases);
 }
 '''
 
+for name, source in [('NF_FLOW_RULE_ACTION_MAX', upstream),
+                     ('NF_FLOW_TABLE_ENCAP_MAX', kernel_header),
+                     ('NF_FLOW_TABLE_VLAN_MAX', kernel_header)]:
+    value = re.search(r'^#define\s+' + name + r'\s+(\d+)', source, re.M)[1]
+    common = re.sub(r'(#define ' + name + r' )\d+', r'\g<1>' + value, common)
 parts = [common, re.search(r'struct rtl_fe_rule \{.*?\n\};', native, re.S)[0]]
 parts += [function(native,n) for n in ('fe_vlan_tpid','fe_vlan_match')]
 parts += [(drivers / 'rtl9617c-fe-vlan.h').read_text()]
@@ -529,13 +551,10 @@ for name in ('flow_action_entry_next','flow_offload_mangle','flow_offload_ipv4_s
              'flow_offload_l4proto','flow_offload_port_snat'):
     parts.append(function(upstream, name))
 parts.append(function(upstream,'nf_flow_rule_vlan_match'))
+parts.append(function(kernel_header,'nf_flow_tuple_encap_valid'))
 parts.append(function(upstream,'nf_flow_rule_match'))
-loop = upstream.index('\tfor (i = 0; i < tuple->encap_num; i++)',
-                      upstream.index('nf_flow_rule_route_common('))
-start = upstream.rfind('\ttuple = &flow->tuplehash[dir].tuple;',0,loop)
-end = upstream.index('\n\treturn 0;\n}',loop)+len('\n\treturn 0;\n}')
-parts.append('static int linux_vlan_actions(const struct flow_offload *flow,enum flow_offload_tuple_dir dir,struct nf_flow_rule *flow_rule) {\n'
-             'const struct flow_offload_tuple *tuple,*other_tuple;int i;\n'+upstream[start:end])
+parts.append(function(upstream,'nf_flow_rule_route_encap'))
+parts.append('#define linux_vlan_actions nf_flow_rule_route_encap\n')
 parts.append(test)
 with tempfile.TemporaryDirectory(dir=root / 'artifacts',prefix='fe-parser-') as work:
     source = Path(work) / 'parser.c'
@@ -549,6 +568,6 @@ with tempfile.TemporaryDirectory(dir=root / 'artifacts',prefix='fe-parser-') as 
     'Linux_NAT_builder_sha256':hashlib.sha256(upstream.encode()).hexdigest(),
     'Linux_version':json.loads((root / 'port/sources.lock.json').read_text())['openwrt']['kernel'],
     'TCP_UDP_both_directions':True,
-    'vectors':1028,'IPv6_128bit_route_vectors':4,'Linux_VLAN_QinQ_vectors':288,'PPPoE_IPv4_IPv6_both_directions':8,'sanitizers':['ASan','UBSan'],
+    'vectors':1028,'IPv6_128bit_route_vectors':4,'Linux_VLAN_QinQ_vectors':288,'PPPoE_IPv4_IPv6_both_directions':128,'sanitizers':['ASan','UBSan'],
     'hardware_flowtable_acceptance':False,
 },indent=2)+'\n')
