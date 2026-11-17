@@ -56,6 +56,7 @@ FIXTURE = r'''
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "rtl9617c-fe-observe.h"
 #define RTL_L2_ACCESS_BUSY 0x80000000U
@@ -107,19 +108,25 @@ static struct rtl_dq_io fe_io(struct rtl_fe *fe) {
 
 TEST = r'''
 static unsigned int cases;
+#define SEMANTIC_CHECK(condition) do { \
+ if (!(condition)) { \
+  fprintf(stderr,"FDB_SEMANTIC_ASSERT reason=%u expr=%s\n",reason,#condition); \
+  exit(73); \
+ } \
+} while(0)
 static void prepare(struct rtl_fe *fe,struct rtl_l2_owner *owner) {
  memset(fe,0,sizeof(*fe));memset(owner,0,sizeof(*owner));
  owner->sealed=1;fe->fabric.ready=1;fe->l2_owner=owner;
  fe->io.control=0x9ca00ff9U; /* R12 raw value with CMD mode set in mock */
 }
 static void expect(struct rtl_fe *fe,int ret,unsigned int reason,unsigned int sampled) {
- assert(fe_destination_mode_preflight(fe)==ret);
- assert(fe->observe.last_fdb_mode_error==ret);
- assert(fe->observe.last_fdb_mode_reason==reason);
- assert(fe->observe.fdb_mode_reason[reason]==1);
- assert(fe->observe.last_fdb_mode_sampled==sampled);
- assert(fe->observe.last_fdb_mode_control==(sampled?fe->io.control:0));
- assert(!fe->io.writes && !fe->io.indirects);
+ SEMANTIC_CHECK(fe_destination_mode_preflight(fe)==ret);
+ SEMANTIC_CHECK(fe->observe.last_fdb_mode_error==ret);
+ SEMANTIC_CHECK(fe->observe.last_fdb_mode_reason==reason);
+ SEMANTIC_CHECK(fe->observe.fdb_mode_reason[reason]==1);
+ SEMANTIC_CHECK(fe->observe.last_fdb_mode_sampled==sampled);
+ SEMANTIC_CHECK(fe->observe.last_fdb_mode_control==(sampled?fe->io.control:0));
+ SEMANTIC_CHECK(!fe->io.writes && !fe->io.indirects);
  cases++;
 }
 int main(void){
@@ -194,6 +201,14 @@ def main():
         "ignore_cmd": ("if(!(control&RTL_L2_FDB_CMD_MODE))", "if(0)"),
         "invert_cmd": ("if(!(control&RTL_L2_FDB_CMD_MODE))", "if(control&RTL_L2_FDB_CMD_MODE)"),
     }
+    # Reason codes are the actual enum constants in rtl9617c-fe-observe.h.
+    # Only the intended fixture check may reject a mutant. Sanitizer crashes,
+    # an unexpected signal or a failed compiler are never successes.
+    expected_reasons = {
+        "skip_fabric": 1, "skip_owner": 2, "skip_fault": 3,
+        "skip_journal_quarantine": 3, "skip_live_probe": 4,
+        "ignore_cmd": 6, "invert_cmd": 6,
+    }
     variants = {"production": PREFLIGHT}
     for name, (before, after) in mutations.items():
         assert PREFLIGHT.count(before) == 1, name
@@ -222,7 +237,9 @@ def main():
                 assert result.returncode == 0, result.stderr
                 print(result.stdout.strip(), flush=True)
             else:
-                assert result.returncode != 0, name + " unexpectedly passed"
+                marker = f"FDB_SEMANTIC_ASSERT reason={expected_reasons[name]} expr="
+                assert result.returncode == 73 and marker in result.stderr, (
+                    name, result.returncode, result.stderr)
     print(f"FE FDB-mode preflight: {len(mutations)} semantic mutants rejected")
 
 

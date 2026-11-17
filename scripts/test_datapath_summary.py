@@ -654,6 +654,17 @@ timed = module.summarize(capture(cold=(timed_cold, timed_cold),
                                  serdes_timing=(timed_serdes, timed_serdes)))
 assert timed['cold_bootstrap_history']['after']['timing']['cold_finished_ns'] == 1010000000
 assert timed['pon_serdes_timing']['after']['valid']
+assert module.pon_serdes_timing_sample({'pon_serdes_timing': [
+    'schema=1 available=0 cached=1 mmio_reads=0 mmio_writes=0 reason=busy retryable=1'
+]}) == {'valid': False, 'reason': 'PON_serdes_timing_busy'}
+assert module.pon_serdes_timing_sample({'pon_serdes_timing': [
+    'schema=1 available=0 cached=1 mmio_reads=1 mmio_writes=0 reason=busy retryable=1'
+]}) == {'valid': False, 'reason': 'PON_serdes_timing_schema_invalid'}
+assert module.pon_serdes_timing_sample({'pon_serdes_timing':
+    timed_serdes.replace('serdes_last_finished_ns=3200000000',
+                         'serdes_last_finished_ns=0').replace(
+        'serdes_last_elapsed_ns=200000000', 'serdes_last_elapsed_ns=0').splitlines()
+}) == {'valid': False, 'reason': 'PON_serdes_timing_in_progress'}
 assert not timed['pon_serdes_timing']['after']['ready_for_fabric_handoff']
 assert timed['cold_serdes_order']['after']['valid']
 assert timed['cold_serdes_order']['after']['serdes_after_ni_cold']
@@ -744,6 +755,17 @@ for reason, text in (
     result = module.summarize(text)
     assert result['clock_window'] == {'valid': False, 'reason': reason}, result
     assert result['qm_cpu']['valid'] is False and result['netdev_host']['valid'] is False
+
+# R13 laboratory exports replaced boot UUIDs with privacy labels. They must
+# remain rejected unless explicitly normalized; distinct labels retain the
+# boot-change rejection and no fabricated hardware proof is introduced.
+private_redaction = capture().replace(f'boot_id={boot}', 'boot_id=<BOOT_ID_1>')
+assert module.summarize(private_redaction)['clock_window']['reason'] == 'boot_identity_missing_or_invalid'
+synthetic_redaction = module.normalize_redacted_boot_ids(private_redaction)
+assert module.summarize(synthetic_redaction)['clock_window']['valid']
+assert not module.summarize(synthetic_redaction)['hardware_forwarding_proven']
+mixed_redaction = private_redaction.replace('boot_id=<BOOT_ID_1>', 'boot_id=<BOOT_ID_2>', 1)
+assert module.summarize(module.normalize_redacted_boot_ids(mixed_redaction))['clock_window']['reason'] == 'boot_changed'
 
 for value in ('1', '9007199254740992'):
     result = module.summarize(capture(q_after=value))

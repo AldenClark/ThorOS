@@ -189,6 +189,7 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 		pon->serdes_first_start_ns = pon->serdes_last_start_ns;
 	pon->serdes_attempts++;
 	pon->serdes_last_finished_ns = 0;
+	pon->serdes_last_config_error = -EINPROGRESS;
 	mutex_unlock(&pon->lock);
 	ret = request_firmware_direct(&fw, configuration->profile, pon->dev);
 	if (ret)
@@ -264,6 +265,7 @@ release:
 finished:
 	mutex_lock(&pon->lock);
 	pon->serdes_error = ret;
+	pon->serdes_last_config_error = ret;
 	pon->serdes_last_finished_ns = ktime_get_boottime_ns();
 	mutex_unlock(&pon->lock);
 	return ret;
@@ -295,7 +297,7 @@ ssize_t rtl_pon_serdes_timing(struct rtl9617c_pon *pon, char *buf)
 		(unsigned long long)pon->serdes_last_finished_ns,
 		(unsigned long long)(pon->serdes_last_finished_ns >= pon->serdes_last_start_ns ?
 			pon->serdes_last_finished_ns - pon->serdes_last_start_ns : 0),
-		pon->serdes_error);
+		pon->serdes_last_config_error);
 }
 
 ssize_t rtl_pon_serdes_registers(struct rtl9617c_pon *pon, char *buf)

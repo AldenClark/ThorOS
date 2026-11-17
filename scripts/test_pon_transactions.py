@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import resource
@@ -64,6 +65,11 @@ static void mutex_lock(struct mutex *lock) {
     assert(pthread_mutex_lock(&lock->native)==0);lock->held=true;
 }
 static void mutex_unlock(struct mutex *lock) {assert(lock->held);lock->held=false;assert(pthread_mutex_unlock(&lock->native)==0);}
+static bool mutex_trylock(struct mutex *lock) {
+    int ret=pthread_mutex_trylock(&lock->native);
+    if(ret==EBUSY)return false;
+    assert(ret==0);lock->held=true;return true;
+}
 #define lockdep_assert_held(lock) assert((lock)->held)
 struct delayed_work {bool pending;};
 struct net_device {bool carrier,control;};
@@ -78,7 +84,7 @@ struct rtl9617c_pon {
     struct mutex lock,control_lock;enum rtl_pon_mode mode;
     void *mac,*control,*epon_control,*gpon_control,*serdes_init,*optical_control,*top_irq,*dev,*ni_dev;
     bool mpcp_enabled,mpcp_configured,mac_prepared,traffic_enabled,serdes_configured,gearbox_ready,rx_synced,puc_configured,pdc_configured,fe_enabled,fe_cpu_path,xgpon_pending_valid;
-    u32 registered,waiting,serdes_status;int sync_result,serdes_error,mpcp_irq,cleanup_error,policy_error;
+    u32 registered,waiting,serdes_status;int sync_result,serdes_error,serdes_last_config_error,mpcp_irq,cleanup_error,policy_error;
     u64 serdes_attempts,serdes_first_start_ns,serdes_last_start_ns,serdes_last_finished_ns;
     uint64_t epon_epoch,epon_llid_epoch[32];
     u32 epon_crypto_llids,epon_sync_failures;
@@ -185,6 +191,12 @@ static int rtl_pon_epon_traffic_locked(struct rtl9617c_pon *pon,bool enable) {
 static int rtl_pon_epon_traffic(struct rtl9617c_pon *pon,bool enable) {return rtl_pon_epon_traffic_locked(pon,enable);}
 '''
 
+timing_model = r'''
+struct device {void *data;};
+struct device_attribute {int unused;};
+static void *dev_get_drvdata(struct device *dev) {return dev->data;}
+'''
+
 transaction_test = r'''
 static int start_result;
 static void *concurrent_start(void *arg) {
@@ -242,11 +254,22 @@ int main(void) {
            control==0x30e && pon.serdes_attempts==8 &&
            pon.serdes_first_start_ns==first &&
            pon.serdes_last_finished_ns>pon.serdes_last_start_ns);
+    assert(pon.serdes_last_config_error==-EINVAL);
+    /* A later warm XGPON recovery may change the live SerDes error; it
+     * cannot change the recorded result of this configuration attempt. */
+    pon.serdes_error=-ETIMEDOUT;
     char state[4096];assert(rtl_pon_serdes_timing(&pon,state)>0);
     assert(strstr(state,"schema=1 cached=1 mmio_reads=0 mmio_writes=0"));
     assert(strstr(state,"serdes_timebase=boottime_ns serdes_attempts=8"));
     assert(strstr(state,"serdes_first_start_ns=101000000"));
     assert(strstr(state,"serdes_last_elapsed_ns=1000000"));
+    assert(strstr(state,"serdes_last_error=-22"));
+    struct device device={.data=&pon};
+    mutex_lock(&pon.lock);
+    assert(serdes_timing_show(&device,NULL,state)>0);
+    assert(strstr(state,"schema=1 available=0 cached=1 mmio_reads=0 mmio_writes=0 reason=busy retryable=1"));
+    mutex_unlock(&pon.lock);
+    assert(serdes_timing_show(&device,NULL,state)>0);
     assert(strstr(state,"serdes_last_error=-22"));
     puts("Actual SerDes/MPCP transaction: concurrent restart blocked; old PUC/PDC reset before mode handoff; failed FE/NI cleanup preserves old mode and hardware ownership");
     pthread_mutex_destroy(&pon.lock.native);pthread_mutex_destroy(&pon.control_lock.native);
@@ -687,7 +710,8 @@ int main(void) {
 controller = read('rtl9617c-pon.c')
 serdes = read('rtl9617c-pon-serdes.c')
 timing_show = function(controller, 'serdes_timing_show')
-assert 'mutex_lock(&pon->lock)' in timing_show
+assert 'mutex_trylock(&pon->lock)' in timing_show
+assert 'reason=busy retryable=1' in timing_show
 assert 'rtl_pon_serdes_timing(pon, buf)' in timing_show
 assert 'mutex_unlock(&pon->lock)' in timing_show
 assert 'readl(' not in timing_show
@@ -713,11 +737,12 @@ with tempfile.TemporaryDirectory(prefix='control-tests-', dir=root / 'artifacts'
             definitions += function(mpcp, 'rtl_pon_mpcp_stop' + locked) + function(mpcp, 'rtl_pon_mpcp_configure' + locked)
             definitions += function(serdes, 'rtl_pon_serdes_configure' + locked)
             definitions += function(serdes, 'rtl_pon_serdes_timing')
+            definitions += function(controller, 'serdes_timing_show')
             if locked:
                 if 'int rtl_pon_stop_locked' in controller:
                     definitions += function(controller, 'rtl_pon_stop_locked')
                 definitions += function(controller, 'rtl_pon_mpcp_configure') + function(controller, 'rtl_pon_serdes_configure')
-            source = common + constants + '\n' + definitions + transaction_test
+            source = common + timing_model + constants + '\n' + definitions + transaction_test
         elif case == 'serdes-sync':
             constants = '\n'.join(re.findall(r'^#define .*$', serdes, re.M))
             source = common + sync_model + constants + '\n' + function(serdes, 'rtl_pon_serdes_work') + sync_test
@@ -806,7 +831,9 @@ with tempfile.TemporaryDirectory(prefix='control-tests-', dir=root / 'artifacts'
             cfile.write_text(program)
             subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-Wno-unused-function', '-Wno-unused-variable', '-Wno-unused-parameter',
                             '-O1', '-g', '-pthread', '-fsanitize=address,undefined', '-I', str(headers), str(cfile), '-o', str(binary)], check=True)
-            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20,
+                                    env={**os.environ, 'ASAN_OPTIONS': 'detect_leaks=0',
+                                         'LSAN_OPTIONS': 'detect_leaks=0'})
             if variant == 'production':
                 if result.returncode:
                     print(result.stderr,end='')

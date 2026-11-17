@@ -224,7 +224,11 @@ static ssize_t serdes_timing_show(struct device *dev, struct device_attribute *a
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
 	ssize_t size;
 
-	mutex_lock(&pon->lock);
+	/* PON profile writes and SerDes polling may hold this mutex for seconds.
+	 * Never block an observer behind live hardware configuration. */
+	if (!mutex_trylock(&pon->lock))
+		return sysfs_emit(buf,
+			"schema=1 available=0 cached=1 mmio_reads=0 mmio_writes=0 reason=busy retryable=1\n");
 	size = rtl_pon_serdes_timing(pon, buf);
 	mutex_unlock(&pon->lock);
 	return size;

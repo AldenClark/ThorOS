@@ -99,6 +99,9 @@ struct rtl9617c_pon {
 	u64 serdes_first_start_ns;
 	u64 serdes_last_start_ns;
 	u64 serdes_last_finished_ns;
+	/* Immutable result of the last profile configuration transaction.  Warm
+	 * XGPON recovery may update serdes_error between these timestamps. */
+	int serdes_last_config_error;
 	int sync_result;
 	bool rx_synced;
 	bool mac_prepared;

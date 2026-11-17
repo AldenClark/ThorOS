@@ -40,7 +40,7 @@ python3 scripts/test_fabric_baseline.py
 python3 scripts/test_fabric_modes.py --mutants
 python3 scripts/test_pon_cold_handoff.py
 python3 scripts/test_pon_probe_unwind.py --mutants
-python3 scripts/test_pon_transactions.py --case address --case epon-policy --mutants
+python3 scripts/test_pon_transactions.py --case transactions --case address --case serdes-sync --case epon-policy --mutants
 python3 scripts/test_pon_dma_owner.py --mutants
 python3 scripts/test_ni_cold_handoff.py --mutants
 python3 scripts/test_l2_policy_races.py

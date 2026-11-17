@@ -10,6 +10,7 @@ absence of such evidence cannot prove there was no intervening reset or ABA.
 import argparse
 import json
 import re
+import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -17,6 +18,20 @@ from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024
 MAX_COUNTER = (1 << 64) - 1
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+REDACTED_BOOT_ID = re.compile(r"(?<=boot_id=)<BOOT_ID_([1-9][0-9]*)>(?=\s|$)")
+
+
+def normalize_redacted_boot_ids(capture):
+    """Opt-in replay adapter for privacy-scrubbed exports, never live evidence.
+
+    Preserve each redaction label's equality/difference relationship by
+    substituting a deterministic, *synthetic* UUID. The exporter may instead
+    create format-preserving synthetic UUIDs before shipping its archive.
+    """
+    return REDACTED_BOOT_ID.sub(
+        lambda match: str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                     'thoros-redacted-boot-id-' + match.group(1))),
+        capture)
 # An empty value still occupies its key: a truncated duplicate must not make
 # a preceding, apparently valid field win silently.
 TOKEN = re.compile(r"(?<!\S)([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]*)")
@@ -872,6 +887,11 @@ def pon_serdes_timing_sample(snapshot):
     if not lines or faulty(lines):
         return invalid('PON_serdes_timing_unavailable')
     raw = fields(lines)
+    if (raw.get('schema') == '1' and raw.get('available') == '0' and
+            raw.get('cached') == '1' and raw.get('mmio_reads') == '0' and
+            raw.get('mmio_writes') == '0' and raw.get('reason') == 'busy' and
+            raw.get('retryable') == '1'):
+        return invalid('PON_serdes_timing_busy')
     required = {'schema': '1', 'cached': '1', 'mmio_reads': '0',
                 'mmio_writes': '0', 'serdes_timebase': 'boottime_ns'}
     if any(raw.get(key) != value for key, value in required.items()):
@@ -891,6 +911,8 @@ def pon_serdes_timing_sample(snapshot):
                 (values['serdes_last_finished_ns'] - values['serdes_last_start_ns']
                  if values['serdes_last_finished_ns'] else 0)):
             return invalid('PON_serdes_timing_inconsistent')
+        if not values['serdes_last_finished_ns']:
+            return invalid('PON_serdes_timing_in_progress')
     elif any(values[key] for key in names[1:]):
         return invalid('PON_serdes_timing_inconsistent')
     return {'valid': True, 'cached': True, 'mmio_reads': 0,
@@ -1295,6 +1317,9 @@ def summarize(text):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--redacted-boot-ids', action='store_true',
+                        help='accept explicit <BOOT_ID_N> privacy labels as synthetic identities; '
+                             'not a live device proof')
     parser.add_argument("capture", type=Path)
     arguments = parser.parse_args()
     try:
@@ -1302,7 +1327,13 @@ def main():
             content = stream.read(MAX_BYTES + 1)
         if len(content) > MAX_BYTES:
             raise ValueError("capture exceeds 2 MiB")
-        result = summarize(content.decode("utf-8", errors="strict"))
+        capture = content.decode("utf-8", errors="strict")
+        redacted = bool(REDACTED_BOOT_ID.search(capture))
+        if arguments.redacted_boot_ids:
+            capture = normalize_redacted_boot_ids(capture)
+        result = summarize(capture)
+        if redacted and arguments.redacted_boot_ids:
+            result['redacted_boot_identity_replayed'] = True
     except (OSError, UnicodeError, ValueError) as error:
         parser.exit(2, f"Invalid capture: {error}\n")
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
