@@ -10,6 +10,7 @@ absence of such evidence cannot prove there was no intervening reset or ABA.
 import argparse
 import json
 import re
+import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -17,6 +18,20 @@ from pathlib import Path
 MAX_BYTES = 2 * 1024 * 1024
 MAX_COUNTER = (1 << 64) - 1
 BOOT_ID = re.compile(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z")
+REDACTED_BOOT_ID = re.compile(r"(?<=boot_id=)<BOOT_ID_([1-9][0-9]*)>(?=\s|$)")
+
+
+def normalize_redacted_boot_ids(capture):
+    """Opt-in replay adapter for privacy-scrubbed exports, never live evidence.
+
+    Preserve each redaction label's equality/difference relationship by
+    substituting a deterministic, *synthetic* UUID. The exporter may instead
+    create format-preserving synthetic UUIDs before shipping its archive.
+    """
+    return REDACTED_BOOT_ID.sub(
+        lambda match: str(uuid.uuid5(uuid.NAMESPACE_URL,
+                                     'thoros-redacted-boot-id-' + match.group(1))),
+        capture)
 # An empty value still occupies its key: a truncated duplicate must not make
 # a preceding, apparently valid field win silently.
 TOKEN = re.compile(r"(?<!\S)([a-zA-Z_][a-zA-Z0-9_]*)=([^\s]*)")
@@ -64,6 +79,10 @@ LEGACY_INSTALL_STAGES = tuple(stage for stage in INSTALL_STAGES if stage != 'fdb
 FDB_MODE_REASONS = ('ready', 'fabric_unready', 'owner_unready', 'owner_fault',
                     'window_busy', 'info_init', 'cmd_disabled', 'read_error')
 FDB_MODE_COUNTERS = tuple(f'fdb_mode_{reason}' for reason in FDB_MODE_REASONS)
+ROUTE_CACHED_FLAGS = ('route_policy_admitted', 'route_fabric_ready',
+                      'route_fabric_poisoned', 'route_fdb_owner_present',
+                      'route_fdb_owner_sealed', 'route_fdb_owner_quarantined',
+                      'route_live_cmd_mode_rechecked')
 ADMISSION_CATEGORIES = ('install_unavailable', 'install_duplicate', 'install_collision',
                         'install_unsupported', 'install_no_space', 'install_no_memory',
                         'install_io', 'install_other')
@@ -555,6 +574,18 @@ def admission_sample(snapshot):
                 (fdb_mode['last_control_sampled'] == 0 and fdb_mode['last_control'] != 0) or
                 (fdb_mode['last_reason'] == 'ready' and fdb_mode['last_error'] != 0)):
             return invalid('L3_fdb_mode_extension_invalid')
+    # R14 records the policy/fabric/owner prerequisites separately. These
+    # flags are an instantaneous cached view, not a live FDB mode attestation.
+    route_extended = any(key in raw for key in ROUTE_CACHED_FLAGS)
+    route_cached = None
+    if route_extended:
+        route_cached = {key: number(raw.get(key)) for key in ROUTE_CACHED_FLAGS}
+        if (any(value not in (0, 1) for value in route_cached.values()) or
+                route_cached['route_live_cmd_mode_rechecked'] != 0 or
+                (not route_cached['route_fdb_owner_present'] and
+                 (route_cached['route_fdb_owner_sealed'] or
+                  route_cached['route_fdb_owner_quarantined']))):
+            return invalid('L3_route_cached_extension_invalid')
     if (last['request'] > counters['requests'] or last['errno'] > 0 or last['rollback_errno'] > 0 or
             sum(counters[key] for key in ADMISSION_REJECTIONS) != counters['parse_rejected'] or
             sum(counters[key] for key in ADMISSION_CATEGORIES) != counters['install_failed'] or
@@ -566,7 +597,7 @@ def admission_sample(snapshot):
         return invalid('L3_admission_inconsistent_last_failure')
     last['stage'] = stage
     return {'valid': True, 'cached': True, 'counts_are_packets': False, 'counters': counters,
-            'fdb_mode': fdb_mode,
+            'fdb_mode': fdb_mode, 'route_cached': route_cached,
             'last_failure': last, 'hardware_forwarding_proven': False,
             'note': 'Cumulative rule admission callbacks, not packet hits. No cross-instance delta is inferred.'}
 
@@ -717,6 +748,24 @@ def cold_sample(snapshot):
                                    record['result'] or not record['pon_snapshot_ready']))):
         return invalid('cold_record_inconsistent_state')
 
+    cold_timing_names = ('cold_timebase', 'cold_started_ns', 'cold_finished_ns',
+                         'cold_elapsed_ns', 'cold_retry_permitted')
+    cold_timing = None
+    if any(key in raw for key in cold_timing_names):
+        cold_timing = {key: number(raw.get(key)) for key in cold_timing_names[1:]}
+        cold_timing['timebase'] = raw.get('cold_timebase')
+        if (any(value is None for value in cold_timing.values()) or
+                cold_timing['timebase'] != 'boottime_ns' or
+                cold_timing['cold_retry_permitted'] != 0 or
+                (record['attempted'] and
+                 (not cold_timing['cold_started_ns'] or
+                  cold_timing['cold_finished_ns'] < cold_timing['cold_started_ns'])) or
+                (not record['attempted'] and
+                 (cold_timing['cold_started_ns'] or cold_timing['cold_finished_ns'])) or
+                cold_timing['cold_elapsed_ns'] !=
+                cold_timing['cold_finished_ns'] - cold_timing['cold_started_ns']):
+            return invalid('cold_timing_extension_partial_or_invalid')
+
     clock_names = ('pon_clock_guard', 'pon_clock_required', 'pon_clock_samples',
                    'pon_clock_valid', 'pon_clock_ready', 'pon_clock_first', 'pon_clock_last')
     clock_extension = None
@@ -814,7 +863,8 @@ def cold_sample(snapshot):
     result = {'valid': True, 'historical': True, 'power_cycle_proven': False,
               'live_RX_state_proven': False, 'runtime_native_L2_proven': False,
               'reason': diagnosis, 'stage_name': COLD_STAGES[record['pon_stage']],
-              'record': record, 'gate_extension_present': extension is not None}
+              'record': record, 'gate_extension_present': extension is not None,
+              'timing': cold_timing}
     if extension is not None:
         result['gate_observations'] = extension
     result['clock_extension_present'] = clock_extension is not None
@@ -828,6 +878,61 @@ def cold_sample(snapshot):
                 result['refused_receive_gate'] = {'family': family, 'register': address, 'mask': mask,
                                                   'last_gate_bits': record['pon_refused_value'] & mask}
     return result
+
+
+def pon_serdes_timing_sample(snapshot):
+    """Read only the new cached time ledger; never request live PSDS state."""
+    lines = snapshot.get('pon_serdes_timing', [])
+    invalid = lambda reason: {'valid': False, 'reason': reason}
+    if not lines or faulty(lines):
+        return invalid('PON_serdes_timing_unavailable')
+    raw = fields(lines)
+    if (raw.get('schema') == '1' and raw.get('available') == '0' and
+            raw.get('cached') == '1' and raw.get('mmio_reads') == '0' and
+            raw.get('mmio_writes') == '0' and raw.get('reason') == 'busy' and
+            raw.get('retryable') == '1'):
+        return invalid('PON_serdes_timing_busy')
+    required = {'schema': '1', 'cached': '1', 'mmio_reads': '0',
+                'mmio_writes': '0', 'serdes_timebase': 'boottime_ns'}
+    if any(raw.get(key) != value for key, value in required.items()):
+        return invalid('PON_serdes_timing_schema_invalid')
+    names = ('serdes_attempts', 'serdes_first_start_ns', 'serdes_last_start_ns',
+             'serdes_last_finished_ns', 'serdes_last_elapsed_ns')
+    values = {key: number(raw.get(key)) for key in names}
+    error = signed32(raw.get('serdes_last_error'))
+    if any(value is None for value in values.values()) or error is None:
+        return invalid('PON_serdes_timing_values_invalid')
+    if values['serdes_attempts']:
+        if (not values['serdes_first_start_ns'] or
+                values['serdes_first_start_ns'] > values['serdes_last_start_ns'] or
+                (values['serdes_last_finished_ns'] and
+                 values['serdes_last_finished_ns'] < values['serdes_last_start_ns']) or
+                values['serdes_last_elapsed_ns'] !=
+                (values['serdes_last_finished_ns'] - values['serdes_last_start_ns']
+                 if values['serdes_last_finished_ns'] else 0)):
+            return invalid('PON_serdes_timing_inconsistent')
+        if not values['serdes_last_finished_ns']:
+            return invalid('PON_serdes_timing_in_progress')
+    elif any(values[key] for key in names[1:]):
+        return invalid('PON_serdes_timing_inconsistent')
+    return {'valid': True, 'cached': True, 'mmio_reads': 0,
+            'timebase': 'boottime_ns', 'values': values, 'last_error': error,
+            'ready_for_fabric_handoff': False}
+
+
+def cold_serdes_order_sample(cold, serdes):
+    """Same boot, same timebase, but chronology is not hardware authorization."""
+    if not cold.get('valid') or not serdes.get('valid'):
+        return {'valid': False, 'reason': 'cold_or_serdes_timing_unavailable'}
+    timing = cold.get('timing')
+    values = serdes['values']
+    if (timing is None or not timing['cold_finished_ns'] or
+            not values['serdes_first_start_ns']):
+        return {'valid': False, 'reason': 'cold_or_serdes_attempt_missing'}
+    difference = values['serdes_first_start_ns'] - timing['cold_finished_ns']
+    return {'valid': True, 'serdes_after_ni_cold': difference > 0,
+            'start_minus_cold_finish_ns': difference,
+            'proves_hardware_readiness': False}
 
 
 def pon_cached_observations(raw):
@@ -1121,7 +1226,8 @@ def summarize(text):
               "states": {}, "qm_cpu": {}, "qm_buffer": {}, "qm_multicast": {},
               "netdev_host": {}, "physical_mac_cached": {}, "fabric_cached": {},
               "cold_bootstrap_history": {}, "l2_completed": {}, "mce_cached": {},
-              "l3_admission": {}, "l3_flows_cached": {}, "mce_inherited": {}}
+              "l3_admission": {}, "l3_flows_cached": {}, "mce_inherited": {},
+              "pon_serdes_timing": {}, "cold_serdes_order": {}}
     fe_keys = ("l2_requested", "l2_active", "l2_reason", "l2_hw_reason", "l2_hw_valid", "l2_worker_busy", "l2_error", "l2_ports",
                "l2_bum_hardware", "l2_vlan_hardware", "l2_mdb_hardware", "l2_multibridge_hardware",
                "l2_route_policy_allowed", "l2_flow_allowed", "l2_local_target", "l2_rx_gate_verified",
@@ -1153,6 +1259,9 @@ def summarize(text):
         result["states"][which] = {"fe": select_fe_state(snapshot, fe_keys),
                                     "ni": select_state(snapshot, "xram_state", LIFECYCLE)}
         result['cold_bootstrap_history'][which] = cold_sample(snapshot)
+        result['pon_serdes_timing'][which] = pon_serdes_timing_sample(snapshot)
+        result['cold_serdes_order'][which] = cold_serdes_order_sample(
+            result['cold_bootstrap_history'][which], result['pon_serdes_timing'][which])
         result['l2_completed'][which] = l2_completed_sample(snapshot)
         result['mce_cached'][which] = mce_sample(snapshot)
         result['mce_inherited'][which] = mce_inherited_sample(snapshot)
@@ -1208,6 +1317,9 @@ def summarize(text):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--redacted-boot-ids', action='store_true',
+                        help='accept explicit <BOOT_ID_N> privacy labels as synthetic identities; '
+                             'not a live device proof')
     parser.add_argument("capture", type=Path)
     arguments = parser.parse_args()
     try:
@@ -1215,7 +1327,13 @@ def main():
             content = stream.read(MAX_BYTES + 1)
         if len(content) > MAX_BYTES:
             raise ValueError("capture exceeds 2 MiB")
-        result = summarize(content.decode("utf-8", errors="strict"))
+        capture = content.decode("utf-8", errors="strict")
+        redacted = bool(REDACTED_BOOT_ID.search(capture))
+        if arguments.redacted_boot_ids:
+            capture = normalize_redacted_boot_ids(capture)
+        result = summarize(capture)
+        if redacted and arguments.redacted_boot_ids:
+            result['redacted_boot_identity_replayed'] = True
     except (OSError, UnicodeError, ValueError) as error:
         parser.exit(2, f"Invalid capture: {error}\n")
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

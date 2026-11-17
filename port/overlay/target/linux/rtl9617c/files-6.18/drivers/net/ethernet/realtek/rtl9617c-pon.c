@@ -219,6 +219,22 @@ static ssize_t serdes_show(struct device *dev, struct device_attribute *attr, ch
 	return size;
 }
 
+static ssize_t serdes_timing_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
+	ssize_t size;
+
+	/* PON profile writes and SerDes polling may hold this mutex for seconds.
+	 * Never block an observer behind live hardware configuration. */
+	if (!mutex_trylock(&pon->lock))
+		return sysfs_emit(buf,
+			"schema=1 available=0 cached=1 mmio_reads=0 mmio_writes=0 reason=busy retryable=1\n");
+	size = rtl_pon_serdes_timing(pon, buf);
+	mutex_unlock(&pon->lock);
+	return size;
+}
+static DEVICE_ATTR_RO(serdes_timing);
+
 static ssize_t serdes_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
@@ -927,6 +943,7 @@ static struct attribute *rtl9617c_pon_attrs[] = {
 	&dev_attr_bosa.attr,
 	&dev_attr_transceiver.attr,
 	&dev_attr_serdes.attr,
+	&dev_attr_serdes_timing.attr,
 	&dev_attr_serdes_registers.attr,
 	&dev_attr_optical.attr,
 	&dev_attr_mac.attr,

@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +67,13 @@ struct rtl_dq_io {
  void (*write)(void *,unsigned int,unsigned int);
  int (*indirect)(void *,unsigned int,unsigned int);
 };
+static const char *semantic_stage="initial";
+#define SEMANTIC_CHECK(condition) do { \
+ if (!(condition)) { \
+  fprintf(stderr,"MCE_SEMANTIC_ASSERT stage=%s expr=%s\n",semantic_stage,#condition); \
+  exit(73); \
+ } \
+} while(0)
 struct mock_mutex {bool held,blocked;};
 struct rtl_fe {
  struct mock_mutex lock;
@@ -81,7 +89,7 @@ static bool mutex_trylock(struct mock_mutex *m) {
  if(m->blocked||m->held)return false;
  m->held=true;return true;
 }
-static void mutex_unlock(struct mock_mutex *m) {assert(m->held);m->held=false;}
+static void mutex_unlock(struct mock_mutex *m) {SEMANTIC_CHECK(m->held);m->held=false;}
 #define spin_lock_irqsave(lock, flags) do { (void)(lock);(flags)=0; } while(0)
 #define spin_unlock_irqrestore(lock, flags) do { (void)(lock);(void)(flags); } while(0)
 static u64 ktime_get_ns(void) { static u64 clock=500;return clock+=10; }
@@ -127,28 +135,28 @@ int main(void) {
  assert(strstr(page,"missing_contracts=0x1f sample_valid=0x1f"));
  assert(strstr(page,"sample_error=0") && strstr(page,"cache_ini=0x00000004"));
 
- fe.reads=0;fe.words[3]=0xffffffffU;
+ semantic_stage="invalid_csr";fe.reads=0;fe.words[3]=0xffffffffU;
  size=rtl_fe_mce_inherited_evidence(&fe,page);
  assert(size>0 && fe.reads==5 && !fe.lock.held);
  assert(strstr(page,"sample_valid=0x17 sample_reads=5 sample_error=-5"));
  assert(strstr(page,"bad_register=0x38a0 bad_value=0xffffffff"));
 
- typeof(*fe.l2_owner) owner={.ledger={.generation=4294967297ULL}};
+ semantic_stage="owner";typeof(*fe.l2_owner) owner={.ledger={.generation=4294967297ULL}};
  fe.l2_owner=&owner;fe.mcast=&owner;fe.reads=0;fe.words[3]=4;
  size=rtl_fe_mce_inherited_evidence(&fe,page);
  assert(size>0 && fe.reads==5 && !fe.lock.held);
  assert(strstr(page,"mce_owner=1 owner_generation_valid=1 owner_generation=4294967297"));
 
- fe.reads=0;fe.lock.blocked=true;
+ semantic_stage="busy";fe.reads=0;fe.lock.blocked=true;
  size=rtl_fe_mce_inherited_evidence(&fe,page);
  assert(size>0 && strstr(page,"reason=busy") && !fe.reads);
- fe.lock.blocked=false;fe.engine_ready=false;
+ semantic_stage="engine_down";fe.lock.blocked=false;fe.engine_ready=false;
  size=rtl_fe_mce_inherited_evidence(&fe,page);
  assert(size>0 && strstr(page,"reason=engine_down") && !fe.reads && !fe.lock.held);
  fe.engine_ready=true;fe.shutting_down=true;
  size=rtl_fe_mce_inherited_evidence(&fe,page);
  assert(size>0 && strstr(page,"reason=engine_down") && !fe.reads);
- size=rtl_fe_mce_inherited_evidence(NULL,page);
+ semantic_stage="no_fe";size=rtl_fe_mce_inherited_evidence(NULL,page);
  assert(size>0 && strstr(page,"reason=no_fe") && !fe.reads);
 
  puts("FE MCE inherited production getter: exact five read-only CSRs, root gated, no-owner, allones, unavailable and page budget PASS");
@@ -170,6 +178,10 @@ def main():
                           'handoff_verified=1 retirement_verified=1'),
         'ignore_busy': ('if(!mutex_trylock(&fe->lock))', 'if(0)'),
     }
+    expected_stage = {
+        'skip_engine_gate': 'engine_down', 'skip_read': 'initial',
+        'claim_handoff': 'initial', 'ignore_busy': 'initial',
+    }
     for name, (before, after) in mutations.items():
         assert GETTER.count(before) == 1, name
         variants[name] = GETTER.replace(before, after, 1)
@@ -177,11 +189,15 @@ def main():
     with tempfile.TemporaryDirectory(prefix='mce-inherited-host-') as directory:
         for name, getter in variants.items():
             path = Path(directory) / f'{name}.c'
-            path.write_text(FIXTURE + MACROS + TYPES.group() + '\n' + READER + '\n' + getter + '\n' + TEST)
+            # Every assertion in the semantic scenarios is deliberately
+            # labelled. A sanitizer abort is not a successful mutation test.
+            case_test = TEST.replace('assert(', 'SEMANTIC_CHECK(')
+            path.write_text(FIXTURE + MACROS + TYPES.group() + '\n' + READER + '\n' + getter + '\n' + case_test)
             binary = path.with_suffix('')
+            platform_flags = [] if sys.platform == 'darwin' else ['-fno-pie', '-no-pie']
             subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-unused-function',
-                            '-O1', '-g', '-fsanitize=address,undefined', '-fno-pie', '-no-pie',
+                            '-O1', '-g', '-fsanitize=address,undefined', *platform_flags,
                             str(path), '-o', str(binary)],
                            check=True, text=True, capture_output=True)
             result = subprocess.run([str(binary)], env=env, capture_output=True, text=True)
@@ -189,7 +205,9 @@ def main():
                 assert result.returncode == 0, (name, result.stderr)
                 print(result.stdout.strip())
             else:
-                assert result.returncode != 0, (name, 'semantic mutation survived')
+                marker = f"MCE_SEMANTIC_ASSERT stage={expected_stage[name]} expr="
+                assert result.returncode == 73 and marker in result.stderr, (
+                    name, result.returncode, result.stderr)
     print(f'MCE inherited getter: {len(mutations)} independent regression mutations rejected')
 
 

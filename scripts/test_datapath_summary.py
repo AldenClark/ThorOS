@@ -15,6 +15,9 @@ program = root / 'scripts/summarize_tyfza1_datapath.py'
 spec = importlib.util.spec_from_file_location('summary', program)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+collector = (root / 'scripts/observe_tyfza1_datapath.sh').read_text()
+assert 'read_cached_probe "$pon_dir/serdes_timing"' in collector
+assert 'read_cached_probe "$pon_dir/serdes"' not in collector
 boot = '11111111-2222-3333-4444-555555555555'
 other_boot = '11111111-2222-3333-4444-666666666666'
 state = 'base_ready=1 dma_exposed=1 engine_poisoned=0 host_active=1 reboot_required=0'
@@ -25,7 +28,8 @@ topology = ('dev=lan1 ifindex=3 iflink=3 mtu=1500 operstate=up carrier=1 speed=1
 def capture(*, after_boot=boot, times=('10.00', '11.00', '21.00', '22.00'),
             q_before='9007199254740993', q_after='9007199254741193',
             ni_after=state, link_after=topology, after=True, missing='', extra='', mib=None, cold=None,
-            admission=None, flow=None, completed=None, resources=None, mce_direct=None):
+            admission=None, flow=None, completed=None, resources=None, mce_direct=None,
+            serdes_timing=None):
     result = 'schema=tyfza1-datapath-v3 mode=passive interval_seconds=10 details=0 active_diagnostics=0\n'
     for index, which in enumerate(('before', 'after') if after else ('before',)):
         identity = boot if index == 0 else after_boot
@@ -52,6 +56,8 @@ PRIVATE_TUPLE=192.0.2.1:1234
 {state if index == 0 else ni_after}
 [cold_bootstrap]
 {cold[index] if cold else 'unavailable'}
+[pon_serdes_timing]
+{serdes_timing[index] if serdes_timing else 'unavailable'}
 [qm_voqs]
 cpu_bytes={q_before if index == 0 else q_after} cpu_packets={20 + index} ring_errors=0 buffer_errors=0 budget_hits={index}
 [lan_mib_evidence]
@@ -264,6 +270,21 @@ mode_record = module.admission_sample({'l3_admission': mode_refusal.splitlines()
 assert mode_record['valid'] and mode_record['last_failure']['stage'] == 'fdb_mode'
 assert mode_record['fdb_mode']['last_control'] == 0x1ca00ff9
 assert mode_record['fdb_mode']['fdb_mode_cmd_disabled'] == 1
+route_line = ('route_policy_admitted=1 route_fabric_ready=0 route_fabric_poisoned=0 '
+              'route_fdb_owner_present=1 route_fdb_owner_sealed=0 route_fdb_owner_quarantined=0 '
+              'route_live_cmd_mode_rechecked=0')
+route_record = module.admission_sample({'l3_admission': (admission + '\n' + route_line).splitlines()})
+assert route_record['valid'] and route_record['route_cached']['route_policy_admitted'] == 1
+assert route_record['route_cached']['route_fabric_ready'] == 0
+assert route_record['route_cached']['route_live_cmd_mode_rechecked'] == 0
+assert module.admission_sample({'l3_admission': admission.splitlines()})['route_cached'] is None
+for invalid_route in (route_line.replace('route_fabric_ready=0', 'route_fabric_ready=2'),
+                      route_line.replace('route_fdb_owner_present=1', 'route_fdb_owner_present=0')
+                                .replace('route_fdb_owner_sealed=0', 'route_fdb_owner_sealed=1'),
+                      route_line.replace('route_live_cmd_mode_rechecked=0', 'route_live_cmd_mode_rechecked=1'),
+                      route_line.replace('route_fabric_poisoned=0 ', ''),
+                      route_line + ' route_policy_admitted=0'):
+    assert not module.admission_sample({'l3_admission': (admission + '\n' + invalid_route).splitlines()})['valid']
 # Historical R12 evidence lacks both the new stage and its diagnostic rows.
 legacy_admission = admission.replace(' stage_fdb_mode_failed=0', '')
 legacy_admission = '\n'.join(line for line in legacy_admission.splitlines()
@@ -622,6 +643,48 @@ clock_refused = (cold_old.replace('result=-5', 'result=-11')
             for i in range(4)))
 clock_result = module.cold_sample({'cold_bootstrap': clock_refused.splitlines()})
 assert clock_result['valid'] and clock_result['stage_name'] == 'clock_precondition'
+# Deliberately synthetic boot intervals, not timestamps from a field report.
+timed_cold = (clock_refused + '\ncold_timebase=boottime_ns cold_started_ns=1000000000 '
+              'cold_finished_ns=1010000000 cold_elapsed_ns=10000000 cold_retry_permitted=0\n')
+timed_serdes = ('schema=1 cached=1 mmio_reads=0 mmio_writes=0 serdes_timebase=boottime_ns '
+                'serdes_attempts=1 serdes_first_start_ns=3000000000 '
+                'serdes_last_start_ns=3000000000 serdes_last_finished_ns=3200000000 '
+                'serdes_last_elapsed_ns=200000000 serdes_last_error=0\n')
+timed = module.summarize(capture(cold=(timed_cold, timed_cold),
+                                 serdes_timing=(timed_serdes, timed_serdes)))
+assert timed['cold_bootstrap_history']['after']['timing']['cold_finished_ns'] == 1010000000
+assert timed['pon_serdes_timing']['after']['valid']
+assert module.pon_serdes_timing_sample({'pon_serdes_timing': [
+    'schema=1 available=0 cached=1 mmio_reads=0 mmio_writes=0 reason=busy retryable=1'
+]}) == {'valid': False, 'reason': 'PON_serdes_timing_busy'}
+assert module.pon_serdes_timing_sample({'pon_serdes_timing': [
+    'schema=1 available=0 cached=1 mmio_reads=1 mmio_writes=0 reason=busy retryable=1'
+]}) == {'valid': False, 'reason': 'PON_serdes_timing_schema_invalid'}
+assert module.pon_serdes_timing_sample({'pon_serdes_timing':
+    timed_serdes.replace('serdes_last_finished_ns=3200000000',
+                         'serdes_last_finished_ns=0').replace(
+        'serdes_last_elapsed_ns=200000000', 'serdes_last_elapsed_ns=0').splitlines()
+}) == {'valid': False, 'reason': 'PON_serdes_timing_in_progress'}
+assert not timed['pon_serdes_timing']['after']['ready_for_fabric_handoff']
+assert timed['cold_serdes_order']['after']['valid']
+assert timed['cold_serdes_order']['after']['serdes_after_ni_cold']
+assert timed['cold_serdes_order']['after']['start_minus_cold_finish_ns'] == 1990000000
+assert not timed['cold_serdes_order']['after']['proves_hardware_readiness']
+for old, new in (('cold_elapsed_ns=10000000', 'cold_elapsed_ns=10000001'),
+                 ('cold_timebase=boottime_ns', 'cold_timebase=realtime_ns'),
+                 ('cold_retry_permitted=0', 'cold_retry_permitted=1'),
+                 ('cold_finished_ns=1010000000', 'cold_finished_ns=990000000'),
+                 ('cold_started_ns=1000000000 ', '')):
+    assert not module.cold_sample({'cold_bootstrap': timed_cold.replace(old, new).splitlines()})['valid']
+for old, new in (('serdes_last_elapsed_ns=200000000', 'serdes_last_elapsed_ns=1'),
+                 ('serdes_attempts=1', 'serdes_attempts=0'),
+                 ('serdes_timebase=boottime_ns', 'serdes_timebase=realtime_ns'),
+                 ('serdes_last_finished_ns=3200000000', 'serdes_last_finished_ns=1'),
+                 ('mmio_reads=0', 'mmio_reads=1'),
+                 ('serdes_last_start_ns=3000000000 ', '')):
+    assert not module.pon_serdes_timing_sample(
+        {'pon_serdes_timing': timed_serdes.replace(old, new).splitlines()})['valid']
+assert not module.summarize(capture())['cold_serdes_order']['after']['valid']
 assert clock_result['reason'] == 'clock_guard_refused_before_receive_gate_write'
 assert clock_result['clock_observations']['pon_clock_last'] == 0x4000
 assert clock_result['clock_ready_proven'] is False
@@ -692,6 +755,17 @@ for reason, text in (
     result = module.summarize(text)
     assert result['clock_window'] == {'valid': False, 'reason': reason}, result
     assert result['qm_cpu']['valid'] is False and result['netdev_host']['valid'] is False
+
+# R13 laboratory exports replaced boot UUIDs with privacy labels. They must
+# remain rejected unless explicitly normalized; distinct labels retain the
+# boot-change rejection and no fabricated hardware proof is introduced.
+private_redaction = capture().replace(f'boot_id={boot}', 'boot_id=<BOOT_ID_1>')
+assert module.summarize(private_redaction)['clock_window']['reason'] == 'boot_identity_missing_or_invalid'
+synthetic_redaction = module.normalize_redacted_boot_ids(private_redaction)
+assert module.summarize(synthetic_redaction)['clock_window']['valid']
+assert not module.summarize(synthetic_redaction)['hardware_forwarding_proven']
+mixed_redaction = private_redaction.replace('boot_id=<BOOT_ID_1>', 'boot_id=<BOOT_ID_2>', 1)
+assert module.summarize(module.normalize_redacted_boot_ids(mixed_redaction))['clock_window']['reason'] == 'boot_changed'
 
 for value in ('1', '9007199254740992'):
     result = module.summarize(capture(q_after=value))
