@@ -185,6 +185,10 @@ struct rtl_xram {
 	u64 tm_owner_generation; /* Before publication, then RTNL-serialized. */
 	bool cold_handoff_required;
 	bool cold_attempted;
+	/* Immutable boottime interval of the one prepublication transaction.
+	 * Compare with PON's separately reported SerDes attempt; these clocks
+	 * expose ordering only, not a license for a later live handoff. */
+	u64 cold_started_ns, cold_finished_ns;
 	bool provider_ready;
 	bool fabric_managed;
 	int fabric_error;
@@ -1622,6 +1626,7 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 	 * In particular snapshot_ready does NOT say live PON RX is still shut. */
 	return sysfs_emit(buf,
 		"schema=1 cached=1 historical=1 requested=%u attempted=%u managed=%u result=%d provider_ready=%u engine_poisoned=%u\n"
+		"cold_timebase=boottime_ns cold_started_ns=%llu cold_finished_ns=%llu cold_elapsed_ns=%llu cold_retry_permitted=0\n"
 		"pon_snapshot_ready=%u pon_stage=%u pon_error=%d pon_pdc_active=%u pon_gated_mask=0x%x pon_fifo=0x%x pon_fifo_polls=%u "
 		"pon_control=0x%08x pon_epon_control=0x%08x pon_gpon_control=0x%08x pon_refused_register=0x%x pon_refused_value=0x%x\n"
 		"pon_gate_written_mask=0x%x pon_gate_sampled_mask=0x%x pon_gate_polls=%u pon_gate_stable=%u\n"
@@ -1644,6 +1649,10 @@ static ssize_t cold_bootstrap_show(struct device *dev, struct device_attribute *
 		"pon_after_psds_mode=0x%08x pon_after_psds_status=0x%08x pon_after_psds_gbox=0x%08x pon_after_pdc_control=0x%08x\n",
 		priv->cold_handoff_required, priv->cold_attempted, priv->fabric_managed,
 		priv->fabric_error, READ_ONCE(priv->provider_ready), READ_ONCE(priv->engine_poisoned),
+		(unsigned long long)priv->cold_started_ns,
+		(unsigned long long)priv->cold_finished_ns,
+		(unsigned long long)(priv->cold_finished_ns >= priv->cold_started_ns ?
+			priv->cold_finished_ns - priv->cold_started_ns : 0),
 		cold->ready, cold->stage, cold->error, cold->pdc_active, cold->gated_mask,
 		cold->fifo_status, cold->fifo_polls, cold->control, cold->epon_control,
 		cold->gpon_control, cold->refused_register, cold->refused_value,
@@ -2017,6 +2026,7 @@ static int rtl_ni_cold_bootstrap(struct rtl_xram *priv, struct platform_device *
 		goto out;
 	}
 	priv->cold_attempted = true;
+	priv->cold_started_ns = ktime_get_boottime_ns();
 	if (!priv->cold_handoff_required)
 		goto out;
 	if (!priv->fe) {
@@ -2078,6 +2088,8 @@ fallback:
 		 priv->pon_cold.refused_register, priv->pon_cold.refused_value);
 	ret = 0;
 out:
+	if (priv->cold_attempted && !priv->cold_finished_ns)
+		priv->cold_finished_ns = ktime_get_boottime_ns();
 	mutex_unlock(&priv->fabric_lock);
 	return ret;
 }

@@ -92,6 +92,7 @@ common = r'''
 #include "rtl9617c-l2-es.h"
 #include "rtl9617c-mcast-cold.h"
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef uint64_t resource_size_t;
 #define __iomem
 #define EPROBE_DEFER 517
@@ -142,6 +143,7 @@ struct rtl_xram {
  unsigned long long tm_owner_generation;
  struct mutex fabric_lock;
  bool cold_handoff_required,cold_attempted,provider_ready,fabric_managed;
+ u64 cold_started_ns,cold_finished_ns;
  bool removing,engine_poisoned,native_groups_created,irq_requested;
  bool dma_tx,qm_rx,base_ready,dma_exposed,host_active,rx_active,tx_pending,pon_gate_valid;
  u32 pon_gate_requested;
@@ -176,6 +178,10 @@ static _Thread_local unsigned int held,role;
 static bool block_baseline,baseline_entered,allow_baseline,second_attempted;
 static bool rtnl;
 static bool native_l2_ivl;
+static u64 ktime_get_boottime_ns(void) {
+ static u64 tick=1000000000ULL;
+ return __sync_add_and_fetch(&tick,1000);
+}
 static void *kvzalloc(size_t size,unsigned int flags){assert(!flags);return calloc(1,size);}
 static void *kvcalloc(size_t count,size_t size,unsigned int flags){assert(!flags);return calloc(count,size);}
 static void kvfree(void *memory){free(memory);}
@@ -445,6 +451,13 @@ static void cached_snapshot(struct rtl_xram *priv){
  assert(length>0 && length<PAGE_SIZE && cached[length]=='\0');
  assert((size_t)length==strlen(cached) && cached[length-1]=='\n');
  assert(strstr(cached,"cached=1 historical=1") && strstr(cached,"attempted=1"));
+ assert(priv->cold_started_ns && priv->cold_finished_ns>=priv->cold_started_ns);
+ snprintf(expected,sizeof(expected),
+          "cold_timebase=boottime_ns cold_started_ns=%llu cold_finished_ns=%llu cold_elapsed_ns=%llu cold_retry_permitted=0\n",
+          (unsigned long long)priv->cold_started_ns,
+          (unsigned long long)priv->cold_finished_ns,
+          (unsigned long long)(priv->cold_finished_ns-priv->cold_started_ns));
+ assert(strstr(cached,expected));
  snprintf(expected,sizeof(expected),
           "requested=%u attempted=%u managed=%u result=%d provider_ready=%u engine_poisoned=%u\n",
           priv->cold_handoff_required,priv->cold_attempted,priv->fabric_managed,priv->fabric_error,

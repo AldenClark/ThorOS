@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -179,9 +180,10 @@ def main():
             path = Path(directory) / f'{name}.c'
             path.write_text(FIXTURE + MACROS + TYPES.group() + '\n' + READER + '\n' + getter + '\n' + TEST)
             binary = path.with_suffix('')
+            platform_flags = [] if sys.platform == 'darwin' else ['-fno-pie', '-no-pie']
             subprocess.run([os.environ.get('CC', 'cc'), '-std=gnu11', '-Wall', '-Wextra', '-Werror',
                             '-Wno-unused-function',
-                            '-O1', '-g', '-fsanitize=address,undefined', '-fno-pie', '-no-pie',
+                            '-O1', '-g', '-fsanitize=address,undefined', *platform_flags,
                             str(path), '-o', str(binary)],
                            check=True, text=True, capture_output=True)
             result = subprocess.run([str(binary)], env=env, capture_output=True, text=True)

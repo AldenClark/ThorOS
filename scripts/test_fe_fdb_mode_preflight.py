@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -202,9 +203,18 @@ def main():
             path = Path(directory) / (name + ".c")
             binary = path.with_suffix("")
             path.write_text(FIXTURE + IO_VALID + CONTROL_READ + body + TEST)
+            # Apple Clang treats -no-pie as an unused/unsupported linker
+            # argument under -Werror; Linux keeps the deterministic non-PIE
+            # executable needed by this host ASan/UBSan model.
+            platform_flags = [] if sys.platform == "darwin" else ["-fno-pie", "-no-pie"]
+            # The skipped live-probe mutant intentionally leaves the extracted
+            # read helper unused. That variant must compile and be rejected by
+            # the runtime assertion, not by a compiler warning.
+            mutation_flags = ["-Wno-unused-function"] if name == "skip_live_probe" else []
             subprocess.run([
                 os.environ.get("CC", "cc"), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
-                "-g", "-O1", "-fsanitize=address,undefined", "-fno-pie", "-no-pie",
+                "-g", "-O1", "-fsanitize=address,undefined", *platform_flags,
+                *mutation_flags,
                 "-I" + str(DRIVER), str(path), "-o", str(binary),
             ], check=True, capture_output=True, text=True)
             result = subprocess.run([str(binary)], capture_output=True, text=True, env=env)

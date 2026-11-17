@@ -2907,6 +2907,18 @@ ssize_t rtl_fe_admission_state(struct rtl_fe *fe,char *buffer)
   o->install_no_space,o->install_no_memory,o->install_io,o->install_other,
   o->last_failure_request,rtl_fe_install_stage_name(o->last_failure_stage),
   o->last_failure_error,o->last_rollback_error);
+ /* Route admission is policy only. A positive policy bit cannot authorize
+  * hardware installation until fabric/owner are ready AND the per-request
+  * preflight has confirmed the live shared FDB CMD_MODE. This is cached
+  * state, not a replacement for that MMIO preflight. */
+ length+=scnprintf(buffer+length,PAGE_SIZE-length,
+  "route_policy_admitted=%u route_fabric_ready=%u route_fabric_poisoned=%u "
+  "route_fdb_owner_present=%u route_fdb_owner_sealed=%u route_fdb_owner_quarantined=%u "
+  "route_live_cmd_mode_rechecked=0\n",
+  READ_ONCE(fe->route_admitted),fe->fabric.ready,fe->fabric.poisoned,
+  !!fe->l2_owner,fe->l2_owner && fe->l2_owner->sealed,
+  fe->l2_owner && (fe->l2_owner->ledger.quarantined ||
+                   fe->l2_owner->journal.quarantined));
  length+=scnprintf(buffer+length,PAGE_SIZE-length,
   "fdb_mode_ready=%llu fdb_mode_fabric_unready=%llu fdb_mode_owner_unready=%llu "
   "fdb_mode_owner_fault=%llu fdb_mode_window_busy=%llu fdb_mode_info_init=%llu "

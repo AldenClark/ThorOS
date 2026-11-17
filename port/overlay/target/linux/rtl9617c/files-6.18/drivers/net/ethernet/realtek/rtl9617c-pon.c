@@ -219,6 +219,18 @@ static ssize_t serdes_show(struct device *dev, struct device_attribute *attr, ch
 	return size;
 }
 
+static ssize_t serdes_timing_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
+	ssize_t size;
+
+	mutex_lock(&pon->lock);
+	size = rtl_pon_serdes_timing(pon, buf);
+	mutex_unlock(&pon->lock);
+	return size;
+}
+static DEVICE_ATTR_RO(serdes_timing);
+
 static ssize_t serdes_store(struct device *dev, struct device_attribute *attr,
 			   const char *buf, size_t count)
 {
@@ -927,6 +939,7 @@ static struct attribute *rtl9617c_pon_attrs[] = {
 	&dev_attr_bosa.attr,
 	&dev_attr_transceiver.attr,
 	&dev_attr_serdes.attr,
+	&dev_attr_serdes_timing.attr,
 	&dev_attr_serdes_registers.attr,
 	&dev_attr_optical.attr,
 	&dev_attr_mac.attr,

@@ -41,6 +41,7 @@ MODEL = r'''
 #include <sys/types.h>
 #include "rtl9617c-fe-observe.h"
 #define PAGE_SIZE 4096
+#define READ_ONCE(v) (v)
 typedef unsigned long long u64;
 static unsigned long jiffies=10000;
 static unsigned int jiffies_to_msecs(unsigned long j) {return j*10;}
@@ -84,6 +85,8 @@ struct rtl_l2_owner {
 struct rtl_fe {
  struct mutex lock;struct list_head flows;struct rtl_fe_observe observe;u64 evidence_instance_ns;
  struct rtl_l2_owner *l2_owner;
+ struct {bool ready,poisoned;} fabric;
+ bool route_admitted;
 };
 static int scnprintf(char *b,size_t cap,const char *f,...) {
  va_list ap;va_start(ap,f);int n=vsnprintf(b,cap,f,ap);va_end(ap);
@@ -167,7 +170,10 @@ int main(void) {
  fe.observe.last_fdb_mode_control=0x1ca00ff9U;
  fe.observe.last_failure_stage=FE_INSTALL_DESTINATION_MAC;
  fe.observe.last_failure_error=-EOPNOTSUPP;fe.observe.last_rollback_error=-ETIMEDOUT;
+ fe.route_admitted=true;
  assert(rtl_fe_admission_state(&fe,output)>0);
+ assert(strstr(output,"route_policy_admitted=1 route_fabric_ready=0 route_fabric_poisoned=0 "));
+ assert(strstr(output,"route_fdb_owner_present=1 route_fdb_owner_sealed=1 route_fdb_owner_quarantined=1 route_live_cmd_mode_rechecked=0"));
  assert(strstr(output,"requests=18446744073709551615"));
  assert(strstr(output,"install_collision=3 install_unsupported=7"));
  assert(strstr(output,"reject_other_ingress=11"));
@@ -178,6 +184,11 @@ int main(void) {
  assert(strstr(output,"stage_fdb_mode_failed=18446744073709551615"));
  assert(strstr(output,"stage_publish_failed=18446744073709551615"));
  assert(strstr(output,"mmio_reads=0 mmio_writes=0"));
+ fe.fabric.ready=true;fe.fabric.poisoned=true;owner.ledger.quarantined=false;
+ owner.journal.quarantined=false;
+ assert(rtl_fe_admission_state(&fe,output)>0);
+ assert(strstr(output,"route_policy_admitted=1 route_fabric_ready=1 route_fabric_poisoned=1 "));
+ assert(strstr(output,"route_fdb_owner_present=1 route_fdb_owner_sealed=1 route_fdb_owner_quarantined=0 route_live_cmd_mode_rechecked=0"));
  assert(rtl_fe_flow_evidence(&fe,output)>0 && strstr(output,"emitted=0 truncated=0"));
  assert(strstr(output,"instance_ns=314159265"));
  struct rtl_fe_port lan={.source=3},pon={.source=7};

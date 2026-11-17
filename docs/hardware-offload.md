@@ -71,6 +71,8 @@
 - R13 `mce_inherited` 是仅 root 可读的独立实时观测：即使冷接管在 PON 阶段被拒绝，也能在 FE 引擎就绪时连续只读五个直接映射的 FE CSR。`sample_valid` 只代表该字并非全 1，**并不证明时钟就绪或寄存器语义有效**；它不会访问 DMALSO/DDR、间接表或触发写入；`scope=runtime_direct`、`atomic_snapshot=0`、`clock_verified=0`、`handoff_verified=0`、`retirement_verified=0` 和 `missing_contracts=0x1f` 明确禁止用其作为 MCE 冷接管或包退役证据。锁定 SDK 中这五个字为引擎配置，而非直接的 IP/MAC 地址；其原始内部状态仍应在分享前审查和按需脱敏。
 - `l3_admission` 按解析原因、安装阶段及实际 errno 计数。其他物理入口的回调单列为 `reject_other_ingress`，非哈希阶段的 `-EOPNOTSUPP` 单列为 unsupported；不能再把所有该 errno 都解释为哈希冲突。请求数、安装数和失败数都是规则操作计数，不是包数或硬件命中数。
 - R13 `l3_admission` 增加 `fdb_mode` 阶段及 `fdb_mode_*` 原因计数。路由目的 FDB 的共享 CMD_MODE/所有者预检必须在 Hash、CAM、计数器分配前只读完成；命令提交点仍会重查模式。`cmd_disabled`、`info_init` 等拒绝是硬件安装未被允许的证据，而非启用 CMD_MODE 的授权。旧版本未包含这些字段的采样在离线摘要中仍可区分。
+- R14 `l3_admission` 进一步显式分开 `route_policy_admitted`（策略接受）、`route_fabric_ready`、`route_fdb_owner_present/sealed/quarantined`（缓存的安装前提）及 `route_live_cmd_mode_rechecked=0`（本次诊断**未重新读取**共享 FDB CSR）。只有实际安装路径的独立预检才能判断当前 CMD_MODE；策略准入为 `1`、owner 存在或一次历史 CONTROL 采样均不证明硬件已安装流。
+- R14 `cold_bootstrap` 增加 `cold_timebase=boottime_ns`、`cold_started_ns`、`cold_finished_ns`、`cold_elapsed_ns` 与 `cold_retry_permitted=0`，都是发布前冻结的历史记录。PON 设备新增**仅缓存**的 `serdes_timing`，输出首次/最近一次 SerDes 初始化的开始、完成时间、次数和最终 errno，且不触发 PSDS MMIO。它区别于原有 `serdes` 实时状态接口，后者读取硬件寄存器。两者可跨驱动使用同一个启动时间基准对照，但不能据此开放冷接管、IVL 或 MCE。
 - `l3_flows` 最多输出 16 条有界、无地址的缓存观测。身份由同一 boot、FE `instance_ns` 与不复用的 `lease` 共同确定；不能仅按可复用的 hash/counter 槽相减。`truncated=1` 明确表示不是全表；`age_hits` 是正的老化采样次数，不是包数；`sample_age_ms` 是最近一次 stats 尝试的年龄，不是最近一次包转发时间。安装成功也不是数据面验收通过。
 - `l2_route_eligible_ports` 是逐端口路由许可；`l2_native_route_policy_allowed` 是 native 共享策略许可。二者不能互相替代。
 - `mdb_cpu_entries`、`mdb_folded_entries`、`mdb_overlap_cpu`、`mdb_capacity_cpu`、`mdb_dynamic_rows` 表示有界控制面结果，不是硬件命中或已经完成冷接管的证明。
@@ -86,6 +88,8 @@ MCE 在获取 lease 或进行 MMIO 前检查完整组所需的 vector/POL token 
 
 PON 冷阶段不在 RMW 中重放继承的 PMAC reset/TCONT flush 命令位。接收门禁读回、FIFO 排空和最终 GLOBAL 状态均需核验；PSDS/PDC 与门禁变化的新增缓存快照用于定位拒绝，不是新的写权限或排空 ACK。R13 对 XGPON 冷阶段新增零写入的 PSDS RX/TX/MPCP CKRDY 前置拒绝和 `pon_clock_*` 历史诊断；时钟未准备好时不进入 MAC gate/FIFO，也不在 O5 之后重新尝试所谓的冷接管。即使三个 CKRDY 均已就绪，也不等于门禁写入已有 ACK。XGPON 接收门无法关闭时仍应拒绝接管，不能用经验延时或更大缓冲代替证明。
 
+R14 提供同一 boottime 下的 NI 冷接管尝试与 SerDes 配置历史时间，方便定位启动阶段的依赖关系。该记录仅证明函数执行先后，不代表 PSDS CKRDY、接收门禁 ACK 或 FDB/MCE 完成契约已经满足；未改变冷阶段顺序、接管协议、硬件写入或非授权重试。
+
 MCE 继承状态诊断给出逐寄存器有效位与 `missing_contracts`：CPU XRAM、DMALSO、继承 classifier roots、DDR retirement、MCE packet retirement 分别占 bit 0–4。配置可读、flush 请求已置位或计数暂时不变，均不证明这些消费者已停止。当前缺失的物理契约仍保持阻断。
 
 流量计数发现字节/包差分不相容时，记录 `-ERANGE` 并重建私有采样基线，不把无符号下溢后的巨量字节记到 conntrack。该处理不重置硬件表或改变流的转发授权。
@@ -93,6 +97,8 @@ MCE 继承状态诊断给出逐寄存器有效位与 `missing_contracts`：CPU X
 ### 实机采集工具
 
 兼容镜像包含 `ip-full` 与 `ip-bridge`，用于获得完整的链路、FDB、MDB 和 VLAN 控制面证据。采集脚本仍兼容工具缺失，使用整数秒等待，保留原始失败、空读取与截断标记；只对明确列出的只读缓存/direct-CSR 接口进行有界重试，主动表读取不重复执行。根权限 `mce_inherited` 的原始配置仅在 `--details` 显式启用时采集；默认保留跳过标记，避免无意公开芯片内部配置。读取失败的半截 FE 状态不得授权后续主动流表遍历。
+
+R14 采集工具额外读取 PON 的 `pon_serdes_timing`（只读驱动缓存），离线摘要产生 `cold_serdes_order`：如 `serdes_after_ni_cold=true` 与有符号的 `start_minus_cold_finish_ns`。对缺失字段、溢出、前后不一致的时间戳保持无效记录；旧版镜像缺少该字段时仅标记不可用，不误判成硬件接管失败。原始采集仍需同一启动周期，不允许把不同重启的时间戳拿来比较。
 
 离线摘要始终保留 `hardware_forwarding_proven=false`。它可定位控制面变化与缓存观测增量，但不会自动把这些诊断解释为六项硬件能力已通过实机验收。
 

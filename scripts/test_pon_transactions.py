@@ -41,13 +41,14 @@ common = r'''
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "rtl9617c-pon-mode.h"
 #include "rtl9617c-mpcp-backoff.h"
 #include "rtl9617c-pon-data.h"
-typedef uint32_t u32;typedef uint16_t u16;typedef uint8_t u8;
+typedef uint64_t u64;typedef uint32_t u32;typedef uint16_t u16;typedef uint8_t u8;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((~0U>>(31-(h))) & (~0U<<(l)))
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
@@ -78,6 +79,7 @@ struct rtl9617c_pon {
     void *mac,*control,*epon_control,*gpon_control,*serdes_init,*optical_control,*top_irq,*dev,*ni_dev;
     bool mpcp_enabled,mpcp_configured,mac_prepared,traffic_enabled,serdes_configured,gearbox_ready,rx_synced,puc_configured,pdc_configured,fe_enabled,fe_cpu_path,xgpon_pending_valid;
     u32 registered,waiting,serdes_status;int sync_result,serdes_error,mpcp_irq,cleanup_error,policy_error;
+    u64 serdes_attempts,serdes_first_start_ns,serdes_last_start_ns,serdes_last_finished_ns;
     uint64_t epon_epoch,epon_llid_epoch[32];
     u32 epon_crypto_llids,epon_sync_failures;
     u32 epon_holdover_active,epon_holdover_pending;
@@ -137,6 +139,12 @@ static void schedule_delayed_work(struct delayed_work *work,unsigned int delay) 
 #define msleep(ms) ((void)0)
 #define udelay(us) ((void)0)
 #define dev_info(...) ((void)0)
+static u64 test_boottime_ns=100000000;
+static u64 ktime_get_boottime_ns(void) {return test_boottime_ns+=1000000;}
+static const char *rtl_pon_mode_name(enum rtl_pon_mode mode) {return rtl_pon_modes[mode].name;}
+static int sysfs_emit(char *buf,const char *fmt,...) {
+    va_list args;va_start(args,fmt);int ret=vsnprintf(buf,4096,fmt,args);va_end(args);assert(ret>=0 && ret<4096);return ret;
+}
 static u32 readl(const void *p) {u32 value;memcpy(&value,p,4);return read_hook?read_hook(p,value):value;}
 static void writel(u32 value,void *p) {
     if(write_check)write_check(value,p);
@@ -156,9 +164,12 @@ static void rtl_pon_oam_carrier(struct rtl9617c_pon *pon) {assert(pon->lock.held
 static void synchronize_irq(int irq) {(void)irq;assert(!current->lock.held);}
 struct firmware {};
 static const struct firmware firmware;
-static int request_firmware_direct(const struct firmware **fw,const char *name,void *dev) {(void)name;(void)dev;*fw=&firmware;return 0;}
+static int firmware_failure,profile_failure;
+static int request_firmware_direct(const struct firmware **fw,const char *name,void *dev) {
+    (void)name;(void)dev;if(firmware_failure)return firmware_failure;*fw=&firmware;return 0;
+}
 static void release_firmware(const struct firmware *fw) {assert(fw==&firmware);}
-static int rtl_pon_profile_validate(const struct firmware *fw) {(void)fw;return 0;}
+static int rtl_pon_profile_validate(const struct firmware *fw) {(void)fw;return profile_failure;}
 static void rtl_pon_profile_load(struct rtl9617c_pon *pon,const struct firmware *fw) {(void)fw;pon->profile_rows=1;}
 static int rtl_pon_burst_polarity(struct rtl9617c_pon *pon,unsigned int page) {(void)pon;(void)page;return 0;}
 static void rtl_pon_gearbox_release(struct rtl9617c_pon *pon) {pon->gearbox_ready=true;}
@@ -216,6 +227,27 @@ int main(void) {
     assert(rtl_pon_serdes_configure(&pon,RTL_PON_EPON_D10G)==-ENOMEM);
     assert(pon.mode==RTL_PON_XGSPON && !pon.fe_enabled && pon.serdes_error==-ENOMEM);
     assert(stale_puc==0x1234 && stale_pdc==0x5678 && control==0x30e && data_resets==4);
+    assert(pon.serdes_attempts==6 && pon.serdes_first_start_ns &&
+           pon.serdes_last_finished_ns>pon.serdes_last_start_ns);
+    u64 first=pon.serdes_first_start_ns,previous=pon.serdes_last_start_ns;
+    pon.policy_error=0;firmware_failure=-ENOENT;
+    assert(rtl_pon_serdes_configure(&pon,RTL_PON_GPON)==-ENOENT);
+    assert(pon.serdes_error==-ENOENT && pon.mode==RTL_PON_XGSPON &&
+           control==0x30e && pon.serdes_attempts==7 &&
+           pon.serdes_first_start_ns==first && pon.serdes_last_start_ns>previous &&
+           pon.serdes_last_finished_ns>pon.serdes_last_start_ns);
+    firmware_failure=0;profile_failure=-EINVAL;
+    assert(rtl_pon_serdes_configure(&pon,RTL_PON_GPON)==-EINVAL);
+    assert(pon.serdes_error==-EINVAL && pon.mode==RTL_PON_XGSPON &&
+           control==0x30e && pon.serdes_attempts==8 &&
+           pon.serdes_first_start_ns==first &&
+           pon.serdes_last_finished_ns>pon.serdes_last_start_ns);
+    char state[4096];assert(rtl_pon_serdes_timing(&pon,state)>0);
+    assert(strstr(state,"schema=1 cached=1 mmio_reads=0 mmio_writes=0"));
+    assert(strstr(state,"serdes_timebase=boottime_ns serdes_attempts=8"));
+    assert(strstr(state,"serdes_first_start_ns=101000000"));
+    assert(strstr(state,"serdes_last_elapsed_ns=1000000"));
+    assert(strstr(state,"serdes_last_error=-22"));
     puts("Actual SerDes/MPCP transaction: concurrent restart blocked; old PUC/PDC reset before mode handoff; failed FE/NI cleanup preserves old mode and hardware ownership");
     pthread_mutex_destroy(&pon.lock.native);pthread_mutex_destroy(&pon.control_lock.native);
 }
@@ -654,6 +686,14 @@ int main(void) {
 
 controller = read('rtl9617c-pon.c')
 serdes = read('rtl9617c-pon-serdes.c')
+timing_show = function(controller, 'serdes_timing_show')
+assert 'mutex_lock(&pon->lock)' in timing_show
+assert 'rtl_pon_serdes_timing(pon, buf)' in timing_show
+assert 'mutex_unlock(&pon->lock)' in timing_show
+assert 'readl(' not in timing_show
+assert 'static DEVICE_ATTR_RO(serdes_timing)' in controller
+assert '&dev_attr_serdes_timing.attr' in controller
+assert 'readl(' not in function(serdes, 'rtl_pon_serdes_timing')
 mpcp = read('rtl9617c-pon-mpcp.c')
 oam = read('rtl9617c-pon-oam.c')
 pdc = read('rtl9617c-pon-pdc.c')
@@ -672,6 +712,7 @@ with tempfile.TemporaryDirectory(prefix='control-tests-', dir=root / 'artifacts'
             locked = '_locked' if 'rtl_pon_mpcp_stop_locked(' in mpcp else ''
             definitions += function(mpcp, 'rtl_pon_mpcp_stop' + locked) + function(mpcp, 'rtl_pon_mpcp_configure' + locked)
             definitions += function(serdes, 'rtl_pon_serdes_configure' + locked)
+            definitions += function(serdes, 'rtl_pon_serdes_timing')
             if locked:
                 if 'int rtl_pon_stop_locked' in controller:
                     definitions += function(controller, 'rtl_pon_stop_locked')

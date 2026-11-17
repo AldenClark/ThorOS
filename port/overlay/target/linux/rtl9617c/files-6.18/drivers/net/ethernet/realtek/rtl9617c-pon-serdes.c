@@ -10,6 +10,7 @@
 #include <linux/firmware.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/unaligned.h>
 
 #include "rtl9617c-pon.h"
@@ -182,9 +183,16 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 	int ret;
 
 	lockdep_assert_held(&pon->control_lock);
+	mutex_lock(&pon->lock);
+	pon->serdes_last_start_ns = ktime_get_boottime_ns();
+	if (!pon->serdes_attempts)
+		pon->serdes_first_start_ns = pon->serdes_last_start_ns;
+	pon->serdes_attempts++;
+	pon->serdes_last_finished_ns = 0;
+	mutex_unlock(&pon->lock);
 	ret = request_firmware_direct(&fw, configuration->profile, pon->dev);
 	if (ret)
-		return ret;
+		goto finished;
 	ret = rtl_pon_profile_validate(fw);
 	if (ret)
 		goto release;
@@ -195,9 +203,6 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 		mutex_unlock(&pon->lock);
 	}
 	if (ret) {
-		mutex_lock(&pon->lock);
-		pon->serdes_error = ret;
-		mutex_unlock(&pon->lock);
 		goto release;
 	}
 	cancel_delayed_work_sync(&pon->serdes_work);
@@ -253,10 +258,14 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 	dev_info(pon->dev, "%s SerDes: %u profile writes, status=%08x\n",
 		 rtl_pon_mode_name(mode), pon->profile_rows, pon->serdes_status);
 unlock:
-	pon->serdes_error = ret;
 	mutex_unlock(&pon->lock);
 release:
 	release_firmware(fw);
+finished:
+	mutex_lock(&pon->lock);
+	pon->serdes_error = ret;
+	pon->serdes_last_finished_ns = ktime_get_boottime_ns();
+	mutex_unlock(&pon->lock);
 	return ret;
 }
 
@@ -270,6 +279,23 @@ ssize_t rtl_pon_serdes_state(struct rtl9617c_pon *pon, char *buf)
 		pon->serdes_error, pon->sync_result, status, !!(status & BIT(0)), !!(status & BIT(10)),
 		!!(status & BIT(11)), !!(status & BIT(12)), !!(status & BIT(15)), pon->gearbox_ready,
 		readl(pon->mac + PSDS_MODE), readl(pon->mac + PSDS_GBOX), readl(pon->serdes_init));
+}
+
+/* Root lab reads may request these cached timestamps without touching a
+ * SerDes CSR while PON ownership or clock readiness is uncertain. */
+ssize_t rtl_pon_serdes_timing(struct rtl9617c_pon *pon, char *buf)
+{
+	return sysfs_emit(buf,
+		"schema=1 cached=1 mmio_reads=0 mmio_writes=0 serdes_timebase=boottime_ns "
+		"serdes_attempts=%llu serdes_first_start_ns=%llu serdes_last_start_ns=%llu "
+		"serdes_last_finished_ns=%llu serdes_last_elapsed_ns=%llu serdes_last_error=%d\n",
+		(unsigned long long)pon->serdes_attempts,
+		(unsigned long long)pon->serdes_first_start_ns,
+		(unsigned long long)pon->serdes_last_start_ns,
+		(unsigned long long)pon->serdes_last_finished_ns,
+		(unsigned long long)(pon->serdes_last_finished_ns >= pon->serdes_last_start_ns ?
+			pon->serdes_last_finished_ns - pon->serdes_last_start_ns : 0),
+		pon->serdes_error);
 }
 
 ssize_t rtl_pon_serdes_registers(struct rtl9617c_pon *pon, char *buf)

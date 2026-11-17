@@ -403,6 +403,10 @@ snapshot() {
             printf 'unavailable\n'
         fi
     done
+    printf '\n[pon_serdes_timing]\n'
+    # The new PON timing endpoint is cached-only. Never read the older
+    # serdes status endpoint here: that performs live PSDS MMIO reads.
+    read_cached_probe "$pon_dir/serdes_timing"
     for attribute in dma_state qm_state; do
         printf '\n[%s]\n' "$attribute"
         if [ "$active_diagnostics" = 1 ] && [ -n "$ni_dir" ]; then

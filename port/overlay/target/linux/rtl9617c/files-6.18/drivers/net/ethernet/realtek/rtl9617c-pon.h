@@ -93,6 +93,12 @@ struct rtl9617c_pon {
 	bool gearbox_ready;
 	u32 serdes_status;
 	int serdes_error;
+	/* Historical timings, sampled under lock; same boottime clock as NI cold
+	 * bootstrap. Never used to authorize a late fabric handoff. */
+	u64 serdes_attempts;
+	u64 serdes_first_start_ns;
+	u64 serdes_last_start_ns;
+	u64 serdes_last_finished_ns;
 	int sync_result;
 	bool rx_synced;
 	bool mac_prepared;
@@ -195,6 +201,7 @@ void rtl_pon_serdes_init_work(struct rtl9617c_pon *pon);
 void rtl_pon_serdes_stop_work(struct rtl9617c_pon *pon);
 const char *rtl_pon_mode_name(enum rtl_pon_mode mode);
 ssize_t rtl_pon_serdes_state(struct rtl9617c_pon *pon, char *buf);
+ssize_t rtl_pon_serdes_timing(struct rtl9617c_pon *pon, char *buf);
 ssize_t rtl_pon_serdes_registers(struct rtl9617c_pon *pon, char *buf);
 int rtl_pon_epon_prepare(struct rtl9617c_pon *pon);
 ssize_t rtl_pon_epon_state(struct rtl9617c_pon *pon, char *buf);
